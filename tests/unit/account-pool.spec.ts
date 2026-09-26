@@ -1570,3 +1570,123 @@ describe('AccountPool · TRAE 签到设备轮换代次', () => {
     })
   })
 })
+
+/**
+ * 供应商级一键开关的账号侧实现：`setAccountsEnabled`。
+ *
+ * 用「跨实例读回」验证真实落盘（而不只是内存副本）：本类的读源是进程内
+ * 权威副本，若只断言同实例的读回，一个「没写磁盘」的实现也能骗过用例。
+ *
+ * ⚠️ 本节是**独立顶层 describe**（自带 ctx/pool 与工厂）：早期把它追加在
+ * `TRAE 签到设备轮换代次` 那个 describe 内部，引用了该作用域不存在的
+ * `makeMockAccount`，于是 8 条用例全部以 ReferenceError 失败 —— 追加段落时
+ * 必须确认自己落在哪个作用域里。
+ */
+describe('AccountPool · setAccountsEnabled（供应商级批量启停）', () => {
+  let ctx: ReturnType<typeof createMockContext>
+  let pool: AccountPool
+
+  /** 本地工厂（与文件顶部同构；不跨 describe 复用，避免作用域耦合）。 */
+  function makeMockAccount(overrides: Partial<ProviderAccountEntry> = {}): ProviderAccountEntry {
+    return {
+      id: 'buddy-001',
+      provider: 'buddy',
+      nickname: 'test-user',
+      enabled: true,
+      credentialRef: 'BUDDY_ACCOUNT_T1',
+      createdAt: Date.now(),
+      expiresAt: Date.now() + 3600000,
+      refreshable: true,
+      ...overrides,
+    }
+  }
+
+  beforeEach(() => {
+    ctx = createMockContext()
+    pool = new AccountPool(ctx as never)
+  })
+
+  describe('setAccountsEnabled', () => {
+    it('停用该 provider 的全部账号，返回实际变更数', async () => {
+      await pool.addAccount(makeMockAccount())
+      await pool.addAccount(makeMockAccount({ id: 'buddy-002', credentialRef: 'BUDDY_ACCOUNT_T2' }))
+      expect(await pool.setAccountsEnabled('buddy', false)).toBe(2)
+      const accounts = await pool.listAccounts('buddy')
+      expect(accounts.every(a => a.enabled === false)).toBe(true)
+    })
+
+    it('启用该 provider 的全部账号', async () => {
+      await pool.addAccount(makeMockAccount({ enabled: false }))
+      await pool.addAccount(makeMockAccount({ id: 'buddy-002', credentialRef: 'BUDDY_ACCOUNT_T2', enabled: false }))
+      expect(await pool.setAccountsEnabled('buddy', true)).toBe(2)
+      const accounts = await pool.listAccounts('buddy')
+      expect(accounts.every(a => a.enabled === true)).toBe(true)
+    })
+
+    it('⚠️ 只改本 provider，不波及其它 provider（账号同存一个全局数组）', async () => {
+      await pool.addAccount(makeMockAccount())
+      await pool.addAccount(makeMockAccount({ id: 'codearts-001', provider: 'codearts', credentialRef: 'CODEARTS_ACCOUNT_C1' }))
+      await pool.setAccountsEnabled('buddy', false)
+      const buddy = await pool.listAccounts('buddy')
+      const codearts = await pool.listAccounts('codearts')
+      expect(buddy[0].enabled).toBe(false)
+      expect(codearts[0].enabled).toBe(true)
+    })
+
+    it('⚠️ 已是目标状态时返回 0 且**不落盘**（避免无意义的文档重写）', async () => {
+      await pool.addAccount(makeMockAccount({ enabled: false }))
+      // 每次 replace 都记录载荷；这里断言调用次数不增加。
+      const before = ctx.replacePayloads.length
+      expect(await pool.setAccountsEnabled('buddy', false)).toBe(0)
+      expect(ctx.replacePayloads.length).toBe(before)
+    })
+
+    it('该 provider 无账号时返回 0，不抛错', async () => {
+      expect(await pool.setAccountsEnabled('qoder', false)).toBe(0)
+    })
+
+    it('⚠️ 写账号时不得抹掉模型黑名单（整体替换语义）', async () => {
+      await pool.addAccount(makeMockAccount())
+      // 先用「关闭全部」写一条黑名单，再改账号状态
+      await ctx.credentials.set(credentialRef('BUDDY_ACCOUNT_T1'), '{"access_token":"AT"}')
+      await pool.setModelsDisabled('buddy', ['glm-5.2'])
+      await pool.setAccountsEnabled('buddy', false)
+      expect([...pool.disabledModelsFor('buddy')]).toEqual(['glm-5.2'])
+    })
+
+    it('⚠️ 首次访问即写也必须先载入（否则覆盖磁盘已有账号）', async () => {
+      // 构造一个「磁盘上已有账号」的上下文，再用**全新实例**直接写入 ——
+      // 若写路径不调 ensureLoaded()，cache 还是空数组，写回会把磁盘账号全抹掉。
+      const seeded = createMockContext([
+        makeMockAccount(),
+        makeMockAccount({ id: 'buddy-002', credentialRef: 'BUDDY_ACCOUNT_T2' }),
+      ])
+      const first = new AccountPool(seeded as never)
+      // 触发一次载入并落盘（写入目标状态）
+      await first.setAccountsEnabled('buddy', false)
+      const raw = seeded.replacePayloads.at(-1) as { accounts?: ProviderAccountEntry[] }
+      expect(raw.accounts).toHaveLength(2)
+      expect(raw.accounts?.every(a => a.enabled === false)).toBe(true)
+    })
+
+    it('enabled 字段缺失的历史条目视为启用（与适配器的 enabled !== false 一致）', async () => {
+      // 老文档可能没有 enabled 字段；关闭时它应被计入变更。
+      const legacy = makeMockAccount()
+      delete (legacy as { enabled?: boolean }).enabled
+      await pool.addAccount(legacy)
+      expect(await pool.setAccountsEnabled('buddy', false)).toBe(1)
+      const accounts = await pool.listAccounts('buddy')
+      expect(accounts[0].enabled).toBe(false)
+    })
+
+    it('跨实例读回：确实落盘（不是只改了内存副本）', async () => {
+      const seeded = createMockContext([makeMockAccount()])
+      const writer = new AccountPool(seeded as never)
+      await writer.setAccountsEnabled('buddy', false)
+      // 新实例从同一后端载入，应读到停用状态
+      const reader = new AccountPool(seeded as never)
+      const accounts = await reader.listAccounts('buddy')
+      expect(accounts[0].enabled).toBe(false)
+    })
+  })
+})

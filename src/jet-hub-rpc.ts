@@ -147,6 +147,11 @@ import type {
   RpcModelSetDisabledResponse,
   RpcModelSetAllDisabledRequest,
   RpcModelSetAllDisabledResponse,
+  RpcProviderStatusRequest,
+  RpcProviderStatusResponse,
+  RpcProviderSetEnabledRequest,
+  RpcProviderSetEnabledResponse,
+  ProviderStatus,
 } from './types.js'
 
 /** Jet Hub RPC API 路径 */
@@ -706,6 +711,38 @@ function broadcastCatalogChanged(ctx: Context): void {
     ctx.emit('llm/adapters-updated')
   } catch (error) {
     ctx.logger.warn(`[jet-hub] 广播模型目录变更事件失败：${String(error)}`)
+  }
+}
+
+/**
+ * 取某 provider 的**全量模型 id**（不套黑名单），供「关闭全部」与「关闭供应商」共用。
+ *
+ * 两条路径的优先级（与 `model.list` 保持一致的取舍，但**不需要展示名**：
+ * 这里只要 id 来写黑名单，故不走 `model.list` 那套回填 disabled 的复杂逻辑）：
+ * 1. 优先 `modelAdapters[provider].listAllModels()` —— **同步**，不触发远端拉取；
+ * 2. 缺失时退化 `llm.listModels(provider)` —— 异步，且**结果已被黑名单过滤**。
+ *
+ * ⚠️ 第 2 条路径拿不到「已关闭」的模型（它们不在 `listModels` 返回值里），
+ * 故它写出的黑名单是**不完整**的。这对「关闭全部」无影响（已关闭的本就无需再关），
+ * 但意味着**不能用它判断「是否全部已关闭」** —— 状态判定必须用
+ * `listAllModels()` 的全量目录（见 `provider.status`）。
+ *
+ * @returns `{ ids }` 成功；`{ error }` 失败原因（调用方据此拒绝且**不落盘**）。
+ */
+async function fullCatalogIds(
+  ctx: Context,
+  modelAdapters: Readonly<Record<string, ModelCatalogSource>> | undefined,
+  provider: string,
+): Promise<{ ids: string[] } | { error: string }> {
+  const all = modelAdapters?.[provider]?.listAllModels()
+  if (all !== undefined) return { ids: all.map((model) => model.id) }
+  const llm = llmServiceOf(ctx)
+  if (llm === undefined) return { error: 'llm 服务不可用' }
+  try {
+    return { ids: (await llm.listModels(provider)).map((model) => model.id) }
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : String(error)
+    return { error: `读取模型列表失败：${reason}` }
   }
 }
 
@@ -2581,26 +2618,15 @@ function registerJetHubEndpoints(
         }
         if (req.disabled) {
           // 关闭全部：先取全量目录，再一次性写入黑名单。
-          let ids: string[]
-          const all = modelAdapters?.[req.provider]?.listAllModels()
-          if (all !== undefined) {
-            ids = all.map((model) => model.id)
-          } else {
-            const llm = llmServiceOf(ctx)
-            if (llm === undefined) {
-              // 目录读不出来就**不落盘**：否则会写入一个不完整的黑名单，
-              // 用户看到「关了一半」且无从判断原因。
-              return { ok: false, error: { code: 'bad-request', message: 'llm 服务不可用' } }
-            }
-            try {
-              ids = (await llm.listModels(req.provider)).map((model) => model.id)
-            } catch (error) {
-              const reason = error instanceof Error ? error.message : String(error)
-              return { ok: false, error: { code: 'bad-request', message: `读取模型列表失败：${reason}` } }
-            }
+          // 目录读取的三条分支（适配器 → llm → 失败即拒绝）与「关闭供应商」
+          // 完全一致，故共用 fullCatalogIds；⚠️ 失败时**不落盘** ——
+          // 否则会写入一个不完整的黑名单，用户看到「关了一半」且无从判断原因。
+          const catalog = await fullCatalogIds(ctx, modelAdapters, req.provider)
+          if ('error' in catalog) {
+            return { ok: false, error: { code: 'bad-request', message: catalog.error } }
           }
-          await pool.setModelsDisabled(req.provider, ids)
-          ctx.logger.info(`[jet-hub] 关闭 ${req.provider} 的全部 ${ids.length} 个模型`)
+          await pool.setModelsDisabled(req.provider, catalog.ids)
+          ctx.logger.info(`[jet-hub] 关闭 ${req.provider} 的全部 ${catalog.ids.length} 个模型`)
         } else {
           // 打开全部：纯本地操作，不读目录 —— 目录故障时用户仍应能把开关全打开。
           await pool.clearDisabledModels(req.provider)
@@ -2611,6 +2637,140 @@ function registerJetHubEndpoints(
         const value: RpcModelSetAllDisabledResponse = {
           provider: req.provider,
           disabledModels: pool.listDisabledModels(req.provider),
+        }
+        return { ok: true, value }
+      }
+
+      /**
+       * 读取多个供应商的汇总状态（Jet Hub 左侧导航分组 + 一键开关据此渲染）。
+       *
+       * 为什么一次取全部：8 个供应商若逐个查，就是 16 次往返，且每次都要走
+       * 异步凭据解析。这里**全程只用同步的内存副本**，不产生任何网络请求：
+       * - 模型目录用 `modelAdapters[provider].listAllModels()`（同步；它内部
+       *   在冷缓存时会**后台**补拉，但不阻塞本次返回）；
+       * - 账号用 `pool.listAccountsByProvider()`（同步读内存）。
+       *
+       * ⚠️ **不得**改用 `pool.listAccounts()` —— 那个方法会对每个账号调
+       * `credentials.describe()`（异步 IO），8 个供应商逐个解析凭据会明显
+       * 拖慢设置页首屏，而我们**只需要计数**，不需要凭据状态。
+       *
+       * 适配器缺失（外部/旧适配器）时 `total = 0`、`closed = false`：
+       * 保守判为「未关闭」，让用户可以尝试操作，而不是误报成已关闭。
+       */
+      case 'provider.status': {
+        const req = payload as RpcProviderStatusRequest
+        if (!Array.isArray(req.providers) || req.providers.some((id) => typeof id !== 'string')) {
+          return { ok: false, error: { code: 'bad-request', message: 'providers 必须是字符串数组' } }
+        }
+        const statuses: Record<string, ProviderStatus> = {}
+        for (const provider of req.providers) {
+          // 空 id 不进结果：它不可能对应任何 provider，留着只会让前端多一个
+          // 无意义的键（前端按 PROVIDERS 取，多出来的键会被忽略，但脏数据不该产生）。
+          if (provider.length === 0) continue
+          const catalog = modelAdapters?.[provider]?.listAllModels()
+          const total = catalog?.length ?? 0
+          // ⚠️ `listAllModels()` **不带 disabled 字段**，故必须另取黑名单再按 id 计数。
+          const disabledMap = pool.listDisabledModels(provider)
+          let disabled = 0
+          if (catalog !== undefined) {
+            for (const model of catalog) {
+              // 与 `disabledModelsFor` 的判定对齐：只有显式 true 才算已关闭。
+              if (disabledMap[model.id] === true) disabled++
+            }
+          }
+          const entries = pool.listAccountsByProvider(provider)
+          statuses[provider] = {
+            models: { total, disabled },
+            accounts: {
+              total: entries.length,
+              // 与适配器一致的判据：`enabled !== false` 视为启用
+              //（老文档可能缺该字段，缺省语义等同启用）。
+              enabled: entries.filter((entry) => entry.enabled !== false).length,
+            },
+            closed: total > 0 && disabled === total,
+          }
+        }
+        const value: RpcProviderStatusResponse = { statuses }
+        return { ok: true, value }
+      }
+
+      /**
+       * 供应商级一键开关（Jet Hub 左侧每个供应商行尾的开关）。
+       *
+       * ## 语义（用户已确认）
+       *
+       * - `enabled: false`（关闭）= **关闭它的全部模型** + **停用它的全部账号**；
+       * - `enabled: true`（打开）= 清空它的模型黑名单 + 启用它的全部账号。
+       *
+       * ## ⚠️ 关闭方向的顺序不可颠倒：先关模型，再停账号
+       *
+       * 「是否已关闭」的判据是**模型是否全关**（见 `provider.status` 的 `closed`）。
+       * 先关模型可保证：即使随后停账号失败，状态判定依然自洽（该供应商确实已关闭），
+       * 用户重试一次即可补齐账号。反过来先停账号、再关模型，中途失败会留下
+       * 「账号全停用但模型仍可见」的中间态 —— 用户在对话框里还能选到它的模型，
+       * 却没有任何可用账号，这正是本次要消除的落差。
+       *
+       * ## ⚠️ 「不关闭模型就不关闭供应商」
+       *
+       * 关闭方向必须拿到模型目录：读失败、或目录**为空**时**整个操作失败**，
+       * 既不落盘也不广播。绝不能「关不掉模型就只停账号」—— 那会让供应商
+       * 显示成已关闭而模型其实还在，用户按关闭的预期却仍能选到它。
+       *
+       * ## 打开方向不读目录
+       *
+       * 与 `model.setAllDisabled` 的「打开全部」同理：直接清空黑名单，这样
+       * 「曾被关闭、后来从服务端目录下线」的历史遗留键才能被清掉；且目录故障时
+       * 用户仍应能把开关全打开。
+       */
+      case 'provider.setEnabled': {
+        const req = payload as RpcProviderSetEnabledRequest
+        // ⚠️ `enabled` 不做默认值猜测：缺失或非布尔一律拒绝。默认成 true 会静默
+        // 打开用户特意关闭的供应商；默认成 false 则反向静默关闭 —— 两个方向都是
+        // 灾难性且难察觉的（与 model.setAllDisabled 同约定）。
+        if (typeof req.provider !== 'string' || req.provider.length === 0 || typeof req.enabled !== 'boolean') {
+          return {
+            ok: false,
+            error: { code: 'bad-request', message: 'provider 与非空布尔 enabled 必填' },
+          }
+        }
+        let modelCount = 0
+        if (req.enabled) {
+          // 打开：清空黑名单（返回被清掉的条目数，供提示）。null 表示本就无关闭项。
+          const cleared = pool.listDisabledModels(req.provider)
+          await pool.clearDisabledModels(req.provider)
+          modelCount = Object.keys(cleared).length
+        } else {
+          const catalog = await fullCatalogIds(ctx, modelAdapters, req.provider)
+          if ('error' in catalog) {
+            // 目录读不出来 → 整个关闭操作失败，**不落盘、不广播**。
+            return { ok: false, error: { code: 'bad-request', message: catalog.error } }
+          }
+          if (catalog.ids.length === 0) {
+            // 「不关闭模型就不关闭供应商」的落点。
+            return {
+              ok: false,
+              error: { code: 'bad-request', message: '该供应商没有可关闭的模型，未做任何变更' },
+            }
+          }
+          await pool.setModelsDisabled(req.provider, catalog.ids)
+          modelCount = catalog.ids.length
+        }
+        // 账号状态**在模型之后**处理（顺序理由见上）。返回实际变更数，
+        // 已是目标状态的账号不计入，避免提示夸大成「已停用 N 个」。
+        const accountCount = await pool.setAccountsEnabled(req.provider, req.enabled)
+        // 两个方向都改变 listModels 的结果（关/开黑名单），**必须广播**，
+        // 否则对话框的模型选择器要重启才更新（成因见 broadcastCatalogChanged）。
+        broadcastCatalogChanged(ctx)
+        ctx.logger.info(
+          `[jet-hub] ${req.enabled ? '打开' : '关闭'}供应商 ${req.provider}：`
+          + `${req.enabled ? '清空' : '写入'} ${modelCount} 个模型、`
+          + `${req.enabled ? '启用' : '停用'} ${accountCount} 个账号`,
+        )
+        const value: RpcProviderSetEnabledResponse = {
+          provider: req.provider,
+          enabled: req.enabled,
+          models: modelCount,
+          accounts: accountCount,
         }
         return { ok: true, value }
       }

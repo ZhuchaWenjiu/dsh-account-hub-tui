@@ -13,7 +13,12 @@ const STYLES = `
 .dim-jh-layout { display: flex; flex: 1; overflow: hidden; }
 
 /* 左侧导航：align dsh-im .dim-rail */
-.dim-jh-rail { width: 200px; border-right: 1px solid var(--dsw-alias-border-default, #e5e5e5); padding: 8px; overflow-y: auto; display: grid; align-content: start; gap: 8px; }
+/* ⚠️ 宽度 243px（原 200px）是**实测反推**的结果，不是随手取的：
+   行内新增 34px 的开关 + 8px 间距后，200px 时标签可用宽度只剩 77px，
+   6/8 行会出现省略号（最长一行超宽 64px）；243px 时标签可用 120px，
+   仅 3 行轻微超宽（-3 / -4 / -21px），且**列表总高不变**（384px）。
+   实测方法与数据见工作区 jet-hub-provider-toggle-notes.md。 */
+.dim-jh-rail { width: 243px; border-right: 1px solid var(--dsw-alias-border-default, #e5e5e5); padding: 8px; overflow-y: auto; display: grid; align-content: start; gap: 8px; }
 
 /* 每个 provider 按钮：align dsh-im .dim-channel */
 .dim-jh-provider { width: 100%; min-height: 48px; display: grid; grid-template-columns: 30px minmax(0, 1fr); align-items: center; gap: 10px; padding: 8px 12px; border: 1px solid var(--dsw-alias-border-l2, #eef0f3); border-radius: 14px; color: inherit; background: var(--dsw-alias-bg-layer-3, #fff); box-shadow: 0 2px 8px rgb(31 35 41 / 3%); font: inherit; text-align: left; cursor: pointer; transition: border-color .16s ease, background .16s ease, box-shadow .16s ease; }
@@ -46,6 +51,18 @@ const STYLES = `
 /* provider 文案：align dsh-im .dim-channelCopy */
 .dim-jh-providerLabel { min-width: 0; display: grid; }
 .dim-jh-providerLabel strong { overflow: hidden; color: inherit; font-size: 14px; line-height: 20px; font-weight: 680; text-overflow: ellipsis; white-space: nowrap; }
+
+/* ── 供应商级一键开关（左侧 rail 的分组 + 行尾开关）── */
+/* 分组：与 rail 同为 grid，组之间留出间隔。分组只是展示分组，不改变声明顺序。 */
+.dim-jh-railGroup { display: grid; gap: 8px; }
+.dim-jh-railGroup + .dim-jh-railGroup { margin-top: 10px; }
+.dim-jh-railGroupTitle { padding: 2px 4px 0; font-size: 12px; line-height: 16px; font-weight: 600; color: var(--dsw-alias-label-tertiary, #8f959e); }
+/* 每行：左侧选择按钮 + 右侧开关。
+   ⚠️ 首列必须是 minmax(0, 1fr)：grid 项的 min-width 默认是 auto，会让长供应商名
+   把行撑宽、把行尾的开关挤出 rail（与模型行那次「开关不可见」的缺陷同型）。
+   开关自身保持 flex: none（它是目标控件，绝不参与收缩）。 */
+.dim-jh-providerRow { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 8px; }
+.dim-jh-providerRow .dim-jh-provider { min-width: 0; }
 
 /* 右侧面板 */
 .dim-jh-panel { flex: 1; padding: 24px; overflow-y: auto; }
