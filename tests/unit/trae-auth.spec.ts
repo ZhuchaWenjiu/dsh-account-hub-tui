@@ -506,3 +506,118 @@ describe('fetchModels 的日志与缓存', () => {
     expect(calls(), '登出后不应带着旧凭据发请求').toBe(1)
   })
 })
+
+/**
+ * 老账号昵称回填。
+ *
+ * 真实缺陷（用户报障 2026-09-27）：「用 trae provider 登录后用户名字显示无法
+ * 区分各个用户」。服务端 ScreenName 是按 uid 自动生成的默认名，而
+ * `GetUserInfo` 的 `NonPlainTextMobile`（脱敏手机号）可区分。
+ * 光改代码只影响新登录的账号，故启动时要主动补一次。
+ */
+describe('repairAccountNicknames 老账号回填', () => {
+  /** GetUserInfo 响应（含脱敏手机号）。 */
+  function userInfoResponse(phone: string, email = ''): Response {
+    return new Response(JSON.stringify({
+      Result: {
+        UserID: 'uid-1',
+        ScreenName: '用户26815487395',
+        TenantID: '7n',
+        NonPlainTextMobile: phone,
+        NonPlainTextEmail: email,
+      },
+    }), { status: 200 })
+  }
+
+  it('把 ScreenName 昵称改成脱敏手机号，并把手机号写回凭据', async () => {
+    const { ctx, credentials } = makeContext()
+    await credentials.set('TRAE_ACCOUNT_AAAA1111', JSON.stringify(makeCredential()))
+    const fetcher = (async () => userInfoResponse('130******00')) as unknown as typeof fetch
+    const service = newService(ctx, { fetcher })
+    const pool = makePool([accountEntry({ nickname: '用户26815487395' })])
+
+    const repaired = await service.repairAccountNicknames(pool as never)
+
+    expect(repaired).toEqual(['trae-1'])
+    expect(pool.updateAccount).toHaveBeenCalledWith('trae-1', { nickname: '130******00' })
+    // 手机号必须写回**凭据**：账号条目会随账号操作整体重写，凭据里存一份才稳。
+    expect(JSON.parse(credentials.raw('TRAE_ACCOUNT_AAAA1111')!).phone).toBe('130******00')
+  })
+
+  it('凭据已有手机号时不再发 GetUserInfo 请求（幂等，不重复补）', async () => {
+    const { ctx, credentials } = makeContext()
+    await credentials.set(
+      'TRAE_ACCOUNT_AAAA1111',
+      JSON.stringify(makeCredential({ phone: '130******00' })),
+    )
+    let calls = 0
+    const fetcher = (async () => { calls++; return userInfoResponse('130******00') }) as unknown as typeof fetch
+    const service = newService(ctx, { fetcher })
+    // 昵称已是手机号 → 不应触发任何写入。
+    const pool = makePool([accountEntry({ nickname: '130******00' })])
+
+    const repaired = await service.repairAccountNicknames(pool as never)
+
+    expect(repaired).toEqual([])
+    expect(calls, '凭据已有手机号时不应再请求').toBe(0)
+    expect(pool.updateAccount).not.toHaveBeenCalled()
+  })
+
+  it('GetUserInfo 失败时保留 ScreenName（不写坏昵称、不抛错）', async () => {
+    const { ctx, credentials } = makeContext()
+    await credentials.set('TRAE_ACCOUNT_AAAA1111', JSON.stringify(makeCredential()))
+    const fetcher = (async () => { throw new Error('network down') }) as unknown as typeof fetch
+    const service = newService(ctx, { fetcher })
+    const pool = makePool([accountEntry({ nickname: '用户26815487395' })])
+
+    const repaired = await service.repairAccountNicknames(pool as never)
+
+    // 拿不到手机号 → 昵称不变（不是写回空值或账号 id）。
+    expect(repaired).toEqual([])
+    expect(pool.updateAccount).not.toHaveBeenCalled()
+  })
+
+  it('单账号失败不中断其余账号', async () => {
+    const { ctx, credentials } = makeContext()
+    await credentials.set('TRAE_ACCOUNT_AAAA1111', JSON.stringify(makeCredential()))
+    await credentials.set('TRAE_ACCOUNT_BBBB2222', JSON.stringify(makeCredential({ uid: 'uid-2' })))
+    let failedOnce = false
+    const fetcher = (async (url: string | URL) => {
+      // 第一个账号的请求失败，第二个成功。
+      if (String(url).includes('GetUserInfo') && !failedOnce) { failedOnce = true; throw new Error('boom') }
+      return userInfoResponse('130******33')
+    }) as unknown as typeof fetch
+    const service = newService(ctx, { fetcher })
+    const pool = makePool([
+      accountEntry({ id: 'trae-1', credentialRef: 'TRAE_ACCOUNT_AAAA1111', nickname: '用户A' }),
+      accountEntry({ id: 'trae-2', credentialRef: 'TRAE_ACCOUNT_BBBB2222', nickname: '用户B' }),
+    ])
+
+    const repaired = await service.repairAccountNicknames(pool as never)
+
+    expect(repaired, '第二个账号仍应被修复').toEqual(['trae-2'])
+  })
+
+  it('凭据缺失的账号被跳过（不留幽灵昵称）', async () => {
+    const { ctx } = makeContext()
+    const service = newService(ctx)
+    const pool = makePool([accountEntry({ credentialRef: 'TRAE_ACCOUNT_MISSING' })])
+
+    expect(await service.repairAccountNicknames(pool as never)).toEqual([])
+    expect(pool.updateAccount).not.toHaveBeenCalled()
+  })
+
+  it('手机号与邮箱都没有时保留原昵称（不用服务端默认名覆盖用户改过的昵称）', async () => {
+    const { ctx, credentials } = makeContext()
+    await credentials.set('TRAE_ACCOUNT_AAAA1111', JSON.stringify(makeCredential()))
+    const fetcher = (async () => userInfoResponse('', '')) as unknown as typeof fetch
+    const service = newService(ctx, { fetcher })
+    // 用户在 Jet Hub 手动改过的昵称。
+    const pool = makePool([accountEntry({ nickname: '我的主力号' })])
+
+    const repaired = await service.repairAccountNicknames(pool as never)
+
+    expect(repaired, '没有可用的真实标识就不该改写昵称').toEqual([])
+    expect(pool.updateAccount).not.toHaveBeenCalled()
+  })
+})

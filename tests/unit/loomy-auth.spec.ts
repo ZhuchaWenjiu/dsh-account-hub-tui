@@ -63,7 +63,7 @@ function makeCredential(overrides: Partial<LoomyCredential> = {}): LoomyCredenti
   return {
     access_token: 'S'.repeat(32),
     userid: '260924225226937524',
-    phone: '18611112222',
+    phone: '13011112222',
     expires_at: String(Date.now() + LOOMY_SESSION_TTL_SECONDS * 1000),
     ...overrides,
   }
@@ -87,7 +87,7 @@ describe('凭据构造', () => {
     const { ctx } = makeContext()
     const service = newService(ctx)
     const now = Date.now()
-    const credential = service.buildCredential('S'.repeat(32), 'u1', '18611112222')
+    const credential = service.buildCredential('S'.repeat(32), 'u1', '13011112222')
 
     const expiresAt = credentialExpiresAtMs(credential)
     expect(expiresAt).toBeDefined()
@@ -103,10 +103,10 @@ describe('凭据构造', () => {
 
   it('字段名是 access_token（AccountPool 的匹配依据）', () => {
     const { ctx } = makeContext()
-    const credential = newService(ctx).buildCredential('X'.repeat(32), 'u', '18611112222')
+    const credential = newService(ctx).buildCredential('X'.repeat(32), 'u', '13011112222')
     expect(credential.access_token).toBe('X'.repeat(32))
     expect(credential.userid).toBe('u')
-    expect(credential.phone).toBe('18611112222')
+    expect(credential.phone).toBe('13011112222')
   })
 
   it('nickname 为空时不写该字段（不产生空串昵称）', () => {
@@ -121,7 +121,7 @@ describe('凭据构造', () => {
    */
   it('凭据恒为不可续期（Loomy 无 refresh 端点）', () => {
     const { ctx } = makeContext()
-    const credential = newService(ctx).buildCredential('S'.repeat(32), 'u', '18611112222')
+    const credential = newService(ctx).buildCredential('S'.repeat(32), 'u', '13011112222')
     expect(isLoomyRefreshable(credential)).toBe(false)
   })
 })
@@ -132,7 +132,7 @@ describe('短信登录', () => {
     const fetcher = vi.fn().mockResolvedValue(ok({ msgid: 'MSG-9' }))
     const service = newService(ctx, { fetcher: fetcher as unknown as typeof fetch })
 
-    expect(await service.sendSmsCode('18611112222')).toBe('MSG-9')
+    expect(await service.sendSmsCode('13011112222')).toBe('MSG-9')
     const [url] = fetcher.mock.calls[0] as [string]
     expect(url).toBe('https://account.xfinfr.com/login/phone/sendMsgCode')
   })
@@ -146,7 +146,7 @@ describe('短信登录', () => {
       .mockResolvedValueOnce(ok({ alreadyProcessed: true, dailyQuota: 5000, dailyBalance: 5000 }))
     const service = newService(ctx, { fetcher: fetcher as unknown as typeof fetch })
 
-    const result = await service.loginWithSmsCode('18611112222', '123456', 'MSG-9')
+    const result = await service.loginWithSmsCode('13011112222', '123456', 'MSG-9')
 
     expect(result.refreshable).toBe(false)
     expect(result.expires).toBeGreaterThan(Date.now())
@@ -165,7 +165,7 @@ describe('短信登录', () => {
       .mockResolvedValueOnce(ok({ alreadyProcessed: true }))
     const service = newService(ctx, { fetcher: fetcher as unknown as typeof fetch })
 
-    await service.loginWithSmsCode('18611112222', '123456', 'MSG-9')
+    await service.loginWithSmsCode('13011112222', '123456', 'MSG-9')
 
     const urls = fetcher.mock.calls.map((call) => String(call[0]))
     expect(urls.some((u) => u.includes('/points/first-login'))).toBe(true)
@@ -182,7 +182,7 @@ describe('短信登录', () => {
       .mockRejectedValueOnce(new Error('network down'))
     const service = newService(ctx, { fetcher: fetcher as unknown as typeof fetch })
 
-    await expect(service.loginWithSmsCode('18611112222', '123456', 'MSG-9')).resolves.toBeDefined()
+    await expect(service.loginWithSmsCode('13011112222', '123456', 'MSG-9')).resolves.toBeDefined()
     expect(credentials.raw(LOOMY_CREDENTIAL_REF)).toBeDefined()
   })
 
@@ -191,7 +191,7 @@ describe('短信登录', () => {
     const fetcher = vi.fn().mockResolvedValue(bizError('020002', '验证码错误，请重新输入'))
     const service = newService(ctx, { fetcher: fetcher as unknown as typeof fetch })
 
-    await expect(service.loginWithSmsCode('18611112222', '000000', 'MSG-9'))
+    await expect(service.loginWithSmsCode('13011112222', '000000', 'MSG-9'))
       .rejects.toThrow(/验证码错误/)
     expect(credentials.raw(LOOMY_CREDENTIAL_REF)).toBeUndefined()
   })

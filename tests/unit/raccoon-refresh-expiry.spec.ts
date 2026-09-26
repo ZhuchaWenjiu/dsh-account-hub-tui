@@ -94,7 +94,7 @@ const EXPIRED_CREDENTIAL = JSON.stringify({
   refresh_token: 'old-refresh',
   user_id: '7445120',
   nickname: 'RaccoonAva',
-  phone: '18611406665',
+  phone: '13011111100',
 })
 
 /** 续期端点返回的**新**凭据（exp 在未来 3 小时）。 */
@@ -122,7 +122,7 @@ function accountOf(patch: Partial<ProviderAccountStatus> = {}): ProviderAccountS
     credentialRef: 'RACCOON_ACCOUNT_ABD05EAC',
     enabled: true,
     refreshable: true,
-    nickname: 'RaccoonAva (6665)',
+    nickname: 'RaccoonAva (1100)',
     createdAt: Date.now(),
     // 账号池里是**续期前的旧值**（这正是 UI 显示「已过期」的来源）
     expiresAt: (NOW_SEC - 3600) * 1000,
@@ -248,7 +248,7 @@ describe('raccoon 续期后必须把新过期时间写回账号池', () => {
     credentials.store.set('RACCOON_ACCOUNT_ABD05EAC', JSON.stringify({
       access_token: `${b64({ alg: 'HS256' })}.${b64({ exp: NOW_SEC + 7200 })}.sig`,
       refresh_token: 'still-good',
-      phone: '18611406665',
+      phone: '13011111100',
     }))
     const { pool, patches } = makePool([accountOf({ expiresAt: (NOW_SEC + 7200) * 1000 })])
     const auth = newService(ctx, refreshFetcher())
@@ -272,7 +272,7 @@ describe('raccoon 续期后必须把新过期时间写回账号池', () => {
     credentials.store.set('RACCOON_ACCOUNT_ABD05EAC', JSON.stringify({
       access_token: `${b64({ alg: 'HS256' })}.${b64({ exp: NEW_EXP_SEC })}.sig`,
       refresh_token: 'valid-refresh',
-      phone: '18611406665',
+      phone: '13011111100',
     }))
     // 账号池却停留在**续期前的旧值**（已过期）—— UI 据此显示「已过期」
     const { pool, patches } = makePool([accountOf({ expiresAt: (NOW_SEC - 3600) * 1000 })])

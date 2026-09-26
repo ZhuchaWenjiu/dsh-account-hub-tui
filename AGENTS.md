@@ -491,6 +491,124 @@ UI 表现为 `TraeAdapter.reasoningFor` 返回 `undefined` → 不声明 `reason
   额度**，双闸门 `DSH_TRAE_REASONING_E2E=1` + `…_CONFIRM=yes`）—— 真实目录档位断言
   + `resolveModel` 真声明出 `efforts` + 新通道真实收发两次
 
+### ⚠️ TRAE 账号展示名：`ScreenName` 是自动生成的默认名，必须用脱敏手机号
+
+**真实缺陷**（用户报障 2026-09-27）：「用 trae provider 登录后用户名字显示无法区分
+各个用户，有其他名字昵称或者手机尾号之类的信息可以区分吗？」
+
+根因：`GetUserInfo` 的 **`ScreenName` 是字节 passport 按 uid 自动生成的默认名**
+（`用户` + uid 片段）。实测四个账号：
+
+形态完全雷同，一屏列出来认不出谁是谁 —— 与 Raccoon 的 `RaccoonAva`
+（`buildRaccoonNickname`）是**同一类问题**。
+
+实测可用字段（2026-09-27，四个真实账号逐个调 `GetUserInfo` 核对）：
+
+| 字段 | 值 | 可区分性 |
+|---|---|---|
+| `ScreenName` | `用户26815487395` 等 | ❌ 自动生成、形态雷同 |
+| **`NonPlainTextMobile`** | `130******00` | ✅ **末两位互异** |
+| `NonPlainTextEmail` | 四个**全为空**（`LastLoginType` 均为 `sms`） | ⚠️ 仅邮箱登录有值 |
+| `Description` | 全为空 | ❌ |
+| `AvatarUrl` | 每人独立 hash | ⚠️ 可区分但不可读 |
+| `RegisterTime` | `2026-03-28` / `2026-09-27` / `2026-08-19` ×2 | ⚠️ 有两个撞车 |
+| `UserID` | `4051111222220009` 等 | ⚠️ 可区分但过长不可读 |
+
+要点：
+
+- ⚠️ **字段名是 `NonPlainTextMobile`**（不是 `Mobile` / `Phone`），且是**脱敏**形态
+  （中间 6 位打码）。展示就照原样用，**不要试图还原或截取后四位** ——
+  `130******00` 整体已足够短且可辨认
+- ⚠️ **`NonPlainTextEmail` 实测为空**，别因为「有手机号就以为邮箱也有」而写死依赖；
+  它只是邮箱登录账号的兜底
+- 取值顺序（`traeDisplayNickname`）：**手机号 → 脱敏邮箱 → `ScreenName` → 账号 id**
+- ⚠️ **手机号必须写回凭据**（不只写账号条目）：账号条目会随 Jet Hub 的账号操作
+  整体重写，凭据里存一份才能在续期后稳定拿到。`applyTraeRefresh` 用 `...previous`
+  展开，故自动保留 `phone` / `email` —— 改它时别把这两个字段丢掉
+- ⚠️ **回调的 `userInfo` 参数不含手机号 / 邮箱**（实测只有 `UserID` / `ScreenName` /
+  `TenantID`），**只在 `GetUserInfo` 响应里** —— 故 `exchangeTraeCallback` 必须真发
+  那次 `GetUserInfo` 才能拿到，不能只依赖回调
+- ⚠️ **老账号必须主动回填**：光改代码只影响新登录的账号。`TraeAuth.repairAccountNicknames`
+  （`src/index.ts` 启动时调用，仿 `RaccoonAuth.repairAccountNicknames`）在启动时补一次
+- ⚠️ **拿不到真实标识时不得改写昵称**：`Jet Hub` 允许用户手动改昵称
+  （`account.update`），若退回去用凭据里的 `ScreenName` 重算，会把用户改过的名字
+  覆盖成服务端默认名 —— 属无谓且有害的写入。故 `fetchUserContact` 在两者皆空时
+  返回 `undefined`，调用方**直接 `continue`**
+- ⚠️ **只在昵称确实变化时落盘**：`updateAccount` 是整体 replace，每次启动都写会
+  平白触发一次文档写
+
+排查 / 验证：
+
+- `scripts/probe-trae-userinfo.mjs` —— 打印每个 TRAE 账号 `GetUserInfo` 的
+  **完整响应**（只读，零模型额度）
+- `scripts/verify-trae-nickname.mjs` —— 用真实账号跑一遍 `repairAccountNicknames`
+  并打印修复前后昵称（⚠️ **会写真实账号池昵称**，这正是修复效果本身）
+- `tests/unit/trae.spec.ts` 的「TRAE 账号展示名」段（6 条，含四个真实手机号
+  互不相同的断言）、`tests/unit/trae-auth.spec.ts` 的「repairAccountNicknames
+  老账号回填」段（7 条，含「无标识不改写昵称」「幂等不重复请求」）
+
+### ⚠️ LobsterAI 账号展示名：服务端把**手机号本身**当昵称下发（露 4 位）
+
+**用户要求**（2026-09-27）：「lobsterai 的用户名字显示的手机号尾号漏出 4 位，
+现在也改为只漏出 2 位」。
+
+⚠️ **关键事实：`130****1100` 是服务端下发的 `user.nickname` 原值，不是本插件
+截取的**。`buildLobsteraiCredential` 只做 `nickname: payload.nickname ?? ''` 照抄。
+实测四个真实账号的登录响应即为此形态：
+
+故修法是**归一化掩码**（`maskLobsteraiPhoneTail`，`src/lobsterai.ts`）而非改
+某个 `slice(-4)` —— 那会是个找不到的假想目标。
+
+要点：
+
+- ⚠️ **两种输入都收敛到同一形态，因此幂等**：完整 11 位（`13011111100`，
+  `profile-summary` 返回的就是完整号码）与已脱敏的露 4 位形态，输出都是
+  `130******00`。幂等意味着老账号无需重新登录、重复运行不产生新写入
+- ⚠️ **判据只认「像手机号」的形态**：`/^1\d{10}$/`（完整）或
+  `/^\d{3}\*+\d+$/`（已脱敏）。**绝不能泛化到任意字符串** —— 那会把真实昵称
+  （`用户26815487395` / `RaccoonAva` / `a@b.c`）一起打掉。单测有专门一条守这个
+- ⚠️ **星号个数按原串总长推算**（`总长 - 3 - 2`），长度保持不变；
+  故对非 11 位的号码也自洽
+- ⚠️ **末 2 位必须仍可区分**：四个真实账号掩码后为
+  掩码把区分度也抹掉就失去意义了（单测断言 `Set.size === 4`）
+- ⚠️ **老账号必须主动回填**：`LobsteraiAuth.repairAccountNicknames`
+  （`src/index.ts` 启动时调用，与 `RaccoonAuth` / `TraeAuth` 同名方法同一模式）
+- ⚠️ **纯本地、零网络**：掩码只依赖凭据里的昵称（与 TRAE 那条需要发
+  `GetUserInfo` 不同）。单测断言 `fetcher` 未被调用
+- ⚠️ **只在昵称确实变化时落盘**：`updateAccount` 是整体 replace
+
+排查 / 验证：
+
+- `scripts/probe-lobsterai-profile.mjs` —— 打印 `profile-summary` 的完整响应
+  （**发现 `nickname` 在这里是完整号码 `13011111100`**，与登录响应的脱敏形态不同）
+- `scripts/verify-lobsterai-nickname.mjs` —— 用真实账号跑一遍
+  `repairAccountNicknames` 并打印修复前后昵称（⚠️ **会写真实账号池昵称**）
+- `tests/unit/lobsterai.spec.ts` 的「手机号掩码（只露末 2 位）」段（8 条，
+  含「非手机号形态原样返回」「末两位仍可区分」）、
+  `tests/unit/lobsterai-auth.spec.ts` 的「老账号展示名回填」段（7 条，
+  含「纯本地不发请求」「幂等」）
+
+### ⚠️ 改昵称类修复必须**重启宿主**才生效，且旧进程会覆盖你的写入
+
+**这是本轮实操踩到的坑**（2026-09-27）：用脚本把 `state.json` 的昵称改对之后，
+**几分钟内又变回了旧值**（TRAE 的 `用户26815487395` 复活）。
+
+根因：**当时有一个 1 小时前启动的 DSH 宿主进程仍在运行**（PID 9616，监听 3080）。
+它加载的是**旧代码**（没有 `repairAccountNicknames`），内存里的账号池是旧昵称；
+而 `AccountPool` 的写入是**整体 replace**（限流标记、续期回写等都会触发落盘），
+于是它的下一次写盘就把脚本的修改**原样盖回去**。
+
+两条必须记住的推论：
+
+- ⚠️ **`repairAccountNicknames` 是「启动时」逻辑**：改完代码必须**重启 DSH**
+  才会执行。不重启的话，无论脚本改多少次，旧进程都会覆盖
+- ⚠️ **手工改 `state.json` 前先确认没有宿主在跑**（`Get-NetTCPConnection -LocalPort 3080`
+  或看 node 进程），否则改动会被静默回滚 —— 症状是「明明改对了，过一会儿又变回去」，
+  极易误判为「修复没生效 / 代码写错了」
+- ⚠️ 验证修复是否真的生效，**唯一可靠方式是重启宿主**，然后看启动日志里有没有
+  `[jet-hub] 已修正 N 个 … 账号的显示名`。脚本验证只能证明「逻辑正确」，
+  不能证明「线上已生效」
+
 ### TRAE 倍率（藏在 `display_contact_config` 里，且该字段是** JSON 字符串**）
 
 ⚠️ **最大的坑**：`display_contact_config` 的值是**一个字符串**，里面才是 JSON。

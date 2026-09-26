@@ -7,7 +7,7 @@ import {
 import type { LoomyCredential } from '../../src/loomy.js'
 
 const CRED: LoomyCredential = {
-  access_token: 'S'.repeat(32), userid: 'u1', phone: '18611112222',
+  access_token: 'S'.repeat(32), userid: 'u1', phone: '13011112222',
 }
 
 /** 造一个余额响应。 */

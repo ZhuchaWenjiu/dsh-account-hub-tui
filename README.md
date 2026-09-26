@@ -861,6 +861,12 @@ Bearer `access_token` 鉴权。
 - 凭据结构（JSON 字符串）：除 `access_token` / `refresh_token` / `expires_at` 外，
   还持久化 `uuid` / `first_keyfrom` / `latest_keyfrom` 三个**身份字段** ——
   它们是续期请求体的必填项，丢失会导致静默续期失败、只能重新登录。
+- ⚠️ **账号展示名是手机号（只露末 2 位）**：服务端把**手机号本身**当
+  `user.nickname` 下发，且只脱敏到「露末 4 位」（实测 `130****1100`）。
+  按用户要求由 `maskLobsteraiPhoneTail` 归一化为只露末 2 位
+  （`130******00`）—— 归一化对「完整号码」与「露 4 位」两种输入**幂等**，
+  故老账号在启动时由 `repairAccountNicknames` 自动补正，无需重新登录。
+  非手机号形态的昵称**原样保留**（不误伤真实昵称）。
 - 模型列表：远端 `GET /api/models/available` 优先（它是权威来源），
   失败时回退 `src/lobsterai-product.ts` 的 19 个内置模型。
 - 续期：启动后每 30 分钟对可续期账号静默刷新（与其他 provider 同一调度器）。
@@ -1150,6 +1156,8 @@ LobsterAI 都不同源。它也是唯一一个**请求与响应都要转换**的
   - `machine_id` 是设备指纹，续期时**绝不可重新生成**（服务端按它标识设备）；
   - `device_id` 是签到设备号，**账号间必须互异** —— 同一天两账号共用会被
     「该设备已签到」拦截，为空则签到报 9004。
+  另有可选的 **`phone` / `email`**（`GetUserInfo` 的脱敏形态，仅用于账号展示名，
+  见下「账号展示名」）。
 - 登录 URL 含 **18 个参数**（对齐唯一权威实现 `login.sh`），包括
   `auth_from=solo`、`login_channel=native_ide`、`plugin_version`、
   `login_trace_id` 与 `x_*` 客户端形态系列。少发参数会让登录页停在授权中。
@@ -1160,6 +1168,13 @@ LobsterAI 都不同源。它也是唯一一个**请求与响应都要转换**的
     「上游走了 PKCE 流程，暂不支持」的**精确报错**，而不是笼统地说
     「缺少 refreshToken」（把合法回调误判为无效会把排查方向带偏）。
   另外 `userInfo` 的中文昵称存在双重编码乱码，插件会自动回转修复。
+- ⚠️ **账号展示名用脱敏手机号，不用 `ScreenName`**：`ScreenName` 是字节 passport
+  **按 uid 自动生成的默认名**（实测四个账号全是 `用户26815487395` 这种形态），
+  多账号在面板里**彼此无法区分**。`GetUserInfo` 会下发 `NonPlainTextMobile`
+  （形如 `130******00`，中间打码），实测末两位互异、足以区分。
+  取值顺序：**手机号 → 脱敏邮箱 → `ScreenName` → 账号 id**。
+  老账号在插件启动时由 `TraeAuth.repairAccountNicknames` 自动回填一次
+  （幂等；**拿不到真实标识时不动昵称**，以免覆盖用户手动改过的名字）。
 - ⚠️ **任何回调路径都必须落定登录结果 Promise**：早期实现里解析失败分支只
   `res.end()` 就 return，导致 `login.poll` 永远拿不到 `done:true`，
   前端**永久停在「认证中」**。这与「参数名写错」是两个独立根因、同一个症状。

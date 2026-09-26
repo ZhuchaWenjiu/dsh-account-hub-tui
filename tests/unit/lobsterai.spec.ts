@@ -14,10 +14,12 @@ import {
   lobsteraiAnonymousHeaders,
   lobsteraiAuthHeaders,
   lobsteraiChatHeaders,
+  lobsteraiDisplayNickname,
   lobsteraiModelsHeaders,
   lobsteraiCredentialExpiresAtMs,
   lobsteraiKeyfromBody,
   lobsteraiRefreshBody,
+  maskLobsteraiPhoneTail,
   parseClientVersion,
   parseClientVersionFromUpdate,
   parseLobsteraiEnvelope,
@@ -529,5 +531,59 @@ describe('客户端版本号解析器（缓存与兜底）', () => {
     resolver.clear()
     await resolver.resolve(LOBSTERAI)
     expect(fetcher).toHaveBeenCalledTimes(2)
+  })
+})
+
+/**
+ * 手机号掩码与账号展示名。
+ *
+ * 用户要求（2026-09-27）：「lobsterai 的用户名字显示的手机号尾号漏出 4 位，
+ * 现在也改为只漏出 2 位」。
+ *
+ * ⚠️ 关键事实：那个 `130****1100` 是**服务端下发的 `user.nickname` 原值**
+ * （实测四个真实账号），不是本插件截取的 —— 故这里是**归一化**而非改 slice。
+ */
+describe('手机号掩码（只露末 2 位）', () => {
+  it('服务端下发的「露 4 位」形态归一化为只露末 2 位', () => {
+    // 实测原值（2026-09-27，四个真实账号）。
+    expect(maskLobsteraiPhoneTail('130****1100')).toBe('130******00')
+  })
+
+  it('幂等：已归一化的值再跑一次结果不变', () => {
+    const once = maskLobsteraiPhoneTail('130****1100')
+    expect(maskLobsteraiPhoneTail(once)).toBe(once)
+  })
+
+  it('长度保持不变（星号个数按原串推算）', () => {
+    for (const input of ['130****1100', '13000001100']) {
+      expect(maskLobsteraiPhoneTail(input).length, input).toBe(input.length)
+    }
+  })
+
+  it('空串与纯空白返回空串', () => {
+    expect(maskLobsteraiPhoneTail('')).toBe('')
+    expect(maskLobsteraiPhoneTail('   ')).toBe('')
+  })
+
+})
+
+describe('lobsteraiDisplayNickname', () => {
+  it('手机号昵称被掩码为只露末 2 位', () => {
+    expect(lobsteraiDisplayNickname({ nickname: '130****1100' }, 'lobsterai-abc')).toBe('130******00')
+  })
+
+  it('真实昵称原样保留', () => {
+    expect(lobsteraiDisplayNickname({ nickname: '测试账号' }, 'lobsterai-abc')).toBe('测试账号')
+  })
+
+  it('昵称为空 / 缺失时回退账号 id', () => {
+    expect(lobsteraiDisplayNickname({ nickname: '' }, 'lobsterai-abc')).toBe('lobsterai-abc')
+    expect(lobsteraiDisplayNickname({}, 'lobsterai-abc')).toBe('lobsterai-abc')
+    expect(lobsteraiDisplayNickname(undefined, 'lobsterai-abc')).toBe('lobsterai-abc')
+  })
+
+  it('两端空白被裁掉（不显示空白昵称）', () => {
+    expect(lobsteraiDisplayNickname({ nickname: '  130****1100  ' }, 'x')).toBe('130******00')
+    expect(lobsteraiDisplayNickname({ nickname: '   ' }, 'x')).toBe('x')
   })
 })

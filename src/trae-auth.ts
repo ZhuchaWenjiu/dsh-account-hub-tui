@@ -28,8 +28,10 @@ import {
   parseTraeExchangeResponse,
   parseTraeUserInfoResponse,
   traeCredentialExpiresAtMs,
+  traeDisplayNickname,
   traeOAuthHeaders,
   traeSOLOHeaders,
+  withTraePhone,
   type TraeCredential,
   type TraeRemoteModel,
 } from './trae.js'
@@ -230,9 +232,10 @@ export class TraeAuth extends Service {
       await flowOptions.pool.addAccount({
         id: flowOptions.accountId,
         provider: this.product.id,
-        nickname: credential?.nickname !== undefined && credential.nickname.length > 0
-          ? credential.nickname
-          : flowOptions.accountId,
+        // ⚠️ 用 `traeDisplayNickname`（手机号优先）而非直接取 `nickname`：
+        // 服务端的 ScreenName 是**按 uid 自动生成的默认名**，多账号无法区分。
+        // 见该函数的说明（用户报障 2026-09-27）。
+        nickname: traeDisplayNickname(credential, flowOptions.accountId),
         enabled: true,
         credentialRef: flowOptions.refName ?? this.credentialRefName,
         createdAt: Date.now(),
@@ -416,6 +419,111 @@ export class TraeAuth extends Service {
           )
         }
       }
+    }
+  }
+
+  /**
+   * 一次性修复**老账号**的展示名：补 `GetUserInfo` 拿脱敏手机号并重算昵称。
+   *
+   * ## 为什么需要它（真实缺陷，用户报障 2026-09-27）
+   *
+   * > 用 trae provider 登录后用户名字显示无法区分各个用户，有其他名字昵称或者
+   * > 手机尾号之类的信息可以区分吗？
+   *
+   * 服务端的 `ScreenName` 是**按 uid 自动生成的默认名**（`用户26815487395`
+   * 这种），四个账号形态完全一致，一屏列出来认不出谁是谁。
+   * `GetUserInfo` 会下发 `NonPlainTextMobile`（脱敏手机号），实测可区分。
+   *
+   * 光改代码只影响**新登录**的账号，已登录的老账号昵称仍是 ScreenName，
+   * 故这里在启动时主动补一次 —— 与 `RaccoonAuth.repairAccountNicknames`
+   * 同一模式（同因：服务端下发的名字是默认名）。
+   *
+   * ## 契约
+   *
+   * - **幂等**：昵称已是手机号时 `traeDisplayNickname` 会算出同一值，
+   *   不触发写入（只在**确实变化**时落盘，否则每次启动都写一次文档）。
+   * - **失败不阻塞**：逐账号 catch，任何异常只记 warn。
+   * - **只读补字段**：不发续期、不动 token，只补 `phone` 与昵称。
+   *
+   * @returns 被修复的账号 id 列表（供日志）
+   */
+  async repairAccountNicknames(pool: AccountPool): Promise<string[]> {
+    const repaired: string[] = []
+    let entries: Awaited<ReturnType<AccountPool['listAccounts']>>
+    try {
+      entries = await pool.listAccounts(this.product.id)
+    } catch {
+      return repaired
+    }
+
+    for (const entry of entries) {
+      try {
+        const ref = credentialRef(entry.credentialRef)
+        const resolved = await this.ctx.credentials.resolve(ref)
+        if (!resolved) continue
+        let credential = parseCredential(resolved.value)
+        if (credential === undefined) continue
+
+        // 缺 phone（且无 email）时补一次 GetUserInfo（只读）。
+        if (
+          (credential.phone === undefined || credential.phone.length === 0)
+          && (credential.email === undefined || credential.email.length === 0)
+        ) {
+          const info = await this.fetchUserContact(credential)
+          // ⚠️ **什么都没拿到就什么都不做**，不要退回去用凭据里的 ScreenName
+          // 重算昵称 —— 那会用服务端的默认名覆盖掉用户在 Jet Hub 里手动改过的
+          // 昵称（`account.update` 是允许改昵称的），属于无谓且有害的写入。
+          if (info === undefined) continue
+          credential = withTraePhone(credential, info.phone, info.email)
+          await this.ctx.credentials.set(ref, JSON.stringify(credential))
+        }
+
+        const target = traeDisplayNickname(credential, entry.id)
+        // ⚠️ 只在**确实变化**时写账号池：`updateAccount` 是整体 replace，
+        // 每次启动都写会平白落盘一次（同 Raccoon 的处理）。
+        if (target !== entry.nickname) {
+          await pool.updateAccount(entry.id, { nickname: target })
+          repaired.push(entry.id)
+        }
+      } catch (error) {
+        this.ctx.logger?.warn?.(
+          `[trae] 修复账号 ${entry.id} 的显示名失败（不影响使用）：`
+          + `${error instanceof Error ? error.message : String(error)}`,
+        )
+      }
+    }
+    return repaired
+  }
+
+  /**
+   * 调 `GetUserInfo` 只取脱敏手机号 / 邮箱。
+   *
+   * ⚠️ 两者都没有时返回 `undefined` 而**不抛错**：它们只是展示信息，拿不到
+   * 不应让启动流程失败（与 `exchangeTraeCallback` 对 GetUserInfo 的容错同原则）。
+   * 返回 `undefined` 也让调用方能区分「确实没有」与「拿到了空值」，
+   * 从而避免用服务端默认名覆盖用户手动改过的昵称。
+   */
+  private async fetchUserContact(
+    credential: TraeCredential,
+  ): Promise<{ phone?: string; email?: string } | undefined> {
+    try {
+      const host = credential.api_host ?? this.product.oauthHost
+      const headers = traeOAuthHeaders(this.product)
+      headers['X-Cloudide-Token'] = credential.access_token
+      const response = await this.fetchImpl(`${host}${TRAE_USER_INFO_PATH}`, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({ ReqSource: 'IDE', IDEVersion: this.product.ideVersion }),
+        signal: AbortSignal.timeout(TRAE_REQUEST_TIMEOUT_MS),
+      })
+      if (!response.ok) return undefined
+      const parsed = parseTraeUserInfoResponse(await response.json() as Record<string, unknown>)
+      if (parsed === undefined) return undefined
+      const phone = parsed.phone.length > 0 ? parsed.phone : undefined
+      const email = parsed.email.length > 0 ? parsed.email : undefined
+      return phone === undefined && email === undefined ? undefined : { phone, email }
+    } catch {
+      return undefined
     }
   }
 

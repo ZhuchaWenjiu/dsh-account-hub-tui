@@ -34,7 +34,11 @@ import { LOBSTERAI } from './lobsterai-product.js'
 import { QODER } from './qoder-product.js'
 import { TRAE } from './trae-product.js'
 import { CLINE } from './cline-product.js'
-import { isLobsteraiRefreshable, lobsteraiCredentialExpiresAtMs } from './lobsterai.js'
+import {
+  isLobsteraiRefreshable,
+  lobsteraiCredentialExpiresAtMs,
+  lobsteraiDisplayNickname,
+} from './lobsterai.js'
 import type { LobsteraiCredential } from './lobsterai.js'
 import {
   fetchQoderUserNickname,
@@ -44,7 +48,7 @@ import {
 } from './qoder.js'
 import type { QoderCredential } from './qoder.js'
 import { claimQoderDailyCheckin, fetchQoderCreditBalance } from './qoder-credits.js'
-import { isTraeRefreshable, traeCredentialExpiresAtMs } from './trae.js'
+import { isTraeRefreshable, traeCredentialExpiresAtMs, traeDisplayNickname } from './trae.js'
 import type { TraeCredential } from './trae.js'
 import { fetchClineCreditBalance } from './cline-credits.js'
 import {
@@ -216,7 +220,7 @@ function parseClineCredential(raw: string): ClineCredential | undefined {
 }
 
 /**
- * 构造 Raccoon 账号的**展示名**：`RaccoonAva (6665)`。
+ * 构造 Raccoon 账号的**展示名**：`RaccoonAva (1100)`。
  *
  * ## 为什么要追加手机号尾号
  *
@@ -861,9 +865,9 @@ function registerJetHubEndpoints(
           started.result.then(async (loginResult) => {
             const credential = parseLobsteraiCredential(loginResult.access)
             await pool.updateAccount(id, {
-              nickname: credential?.nickname !== undefined && credential.nickname.length > 0
-                ? credential.nickname
-                : id,
+              // ⚠️ 用 `lobsteraiDisplayNickname`：服务端把**手机号本身**当昵称
+              // 下发且只脱敏到「露末 4 位」，需归一化为末 2 位（用户要求）。
+              nickname: lobsteraiDisplayNickname(credential, id),
               expiresAt: credential !== undefined ? lobsteraiCredentialExpiresAtMs(credential) : undefined,
               refreshable: credential !== undefined && isLobsteraiRefreshable(credential),
             })
@@ -934,9 +938,10 @@ function registerJetHubEndpoints(
           started.result.then(async (loginResult) => {
             const credential = parseTraeCredential(loginResult.access)
             await pool.updateAccount(id, {
-              nickname: credential?.nickname !== undefined && credential.nickname.length > 0
-                ? credential.nickname
-                : id,
+              // ⚠️ 用 `traeDisplayNickname`（手机号优先）而非直接取 `nickname`：
+              // 服务端 ScreenName 是**按 uid 自动生成的默认名**，多账号无法区分
+              // （用户报障 2026-09-27）。见该函数的说明。
+              nickname: traeDisplayNickname(credential, id),
               expiresAt: credential !== undefined ? traeCredentialExpiresAtMs(credential) : undefined,
               refreshable: credential !== undefined && isTraeRefreshable(credential),
             })
@@ -1077,7 +1082,7 @@ function registerJetHubEndpoints(
               // 就显示它），故**保留**；但若注册第二个账号，服务端很可能又给一个
               // 相近的默认名 → 多账号重名、无法区分。
               //
-              // 故追加**手机号尾号**消歧：`RaccoonAva (6665)`。
+              // 故追加**手机号尾号**消歧：`RaccoonAva (1100)`。
               // 与 Loomy 的 `Loomy 2222` 同策略（那边没有真实名字可用，
               // 这边有，所以保留原名再挂尾号）。
               nickname: buildRaccoonNickname(saved, id),

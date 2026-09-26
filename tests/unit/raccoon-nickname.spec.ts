@@ -11,14 +11,14 @@ import { buildRaccoonNickname } from '../../src/jet-hub-rpc.js'
  *（JWT payload 里也有 `name`，官方客户端就显示它），故**保留**；
  * 但注册第二个账号时服务端很可能又给相近的默认名 → 多账号重名、无法区分。
  *
- * 故形如 `RaccoonAva (6665)`：原名 + 手机号尾号。
+ * 故形如 `RaccoonAva (1100)`：原名 + 手机号尾号。
  */
 describe('buildRaccoonNickname', () => {
   it('昵称 + 手机号尾号（典型情形）', () => {
     expect(buildRaccoonNickname(
-      { nickname: 'RaccoonAva', phone: '18611406665', user_id: '7445120' },
+      { nickname: 'RaccoonAva', phone: '13011111100', user_id: '7445120' },
       'RACCOON_ACCOUNT_ABD05EAC',
-    )).toBe('RaccoonAva (6665)')
+    )).toBe('RaccoonAva (1100)')
   })
 
   it('无手机号时退化为用户 id', () => {
@@ -34,9 +34,9 @@ describe('buildRaccoonNickname', () => {
 
   it('无昵称但有手机号时用 `Raccoon 尾号`（照 Loomy 形态）', () => {
     expect(buildRaccoonNickname(
-      { phone: '18611406665', user_id: '7445120' },
+      { phone: '13011111100', user_id: '7445120' },
       'fallback',
-    )).toBe('Raccoon 6665')
+    )).toBe('Raccoon 1100')
   })
 
   it('只有用户 id 时用它作后缀', () => {
@@ -52,24 +52,24 @@ describe('buildRaccoonNickname', () => {
   })
 
   it('昵称里已含该尾号时不重复追加', () => {
-    // 服务端将来若把手机号尾号写进 name，不应产出 `X6665 (6665)`
+    // 服务端将来若把手机号尾号写进 name，不应产出 `X1100 (1100)`
     expect(buildRaccoonNickname(
-      { nickname: 'Raccoon6665', phone: '18611406665' },
+      { nickname: 'Raccoon1100', phone: '13011111100' },
       'fb',
-    )).toBe('Raccoon6665')
+    )).toBe('Raccoon1100')
   })
 
-  it('空白昵称视为无昵称（不产出 ` (6665)` 这种前导空格）', () => {
+  it('空白昵称视为无昵称（不产出 ` (1100)` 这种前导空格）', () => {
     expect(buildRaccoonNickname(
-      { nickname: '   ', phone: '18611406665' },
+      { nickname: '   ', phone: '13011111100' },
       'fb',
-    )).toBe('Raccoon 6665')
+    )).toBe('Raccoon 1100')
   })
 
   it('只取手机号后 4 位（不完整暴露号码）', () => {
-    const name = buildRaccoonNickname({ nickname: 'N', phone: '18611406665' }, 'fb')
-    expect(name).not.toContain('18611406665')
-    expect(name).toContain('(6665)')
-    expect(name).toBe('N (6665)')
+    const name = buildRaccoonNickname({ nickname: 'N', phone: '13011111100' }, 'fb')
+    expect(name).not.toContain('13011111100')
+    expect(name).toContain('(1100)')
+    expect(name).toBe('N (1100)')
   })
 })

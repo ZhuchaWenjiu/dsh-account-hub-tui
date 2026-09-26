@@ -104,6 +104,34 @@ export interface TraeCredential {
   /** 昵称（UI 展示）。 */
   nickname?: string
   /**
+   * **脱敏手机号**（`GetUserInfo` 的 `NonPlainTextMobile`，形如 `130******00`）。
+   *
+   * ## 为什么需要它
+   *
+   * `ScreenName` 是字节 passport **按 uid 自动生成的默认名**
+   * （`用户` + uid 片段，实测四个账号全是 `用户26815487395` 这种），
+   * 多账号时彼此几乎无法区分 —— 与 Raccoon 的 `RaccoonAva` 是同一类问题。
+   *
+   * 而 `GetUserInfo` 会下发 `NonPlainTextMobile`（中间 6 位打码），
+   * 实测末两位互不相同，**足以区分账号**；`NonPlainTextEmail` 只在邮箱
+   * 登录时才有值（本机四个账号都是 `LastLoginType: "sms"`，故为空）。
+   *
+   * ⚠️ 是**脱敏**号码，插件拿不到完整手机号 —— 这是 passport 的下发口径，
+   * 展示与消歧都用它，不要试图拼回完整号码。
+   */
+  phone?: string
+  /**
+   * **脱敏邮箱**（`GetUserInfo` 的 `NonPlainTextEmail`）。
+   *
+   * 与 {@link TraeCredential.phone} 同源同用途：`ScreenName` 是自动生成的默认名，
+   * 需要一个真实账号标识来消歧。
+   *
+   * ⚠️ 实测（2026-09-27）本机四个账号的该字段**全为空** —— 它们都是
+   * `LastLoginType: "sms"`（短信登录）。字段名与 `NonPlainTextMobile` 并列，
+   * 形态也一致，故对**邮箱登录**的账号按同一口径采集，作为手机号缺失时的兜底。
+   */
+  email?: string
+  /**
    * 设备指纹（32 hex 字符）。
    *
    * **不可每次重新生成**：TRAE 使用 `machine_id` 标识设备，
@@ -425,12 +453,26 @@ export interface TraeUserInfoResult {
   uid: string
   screenName: string
   enterpriseId: string
+  /**
+   * 脱敏手机号（`NonPlainTextMobile`，形如 `130******00`）；无则空串。
+   *
+   * 见 {@link TraeCredential.phone} 说明 —— 这是多账号消歧最有效的字段。
+   */
+  phone: string
+  /**
+   * 脱敏邮箱（`NonPlainTextEmail`）；短信登录的账号为空串。
+   *
+   * 见 {@link TraeCredential.email} 说明 —— 作为手机号缺失时的兜底。
+   */
+  email: string
 }
 
 /**
  * 解析 GetUserInfo 响应。
  *
- * Go 端响应结构：`{ Result: { UserID, ScreenName, EnterpriseID } }`
+ * Go 端响应结构：`{ Result: { UserID, ScreenName, EnterpriseID, NonPlainTextMobile } }`
+ *
+ * ⚠️ `NonPlainTextMobile` 实测**确实下发**（2026-09-27 用四个真实账号核对
  */
 export function parseTraeUserInfoResponse(data: Record<string, unknown>): TraeUserInfoResult | undefined {
   const result = data.Result ?? data.result
@@ -442,6 +484,10 @@ export function parseTraeUserInfoResponse(data: Record<string, unknown>): TraeUs
     uid,
     screenName: readStringField(r, 'ScreenName') || readStringField(r, 'screenName') || uid,
     enterpriseId: readStringField(r, 'EnterpriseID') || readStringField(r, 'enterpriseId') || '',
+    // ⚠️ 字段名是 **NonPlainTextMobile / NonPlainTextEmail**（不是 Mobile /
+    // Phone / Email）—— 实测 `GetUserInfo` 只下发这两个脱敏形态。
+    phone: readStringField(r, 'NonPlainTextMobile') || readStringField(r, 'nonPlainTextMobile'),
+    email: readStringField(r, 'NonPlainTextEmail') || readStringField(r, 'nonPlainTextEmail'),
   }
 }
 
@@ -482,9 +528,80 @@ export function buildTraeCredential(
     expires_at: expiresAt,
     uid: userInfo.uid,
     nickname: userInfo.screenName,
+    ...userInfo.phone.length > 0 ? { phone: userInfo.phone } : {},
+    ...userInfo.email.length > 0 ? { email: userInfo.email } : {},
     machine_id: session.machineId,
     device_id: session.deviceId,
     enterprise_id: userInfo.enterpriseId,
+  }
+}
+
+/**
+ * 构造 TRAE 账号在 Jet Hub 里的**展示名**：手机号优先，缺失时回退 ScreenName。
+ *
+ * ## 为什么不是直接用 ScreenName（真实缺陷，用户报障 2026-09-27）
+ *
+ * > 用 trae provider 登录后用户名字显示无法区分各个用户，有其他名字昵称或者
+ * > 手机尾号之类的信息可以区分吗？
+ *
+ * 根因：`ScreenName` 是字节 passport **按 uid 自动生成的默认名**
+ * （`用户` + uid 片段）。实测四个账号分别是
+ * `用户26815487395` / `用户9340371069` / `用户5061993825` / `用户86180215561`
+ * —— 长度、形态完全一致，一屏列出来根本认不出谁是谁。
+ * 这与 Raccoon 的 `RaccoonAva` 是同一类问题（那边用「名字 + 手机尾号」消歧）。
+ *
+ * 可用字段实测（2026-09-27，四个真实账号）：
+ *
+ * | 字段 | 值 | 可区分性 |
+ * |---|---|---|
+ * | `ScreenName` | `用户26815487395` 等 | ❌ 自动生成，形态雷同 |
+ * | `NonPlainTextMobile` | `130******00` | ✅ 末两位互异 |
+ * | `NonPlainTextEmail` | 全为空（`LastLoginType` 均为 `sms`） | ❌ 短信登录无邮箱 |
+ * | `Description` | 全为空 | ❌ |
+ * | `UserID` | `4056564292660009` 等 | ⚠️ 可区分但过长、不可读 |
+ *
+ * 故**取手机号优先**（用户明确要求的展示形态）：
+ * 手机号 → 邮箱 → ScreenName → 账号 id。
+ *
+ * ⚠️ 手机号与邮箱都是**脱敏**形态，照原样展示即可，不要试图还原或截取后四位
+ * —— 中间本就打码，`130******00` 整体已经足够短且可辨认。
+ */
+export function traeDisplayNickname(
+  credential: Pick<TraeCredential, 'phone' | 'email' | 'nickname' | 'uid'> | undefined,
+  fallbackId: string,
+): string {
+  const phone = typeof credential?.phone === 'string' ? credential.phone.trim() : ''
+  if (phone.length > 0) return phone
+  // 邮箱登录的账号没有手机号（`LastLoginType` 为 email），用脱敏邮箱兜底。
+  const email = typeof credential?.email === 'string' ? credential.email.trim() : ''
+  if (email.length > 0) return email
+  const nickname = typeof credential?.nickname === 'string' ? credential.nickname.trim() : ''
+  if (nickname.length > 0) return nickname
+  const uid = typeof credential?.uid === 'string' ? credential.uid.trim() : ''
+  return uid.length > 0 ? uid : fallbackId
+}
+
+/**
+ * 把脱敏手机号 / 邮箱写进凭据（返回新对象，不改原凭据）。
+ *
+ * 与 `withQoderNickname` 同因：账号条目会随 Jet Hub 的账号操作整体重写，
+ * 而凭据里存一份才能在续期后（`applyTraeRefresh` 会保留它）与其它面板
+ * （积分、模型）都稳定拿到。
+ *
+ * 空串与 undefined 均视为「没有」，此时**原样返回**（不写入空字段）。
+ */
+export function withTraePhone(
+  credential: TraeCredential,
+  phone: string | undefined,
+  email?: string | undefined,
+): TraeCredential {
+  const hasPhone = phone !== undefined && phone.length > 0
+  const hasEmail = email !== undefined && email.length > 0
+  if (!hasPhone && !hasEmail) return credential
+  return {
+    ...credential,
+    ...hasPhone ? { phone } : {},
+    ...hasEmail ? { email } : {},
   }
 }
 

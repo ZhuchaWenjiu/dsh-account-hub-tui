@@ -4,7 +4,7 @@ import { LoomyAdapter, parseLoomyRemoteModels } from '../../src/loomy-adapter.js
 import type { LoomyCredential } from '../../src/loomy.js'
 
 const CRED: LoomyCredential = {
-  access_token: 'S'.repeat(32), userid: 'u1', phone: '18611112222',
+  access_token: 'S'.repeat(32), userid: 'u1', phone: '13011112222',
 }
 
 /** 实测的远端模型条目（2026-09-26 GET /api/v1/models 的真实形状）。 */
