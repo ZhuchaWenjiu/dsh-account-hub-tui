@@ -51,11 +51,13 @@ import {
   readNumberField,
   readStringField,
   traeCredentialExpiresAtMs,
+  traeDisplayNickname,
   traeMaxModeFields,
   traeOAuthHeaders,
   traeSOLOHeaders,
   traeUgHeaders,
   transformToSOLOBody,
+  withTraePhone,
 } from '../../src/trae.js'
 import { TRAE } from '../../src/trae-product.js'
 import type { TraeCredential, TraeRemoteModel } from '../../src/trae.js'
@@ -239,7 +241,9 @@ describe('ExchangeToken / GetUserInfo 响应解析', () => {
     const parsed = parseTraeUserInfoResponse({
       Result: { UserID: 'u-1', ScreenName: '张三', EnterpriseID: 'ent-1' },
     })
-    expect(parsed).toEqual({ uid: 'u-1', screenName: '张三', enterpriseId: 'ent-1' })
+    expect(parsed).toEqual({
+      uid: 'u-1', screenName: '张三', enterpriseId: 'ent-1', phone: '', email: '',
+    })
   })
 
   it('GetUserInfo 缺少 UserID 时返回 undefined', () => {
@@ -252,7 +256,7 @@ describe('凭据组装与续期合并', () => {
     accessToken: 'AT', refreshToken: 'RT', tokenExpireAt: 0,
     tokenExpireDuration: 3600, refreshExpireAt: 0,
   }
-  const userInfo = { uid: 'u-1', screenName: '张三', enterpriseId: 'ent-1' }
+  const userInfo = { uid: 'u-1', screenName: '张三', enterpriseId: 'ent-1', phone: '', email: '' }
   const session = { machineId: 'a'.repeat(32), deviceId: 'c'.repeat(32) }
 
   it('buildTraeCredential 保留机器指纹与用户信息', () => {
@@ -270,6 +274,23 @@ describe('凭据组装与续期合并', () => {
     expect(credential.expires_at).toBe(String(1_700_000_000_000 + 3_600_000))
   })
 
+  it('buildTraeCredential 写入脱敏手机号；无手机号时不写空字段', () => {
+    const withPhone = buildTraeCredential(
+      exchange, { ...userInfo, phone: '130******00' }, session,
+    )
+    expect(withPhone.phone).toBe('130******00')
+    // 空串视为「没有」——不写入，避免凭据里出现无意义的空字段。
+    expect(buildTraeCredential(exchange, userInfo, session)).not.toHaveProperty('phone')
+  })
+
+  it('buildTraeCredential 写入脱敏邮箱（邮箱登录的账号）', () => {
+    const withEmail = buildTraeCredential(
+      exchange, { ...userInfo, email: 'a***@163.com' }, session,
+    )
+    expect(withEmail.email).toBe('a***@163.com')
+    expect(buildTraeCredential(exchange, userInfo, session)).not.toHaveProperty('email')
+  })
+
   it('tokenExpireAt 为毫秒级时直接采用', () => {
     const ms = 1_786_847_930_141
     const credential = buildTraeCredential({ ...exchange, tokenExpireAt: ms }, userInfo, session)
@@ -284,7 +305,7 @@ describe('凭据组装与续期合并', () => {
   it('applyTraeRefresh 轮换 token 但保留全部身份字段', () => {
     // 这是本 provider 的关键契约：machine_id / device_id 必须原样保留，
     // 重新生成会让服务端按新设备处理，可能要求重新登录。
-    const previous = makeCredential({ uid: 'u-1', nickname: '张三' })
+    const previous = makeCredential({ uid: 'u-1', nickname: '张三', phone: '130******00' })
     const refreshed = applyTraeRefresh(previous, { ...exchange, accessToken: 'AT2', refreshToken: 'RT2' })
     expect(refreshed.access_token).toBe('AT2')
     expect(refreshed.refresh_token).toBe('RT2')
@@ -292,6 +313,8 @@ describe('凭据组装与续期合并', () => {
     expect(refreshed.device_id).toBe(previous.device_id)
     expect(refreshed.uid).toBe('u-1')
     expect(refreshed.nickname).toBe('张三')
+    // 手机号不在续期响应里，必须原样保留（否则续期后昵称又变回 ScreenName）。
+    expect(refreshed.phone).toBe('130******00')
   })
 
   it('续期响应未返回新 refresh_token 时沿用旧值（不覆盖成空串）', () => {

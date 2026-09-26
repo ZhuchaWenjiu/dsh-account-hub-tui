@@ -26,6 +26,7 @@ import {
   isLobsteraiRefreshable,
   lobsteraiAnonymousHeaders,
   lobsteraiCredentialExpiresAtMs,
+  lobsteraiDisplayNickname,
   lobsteraiModelsHeaders,
   lobsteraiRefreshBody,
   parseLobsteraiEnvelope,
@@ -267,9 +268,9 @@ export class LobsteraiAuth extends Service {
       await flowOptions.pool.addAccount({
         id: flowOptions.accountId,
         provider: this.product.id,
-        nickname: credential?.nickname !== undefined && credential.nickname.length > 0
-          ? credential.nickname
-          : flowOptions.accountId,
+        // ⚠️ 用 `lobsteraiDisplayNickname`：服务端把**手机号本身**当昵称下发，
+        // 且只脱敏到「露末 4 位」，需归一化为末 2 位（用户要求 2026-09-27）。
+        nickname: lobsteraiDisplayNickname(credential, flowOptions.accountId),
         enabled: true,
         credentialRef: flowOptions.refName ?? this.credentialRefName,
         createdAt: Date.now(),
@@ -312,9 +313,8 @@ export class LobsteraiAuth extends Service {
       await options.pool.addAccount({
         id: options.accountId,
         provider: this.product.id,
-        nickname: credential.nickname !== undefined && credential.nickname.length > 0
-          ? credential.nickname
-          : options.accountId,
+        // 同 `persistLogin`：手机号归一化为只露末 2 位。
+        nickname: lobsteraiDisplayNickname(credential, options.accountId),
         enabled: true,
         credentialRef: options.refName ?? this.credentialRefName,
         createdAt: Date.now(),
@@ -409,6 +409,63 @@ export class LobsteraiAuth extends Service {
     }
     const refreshed = await this.refreshCredential(credential)
     await this.ctx.credentials.set(ref, JSON.stringify(refreshed))
+  }
+
+  /**
+   * 一次性修复**老账号**的展示名：把手机号掩码归一化为「只露末 2 位」。
+   *
+   * ## 为什么需要它（用户要求 2026-09-27）
+   *
+   * > lobsterai 的用户名字显示的手机号尾号漏出 4 位，现在也改为只漏出 2 位
+   *
+   * ⚠️ 那个 `130****1100` 是**服务端下发的 `user.nickname` 原值**，不是本插件
+   * 截取的（实测四个账号登录响应即为此形态）。故只改代码只影响新登录账号，
+   * 已登录的老账号昵称仍是露 4 位 —— 启动时主动补一次。
+   *
+   * 与 `RaccoonAuth.repairAccountNicknames` / `TraeAuth.repairAccountNicknames`
+   * 同一模式（都是「服务端下发的名字不适合直接展示」）。
+   *
+   * ## 契约
+   *
+   * - **幂等**：`lobsteraiDisplayNickname` 对已归一化的值算出同一结果，
+   *   故不触发写入（只在**确实变化**时落盘）。
+   * - **失败不阻塞**：逐账号 catch，异常只记 warn。
+   * - **纯本地**：不发任何网络请求（掩码只依赖凭据里的昵称）。
+   * - **不误伤真实昵称**：非手机号形态（如 `用户26815487395`）原样保留。
+   *
+   * @returns 被修复的账号 id 列表（供日志）
+   */
+  async repairAccountNicknames(pool: AccountPool): Promise<string[]> {
+    const repaired: string[] = []
+    let entries: Awaited<ReturnType<AccountPool['listAccounts']>>
+    try {
+      entries = await pool.listAccounts(this.product.id)
+    } catch {
+      return repaired
+    }
+
+    for (const entry of entries) {
+      try {
+        const resolved = await this.ctx.credentials.resolve(credentialRef(entry.credentialRef))
+        if (!resolved) continue
+        const credential = parseCredential(resolved.value)
+        if (credential === undefined) continue
+
+        const target = lobsteraiDisplayNickname(credential, entry.id)
+        // ⚠️ 只在**确实变化**时写账号池：`updateAccount` 是整体 replace，
+        // 每次启动都写会平白落盘一次。
+        if (target !== entry.nickname) {
+          await pool.updateAccount(entry.id, { nickname: target })
+          repaired.push(entry.id)
+        }
+      } catch (error) {
+        this.ctx.logger?.warn?.(
+          `[lobsterai] 修复账号 ${entry.id} 的显示名失败（不影响使用）：`
+          + `${error instanceof Error ? error.message : String(error)}`,
+        )
+      }
+    }
+    return repaired
   }
 
   /**

@@ -552,3 +552,109 @@ describe('LobsteraiAuth 登录与凭据管理', () => {
     expect(status.refreshable).toBe(false)
   })
 })
+
+/**
+ * 老账号展示名回填。
+ *
+ * 用户要求（2026-09-27）：「lobsterai 的用户名字显示的手机号尾号漏出 4 位，
+ * 现在也改为只漏出 2 位」。
+ *
+ * ⚠️ 那个 `130****1100` 是**服务端下发的 `user.nickname` 原值**，不是本插件
+ * 截取的 —— 故光改代码只影响新登录账号，老账号要在启动时主动回填。
+ */
+describe('LobsteraiAuth 老账号展示名回填', () => {
+  /** 最小账号池桩。 */
+  function makePool(accounts: Array<Record<string, unknown>>) {
+    const updates: Array<{ id: string; patch: Record<string, unknown> }> = []
+    return {
+      updates,
+      async listAccounts(provider: string) {
+        return accounts.filter((a) => a.provider === provider) as never
+      },
+      async updateAccount(id: string, patch: Record<string, unknown>) {
+        updates.push({ id, patch })
+      },
+    }
+  }
+
+  function accountEntry(overrides: Record<string, unknown> = {}) {
+    return {
+      id: 'lobsterai-1',
+      provider: 'lobsterai',
+      nickname: '130****1100',
+      enabled: true,
+      credentialRef: 'LOBSTERAI_ACCOUNT_AAAA1111',
+      createdAt: 1,
+      refreshable: true,
+      ...overrides,
+    }
+  }
+
+  it('把露 4 位的昵称改成只露末 2 位', async () => {
+    const { ctx, credentials } = makeContext()
+    await credentials.set('LOBSTERAI_ACCOUNT_AAAA1111', JSON.stringify(makeCredential({ nickname: '130****1100' })))
+    const service = newService(ctx, { fetcher: stubFetcher(() => refreshSuccess()) })
+    const pool = makePool([accountEntry()])
+
+    const repaired = await service.repairAccountNicknames(pool as never)
+
+    expect(repaired).toEqual(['lobsterai-1'])
+    expect(pool.updates).toEqual([{ id: 'lobsterai-1', patch: { nickname: '130******00' } }])
+  })
+
+  it('幂等：昵称已是末 2 位时不写账号池', async () => {
+    const { ctx, credentials } = makeContext()
+    await credentials.set('LOBSTERAI_ACCOUNT_AAAA1111', JSON.stringify(makeCredential({ nickname: '130******00' })))
+    const service = newService(ctx, { fetcher: stubFetcher(() => refreshSuccess()) })
+    const pool = makePool([accountEntry({ nickname: '130******00' })])
+
+    expect(await service.repairAccountNicknames(pool as never)).toEqual([])
+    expect(pool.updates).toEqual([])
+  })
+
+  it('真实昵称不被改写（不误伤非手机号昵称）', async () => {
+    const { ctx, credentials } = makeContext()
+    await credentials.set('LOBSTERAI_ACCOUNT_AAAA1111', JSON.stringify(makeCredential({ nickname: '我的龙虾号' })))
+    const service = newService(ctx, { fetcher: stubFetcher(() => refreshSuccess()) })
+    const pool = makePool([accountEntry({ nickname: '我的龙虾号' })])
+
+    expect(await service.repairAccountNicknames(pool as never)).toEqual([])
+    expect(pool.updates).toEqual([])
+  })
+
+  it('纯本地：不发任何网络请求', async () => {
+    const { ctx, credentials } = makeContext()
+    await credentials.set('LOBSTERAI_ACCOUNT_AAAA1111', JSON.stringify(makeCredential({ nickname: '130****1100' })))
+    const fetcher = vi.fn(async () => refreshSuccess()) as unknown as typeof fetch
+    const service = newService(ctx, { fetcher })
+    const pool = makePool([accountEntry()])
+
+    await service.repairAccountNicknames(pool as never)
+
+    // 掩码只依赖凭据里的昵称，不需要任何远端调用。
+    expect(fetcher).not.toHaveBeenCalled()
+  })
+
+  it('凭据缺失的账号被跳过（不留幽灵昵称）', async () => {
+    const { ctx } = makeContext()
+    const service = newService(ctx, { fetcher: stubFetcher(() => refreshSuccess()) })
+    const pool = makePool([accountEntry({ credentialRef: 'LOBSTERAI_ACCOUNT_MISSING' })])
+
+    expect(await service.repairAccountNicknames(pool as never)).toEqual([])
+    expect(pool.updates).toEqual([])
+  })
+
+  it('只处理本 provider 的账号（不碰其它 provider）', async () => {
+    const { ctx, credentials } = makeContext()
+    await credentials.set('LOBSTERAI_ACCOUNT_AAAA1111', JSON.stringify(makeCredential({ nickname: '130****1100' })))
+    const service = newService(ctx, { fetcher: stubFetcher(() => refreshSuccess()) })
+    const pool = makePool([
+      accountEntry(),
+      { ...accountEntry({ id: 'buddy-1' }), provider: 'buddy' },
+    ])
+
+    const repaired = await service.repairAccountNicknames(pool as never)
+
+    expect(repaired).toEqual(['lobsterai-1'])
+  })
+})
