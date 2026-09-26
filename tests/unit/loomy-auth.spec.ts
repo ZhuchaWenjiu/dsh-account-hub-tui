@@ -63,33 +63,50 @@ function makeCredential(overrides: Partial<LoomyCredential> = {}): LoomyCredenti
   return {
     access_token: 'S'.repeat(32),
     userid: '260924225226937524',
-    phone: '18611112222',
+    phone: '13011112222',
     expires_at: String(Date.now() + LOOMY_SESSION_TTL_SECONDS * 1000),
     ...overrides,
   }
 }
 
 describe('凭据构造', () => {
-  it('expires_at = 现在 + 14 天（毫秒时间戳字符串）', () => {
+  /**
+   * ⚠️ 本用例的**语义边界**（容易被误读，故写清楚）：
+   *
+   * `buildCredential` 只在**登录完成的那一刻**被调用
+   *（`persistWechatLogin` / `loginWithSmsCode`），
+   * 所以它算出的 `expires_at` 就是「**登录时刻** + 14 天」——
+   * 这个值当场写进凭据并**持久化**，之后读取时**不重算**
+   *（`credentialExpiresAtMs` 只解析已存的值）。
+   *
+   * 因此本用例断言的是「**新造**凭据的 TTL 是 14 天」，
+   * 与「凭据是什么时候登录的」无关 —— 旧凭据的 `expires_at` 是历史值，
+   * 本来就该随真实时间流逝而减少（那不是缺陷，正是它能表达过期的原因）。
+   */
+  it('新建凭据的 expires_at = 构建时刻 + 14 天（登录时写入，之后不重算）', () => {
     const { ctx } = makeContext()
     const service = newService(ctx)
     const now = Date.now()
-    const credential = service.buildCredential('S'.repeat(32), 'u1', '18611112222')
+    const credential = service.buildCredential('S'.repeat(32), 'u1', '13011112222')
 
     const expiresAt = credentialExpiresAtMs(credential)
     expect(expiresAt).toBeDefined()
     // 14 天 = 1_209_600_000 毫秒（允许少量执行耗时）
     const delta = expiresAt! - now
     expect(delta).toBeGreaterThan(LOOMY_SESSION_TTL_SECONDS * 1000 - 5_000)
-    expect(delta).toBeLessThanOrEqual(LOOMY_SESSION_TTL_SECONDS * 1000)
+    // ⚠️ 上界也要留余量：`buildCredential` 内部的 `Date.now()` 晚于本用例捕获的
+    // `now`，故 delta 会**略大于** 14 天整。原先写 `toBeLessThanOrEqual(14天)`
+    // 单跑时恰好通过（差值常为 0–1 ms），但**全量并发**下机器负载高，
+    // 该差值可达数毫秒 → 偶发假失败（与具体 provider 改动无关的既有抖动）。
+    expect(delta).toBeLessThanOrEqual(LOOMY_SESSION_TTL_SECONDS * 1000 + 5_000)
   })
 
   it('字段名是 access_token（AccountPool 的匹配依据）', () => {
     const { ctx } = makeContext()
-    const credential = newService(ctx).buildCredential('X'.repeat(32), 'u', '18611112222')
+    const credential = newService(ctx).buildCredential('X'.repeat(32), 'u', '13011112222')
     expect(credential.access_token).toBe('X'.repeat(32))
     expect(credential.userid).toBe('u')
-    expect(credential.phone).toBe('18611112222')
+    expect(credential.phone).toBe('13011112222')
   })
 
   it('nickname 为空时不写该字段（不产生空串昵称）', () => {
@@ -104,7 +121,7 @@ describe('凭据构造', () => {
    */
   it('凭据恒为不可续期（Loomy 无 refresh 端点）', () => {
     const { ctx } = makeContext()
-    const credential = newService(ctx).buildCredential('S'.repeat(32), 'u', '18611112222')
+    const credential = newService(ctx).buildCredential('S'.repeat(32), 'u', '13011112222')
     expect(isLoomyRefreshable(credential)).toBe(false)
   })
 })
@@ -115,7 +132,7 @@ describe('短信登录', () => {
     const fetcher = vi.fn().mockResolvedValue(ok({ msgid: 'MSG-9' }))
     const service = newService(ctx, { fetcher: fetcher as unknown as typeof fetch })
 
-    expect(await service.sendSmsCode('18611112222')).toBe('MSG-9')
+    expect(await service.sendSmsCode('13011112222')).toBe('MSG-9')
     const [url] = fetcher.mock.calls[0] as [string]
     expect(url).toBe('https://account.xfinfr.com/login/phone/sendMsgCode')
   })
@@ -129,7 +146,7 @@ describe('短信登录', () => {
       .mockResolvedValueOnce(ok({ alreadyProcessed: true, dailyQuota: 5000, dailyBalance: 5000 }))
     const service = newService(ctx, { fetcher: fetcher as unknown as typeof fetch })
 
-    const result = await service.loginWithSmsCode('18611112222', '123456', 'MSG-9')
+    const result = await service.loginWithSmsCode('13011112222', '123456', 'MSG-9')
 
     expect(result.refreshable).toBe(false)
     expect(result.expires).toBeGreaterThan(Date.now())
@@ -148,7 +165,7 @@ describe('短信登录', () => {
       .mockResolvedValueOnce(ok({ alreadyProcessed: true }))
     const service = newService(ctx, { fetcher: fetcher as unknown as typeof fetch })
 
-    await service.loginWithSmsCode('18611112222', '123456', 'MSG-9')
+    await service.loginWithSmsCode('13011112222', '123456', 'MSG-9')
 
     const urls = fetcher.mock.calls.map((call) => String(call[0]))
     expect(urls.some((u) => u.includes('/points/first-login'))).toBe(true)
@@ -165,7 +182,7 @@ describe('短信登录', () => {
       .mockRejectedValueOnce(new Error('network down'))
     const service = newService(ctx, { fetcher: fetcher as unknown as typeof fetch })
 
-    await expect(service.loginWithSmsCode('18611112222', '123456', 'MSG-9')).resolves.toBeDefined()
+    await expect(service.loginWithSmsCode('13011112222', '123456', 'MSG-9')).resolves.toBeDefined()
     expect(credentials.raw(LOOMY_CREDENTIAL_REF)).toBeDefined()
   })
 
@@ -174,7 +191,7 @@ describe('短信登录', () => {
     const fetcher = vi.fn().mockResolvedValue(bizError('020002', '验证码错误，请重新输入'))
     const service = newService(ctx, { fetcher: fetcher as unknown as typeof fetch })
 
-    await expect(service.loginWithSmsCode('18611112222', '000000', 'MSG-9'))
+    await expect(service.loginWithSmsCode('13011112222', '000000', 'MSG-9'))
       .rejects.toThrow(/验证码错误/)
     expect(credentials.raw(LOOMY_CREDENTIAL_REF)).toBeUndefined()
   })

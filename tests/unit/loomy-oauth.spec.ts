@@ -31,7 +31,7 @@ describe('buildLoomyAccountBody：账号请求体信封', () => {
    * ⚠️ `ua` 硬编码 macOS —— **Windows 上也是这个值**，照抄不要「修正」。
    */
   it('base 字段与客户端逐项一致', () => {
-    const body = buildLoomyAccountBody(LOOMY, { phone: '18611112222' })
+    const body = buildLoomyAccountBody(LOOMY, { phone: '13011112222' })
     const base = body.base as Record<string, unknown>
     expect(base.appid).toBe('GM3LOOMY')
     expect(base.modelid).toBe('Web')
@@ -43,8 +43,8 @@ describe('buildLoomyAccountBody：账号请求体信封', () => {
   })
 
   it('param 原样放进 body.param', () => {
-    const body = buildLoomyAccountBody(LOOMY, { phone: '18611112222', ccode: '86' })
-    expect(body.param).toEqual({ phone: '18611112222', ccode: '86' })
+    const body = buildLoomyAccountBody(LOOMY, { phone: '13011112222', ccode: '86' })
+    expect(body.param).toEqual({ phone: '13011112222', ccode: '86' })
   })
 
   it('每次调用的 traceid 都不同', () => {
@@ -58,7 +58,7 @@ describe('buildLoomyAccountBody：账号请求体信封', () => {
 describe('sendLoomySmsCode', () => {
   it('POST 到 /login/phone/sendMsgCode 并返回 msgid', async () => {
     const fetcher = vi.fn().mockResolvedValue(ok({ msgid: 'MSG-1' }))
-    const msgid = await sendLoomySmsCode('18611112222', LOOMY, fetcher as unknown as typeof fetch)
+    const msgid = await sendLoomySmsCode('13011112222', LOOMY, fetcher as unknown as typeof fetch)
 
     expect(msgid).toBe('MSG-1')
     const [url, init] = fetcher.mock.calls[0] as [string, RequestInit]
@@ -68,20 +68,20 @@ describe('sendLoomySmsCode', () => {
     expect(String((init.headers as Record<string, string>).Authorization)).toMatch(/^account /)
     // body 里 expire 是 300 秒
     const sent = JSON.parse(String(init.body)) as { param: Record<string, unknown> }
-    expect(sent.param.phone).toBe('18611112222')
+    expect(sent.param.phone).toBe('13011112222')
     expect(sent.param.ccode).toBe('86')
     expect(sent.param.expire).toBe(300)
   })
 
   it('响应缺 msgid 时抛错（不能返回空串让上层拿去登录）', async () => {
     const fetcher = vi.fn().mockResolvedValue(ok({}))
-    await expect(sendLoomySmsCode('18611112222', LOOMY, fetcher as unknown as typeof fetch))
+    await expect(sendLoomySmsCode('13011112222', LOOMY, fetcher as unknown as typeof fetch))
       .rejects.toThrow(/msgid/)
   })
 
   it('业务错误码抛错并带上服务端 desc', async () => {
     const fetcher = vi.fn().mockResolvedValue(bizError('020002', '手机号格式不正确'))
-    await expect(sendLoomySmsCode('18611112222', LOOMY, fetcher as unknown as typeof fetch))
+    await expect(sendLoomySmsCode('13011112222', LOOMY, fetcher as unknown as typeof fetch))
       .rejects.toThrow(/手机号格式不正确/)
   })
 })
@@ -90,7 +90,7 @@ describe('loginLoomyBySmsCode', () => {
   it('POST 到 /login/phone/checkCode 并返回 session/userid', async () => {
     const fetcher = vi.fn().mockResolvedValue(ok({ session: 'S'.repeat(32), userid: '260924225226937524' }))
     const result = await loginLoomyBySmsCode(
-      '18611112222', '123456', 'MSG-1', LOOMY, fetcher as unknown as typeof fetch,
+      '13011112222', '123456', 'MSG-1', LOOMY, fetcher as unknown as typeof fetch,
     )
 
     expect(result.session).toBe('S'.repeat(32))
@@ -172,27 +172,27 @@ describe('bindLoomyThirdAccount', () => {
 describe('bindLoomySendMsg / bindLoomyCheckCode / bindLoomySkip', () => {
   it('bindSendMsg 带 rcode + phone，expire 为 300', async () => {
     const fetcher = vi.fn().mockResolvedValue(ok({ msgid: 'MSG-9' }))
-    const msgid = await bindLoomySendMsg('RC-1', '18611112222', LOOMY, fetcher as unknown as typeof fetch)
+    const msgid = await bindLoomySendMsg('RC-1', '13011112222', LOOMY, fetcher as unknown as typeof fetch)
 
     expect(msgid).toBe('MSG-9')
     const [url, init] = fetcher.mock.calls[0] as [string, RequestInit]
     expect(url).toBe('https://account.xfinfr.com/login/thirdAccount/bind/sendMsg')
     const sent = JSON.parse(String(init.body)) as { param: Record<string, unknown> }
     expect(sent.param.rcode).toBe('RC-1')
-    expect(sent.param.phone).toBe('18611112222')
+    expect(sent.param.phone).toBe('13011112222')
     expect(sent.param.ccode).toBe('86')
     expect(sent.param.expire).toBe(300)
   })
 
   it('bindSendMsg 缺 msgid 时抛错', async () => {
     const fetcher = vi.fn().mockResolvedValue(ok({}))
-    await expect(bindLoomySendMsg('RC', '18611112222', LOOMY, fetcher as unknown as typeof fetch))
+    await expect(bindLoomySendMsg('RC', '13011112222', LOOMY, fetcher as unknown as typeof fetch))
       .rejects.toThrow(/msgid/)
   })
 
   it('bindCheckCode 返回 session/userid/phone，expire 为 14 天', async () => {
     const fetcher = vi.fn().mockResolvedValue(ok({
-      session: 'S'.repeat(32), userid: 'u-1', phone: '18611112222',
+      session: 'S'.repeat(32), userid: 'u-1', phone: '13011112222',
     }))
     const result = await bindLoomyCheckCode(
       'RC-1', '123456', 'MSG-9', LOOMY, fetcher as unknown as typeof fetch,
@@ -200,7 +200,7 @@ describe('bindLoomySendMsg / bindLoomyCheckCode / bindLoomySkip', () => {
 
     expect(result.session).toBe('S'.repeat(32))
     expect(result.userid).toBe('u-1')
-    expect(result.phone).toBe('18611112222')
+    expect(result.phone).toBe('13011112222')
 
     const [url, init] = fetcher.mock.calls[0] as [string, RequestInit]
     expect(url).toBe('https://account.xfinfr.com/login/thirdAccount/bind/checkCode')

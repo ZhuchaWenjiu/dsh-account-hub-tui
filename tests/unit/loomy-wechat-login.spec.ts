@@ -77,7 +77,7 @@ function makeFetcher(overrides: {
       return ok({ msgid: 'MSG-1' })
     }
     if (url.includes('/login/thirdAccount/bind/checkCode')) {
-      return ok({ session: 'S'.repeat(32), userid: 'u-bind', phone: '18611112222' })
+      return ok({ session: 'S'.repeat(32), userid: 'u-bind', phone: '13011112222' })
     }
     if (url.includes('/points/first-login')) {
       return ok({ alreadyProcessed: true })
@@ -148,7 +148,7 @@ describe('startLoomyWechatLoginFlow', () => {
       const sent = await (await fetch(`${base}${LOOMY_WECHAT_COMPLETE_PATH}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ action: 'send_sms', phone: '18611112222' }),
+        body: JSON.stringify({ action: 'send_sms', phone: '13011112222' }),
       })).json()
       expect(sent.ok).toBe(true)
 
@@ -156,7 +156,7 @@ describe('startLoomyWechatLoginFlow', () => {
       const verified = await (await fetch(`${base}${LOOMY_WECHAT_COMPLETE_PATH}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ action: 'verify_sms', phone: '18611112222', code: '123456' }),
+        body: JSON.stringify({ action: 'verify_sms', phone: '13011112222', code: '123456' }),
       })).json()
       expect(verified.ok).toBe(true)
       expect(verified.done).toBe(true)
@@ -164,7 +164,7 @@ describe('startLoomyWechatLoginFlow', () => {
       const result = await flow.result
       expect(result.session).toBe('S'.repeat(32))
       expect(result.userid).toBe('u-bind')
-      expect(result.phone).toBe('18611112222')
+      expect(result.phone).toBe('13011112222')
     } finally {
       await flow.close()
     }
@@ -198,7 +198,7 @@ describe('startLoomyWechatLoginFlow', () => {
       const bad = await (await fetch(`${base}${LOOMY_WECHAT_COMPLETE_PATH}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ action: 'verify_sms', phone: '18611112222', code: '000000' }),
+        body: JSON.stringify({ action: 'verify_sms', phone: '13011112222', code: '000000' }),
       })).json()
       expect(bad.ok).toBe(false)
       expect(bad.message).toMatch(/验证码错误/)
@@ -207,7 +207,7 @@ describe('startLoomyWechatLoginFlow', () => {
       const good = await (await fetch(`${base}${LOOMY_WECHAT_COMPLETE_PATH}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ action: 'verify_sms', phone: '18611112222', code: '123456' }),
+        body: JSON.stringify({ action: 'verify_sms', phone: '13011112222', code: '123456' }),
       })).json()
       expect(good.done).toBe(true)
       await expect(flow.result).resolves.toBeDefined()

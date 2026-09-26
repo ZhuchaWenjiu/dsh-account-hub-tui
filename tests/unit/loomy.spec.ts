@@ -149,7 +149,7 @@ describe('parseLoomyEnvelope：业务信封', () => {
 
 describe('凭据过期判定', () => {
   const base: LoomyCredential = {
-    access_token: 'a'.repeat(32), userid: 'u1', phone: '18611112222',
+    access_token: 'a'.repeat(32), userid: 'u1', phone: '13011112222',
   }
 
   it('expires_at 是毫秒时间戳**字符串**', () => {
