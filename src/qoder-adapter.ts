@@ -44,10 +44,14 @@ import {
   serializeMessages,
 } from './openai-compat.js'
 import {
+  BILLING_BUSINESS_CODE,
   QUEUE_BUSINESS_CODE,
   QUEUE_MAX_ATTEMPTS,
   QUEUE_MAX_DELAY_MS,
+  isBillingBusinessCode,
   isQueueBusinessCode,
+  looksLikeBillingError,
+  nextUtc8DayStartMs,
   parseQueueError,
   queueDelayMs,
   type QueueInfo,
@@ -67,13 +71,39 @@ const qoderQueueDelayMs = queueDelayMs
  * 这里保留同名导出，避免既有调用方与测试失效。
  */
 export {
+  BILLING_BUSINESS_CODE as QODER_BILLING_CODE,
   QUEUE_BUSINESS_CODE as QODER_QUEUE_CODE,
   QUEUE_MAX_ATTEMPTS as QODER_QUEUE_MAX_ATTEMPTS,
   QUEUE_MAX_DELAY_MS as QODER_QUEUE_MAX_DELAY_MS,
+  isBillingBusinessCode,
   isQueueBusinessCode,
+  looksLikeBillingError,
+  nextUtc8DayStartMs,
   parseQueueError as parseQoderQueueError,
   queueDelayMs as qoderQueueDelayMs,
   type QueueInfo as QoderQueueInfo,
+}
+
+/**
+ * 判断一个错误是否为**额度受限**（`QUOTA_EXCEEDED`）。
+ *
+ * ⚠️ 必须同时认 `code` **与** `message`：
+ * - `code`：`openai-compat` 抛的 `LlmError(…, 'QUOTA_EXCEEDED')`（主判据）；
+ * - `message`：兜底 —— 若哪天错误从别的路径冒出来（如未被包装的原始文本），
+ *   文案里仍带 `Billing daily count exceeded`，可据此识别。
+ *
+ * ⚠️ 用 `code` 判据**而不是**重新解析错误文本：`ModelQueuedError` 已证明
+ * 「在适配器里重解析一遍」会与上游判定漂移（同一份判据两处实现必然不同步）。
+ */
+function isQuotaExceededError(error: unknown): boolean {
+  if (error instanceof LlmError) {
+    if (error.code === 'QUOTA_EXCEEDED' || error.code === 'QUOTA') return true
+  }
+  if (error instanceof Error) {
+    // 仅在**没有**更精确的 code 时用文案兜底（避免把正常文本误判）
+    if (!(error instanceof LlmError)) return looksLikeBillingError(error.message)
+  }
+  return false
 }
 
 /** 本适配器注册的 provider 路由名（历史常量，等价于 `QODER.id`）。 */
@@ -337,6 +367,14 @@ export interface QoderAdapterOptions {
   product?: QoderProduct
   /** 注入的 fetch（测试用）。 */
   fetchImpl?: typeof fetch
+  /**
+   * 当前生效账号的 id（额度受限时用于**标记该账号**）。
+   *
+   * ⚠️ 做成**回调**而不是构造期常量：账号会在 `refreshAll` / 限流切换 /
+   * Jet Hub 手动启停后变化，构造期快照会标记到**已经不再使用**的账号上。
+   * 未提供时跳过标记（仍会尝试切号），不会因此崩。
+   */
+  currentAccountId?: () => string | undefined
   /**
    * 注入的休眠实现（**测试用**）。
    *
@@ -623,6 +661,27 @@ export class QoderAdapter extends LlmAdapter {
     let authRefreshed = false
     let duplicateRetried = false
     let response: Response
+    /**
+     * 已尝试过的账号 id（额度受限切号用）。
+     *
+     * ⚠️ 必须跨重试保留（不能在每次迭代里新建）：它是「**已试过哪些账号**」的
+     * 记录，用来保证每个账号最多试一次、试完才判定「全部受限」。每次迭代重置
+     * 会让切换在两个账号之间**无限来回**。
+     */
+    const triedAccounts = new Set<string>()
+    /**
+     * **当前生效账号的 id**（会随额度受限切号而更新）。
+     *
+     * ⚠️ 是**局部可变**状态、而不是每次都问 `this.options.currentAccountId()`：
+     * 那个回调返回的是「池当前的默认账号」，一旦我们切到下一个账号它**不会跟着变**
+     * —— 若用它标记，切到 B 后失败时会**再标记一次 A**，而 B 从未被标记，
+     * 下次取号又把 B 选中，于是在 A/B 之间**反复空转**
+     *（写单测时实测到了：标记记录是 `['acct-A','acct-A']` 而非 `['acct-A','acct-B']`）。
+     */
+    let activeAccountId = this.options.currentAccountId?.()
+    if (activeAccountId !== undefined && activeAccountId.length > 0) {
+      triedAccounts.add(activeAccountId)
+    }
     // 4. 剥掉加密端点的响应信封，交给统一的 OpenAI SSE 消费器。
     //
     // ⚠️ **必须放在重试循环内**：排队错误的**第二种**下发形态是
@@ -642,6 +701,22 @@ export class QoderAdapter extends LlmAdapter {
         if (queueInfo !== undefined) {
           await this.waitForQueue(queueInfo, ++queueAttempts, queueDeadline, options)
           continue
+        }
+
+        // ⚠️ **额度受限也要切账号**（用户要求，2026-09-27）。
+        //
+        // 这条与 SSE 层那条**必须都有**：Qoder 的额度错误实测走 SSE 通道
+        // （HTTP 200），但若哪天服务端改成用 HTTP 状态码下发，只处理一条就会漏。
+        // 两处调用**同一个** `switchAccountOnQuota`，不会漂移。
+        if (isBillingBusinessCode(response.status) || looksLikeBillingError(errorText)) {
+          const switched = await this.switchAccountOnQuota(options, triedAccounts, activeAccountId)
+          if (switched !== undefined) {
+            credential = switched.credential
+            activeAccountId = switched.accountId
+            authRefreshed = false // 新账号可再续期一次
+            continue
+          }
+          throw new LlmError(`qoder: ${errorDetail(errorText)}`, 'QUOTA_EXCEEDED', { status: response.status })
         }
 
         // 非排队：认证失败才续期（且每次请求最多一次，避免刷爆 userinfo）。
@@ -698,6 +773,21 @@ export class QoderAdapter extends LlmAdapter {
             queued = true
             break
           }
+          // ⚠️ **额度受限（110）要标记 + 切账号**（用户要求，2026-09-27）。
+          //
+          // ⚠️ 必须**在这里**捕获（SSE 层）而不只在 HTTP 层：Qoder 的额度错误
+          // 实测以 **HTTP 200 + SSE 内嵌帧** 下发（与排队同通道），
+          // 只在 HTTP 层处理会漏掉真实链路。
+          if (isQuotaExceededError(error)) {
+            const switched = await this.switchAccountOnQuota(options, triedAccounts, activeAccountId)
+            if (switched !== undefined) {
+              credential = switched.credential
+              activeAccountId = switched.accountId
+              queued = true // 复用「回到循环顶部重发」的语义
+              break
+            }
+            throw error // 无可用账号 → 如实抛出（已含额度语义）
+          }
           throw error
         }
         if (step.done === true) break
@@ -706,6 +796,63 @@ export class QoderAdapter extends LlmAdapter {
       if (queued) continue
       return
     }
+  }
+
+  /**
+   * 额度受限时：**标记当前账号该模型受限到 UTC+8 当日 24:00，然后切下一个账号**。
+   *
+   * ## 用户要求（2026-09-27）
+   *
+   * > qoder 碰到当日额度受限应该像 workbuddy/codebuddy 一样，设置一个模型受限时间
+   * > （他们是返回错误中带时间，qoder 和 qodercn 需要自己设置当日 24:00 受限）
+   * > 然后切换账号池中的下一个可用模型
+   *
+   * ## ⚠️ 与 buddy/CodeArts 的**关键差异**
+   *
+   * 它们的错误文案里**带重置时间**（`parseRateLimitError` 从中解析）；
+   * Qoder **不带** —— 故这里用 {@link nextUtc8DayStartMs} **自己算**
+   * 「UTC+8 当日 24:00」。**不能**复用 `parseRateLimitError`：它会因解析不到
+   * 时间而退回「1 小时后」（`Date.now() + 3_600_000`），那对**按自然日**结算的
+   * 额度是错的 —— 会让标记过早失效，用户 1 小时后再撞一次同样的墙。
+   *
+   * @param activeAccountId - **当前正在使用的**账号 id（见下）。
+   * @returns 新凭据；无可用账号时 `undefined`（调用方如实抛出原错误）。
+   */
+  private async switchAccountOnQuota(
+    options: GenerateOptions,
+    tried: Set<string>,
+    activeAccountId: string | undefined,
+  ): Promise<{ credential: QoderCredential; accountId: string } | undefined> {
+    const pool = this.options.accountPool
+    if (pool === undefined) return undefined
+
+    // ① 记录「本账号 + 本模型」受限到 UTC+8 当日 24:00。
+    //
+    // ⚠️ 只标记**该模型**（不标记账号全部模型）：额度是「模型 + 账号」维度的，
+    // 该账号在别的模型上仍可能可用（`modelRateLimits` 的既有语义即如此）。
+    //
+    // ⚠️ 用的是调用方传入的 `activeAccountId`，**不是** `this.options.currentAccountId()`：
+    // 后者是「会话启动时/池当前的默认账号」，一旦我们切换到下一个账号，它**不会
+    // 跟着变** —— 若用它标记，切到 B 后失败时会**再标记一次 A**，而 B 从未被标记，
+    // 下次取号又把 B 选中，导致在 A/B 之间**反复空转**（写单测时实测到了：
+    // 标记记录是 `['acct-A','acct-A']` 而非 `['acct-A','acct-B']`）。
+    if (activeAccountId !== undefined && activeAccountId.length > 0) {
+      await pool.updateModelRateLimit(activeAccountId, options.model, nextUtc8DayStartMs())
+      tried.add(activeAccountId)
+    }
+
+    // ② 取下一个可用账号。
+    //
+    // ⚠️ 必须传 `tried`：池按「限流重置时间最早到期」排序，**刚失败的账号可能
+    // 仍排第一**，不排除就会拿回同一个、命中下面的检查而立即放弃切换。
+    // （与 buddy 的注释同因，见 `buddy-adapter.ts` 的 1200 行附近。）
+    const next = await pool.getAvailableAccount(this.product.id, options.model, tried)
+    if (next === null || tried.has(next.entry.id)) return undefined
+    tried.add(next.entry.id)
+
+    const credential = next.credential as QoderCredential
+    // 切号后必须重新过一遍 uid 补齐（每个账号的 uid 不同，缺了会签名无效）。
+    return { credential: await this.ensureUid(credential), accountId: next.entry.id }
   }
 
   /**

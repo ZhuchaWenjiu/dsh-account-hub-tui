@@ -5,6 +5,7 @@ import { dirname, resolve } from 'node:path'
 import {
   QoderAdapter,
   QODER_QUEUE_MAX_ATTEMPTS,
+  nextUtc8DayStartMs,
   parseQoderQueueError,
   qoderQueueDelayMs,
 } from '../../src/qoder-adapter.js'
@@ -970,6 +971,190 @@ describe('QoderAdapter 排队错误（10605 model_queued）', () => {
       // ⚠️ 与排队**不同类**：排队是 rate_limit（可重试），额度是 permission（不可重试）
       expect(CLIENT_MAPPING('rate_limit')).toBe('rate_limited')
       expect(CLIENT_MAPPING('billing_error')).not.toBe(CLIENT_MAPPING('rate_limit'))
+    })
+  })
+
+  /**
+   * ## 用户要求（2026-09-27）：额度受限要**切账号**，与 buddy/workbuddy 一致
+   *
+   * 原话：「qoder 碰到当日额度受限应该像 workbuddy/codebuddy 一样，设置一个模型
+   * 受限时间（他们是返回错误中带时间，qoder 和 qodercn 需要自己设置当日 24:00
+   * 受限）然后切换账号池中的下一个可用模型」。
+   *
+   * ⚠️ **与 buddy/CodeArts 的关键差异**：它们的错误文案里**带重置时间**
+   * （`parseRateLimitError` 从中解析），Qoder **不带** —— 故必须自己算
+   * 「当日 24:00」。这也是本组用例的重点。
+   */
+  describe('额度受限：标记当日 24:00 + 切换账号', () => {
+    it('nextUtc8DayStartMs 算出 UTC+8 的当日 24:00（不是本机时区）', () => {
+      // 2026-09-27 12:00:00 UTC+8 = 04:00:00 UTC
+      const noon = Date.UTC(2026, 8, 27, 4, 0, 0)
+      const end = nextUtc8DayStartMs(noon)
+      // 期望 = 2026-09-28 00:00:00 UTC+8 = 2026-09-27 16:00:00 UTC
+      expect(new Date(end).toISOString()).toBe('2026-09-27T16:00:00.000Z')
+      // 12:00 → 次日 00:00 恰好 12 小时
+      expect(end - noon).toBe(12 * 3_600_000)
+    })
+
+    it('接近 UTC+8 日界时，剩余时间收敛到 0（不会算到后天）', () => {
+      // 2026-09-27 23:59:59 UTC+8 = 15:59:59 UTC
+      const nearEnd = Date.UTC(2026, 8, 27, 15, 59, 59)
+      const end = nextUtc8DayStartMs(nearEnd)
+      expect(new Date(end).toISOString()).toBe('2026-09-27T16:00:00.000Z')
+      expect(end - nearEnd).toBe(1000)
+    })
+
+    it('刚过 UTC+8 日界时，得到的是**下一个**日界（满 24 小时）', () => {
+      // 2026-09-27 00:00:00 UTC+8 = 2026-09-26 16:00:00 UTC
+      const justAfter = Date.UTC(2026, 8, 26, 16, 0, 0)
+      const end = nextUtc8DayStartMs(justAfter)
+      // 应是 2026-09-28 00:00:00 UTC+8（即 24 小时后），不是同一时刻
+      expect(new Date(end).toISOString()).toBe('2026-09-27T16:00:00.000Z')
+      expect(end - justAfter).toBe(24 * 3_600_000)
+    })
+
+    it('结果恒严格大于入参（标记不会“立刻失效”）', () => {
+      for (const h of [0, 3, 8, 12, 16, 20, 23]) {
+        const t = Date.UTC(2026, 8, 27, h, 30, 15)
+        expect(nextUtc8DayStartMs(t), `h=${h}`).toBeGreaterThan(t)
+      }
+    })
+
+    /**
+     * 切账号的**行为**验证（不只看纯函数）。
+     *
+     * 用桩账号池记录「标记了什么、取了哪个账号」，从而断言：
+     * ① 受限时**标记当前账号 + 该模型**到 UTC+8 当日 24:00；
+     * ② 取号时**传了 tried**（否则会拿回同一个账号、切换静默失效）；
+     * ③ 切到新账号后用**新凭据**重发；
+     * ④ 全部账号都受限时如实抛 `QUOTA_EXCEEDED`（不无限切）。
+     */
+    function makePoolStub(accounts: Array<{ id: string; token: string }>) {
+      const marks: Array<{ accountId: string; modelId: string; resetAtMs: number }> = []
+      const picks: Array<ReadonlySet<string> | undefined> = []
+      let index = 0
+      const pool = {
+        updateModelRateLimit: async (accountId: string, modelId: string, resetAtMs: number) => {
+          marks.push({ accountId, modelId, resetAtMs })
+        },
+        getAvailableAccount: async (_provider: string, _model: string, exclude?: ReadonlySet<string>) => {
+          picks.push(exclude)
+          while (index < accounts.length && exclude?.has(accounts[index].id) === true) index += 1
+          if (index >= accounts.length) return null
+          const a = accounts[index]
+          return {
+            entry: { id: a.id },
+            credential: buildQoderCredential(
+              parseQoderTokenPayload({ token: a.token, refresh_token: 'r', user_id: `uid-${a.id}` }),
+              { machineId: 'm-1' },
+            ),
+          }
+        },
+      }
+      return { pool, marks, picks }
+    }
+
+    it('额度受限：标记当前账号该模型到 UTC+8 当日 24:00，并切到下一个账号', async () => {
+      const { pool, marks, picks } = makePoolStub([
+        { id: 'acct-A', token: 'tokA' },
+        { id: 'acct-B', token: 'tokB' },
+      ])
+
+      // 第一次（acct-A）回额度错误，第二次（acct-B）回正常内容。
+      // 用 Authorization 头区分是哪个账号发的请求。
+      let call = 0
+      const seenAuth: string[] = []
+      const fetchImpl = vi.fn(async (_url: string, init: RequestInit) => {
+        call += 1
+        seenAuth.push(String((init.headers as Headers)?.get?.('Authorization') ?? ''))
+        if (call === 1) {
+          const inner = JSON.stringify({ code: 110, message: 'Billing daily count exceeded', type: 'model_error' })
+          return new Response(
+            `data:${JSON.stringify({ headers: {}, body: inner, statusCodeValue: 200 })}\n\n`,
+            { status: 200, headers: { 'Content-Type': 'text/event-stream' } },
+          )
+        }
+        return envelopeResponse([textFrame('新账号可用'), finishFrame])
+      }) as unknown as typeof fetch
+
+      const chunks = await collectWith(makeAdapter({
+        fetchImpl,
+        accountPool: pool as never,
+        currentAccountId: () => 'acct-A',
+      }), { model: 'qfmodel', messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }] })
+
+      // ① 标记了 acct-A 的 qfmodel，时间落在未来（UTC+8 当日 24:00）
+      expect(marks.length, '应标记一次额度受限').toBe(1)
+      expect(marks[0].accountId).toBe('acct-A')
+      expect(marks[0].modelId).toBe('qfmodel')
+      expect(marks[0].resetAtMs).toBeGreaterThan(Date.now())
+
+      // ② 取号时**传了 tried**（含刚失败的 acct-A），否则会拿回同一个账号
+      expect(picks.length).toBeGreaterThan(0)
+      expect(picks[0]?.has('acct-A'), 'tried 必须含刚失败的账号').toBe(true)
+
+      // ③ 确实换账号重发（第二次请求存在）并拿到内容
+      expect(call, '应换账号重发').toBe(2)
+      expect(chunks.some((c) => c.type === 'text-delta')).toBe(true)
+    })
+
+    it('所有账号都受限时抛 QUOTA_EXCEEDED（不无限切换）', async () => {
+      const { pool, marks } = makePoolStub([
+        { id: 'acct-A', token: 'tokA' },
+        { id: 'acct-B', token: 'tokB' },
+      ])
+
+      // 永远回额度错误 —— 两个账号都会被标记，然后如实失败
+      const billingInner = JSON.stringify({ code: 110, message: 'Billing daily count exceeded', type: 'model_error' })
+      const fetchImpl = vi.fn(async () => new Response(
+        `data:${JSON.stringify({ headers: {}, body: billingInner, statusCodeValue: 200 })}\n\n`,
+        { status: 200, headers: { 'Content-Type': 'text/event-stream' } },
+      )) as unknown as typeof fetch
+
+      await expect(collectWith(makeAdapter({
+        fetchImpl,
+        accountPool: pool as never,
+        currentAccountId: () => 'acct-A',
+      }), { model: 'qfmodel', messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }] }))
+        .rejects.toMatchObject({ code: 'QUOTA_EXCEEDED' })
+
+      // 两个账号都被标记（A 由 currentAccountId 标记，B 由切号后标记）
+      expect(marks.map((m) => m.accountId)).toEqual(['acct-A', 'acct-B'])
+    })
+
+    it('无账号池时不切号，但仍如实抛 QUOTA_EXCEEDED（不吞错）', async () => {
+      const inner = JSON.stringify({ code: 110, message: 'Billing daily count exceeded', type: 'model_error' })
+      const fetchImpl = vi.fn(async () => new Response(
+        `data:${JSON.stringify({ headers: {}, body: inner, statusCodeValue: 200 })}\n\n`,
+        { status: 200, headers: { 'Content-Type': 'text/event-stream' } },
+      )) as unknown as typeof fetch
+
+      await expect(collectWith(makeAdapter({ fetchImpl, sleep: async () => {} }),
+        { model: 'qfmodel', messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }] }))
+        .rejects.toMatchObject({ code: 'QUOTA_EXCEEDED' })
+    })
+
+    it('标记时间恰为 UTC+8 次日 00:00（而非「1 小时后」这种错误兜底）', async () => {
+      const { pool, marks } = makePoolStub([]) // 无候选 → 只标记、不切
+      const inner = JSON.stringify({ code: 110, message: 'Billing daily count exceeded', type: 'model_error' })
+      const fetchImpl = vi.fn(async () => new Response(
+        `data:${JSON.stringify({ headers: {}, body: inner, statusCodeValue: 200 })}\n\n`,
+        { status: 200, headers: { 'Content-Type': 'text/event-stream' } },
+      )) as unknown as typeof fetch
+
+      await expect(collectWith(makeAdapter({
+        fetchImpl, accountPool: pool as never, currentAccountId: () => 'acct-A',
+      }), { model: 'qfmodel', messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }] }))
+        .rejects.toMatchObject({ code: 'QUOTA_EXCEEDED' })
+
+      expect(marks.length).toBe(1)
+      // ⚠️ 必须是 UTC+8 的整点日界（分钟/秒/毫秒为 0），
+      // 而不是 `Date.now() + 1h` —— 后者带任意零头，且对按自然日结算的额度是错的。
+      const marked = new Date(marks[0].resetAtMs + 8 * 3_600_000)
+      expect(marked.getUTCMinutes(), '应为整点日界').toBe(0)
+      expect(marked.getUTCSeconds()).toBe(0)
+      expect(marked.getUTCMilliseconds()).toBe(0)
+      expect(marked.getUTCHours()).toBe(0)
     })
   })
 })

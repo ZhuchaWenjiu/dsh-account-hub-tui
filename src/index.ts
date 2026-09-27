@@ -315,6 +315,22 @@ export function apply(ctx: Context): void {
   // 服务名由产品 id 派生，注册为 ctx.qoderAuth。
   // 与其它 provider 一样不注册斜杠命令：入口在 Jet Hub 的 Qoder 面板。
   const qoder = new QoderAuth(ctx)
+  /**
+   * 「本次实际使用的账号 id」跟踪表（provider id → 账号 id）。
+   *
+   * ## 为什么需要它
+   *
+   * 额度受限时要标记**当前账号**（见 `QoderAdapter.switchAccountOnQuota`）。
+   * 但「当前账号」不能靠「再问一次账号池的默认账号」得到 —— 池的选号是
+   * `getAvailableAccount()` 的即时决策，与适配器**本次实际拿到**的那份凭据
+   * 可能是两个账号（例如池已因限流切走，而适配器手上仍是旧凭据）。
+   * 标记落错账号的后果：真正受限的账号没被标记 → 下次又被选中 → 反复撞墙；
+   * 无辜账号被标记 → 它当天用不了（虽不致命，但属无谓损失）。
+   *
+   * 故在 `resolveCredential` 里**记录实际返回的那个账号**，供适配器查询。
+   * 用 `Map` 按 provider 分开，国际版与中国版互不影响。
+   */
+  const activeQoderAccountId = new Map<string, string | undefined>()
   const qoderAdapter = registerQoderLlm(ctx, {
     credentialRef: credentialRef(QODER.defaultCredentialRef),
     resolveCredential: async () => {
@@ -323,7 +339,12 @@ export function apply(ctx: Context): void {
       // provider 实参用 QODER.id 而非字面量 'qoder'：写死字面量在
       // 改名/多产品场景下会静默查不到账号（本插件在 workbuddy 上踩过同类坑）。
       const available = await pool.getAvailableAccount(QODER.id, '')
-      if (available) return available.credential as QoderCredential
+      if (available) {
+        activeQoderAccountId.set(QODER.id, available.entry.id)
+        return available.credential as QoderCredential
+      }
+      // 回退到单凭据路径：没有账号条目可标记，清空以免标记到过期的 id。
+      activeQoderAccountId.set(QODER.id, undefined)
       const resolved = await ctx.credentials.resolve(credentialRef(QODER.defaultCredentialRef))
       if (!resolved) return undefined
       try {
@@ -349,6 +370,8 @@ export function apply(ctx: Context): void {
     readImage: makeReadImage(ctx),
     accountPool: pool,
     product: QODER,
+    // 额度受限时标记「本次实际使用的账号」（理由见 `activeQoderAccountId` 注释）。
+    currentAccountId: () => activeQoderAccountId.get(QODER.id),
   })
 
   // ===== Qoder 中国版（qodercn）=====
@@ -367,7 +390,11 @@ export function apply(ctx: Context): void {
       // ⚠️ provider 实参必须是 QODER_CN.id：写死 'qoder' 会让中国版
       // 永远查不到自己的账号（本插件在 workbuddy 上踩过同类坑）。
       const available = await pool.getAvailableAccount(QODER_CN.id, '')
-      if (available) return available.credential as QoderCredential
+      if (available) {
+        activeQoderAccountId.set(QODER_CN.id, available.entry.id)
+        return available.credential as QoderCredential
+      }
+      activeQoderAccountId.set(QODER_CN.id, undefined)
       const resolved = await ctx.credentials.resolve(credentialRef(QODER_CN.defaultCredentialRef))
       if (!resolved) return undefined
       try {
@@ -388,6 +415,10 @@ export function apply(ctx: Context): void {
     readImage: makeReadImage(ctx),
     accountPool: pool,
     product: QODER_CN,
+    // 额度受限时用它标记「当前账号」（见 `QoderAdapter.switchAccountOnQuota`）。
+    // ⚠️ 取「**本次实际使用**的账号」而非池里默认那一个：池的默认账号可能与之
+    // 不同（例如本账号被限流、池已切到别的账号），标错就会让标记落在无辜账号上。
+    currentAccountId: () => activeQoderAccountId.get(QODER_CN.id),
   })
 
   // ===== TRAE（字节 TRAE IDE）服务 =====
