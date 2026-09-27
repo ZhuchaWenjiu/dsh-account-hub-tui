@@ -375,6 +375,46 @@ function errorMessage(error: unknown): string {
   try { return String(error) } catch { return 'unknown error' }
 }
 
+/**
+ * 腾讯侧**内容级拒绝**（安全审核）判定。
+ *
+ * ⚠️ 这类拒绝**也回 HTTP 403**，但与认证、额度都无关 —— 报文实测（2026-09-27，
+ * workbuddy / deepseek-v4.1-flash）：
+ * ```json
+ * {"code":11140,"msg":"request illegal","requestId":"…",
+ *  "displayMsg":{"en":"The content did not pass the safety review. …",
+ *                "zh":"内容未通过安全审核，请调整后重试。"}}
+ * ```
+ * 同一报文在 CodeArts 侧还会以 HTTP 200 + SSE 内嵌错误帧的形式出现。
+ *
+ * **必须先于认证判定排除它**，否则会：白跑一整轮「刷新 + 逐个换号」（每个账号
+ * 都被同一份内容拦下，纯浪费额度与时间），并把**内容问题**报成**账号问题**
+ * （错误码落到 AUTH → UI 提示「API 密钥无效」→ 用户去重新登录）。
+ *
+ * 判据用三个独立信号（任一命中即可）：业务码、`msg` 措辞、`displayMsg` 文案。
+ * 只看状态码无法区分 —— 403 同时覆盖「真认证失败 / 额度 / 权限 / 安全审核」。
+ */
+function isContentRejection(body: string): boolean {
+  if (body.length === 0) return false
+  return /"code"\s*:\s*11140/.test(body)
+    || /request illegal/i.test(body)
+    || /安全审核|safety review/i.test(body)
+}
+
+/**
+ * 内容级拒绝的错误：**不得**标成 AUTH。
+ *
+ * 错误码取 `INVALID_REQUEST`（请求本身有问题，可通过调整内容解决），
+ * 消息里带上服务端原始说明，便于判断是提示词/tool 输出触发了审核。
+ */
+function contentRejectionError(productId: string, status: number, body: string): LlmError {
+  return new LlmError(
+    `${productId}: 请求内容未通过服务端安全审核，请调整内容后重试：${errorDetail(body)}`,
+    'INVALID_REQUEST',
+    { status },
+  )
+}
+
 /** 从错误体提取可读 detail 文本。 */
 function errorDetail(body: string): string {
   try {
@@ -1044,6 +1084,18 @@ export class BuddyAdapter extends LlmAdapter {
     // 4. 发送请求（401/403 时刷新当前账号一次，仍认证失败则换号重试）
     let response = await this.send(credential, body, options)
     if (!response.ok && (response.status === 401 || response.status === 403)) {
+      // ⚠️ **先排除内容级拒绝**（真实缺陷，2026-09-27，用户重启后仍复现）：
+      // 腾讯侧的内容安全审核拦截**也回 HTTP 403**，报文是
+      // `{"code":11140,"msg":"request illegal",displayMsg:{zh:"内容未通过安全审核…"}}`。
+      // 它与认证毫无关系，却被当成「认证失败」，于是：
+      // ① 白跑一整轮「刷新 + 逐个换号」（5 个账号各发一次同样被拦的请求）；
+      // ② 最后报「所有账号均被拒绝（HTTP 403）」——把**内容问题**说成**账号问题**；
+      // ③ 错误码落到 AUTH，UI 提示「API 密钥无效」，把用户引向重新登录。
+      // 实测那次：换号 5 次全被同一份内容拦下，而 5 个账号 token 全部有效。
+      const rejectedBody = await response.clone().text().catch(() => '')
+      if (isContentRejection(rejectedBody)) {
+        throw contentRejectionError(this.product.id, response.status, rejectedBody)
+      }
       // ⚠️ 真实缺陷（2026-09-26，用户报障「账号池里明明有 3~4 个账号没被限流，
       // 却报『未配置凭据，请先登录』」）。早期实现在这里刷新一次就 `return`：
       //
@@ -1051,7 +1103,7 @@ export class BuddyAdapter extends LlmAdapter {
       //    一个都用不上。轮换逻辑（下一段）只覆盖 `isRateLimited` 的 429 类，
       //    而 401/403 在这里就返回了。
       // ② **刷新失败直接冒泡** —— 刷新接线一旦指向单凭据 ref（见 `src/index.ts`
-      //    的 buddyRefresh 注释），抛出的「未配置凭据，请先登录」与真实原因
+      //    的 createPoolRefresh 注释），抛出的「未配置凭据，请先登录」与真实原因
       //    毫无关系：账号池凭据完好，只是刷错了 ref。
       // ③ **下一轮必然复现** —— 刷新抛错前没有写回任何凭据，池首账号不变，
       //    于是「中断后继续 goal」永远撞同一条死路（自锁）。
@@ -1101,12 +1153,23 @@ export class BuddyAdapter extends LlmAdapter {
       }
       // 刷新既没产出凭据、也没换到别的账号：保留原有的可诊断报错。
       if (refreshedCredential === undefined && !rotated) {
-        throw new LlmError('buddy: credential expired and refresh failed', 'AUTH', { status: authStatus })
+        throw new LlmError(`${this.product.id}: credential expired and refresh failed`, 'AUTH', { status: authStatus })
       }
       if (response.status === 401 || response.status === 403) {
+        // ⚠️ **必须带上响应体**（真实缺陷，我自己引入的回归，2026-09-27）：
+        // 换号耗尽后若只报「所有账号均认证失败」，就把服务端真正说的原因丢掉了 ——
+        // 而 403 在腾讯侧**并不等于认证失败**（额度耗尽 / 模型无权限 / 安全策略
+        // 都可能回 403）。实测（2026-09-27 10:26）workbuddy 连续三轮报
+        // 「所有账号均认证失败（HTTP 403）」，而随后逐账号复验发现 5 个 token
+        // 全部有效（请求能进业务层、只因缺 system 提示回 400）—— 即那 403 并非
+        // 登录问题。没有响应体就完全无从判断，只能靠猜。
+        const detail = await response.text().catch(() => '')
+        // 换号途中撞上的内容级拒绝：同样不能报成认证失败。
+        if (isContentRejection(detail)) throw contentRejectionError(this.product.id, response.status, detail)
         throw new LlmError(
-          `buddy: 所有账号均认证失败（HTTP ${authStatus}），请在 Jet Hub 重新登录`,
-          'AUTH',
+          `${this.product.id}: 所有账号均被拒绝`
+          + `（HTTP ${authStatus}${authStatus === 401 ? '，请在 Jet Hub 重新登录' : ''}）：${errorDetail(detail)}`,
+          httpErrorCode(authStatus, detail),
           { status: authStatus },
         )
       }

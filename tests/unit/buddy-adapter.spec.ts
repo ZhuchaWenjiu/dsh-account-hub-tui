@@ -639,8 +639,79 @@ describe('BuddyAdapter credential handling', () => {
     const error = await collectChunks(adapter, streamOptions).catch((e: unknown) => e)
     expect(error).toBeInstanceOf(LlmError)
     expect((error as LlmError).failure.code).toBe('AUTH')
-    // 文案必须指向真实原因（全部账号认证失败），而不是「请先登录」。
+    // 文案必须指向真实原因（全部账号被拒绝），而不是「请先登录」。
     expect((error as LlmError).message).not.toContain('未配置凭据')
+  })
+
+  it('换号耗尽时错误必须带上服务端响应体（403 在腾讯侧不等于认证失败）', async () => {
+    // 真实回归（修复自身引入的，2026-09-27）：换号耗尽后只报「所有账号均认证失败」，
+    // 把服务端真正说的原因丢掉了 —— 而 403 也可能是额度耗尽 / 模型无权限 /
+    // 安全策略。实测那批 403 之后逐账号复验，5 个 token 全部有效。
+    const body = JSON.stringify({ code: 8003, msg: 'insufficient balance' })
+    const adapter = makeAdapter({
+      credential: makeCredential({ access_token: 'AT1' }),
+      refresh: async () => { throw new Error('未配置凭据，请先登录') },
+      accountPool: makePool([
+        { id: 'acc-1', credential: makeCredential({ access_token: 'AT1' }) },
+        { id: 'acc-2', credential: makeCredential({ access_token: 'AT2' }) },
+      ]),
+      fetchImpl: async () => new Response(body, { status: 403 }),
+    })
+    const error = await collectChunks(adapter, streamOptions).catch((e: unknown) => e)
+    const message = (error as LlmError).message
+    expect(message).toContain('403')
+    expect(message).toContain('insufficient balance')
+    // 403 不得断言成「请重新登录」——那会把额度问题引向错误的修复动作。
+    expect(message).not.toContain('重新登录')
+  })
+
+  it('安全审核拦截的 403 不刷新、不换号，且不得报成 AUTH', async () => {
+    // 真实缺陷（2026-09-27，用户重启后仍复现）：腾讯的内容安全审核**也回 403**，
+    // 报文 code 11140 request illegal。修复前它被当成认证失败 → 刷新 + 逐个换号
+    // （每个账号都被同一份内容拦下），最后报「所有账号均被拒绝（HTTP 403）」。
+    const body = JSON.stringify({
+      code: 11140,
+      msg: 'request illegal',
+      requestId: '5b2240b4-efdf-40e0-94e4-cfee1aa80585',
+      displayMsg: { zh: '内容未通过安全审核，请调整后重试。' },
+    })
+    let calls = 0
+    let refreshes = 0
+    const adapter = makeAdapter({
+      credential: makeCredential({ access_token: 'AT1' }),
+      refresh: async () => { refreshes++ },
+      accountPool: makePool([
+        { id: 'acc-1', credential: makeCredential({ access_token: 'AT1' }) },
+        { id: 'acc-2', credential: makeCredential({ access_token: 'AT2' }) },
+      ]),
+      fetchImpl: async () => { calls++; return new Response(body, { status: 403 }) },
+    })
+    const error = await collectChunks(adapter, streamOptions).catch((e: unknown) => e)
+    expect((error as LlmError).failure.code).toBe('INVALID_REQUEST')
+    expect((error as LlmError).message).toContain('安全审核')
+    // 关键：内容被拦时换号毫无意义 —— 一次都不该多发。
+    expect(calls).toBe(1)
+    expect(refreshes).toBe(0)
+  })
+
+  it('换号途中撞上的安全审核同样按内容问题报（不报 AUTH）', async () => {
+    const safety = JSON.stringify({ code: 11140, msg: 'request illegal' })
+    const adapter = makeAdapter({
+      credential: makeCredential({ access_token: 'AT1' }),
+      refresh: async () => { throw new Error('未配置凭据，请先登录') },
+      accountPool: makePool([
+        { id: 'acc-1', credential: makeCredential({ access_token: 'AT1' }) },
+        { id: 'acc-2', credential: makeCredential({ access_token: 'AT2' }) },
+      ]),
+      // 首发 401（真认证失败）→ 换号后拿到 403 安全审核。
+      fetchImpl: async (_url: unknown, init: { headers: Headers }) =>
+        (init.headers.get('Authorization') ?? '').includes('AT1')
+          ? new Response('unauthorized', { status: 401 })
+          : new Response(safety, { status: 403 }),
+    })
+    const error = await collectChunks(adapter, streamOptions).catch((e: unknown) => e)
+    expect((error as LlmError).failure.code).toBe('INVALID_REQUEST')
+    expect((error as LlmError).message).toContain('安全审核')
   })
 
   it('401 换号不会无限循环：每个账号最多试一次', async () => {
