@@ -1,0 +1,28 @@
+{
+  "name": "dsh-account-hub-tui",
+  "version": "0.2.0",
+  "description": "dst（dsh-TUI）桥接插件：/account_hub 交互式管理 dsh-account-hub 账号——选 provider、浏览器登录、切换优先账号、积分余额、每日签到",
+  "type": "module",
+  "main": "lib/index.js",
+  "files": [
+    "lib",
+    "cordis.patch.yml",
+    "install.sh"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "keywords": [
+    "deepseek-harness",
+    "dsh",
+    "dsh-tui",
+    "dst",
+    "account-hub"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "license": "MIT"
+}

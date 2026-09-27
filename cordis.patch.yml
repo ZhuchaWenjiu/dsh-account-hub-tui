@@ -1,0 +1,6 @@
+# dsh-account-hub-tui 配置包补丁：在配置根上追加本插件的加载行。
+# 与 dsh-account-hub 的补丁行（id: codearts-auth）互不依赖：
+# 本插件对 hub 服务的访问全部延迟到命令 handler 运行时，加载顺序无关。
+- insert:
+    - id: account-hub-tui
+      name: 'dsh-account-hub-tui'
