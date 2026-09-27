@@ -40,11 +40,83 @@ import {
   errorDetail,
   httpErrorCode,
   isTransportError,
+  ModelQueuedError,
   serializeMessages,
 } from './openai-compat.js'
+import {
+  QUEUE_BUSINESS_CODE,
+  QUEUE_MAX_ATTEMPTS,
+  QUEUE_MAX_DELAY_MS,
+  isQueueBusinessCode,
+  parseQueueError,
+  queueDelayMs,
+  type QueueInfo,
+} from './model-queue.js'
+
+/**
+ * 本模块内使用的别名（`export { … as …
+ * }` **不会**在模块内建立可用的名字 —— 那只对导入方生效）。
+ */
+type QoderQueueInfo = QueueInfo
+const parseQoderQueueError = parseQueueError
+const qoderQueueDelayMs = queueDelayMs
+
+/**
+ * ⚠️ **向后兼容的再导出**：排队解析的实现已移到 `src/model-queue.ts`
+ * （因为 SSE 消费器也要用，而它不能被本模块反向 import —— 会成环）。
+ * 这里保留同名导出，避免既有调用方与测试失效。
+ */
+export {
+  QUEUE_BUSINESS_CODE as QODER_QUEUE_CODE,
+  QUEUE_MAX_ATTEMPTS as QODER_QUEUE_MAX_ATTEMPTS,
+  QUEUE_MAX_DELAY_MS as QODER_QUEUE_MAX_DELAY_MS,
+  isQueueBusinessCode,
+  parseQueueError as parseQoderQueueError,
+  queueDelayMs as qoderQueueDelayMs,
+  type QueueInfo as QoderQueueInfo,
+}
 
 /** 本适配器注册的 provider 路由名（历史常量，等价于 `QODER.id`）。 */
 export const PROVIDER = 'qoder'
+
+/**
+ * 排队总时长上限（毫秒），可用 `DSH_QODER_QUEUE_TIMEOUT_MS` 覆盖。
+ *
+ * ⚠️ **不能用 `parseInt(…) || 默认值`**：`0` 是**合法**配置（表示「不等，立即
+ * 判超时」，单测就靠它验证该开关），而 `0` 是 falsy，会被 `||` 静默换成 30 分钟
+ * —— 那会让这个开关在「想关掉排队等待」时**恰好失效**。故显式判 `undefined`。
+ */
+function resolveQueueTimeoutMs(): number {
+  const raw = process.env.DSH_QODER_QUEUE_TIMEOUT_MS
+  if (raw === undefined || raw.length === 0) return 30 * 60_000
+  const parsed = Number.parseInt(raw, 10)
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : 30 * 60_000
+}
+
+/**
+ * 读 `AbortSignal.aborted`（**刻意做成函数**）。
+ *
+ * 为什么不能内联 `signal?.aborted === true`：TS 会在 `await` 之前的一次
+ * early-throw 之后把该表达式**静态窄化**为字面量 `false`，于是「等待期间被
+ * 中止」这第二次检查会被判为「无重叠的比较」而**编译报错** —— 那个报错本身
+ * 是假阳性（`aborted` 是随时间的可变状态）。经函数读取即可保留真实语义，
+ * 也把「这里为什么再查一次」的意图写清楚。
+ */
+function isAborted(signal?: AbortSignal): boolean {
+  return signal?.aborted === true
+}
+
+/**
+ * 从 SSE 层抛出的 {@link ModelQueuedError} 里取出排队信息。
+ *
+ * `ModelQueuedError.queueInfo` 是已经解析好的 `QueueInfo`，但类型放宽成了
+ * `Record<string, unknown>`（共享模块不该暴露 provider 私有类型）。
+ * 这里原样取回 —— **不要再解析一次**（那会与已解析的结果产生两套口径）。
+ */
+function queueInfoOf(error: ModelQueuedError): QoderQueueInfo {
+  return error.queueInfo as QoderQueueInfo
+}
+
 
 /**
  * 把 DSH 的工具 schema 映射成加密端点认的 `tools[]`。
@@ -265,6 +337,13 @@ export interface QoderAdapterOptions {
   product?: QoderProduct
   /** 注入的 fetch（测试用）。 */
   fetchImpl?: typeof fetch
+  /**
+   * 注入的休眠实现（**测试用**）。
+   *
+   * 排队重试要真等（最长 10s × 180 次），单测不能真睡 —— 注入后即可断言
+   * 「等了几次、每次多久」，并在毫秒级完成。
+   */
+  sleep?: (ms: number, signal?: AbortSignal) => Promise<void>
 }
 
 /** Qoder 模型适配器。使用 Bearer access_token 鉴权，仅支持 SSE。 */
@@ -281,6 +360,28 @@ export class QoderAdapter extends LlmAdapter {
     this.fallbackIndex = new Map(
       (this.product.fallbackModels ?? []).map((model) => [model.id, model]),
     )
+  }
+
+  /**
+   * 可中止的休眠；信号中止时立即 resolve（不抛错，由调用方检查 signal）。
+   *
+   * ⚠️ **必须响应 `signal`**：排队等待最长可达 30 分钟，用户中途取消会话时
+   * 不能让 generator 卡在 `setTimeout` 里 —— 那会表现为「点了停止但没反应」。
+   */
+  private async sleep(ms: number, signal?: AbortSignal): Promise<void> {
+    if (this.options.sleep !== undefined) {
+      await this.options.sleep(ms, signal)
+      return
+    }
+    if (ms <= 0 || signal?.aborted === true) return
+    await new Promise<void>((resolve) => {
+      const onAbort = (): void => { clearTimeout(timer); resolve() }
+      const timer = setTimeout(() => {
+        signal?.removeEventListener('abort', onAbort)
+        resolve()
+      }, ms)
+      signal?.addEventListener('abort', onAbort, { once: true })
+    })
   }
 
   /**
@@ -504,28 +605,150 @@ export class QoderAdapter extends LlmAdapter {
 
     // 3. 发送（⚠️ 头必须原样透传：Authorization 是 WASM 生成的
     //    `Bearer COSY.<载荷>.<签名>`，用普通 Bearer 覆盖会 403 Signature invalid）
-    let response = await this.sendEncrypted(await buildRequest(credential), options)
-    if (response.status === 401 || response.status === 403) {
-      await this.options.refresh()
-      const refreshed = await this.options.resolveCredential()
-      if (refreshed === undefined || refreshed.access_token.length === 0) {
-        throw new LlmError('qoder: credential expired and refresh failed', 'AUTH', { status: response.status })
-      }
-      credential = await this.ensureUid(refreshed)
+    //
+    // ## 三种 403 的语义**互不相同**，必须分开处理
+    //
+    // | 形态 | 判据 | 处理 |
+    // |---|---|---|
+    // | **排队** | 业务码 `10605`（`model_queued`） | 按服务端给的延迟**内部等待后重试**（见下） |
+    // | 重复请求 | 业务码（客户端 `_TA="duplicate_request"`） | 不刷新凭据，直接重发一次 |
+    // | 认证失败 | 业务码 `105`（`auth_error`）或 401 | 续期凭据后重试（**唯一**该走 refresh 的情形） |
+    //
+    // ⚠️ **真实缺陷**（用户报障，2026-09-27）：旧实现把**所有** 401/403 都当认证
+    // 失败 → 排队时白白续期一次，再落到 harness 的 5 次通用退避（500/1000/2000/
+    // 4000/8000 ≈ 共 15.5 秒）—— 而服务端明确要求等 30 秒，于是**永远等不到**；
+    // 中国版那条「等 2 秒就能成功」的瞬时排队也因走错路径而反复失败。
+    const queueDeadline = Date.now() + resolveQueueTimeoutMs()
+    let queueAttempts = 0
+    let authRefreshed = false
+    let duplicateRetried = false
+    let response: Response
+    // 4. 剥掉加密端点的响应信封，交给统一的 OpenAI SSE 消费器。
+    //
+    // ⚠️ **必须放在重试循环内**：排队错误的**第二种**下发形态是
+    // **HTTP 200 + SSE 内嵌 `{code:"10605",…}` 帧**（真实缺陷，用户报障
+    // 2026-09-27 —— 第一版修复只覆盖了 HTTP 403 形态，于是这条路径被
+    // SSE 消费器归为 `SERVER` 直接抛给 harness，以 500…8000ms 快退避重试
+    // 5 次，而服务端要求等 30 秒，**永远等不到**）。
+    for (;;) {
       response = await this.sendEncrypted(await buildRequest(credential), options)
-    }
 
-    if (!response.ok) {
-      const errorText = await response.text().catch(() => '')
-      throw new LlmError(`qoder: ${errorDetail(errorText)}`, httpErrorCode(response.status), { status: response.status })
-    }
+      if (!response.ok && (response.status === 401 || response.status === 403)) {
+        // ⚠️ 必须**先读体再判断**，且 body 只能读一次 —— 排队信息就藏在
+        // `message` 那个 JSON 字符串里（见 `parseQoderQueueError`）。
+        const errorText = await response.text().catch(() => '')
+        const queueInfo = parseQoderQueueError(errorText)
 
-    // 4. 剥掉加密端点的响应信封，交给统一的 OpenAI SSE 消费器
-    yield* consumeOpenAiSse(unwrapQoderEnvelopeStream(response, 'qoder'), { signal: options.signal }, {
-      label: 'qoder',
-      firstTokenTimeoutMs: resolveFirstTokenTimeoutMs(),
-      chunkTimeoutMs: resolveChunkTimeoutMs(),
-    })
+        if (queueInfo !== undefined) {
+          await this.waitForQueue(queueInfo, ++queueAttempts, queueDeadline, options)
+          continue
+        }
+
+        // 非排队：认证失败才续期（且每次请求最多一次，避免刷爆 userinfo）。
+        if (!authRefreshed) {
+          authRefreshed = true
+          await this.options.refresh()
+          const refreshed = await this.options.resolveCredential()
+          if (refreshed === undefined || refreshed.access_token.length === 0) {
+            throw new LlmError('qoder: credential expired and refresh failed', 'AUTH', { status: response.status })
+          }
+          credential = await this.ensureUid(refreshed)
+          continue
+        }
+        throw new LlmError(`qoder: ${errorDetail(errorText)}`, httpErrorCode(response.status), { status: response.status })
+      }
+
+      // 重复请求（客户端 `duplicate_request`）：凭据没问题，重发一次即可。
+      if (!response.ok && response.status === 409 && !duplicateRetried) {
+        duplicateRetried = true
+        continue
+      }
+
+      if (!response.ok) {
+        const errorText = await response.text().catch(() => '')
+        throw new LlmError(`qoder: ${errorDetail(errorText)}`, httpErrorCode(response.status), { status: response.status })
+      }
+
+      // ⚠️ 消费 SSE 时**捕获流内排队错误**，走与 HTTP 层**完全相同**的等待逻辑。
+      // `consumeOpenAiSse` 是生成器：无法「try 一次再重试」，故这里手动迭代，
+      // 捕获到排队就等待后重发整条请求（排队期间未产出任何 chunk，可安全重放）。
+      const inner = consumeOpenAiSse(
+        unwrapQoderEnvelopeStream(response, 'qoder'),
+        { signal: options.signal },
+        {
+          label: 'qoder',
+          firstTokenTimeoutMs: resolveFirstTokenTimeoutMs(),
+          chunkTimeoutMs: resolveChunkTimeoutMs(),
+        },
+      )
+      const iterator = inner[Symbol.asyncIterator]()
+      let queued = false
+      for (;;) {
+        let step: IteratorResult<StreamChunk>
+        try {
+          step = await iterator.next()
+        } catch (error) {
+          if (error instanceof ModelQueuedError) {
+            await this.waitForQueue(
+              queueInfoOf(error),
+              ++queueAttempts,
+              queueDeadline,
+              options,
+            )
+            queued = true
+            break
+          }
+          throw error
+        }
+        if (step.done === true) break
+        yield step.value
+      }
+      if (queued) continue
+      return
+    }
+  }
+
+  /**
+   * 排队等待（HTTP 层与 SSE 层**共用**）。
+   *
+   * 两处形态必须走同一套判据，否则会再次出现「只修了一条路径」的缺陷。
+   */
+  private async waitForQueue(
+    queueInfo: QoderQueueInfo | undefined,
+    attempts: number,
+    deadline: number,
+    options: GenerateOptions,
+  ): Promise<void> {
+    // ⚠️ **先判时间、再判次数**：时间上限是硬约束（用户可调），次数上限只是
+    // 防御性兜底。反过来写会让「180 次空转」在绝大多数情况下先生效，
+    // 使 `DSH_QODER_QUEUE_TIMEOUT_MS` **形同虚设**（写用例时实测到了）。
+    //
+    // ⚠️ 用 `>=` 而不是 `>`：上限为 **0** 是合法配置（「不等，立即判超时」），
+    // 而同一毫秒内 `Date.now() > now + 0` 为 **false**，会让它**先等一次**才
+    // 超时 —— 那与「0 = 不等待」的语义不符（单测专门守这一点）。
+    if (Date.now() >= deadline) {
+      throw new LlmError('qoder: 排队等待超时', 'QUEUE')
+    }
+    if (attempts > QUEUE_MAX_ATTEMPTS) {
+      throw new LlmError(
+        `qoder: 排队重试超过上限（${QUEUE_MAX_ATTEMPTS} 次）`,
+        'QUEUE',
+      )
+    }    if (options.signal?.aborted === true) {
+      throw new LlmError('qoder: 排队等待期间请求已取消', 'QUEUE')
+    }
+    const waitMs = qoderQueueDelayMs(queueInfo)
+    // ⚠️ 拿不到服务端延迟时**不忙等**：用保守的短退避，避免瞬间烧掉机会
+    // （客户端 W7c() 此时会退回 ltA() 指数退避）。
+    await this.sleep(waitMs ?? 1_000, options.signal)
+    // ⚠️ 这次检查**不是**上一次的重复：它检测的是「**等待期间**被中止」。
+    // `AbortSignal.aborted` 是随时间的可变状态，但 TS 会静态窄化成字面量
+    // `false` 而报「无重叠」—— 故经**不透明函数**读取，避免静态收窄掩盖
+    // 这个真实场景（`await` 之后状态可能已变）。
+    if (isAborted(options.signal)) {
+      throw new LlmError('qoder: 排队等待期间请求已取消', 'QUEUE')
+    }
+    // ⚠️ 排队**不刷新凭据**、不换账号：它与认证和额度都无关。
   }
 
   /**

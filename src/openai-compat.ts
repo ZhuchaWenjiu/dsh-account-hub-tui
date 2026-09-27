@@ -51,6 +51,7 @@ import {
   stripCourseLeakIfEnabled,
 } from './sse.js'
 import { normalizeHarnessMessages } from './message-shape.js'
+import { parseQueueError, queueDelayMs } from './model-queue.js'
 
 /** 将消息内容载荷展平为纯文本字符串。 */
 export function contentToText(content: unknown): string {
@@ -298,6 +299,47 @@ export function httpErrorCode(status: number): string {
   if (status === 400) return 'INVALID_REQUEST'
   if (status >= 500) return 'SERVER'
   return `HTTP_${status}`
+}
+
+/**
+ * **模型排队**（Qoder 业务码 `10605`）—— 从 SSE 错误帧里透出来的专用错误。
+ *
+ * ## 为什么需要它（真实缺陷，用户报障 2026-09-27）
+ *
+ * Qoder 的排队错误有**两种**下发形态，第一版修复只覆盖了第一种：
+ *
+ * | 形态 | 第一版 | 说明 |
+ * |---|---|---|
+ * | HTTP **403** + 排队 JSON | ✅ 已覆盖 | 在适配器的 HTTP 状态分支里识别 |
+ * | HTTP **200** + **SSE 内嵌** `{code:"10605",…}` | ❌ **漏掉** | 走 `consumeOpenAiSse`，被一律归为 `SERVER` 抛出 |
+ *
+ * 真实症状：`失败原因：qoder: {"code":"10605",…} (403)` + harness 以
+ * `500/1000/2000/4000/8000`（约 15.5 秒）重试 5 次 —— 而服务端要求等 30 秒，
+ * 于是**永远等不到**。
+ *
+ * ⚠️ 该模块是**共享**的（qoder 适配器在用），故这里只**认码并透出信息**，
+ * 不在此处等待 —— 等待策略属于各 provider（只有 qoder 有排队语义）。
+ * 消费方捕获本类后自行按 `retryAfterMs` 内部重试。
+ *
+ * ⚠️ `code` 故意用 `'QUEUE'`（**不是** `SERVER`）：harness 的
+ * `DEFAULT_RETRYABLE_CODES` 不含 `QUEUE`，这样万一没人捕获，它会**直接失败**
+ * 并把「排队」这一语义暴露给用户，而不是被 harness 当作 `SERVER` 静默快重试。
+ */
+export class ModelQueuedError extends LlmError {
+  /** 解析出的排队信息（`isQueued` / `serviceAvailable` / `waitTime` 等）。 */
+  readonly queueInfo: Readonly<Record<string, unknown>>
+  /** 服务端要求的等待时长（毫秒）；无法解析时为 undefined。 */
+  readonly retryAfterMs: number | undefined
+
+  constructor(
+    message: string,
+    options: { queueInfo: Readonly<Record<string, unknown>>; retryAfterMs?: number },
+  ) {
+    super(message, 'QUEUE')
+    this.name = 'ModelQueuedError'
+    this.queueInfo = options.queueInfo
+    this.retryAfterMs = options.retryAfterMs
+  }
 }
 
 /**
@@ -560,6 +602,33 @@ export async function* consumeOpenAiSse(
           && data.code !== undefined
           && typeof data.message === 'string'
         ) {
+          // ⚠️ **排队识别：绝不能拿顶层 `code` 当门禁**（真实缺陷，用户报障
+          // 2026-09-27 的**第三次**回归）。
+          //
+          // 实测帧（用户贴出的后缀 `(403/model_error)` 反推所得）：
+          // ```json
+          // { "code": 403,
+          //   "message": "{\"code\":\"10605\",\"message\":\"{\\\"isQueued\\\":…}\"}",
+          //   "type": "model_error" }
+          // ```
+          // **顶层 `code` 是 403，业务码 `10605` 在 `message` 里再嵌一层。**
+          // 上一版写成 `if (isQueueBusinessCode(data.code))` —— 拿 403 比 10605
+          // **必然不命中**，于是又落到 `SERVER`（这就是「修了两次仍失败」的原因）。
+          //
+          // 正确处理：**直接尝试解析 `message`**。`parseQueueError` 自身会递归
+          // 遍历 `data`/`result`/`message`/`body` 并解析字符串，命中 `10605`
+          // **或**出现排队标志即返回信息 —— 嵌套几层都能穿透。
+          const queueInfo = parseQueueError(data.message)
+          if (queueInfo !== undefined) {
+            const retryAfterMs = queueDelayMs(queueInfo)
+            throw new ModelQueuedError(
+              `${label}: ${data.message}`,
+              {
+                queueInfo: { ...queueInfo },
+                ...(retryAfterMs === undefined ? {} : { retryAfterMs }),
+              },
+            )
+          }
           const detail = [String(data.code), data.type].filter(Boolean).join('/')
           throw new LlmError(
             `${label}: ${data.message}${detail.length > 0 ? ` (${detail})` : ''}`,
@@ -571,10 +640,33 @@ export async function* consumeOpenAiSse(
         // 早期解析器对这种帧**全部条件都不命中** → 整帧丢弃 → 流照常结束 →
         // 报 `{kind:'stop'}`，UI 表现为「没有任何报错就中断」（真实缺陷，
         // 与顶层 code/message 那条同源）。判据必须**显式覆盖**这一形态。
+        //
+        // ⚠️ **另有一条来自信封剥离的变体**：`unwrapQoderEnvelopeStream` 把
+        // 内层错误统一转成 `{code?, message, type:'model_error'}`，此时
+        // `statusCodeValue` 已被信封吃掉 —— 若只判 `statusCodeValue >= 400`，
+        // **整帧会被静默丢弃**。故把 `type === 'model_error'` 也算作错误判据
+        //（真实缺陷：网关形态的排队错误因此既不被识别、连报错都没有）。
         if (data.choices === undefined && typeof data.message === 'string') {
           const status = typeof data.statusCodeValue === 'number' ? data.statusCodeValue : undefined
-          const looksLikeError = (status !== undefined && status >= 400) || data.stackTrace !== undefined
+          const looksLikeError = (status !== undefined && status >= 400)
+            || data.stackTrace !== undefined
+            || data.type === 'model_error'
           if (looksLikeError) {
+            // ⚠️ **这一形态也可能是排队**（实测内层
+            // `{statusCodeValue:403, message:"{…isQueued…}"}`，或信封剥离后的
+            // `{message:"{…}", type:'model_error'}`）—— 都**没有顶层 `code`**，
+            // 故必须靠 `message` 里的排队字段识别。
+            const queueInfo = parseQueueError(data.message)
+            if (queueInfo !== undefined) {
+              const retryAfterMs = queueDelayMs(queueInfo)
+              throw new ModelQueuedError(
+                `${label}: ${data.message}`,
+                {
+                  queueInfo: { ...queueInfo },
+                  ...(retryAfterMs === undefined ? {} : { retryAfterMs }),
+                },
+              )
+            }
             const suffix = status === undefined ? '' : ` (status=${status})`
             throw new LlmError(`${label}: ${data.message}${suffix}`, 'SERVER', {
               ...(status === undefined ? {} : { status }),

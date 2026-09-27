@@ -94,6 +94,121 @@
      ⚠️ 已做**反向验证**：让 `qoderContentParts` 恒返回 undefined（= 修复前行为）
      时其中 4 条会失败，故不是同义反复。
 
+8. **排队错误（业务码 `10605`）必须识别、按服务端延迟等待，且与认证失败分开**
+   —— **真实缺陷**（用户报障，2026-09-27）：国际版「排队 30 秒、5 次重试都没过」；
+   中国版「一次重试就能成功却被当失败」。
+
+   **四种 403 的语义互不相同，绝不能合并**（客户端 `rJc()` 就是分开映射的）：
+
+   | 形态 | 判据 | 处理 |
+   |---|---|---|
+   | **排队** | 业务码 `10605`（客户端 `mRA`）→ `model_queued` | **内部按服务端延迟等待后重试**，不刷新凭据、不换账号 |
+   | 认证失败 | 业务码 `105`（客户端 `MF`）→ `auth_error`，或 401 | 续期凭据后重试（**唯一**该走 refresh 的情形） |
+   | 重复请求 | 客户端 `_TA="duplicate_request"` | 直接重发，**不**续期 |
+   | 签名无效 | `Signature invalid (101)` | 见上文第 2 条（签名头被覆盖） |
+
+   ⚠️ **排队信息藏在 `message` 里，且 `message` 是「一个 JSON 字符串」**：
+   ```json
+   {"code":"10605","message":"{\"isQueued\":true,…,\"retryAfterSeconds\":30,…}"}
+   ```
+
+   ⚠️⚠️ **排队有 TWO 种下发通道，第一版只修了一种（第二次回归，2026-09-27）**：
+
+   | 通道 | 形态 | 识别位置 |
+   |---|---|---|
+   | **① HTTP 状态层** | HTTP **403** + 排队 JSON 体 | `qoder-adapter.ts` 的 `!response.ok && 401/403` 分支 |
+   | **② SSE 流内** | HTTP **200** + 内嵌 `{code:"10605",…}` **帧** | `openai-compat.ts` 的 `consumeOpenAiSse` |
+
+   用户第二次报障的症状（`重试延迟 7967ms` + `code=SERVER`）暴露了 ② 未被覆盖：
+   `httpErrorCode(403)='AUTH'` 而日志里是 **`SERVER`** —— 后者**只能**来自 SSE
+   消费器的三处 throw。**判据：错误码与状态码不一致时，去 SSE 层找。**
+   会话证据：`~/.dsh/sessions/--D-jet-code-go-lilishop-go--/…/session.v4.jsonl.zstd`
+   （用 `scripts/probe-qoder-queue-session.mjs` 解压检索，Node 内置
+   `zstdDecompressSync`，Windows 无需装 zstd）。
+
+   ⚠️ **修 SSE 通道时踩到的两个更深一层的坑**（都写进单测锁住了）：
+
+   - **`unwrapQoderEnvelopeStream` 会「降级重组」错误帧**：它把内层
+     `{code, message}` 转成 `{error:{message:"… (10605)"}}` —— **丢掉 `code`
+     字段**并把后缀拼进 `message`。两个后果都极隐蔽：
+     ① 下游排队识别（依赖顶层 `code === '10605'`）**永远不命中**；
+     ② 后缀污染了 `message` 里那段**内层 JSON 字符串**，使二次解析失败 →
+        拿不到 `retryAfterSeconds`，只能退回 1 秒兜底（写单测时实测到：
+        期望 2000ms 实际 1000ms）。
+     现在改为**保真转发** `{code?, message, type:'model_error'}`。
+   - **`parseQueueError` 必须同时支持两种入参**：外层整体
+     （`{code, message}`）**与内层消息**（`{isQueued:…}`，**没有 `code`**）。
+     第一版要求「必须命中 `code`」，于是 SSE 路径传内层消息时被判 undefined
+     —— 修复**静默失效**（探针显示 `sleep 次数 = 0`）。
+     判据改为「命中 `code` **或**含排队标志」。
+   - ⚠️ **瞬时排队是 `isQueued:false`**（`serviceAvailable:true, waitTime:0`）——
+     用户报告「一次重试就能成功」正是这一形态。判据**不能要求
+     `isQueued === true`**，否则它会落到 1 秒兜底而非服务端要求的 2 秒。
+   - ⚠️ **网关形态（无 `code`，只有 `message` + `type`）也要认**：信封剥离后
+     `statusCodeValue` 被吃掉，若只判 `statusCodeValue >= 400`，整帧会被
+     **静默丢弃**（既识别不出排队、连报错都没有）。
+
+   ⚠️ **两处等待逻辑必须共用同一实现**（`QoderAdapter.waitForQueue`）——
+   否则会再次出现「只修了一条通道」的缺陷。
+
+   ⚠️⚠️ **第三次回归（2026-09-27 13:15）：判据**不能**用顶层 `code` 当门禁**。
+   用户贴出的后缀是 **`(403/model_error)`**，它由
+   `[String(data.code), data.type].join('/')` 产出，据此反推消费器收到的帧：
+
+   ```json
+   { "code": 403,
+     "message": "{\"code\":\"10605\",\"message\":\"{\\\"isQueued\\\":…}\"}",
+     "type": "model_error" }
+   ```
+
+   **业务码嵌了两层**：顶层 `code` 是 **403**，`10605` 在 `message` 里。
+   上一版写成 `if (isQueueBusinessCode(data.code))` —— 拿 403 比 10605
+   **必然不命中**，于是又落到 `SERVER`（这就是「修了两次仍失败」的原因）。
+
+   ✅ **正确判据：直接尝试 `parseQueueError(data.message)`**，用它是否返回
+   信息来决定 —— 该函数递归遍历 `data`/`result`/`message`/`body` 并解析字符串，
+   **嵌套几层都能穿透**，且不会误判（要求命中 `10605` 或出现排队标志）。
+   ⚠️ 这个坑的教训具有普遍性：**外部错误体的嵌套深度不可假设**。
+   用「先按某字段判门禁、再解析」的写法，一旦真实结构比预期深一层就静默失效；
+   应让解析函数自己判定。
+
+   ⚠️ **读用户给的后缀能直接定位抛错点**：本仓库错误消息的后缀是各分支自己拼的
+   （`(10605)` = SSE 顶层 code 分支、`(403/model_error)` = 该分支的 `code/type`
+   拼接、`(status=…)` = 网关分支）。**排障时先看后缀**，能省掉大量猜测 ——
+   这次正是靠它一步定位到「顶层 `code` 是 403」。
+
+   ⚠️ **延迟的取值优先序**（客户端 `kJa()`/`EV()`/`IRA()`）：
+   `retry_after_ms` → `retryAfterMs` → `retryAfterSeconds × 1000`
+   → 兜底 `Retry-After` 响应头（纯数字当**秒**，否则 HTTP 日期）。
+
+   ⚠️ **用户定下的等待规则**（`qoderQueueDelayMs()`，**不要擅自改**）：
+   - 服务端给的排队时间 **< 10 秒 → 按它的值**（如 2s → 等 2s，重试即成功）；
+   - **≥ 10 秒 → 封顶 10 秒**（`QODER_QUEUE_MAX_DELAY_MS`）—— 避免一次阻塞
+     30 秒让 UI 长期停在「运行中」且无法区分「排队」与「卡死」；
+   - **最多 180 次**（`QODER_QUEUE_MAX_ATTEMPTS`，与 CodeArts 惯例一致）
+     → 10s × 180 = 最长 30 分钟；总时长可用 `DSH_QODER_QUEUE_TIMEOUT_MS` 覆盖。
+   - ⚠️ **超时判定必须先于次数判定**：反过来写会让「180 次空转」在绝大多数情况下
+     先生效，使 `DSH_QODER_QUEUE_TIMEOUT_MS` **形同虚设**（写用例时实测到了）。
+   - ⚠️ **该环境变量不能写成 `parseInt(…) || 默认值`**：`0` 是合法值（表示「不等」，
+     单测靠它验证开关），而 `0` 是 falsy 会被 `||` 静默换成 30 分钟。
+
+   ⚠️ **为什么不用 harness 的 `retryPolicy`**：它的 `DEFAULT_RETRYABLE_CODES` 是
+   `[EMPTY_RESPONSE, RATE_LIMIT, SERVER, TIMEOUT, TRANSPORT]` **不含 `QUEUE`/`AUTH`**，
+   且它的退避是**固定参数**（`initialDelayMs=500`、`maxDelayMs=10_000`、
+   `maxRetries=5`），**没有 per-error「服务端指定延迟」的通道** ——
+   500/1000/2000/4000/8000 共约 15.5 秒，永远等不到服务端要的 30 秒。
+   故排队必须在**适配器内部**自己等（与 CodeArts 的 `QUEUE_RETRY_DELAY_MS` 同思路，
+   但延迟**来自服务端**而非固定 10 秒）。
+
+   ⚠️ **两站同时受益**：`qoder` 与 `qodercn` 共用同一个 `QoderAdapter`。
+
+   排查脚本 `scripts/probe-qoder-queue-error.mjs`（只读、离线：按客户端算法
+   解析两种真实错误并打印该等多久）。回归用例在 `tests/unit/qoder-adapter.spec.ts`
+   的「排队错误（10605 model_queued）」段（16 条：纯函数解析/换算 + stream 行为，
+   含「瞬时排队等 2s 即成功且**不刷新凭据**」「30s 压到 10s」「超上限抛错」
+   「认证失败不误判为排队」）。sleep 可注入，全部毫秒级完成。
+   ⚠️ 已做**反向验证**：把封顶改回 30s → 3 条失败；去掉二次解析 → 6 条失败。
+
 ⚠️ **`src/qoder-auth-wasm.wasm`（298 KB）随插件分发**，构建时由 `scripts/copy-assets.mjs` 复制到 `lib/`（`tsc` 不搬 `.wasm`）。`build:all` 已含该步骤。
 
 ⚠️ **WASM 提取自 Qoder `0.3.4`**（runtime `1.1.57`）。升级方式：
@@ -174,6 +289,29 @@ CN asar 里同样是 `Fh = Object.freeze({ clientType: 10, … })`，
 （用**国际版** WASM 解 CN 目录并输出可粘贴的 TS 兜底表条目）、
 `scripts/verify-qodercn-live.mjs`（一次性「登录→推理→积分」，**token 不落盘**）。
 e2e：`pnpm test:e2e:qodercn`（只读）/ `:qodercn-chat` / `:qodercn-credits`。
+
+### ⚠️ `scripts/` 里哪些入库、哪些**不入库**（容易误判）
+
+`.gitignore` 有 `scripts` 一行，但**它只对未跟踪文件生效** —— 已被跟踪的文件
+不会因该行而移出仓库。故现状是「部分入库、部分不入库」，**新增脚本前先看清**：
+
+| 类别 | 入库 | 说明 |
+|---|---|---|
+| **构建必需** | ✅ | `copy-assets.mjs`（`pnpm build:assets` 用它把 `.wasm` 复制到 `lib/`）、`extract-qoder-wasm.mjs`（`pnpm qoder:wasm`）。**删了构建会坏** |
+| **图标/产物提取** | ❌ | `extract-qodercn-icon.mjs` 等 —— 产物是提取自客户端安装目录的二进制，不入库 |
+| **只读排查/取证** | ❌ | `probe-*.mjs` / `verify-*.mjs` —— 本文件大量引用它们作为「怎么复核这个结论」的指针，但**它们不在仓库里** |
+
+⚠️ **因此 AGENTS.md 里 `scripts/xxx.mjs` 的引用是「本地指针」而非仓库文件**：
+新克隆的仓库里**没有**这些脚本，需要时按本文件描述的思路自行重写
+（多数脚本只做「解压/解析/打印」，几十行即可复现）。
+⚠️ 引用它们**不代表它们存在** —— 别照着路径去 `import`（没有任何 `src/` 代码
+依赖它们；注释里的提及仅作文档指针）。
+
+⚠️ **不要把只读排查脚本 `git add -f` 进去**：`.gitignore` 的 `scripts` 行是
+**有意为之**（研究工具仅本地保留）。`git add -f` 会绕过它，让仓库里出现
+「本不该入库」的文件 —— 2026-09-27 真踩过（`probe-qoder-queue-error.mjs` 等
+被强加进去，事后又得撤出）。
+
 
 ### ⚠️ Qoder 积分余额：路径在 `/sash/` 下，且只需 Bearer
 
