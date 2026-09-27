@@ -665,10 +665,15 @@ describe('BuddyAdapter credential handling', () => {
     expect(message).not.toContain('重新登录')
   })
 
-  it('安全审核拦截的 403 不刷新、不换号，且不得报成 AUTH', async () => {
-    // 真实缺陷（2026-09-27，用户重启后仍复现）：腾讯的内容安全审核**也回 403**，
-    // 报文 code 11140 request illegal。修复前它被当成认证失败 → 刷新 + 逐个换号
-    // （每个账号都被同一份内容拦下），最后报「所有账号均被拒绝（HTTP 403）」。
+  it('安全策略拦截（11140）会逐个换号，全部试完才报错', async () => {
+    // ⚠️ **结论修正（2026-09-27 实测）**：早期实现断言「安全审核是内容问题，
+    // 换号毫无意义 → 一次都不多发」。逐账号对照实测推翻了它：
+    // **同一份请求体**（system + 两个字）发往池里 7 个账号，得到
+    // 「2 个 200 / 4 个 403·11140 / 1 个 429」——拦截**按账号生效**，与内容无关。
+    //
+    // 用户侧现象吻合：连「你好」都被拦，且换新会话照样被拦（排除上下文累积）。
+    // 因此正确行为是**换号**（与 401/403 认证失败同一条路径）：坏账号可能排在
+    // 池里任何位置，不换号就等于让池中可用账号永远闲置。
     const body = JSON.stringify({
       code: 11140,
       msg: 'request illegal',
@@ -676,10 +681,9 @@ describe('BuddyAdapter credential handling', () => {
       displayMsg: { zh: '内容未通过安全审核，请调整后重试。' },
     })
     let calls = 0
-    let refreshes = 0
     const adapter = makeAdapter({
       credential: makeCredential({ access_token: 'AT1' }),
-      refresh: async () => { refreshes++ },
+      refresh: async () => { throw new Error('refresh failed') },
       accountPool: makePool([
         { id: 'acc-1', credential: makeCredential({ access_token: 'AT1' }) },
         { id: 'acc-2', credential: makeCredential({ access_token: 'AT2' }) },
@@ -687,14 +691,42 @@ describe('BuddyAdapter credential handling', () => {
       fetchImpl: async () => { calls++; return new Response(body, { status: 403 }) },
     })
     const error = await collectChunks(adapter, streamOptions).catch((e: unknown) => e)
-    expect((error as LlmError).failure.code).toBe('INVALID_REQUEST')
-    expect((error as LlmError).message).toContain('安全审核')
-    // 关键：内容被拦时换号毫无意义 —— 一次都不该多发。
-    expect(calls).toBe(1)
-    expect(refreshes).toBe(0)
+    // 错误码取 AUTH：这些账号在服务端不可用，需要换号/重新登录，而不是「你的内容有问题」。
+    expect((error as LlmError).failure.code).toBe('AUTH')
+    // 文案必须指向**账号**，不再断言「请调整内容后重试」把用户引向错误方向。
+    expect((error as LlmError).message).toContain('安全策略')
+    expect((error as LlmError).message).toContain('账号')
+    expect((error as LlmError).message).not.toContain('请调整内容')
+    // 关键：**必须换号**——两个账号各试一次（首发 acc-1 + 换号 acc-2）。
+    expect(calls).toBeGreaterThanOrEqual(2)
   })
 
-  it('换号途中撞上的安全审核同样按内容问题报（不报 AUTH）', async () => {
+  it('安全策略拦截在换号途中被剔除：换到可用账号即成功', async () => {
+    // 本用例对应真实故障场景：池首账号被安全策略拦下，池尾账号可用。
+    // 修复前「不换号」会让这次请求必然失败（正是用户连续多轮失败的原因）。
+    const safety = JSON.stringify({ code: 11140, msg: 'request illegal' })
+    const adapter = makeAdapter({
+      credential: makeCredential({ access_token: 'AT1' }),
+      refresh: async () => { throw new Error('refresh failed') },
+      accountPool: makePool([
+        { id: 'acc-1', credential: makeCredential({ access_token: 'AT1' }) },
+        { id: 'acc-2', credential: makeCredential({ access_token: 'AT2' }) },
+      ]),
+      // AT1 → 安全策略拦截；AT2 → 正常 SSE。
+      fetchImpl: async (_url: unknown, init: { headers: Headers }) =>
+        (init.headers.get('Authorization') ?? '').includes('AT1')
+          ? new Response(safety, { status: 403 })
+          : new Response('data: {"choices":[{"delta":{"content":"ok"}}]}\n\ndata: [DONE]\n\n', {
+              status: 200,
+              headers: { 'content-type': 'text/event-stream' },
+            }),
+    })
+    const chunks = await collectChunks(adapter, streamOptions)
+    // 换到 acc-2 后成功产出内容，而不是抛错。
+    expect(chunks.length).toBeGreaterThan(0)
+  })
+
+  it('换号途中撞上的安全策略同样报专门的提示（不混入其他 403 文案）', async () => {
     const safety = JSON.stringify({ code: 11140, msg: 'request illegal' })
     const adapter = makeAdapter({
       credential: makeCredential({ access_token: 'AT1' }),
@@ -703,15 +735,52 @@ describe('BuddyAdapter credential handling', () => {
         { id: 'acc-1', credential: makeCredential({ access_token: 'AT1' }) },
         { id: 'acc-2', credential: makeCredential({ access_token: 'AT2' }) },
       ]),
-      // 首发 401（真认证失败）→ 换号后拿到 403 安全审核。
+      // 首发 401（真认证失败）→ 换号后拿到 403 安全策略拦截。
       fetchImpl: async (_url: unknown, init: { headers: Headers }) =>
         (init.headers.get('Authorization') ?? '').includes('AT1')
           ? new Response('unauthorized', { status: 401 })
           : new Response(safety, { status: 403 }),
     })
     const error = await collectChunks(adapter, streamOptions).catch((e: unknown) => e)
-    expect((error as LlmError).failure.code).toBe('INVALID_REQUEST')
-    expect((error as LlmError).message).toContain('安全审核')
+    expect((error as LlmError).failure.code).toBe('AUTH')
+    // 走的是安全策略专用文案（指向账号），而不是泛化的「所有账号均被拒绝」。
+    expect((error as LlmError).message).toContain('安全策略')
+  })
+
+  it('错误提示只取服务端 displayMsg.zh，不倾倒整段 JSON 原文', async () => {
+    // 真实缺陷（2026-09-27 用户报障）：腾讯系用 `msg` + `displayMsg.{zh,en}`
+    // 报错，**没有**标准 `message` 字段。早期 errorDetail 只读 `data.message`，
+    // 于是全部落空、退化成返回整段 JSON —— 实测把 291 字符的原始报文糊进提示，
+    // 而服务端早已备好中文说明，被白白埋掉。
+    const raw = JSON.stringify({
+      code: 11140,
+      msg: 'request illegal',
+      requestId: 'b1fd90ae-0c5f-45b6-9209-002f3ab3c4a3',
+      displayMsg: {
+        en: 'The content did not pass the safety review. Please adjust and retry.',
+        zh: '内容未通过安全审核，请调整后重试。',
+        'zh-hant': '內容未通過安全審核，請調整後重試。',
+      },
+      actions: ['SUBMIT_FEEDBACK', 'COPY_ERROR', 'EDIT_INPUT'],
+    })
+    const adapter = makeAdapter({
+      credential: makeCredential({ access_token: 'AT1' }),
+      refresh: async () => { throw new Error('refresh failed') },
+      accountPool: makePool([
+        { id: 'acc-1', credential: makeCredential({ access_token: 'AT1' }) },
+        { id: 'acc-2', credential: makeCredential({ access_token: 'AT2' }) },
+      ]),
+      // 两个账号都被拦 → 走到「全部账号均被安全策略拦截」这条报错路径。
+      fetchImpl: async () => new Response(raw, { status: 403 }),
+    })
+    const error = await collectChunks(adapter, streamOptions).catch((e: unknown) => e)
+    const message = (error as LlmError).message
+    // 服务端的中文说明必须**出现**（此前被丢弃）。
+    expect(message).toContain('内容未通过安全审核')
+    // 原始 JSON 的噪声字段不应被倾倒进来。
+    expect(message).not.toContain('SUBMIT_FEEDBACK')
+    expect(message).not.toContain('zh-hant')
+    expect(message).not.toContain('requestId')
   })
 
   it('401 换号不会无限循环：每个账号最多试一次', async () => {

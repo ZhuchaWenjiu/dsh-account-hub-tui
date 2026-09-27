@@ -376,10 +376,10 @@ function errorMessage(error: unknown): string {
 }
 
 /**
- * 腾讯侧**内容级拒绝**（安全审核）判定。
+ * 腾讯侧**安全策略拦截**（业务码 11140）判定。
  *
- * ⚠️ 这类拒绝**也回 HTTP 403**，但与认证、额度都无关 —— 报文实测（2026-09-27，
- * workbuddy / deepseek-v4.1-flash）：
+ * ⚠️ 这类拒绝**也回 HTTP 403**，报文实测（2026-09-27，workbuddy /
+ * deepseek-v4.1-flash）：
  * ```json
  * {"code":11140,"msg":"request illegal","requestId":"…",
  *  "displayMsg":{"en":"The content did not pass the safety review. …",
@@ -387,12 +387,18 @@ function errorMessage(error: unknown): string {
  * ```
  * 同一报文在 CodeArts 侧还会以 HTTP 200 + SSE 内嵌错误帧的形式出现。
  *
- * **必须先于认证判定排除它**，否则会：白跑一整轮「刷新 + 逐个换号」（每个账号
- * 都被同一份内容拦下，纯浪费额度与时间），并把**内容问题**报成**账号问题**
- * （错误码落到 AUTH → UI 提示「API 密钥无效」→ 用户去重新登录）。
+ * ## ⚠️ 服务端称它「内容」问题，实测却是**账号级**的（2026-09-27 修正）
+ *
+ * 逐账号对照实测：**同一份请求体**（`system` + 两个字）发往池里 7 个账号，
+ * 结果 2 个 200、4 个 403/11140、1 个 429 —— 拦截**按账号生效**，与内容无关。
+ * 用户侧现象吻合：连「你好」都被拦，且换新会话照样被拦（排除上下文累积）。
+ *
+ * 因此**不能**把它当成「内容问题，与账号无关」而拒绝换号（早期实现的错误结论）：
+ * 那样池里有可用账号也永远用不上，且提示用户「请调整内容」——指错方向。
+ * 正确处理与 401/403 认证失败一致：**换号**，全部试完才报错。
  *
  * 判据用三个独立信号（任一命中即可）：业务码、`msg` 措辞、`displayMsg` 文案。
- * 只看状态码无法区分 —— 403 同时覆盖「真认证失败 / 额度 / 权限 / 安全审核」。
+ * 只看状态码无法区分 —— 403 同时覆盖「真认证失败 / 额度 / 权限 / 安全策略」。
  */
 function isContentRejection(body: string): boolean {
   if (body.length === 0) return false
@@ -402,15 +408,21 @@ function isContentRejection(body: string): boolean {
 }
 
 /**
- * 内容级拒绝的错误：**不得**标成 AUTH。
+ * 安全策略拦截的错误。
  *
- * 错误码取 `INVALID_REQUEST`（请求本身有问题，可通过调整内容解决），
- * 消息里带上服务端原始说明，便于判断是提示词/tool 输出触发了审核。
+ * ⚠️ 错误码**不能**取 `INVALID_REQUEST`（早期实现如此）：那会把「所有账号都被
+ * 安全策略拦下」说成「你的请求有问题」，提示用户去改内容——而实测这是**账号级**
+ * 拦截（见 `isContentRejection` 的注释）。取 `AUTH` 与其余 401/403 口径一致，
+ * 语义上也对：这些账号在服务端不可用，需要换号或重新登录。
+ *
+ * 文案如实说明「已试完全部账号」并保留服务端原文，便于用户判断该换号还是
+ * 真的调整内容；不再断言「请调整内容后重试」。
  */
 function contentRejectionError(productId: string, status: number, body: string): LlmError {
   return new LlmError(
-    `${productId}: 请求内容未通过服务端安全审核，请调整内容后重试：${errorDetail(body)}`,
-    'INVALID_REQUEST',
+    `${productId}: 全部账号均被服务端安全策略拦截（HTTP ${status}，已逐个换号重试）。`
+    + `该拦截按账号生效，请在 Jet Hub 停用或更换被拦账号后重试：${errorDetail(body)}`,
+    'AUTH',
     { status },
   )
 }
@@ -422,10 +434,24 @@ function errorDetail(body: string): string {
     const error = typeof data.error === 'object' && data.error !== null
       ? data.error as Record<string, unknown>
       : undefined
+    // ⚠️ 腾讯系（buddy / workbuddy）用 `msg` + `displayMsg.{zh,en}` 报错，而标准
+    // `message` 字段**不存在**。早期实现只读 `error.*` / `data.message`，于是
+    // 全部落空、退化成「返回整段 JSON 原文」——实测把 291 字符的原始报文糊在
+    // 错误提示里，而服务端早已备好中文说明 `displayMsg.zh`，被白白埋掉。
+    const display = typeof data.displayMsg === 'object' && data.displayMsg !== null
+      ? data.displayMsg as Record<string, unknown>
+      : undefined
+    const localized = typeof display?.zh === 'string'
+      ? display.zh
+      : typeof display?.en === 'string' ? display.en : undefined
     const parts = [
+      // 本地化文案最可读，排在最前。
+      localized,
       typeof error?.code === 'string' ? error.code : undefined,
       typeof error?.type === 'string' ? error.type : undefined,
       typeof error?.message === 'string' ? error.message : undefined,
+      // 腾讯系用 `msg` 而非 `message`。
+      typeof data.msg === 'string' ? data.msg : undefined,
       typeof data.message === 'string' ? data.message : undefined,
     ].filter((value): value is string => value !== undefined)
     if (parts.length > 0) return parts.join(' ')
@@ -1081,20 +1107,28 @@ export class BuddyAdapter extends LlmAdapter {
     }
     const body = JSON.stringify(bodyObj)
 
-    // 4. 发送请求（401/403 时刷新当前账号一次，仍认证失败则换号重试）
+    // 4. 发送请求（401/403 时刷新当前账号一次，仍失败则换号重试）
     let response = await this.send(credential, body, options)
     if (!response.ok && (response.status === 401 || response.status === 403)) {
-      // ⚠️ **先排除内容级拒绝**（真实缺陷，2026-09-27，用户重启后仍复现）：
-      // 腾讯侧的内容安全审核拦截**也回 HTTP 403**，报文是
-      // `{"code":11140,"msg":"request illegal",displayMsg:{zh:"内容未通过安全审核…"}}`。
-      // 它与认证毫无关系，却被当成「认证失败」，于是：
-      // ① 白跑一整轮「刷新 + 逐个换号」（5 个账号各发一次同样被拦的请求）；
-      // ② 最后报「所有账号均被拒绝（HTTP 403）」——把**内容问题**说成**账号问题**；
-      // ③ 错误码落到 AUTH，UI 提示「API 密钥无效」，把用户引向重新登录。
-      // 实测那次：换号 5 次全被同一份内容拦下，而 5 个账号 token 全部有效。
+      // ⚠️ 腾讯侧的安全策略拦截（`code:11140`）**也回 HTTP 403**。实测确认它是
+      // **账号级**拦截（同一请求体在池里 7 个账号上「2 通 4 拦 1 限流」），因此
+      // 处理方式与认证失败一致：**刷新 → 换号 → 全部试完才报错**。
+      //
+      // 早期实现把它当成「内容问题、与账号无关」而**拒绝换号**并直接抛
+      // `INVALID_REQUEST`，后果（2026-09-27 用户实测）：池里有可用账号也永远
+      // 用不上，每次都拿最先选中的坏账号去撞，且提示「请调整内容后重试」——
+      // 把用户引向改内容，而真正该做的是换号／停用坏账号。
+      //
+      // 判据必须在认证分支内联判定而非提前 return：坏账号可能排在任何位置，
+      // 必须让它和 401/403 一样进入下面的换号循环。
       const rejectedBody = await response.clone().text().catch(() => '')
-      if (isContentRejection(rejectedBody)) {
-        throw contentRejectionError(this.product.id, response.status, rejectedBody)
+      const contentRejected = isContentRejection(rejectedBody)
+      if (contentRejected) {
+        // 只记一条诊断日志便于排查，**不中断**换号。
+        console.warn(
+          `[${this.product.id}] 账号 ${currentAccountId || '(current)'} 被安全策略拦截`
+          + `（HTTP ${response.status}，code 11140），继续换号：${errorDetail(rejectedBody).slice(0, 200)}`,
+        )
       }
       // ⚠️ 真实缺陷（2026-09-26，用户报障「账号池里明明有 3~4 个账号没被限流，
       // 却报『未配置凭据，请先登录』」）。早期实现在这里刷新一次就 `return`：
@@ -1131,6 +1165,8 @@ export class BuddyAdapter extends LlmAdapter {
         }
       }
       let rotated = false
+      /** 换号过程中是否撞到过安全策略拦截（用于最后的报错口径）。 */
+      let sawContentRejection = contentRejected
       if ((response.status === 401 || response.status === 403) && this.options.accountPool !== undefined) {
         for (;;) {
           // modelId 参与过滤：正在限流期的账号不会被选中（与限流换号同语义）。
@@ -1147,7 +1183,14 @@ export class BuddyAdapter extends LlmAdapter {
             yield* this.consumeSse(response, options)
             return
           }
-          // 只有认证类失败才继续换号；429/5xx/400 交给下面的既有分类逻辑。
+          // ⚠️ 安全策略拦截（11140）同样继续换号 —— 它按账号生效，换号是唯一出路。
+          // 必须**先于**「仅 401/403 才继续」的判据检查，否则会被当成普通 403
+          // 之外的错误而 break，退回到「只试一个账号」的老问题。
+          if (isContentRejection(await response.clone().text().catch(() => ''))) {
+            sawContentRejection = true
+          }
+          // 只有认证类失败（含安全策略拦截）才继续换号；
+          // 429/5xx/400 交给下面的既有分类逻辑。
           if (response.status !== 401 && response.status !== 403) break
         }
       }
@@ -1164,8 +1207,10 @@ export class BuddyAdapter extends LlmAdapter {
         // 全部有效（请求能进业务层、只因缺 system 提示回 400）—— 即那 403 并非
         // 登录问题。没有响应体就完全无从判断，只能靠猜。
         const detail = await response.text().catch(() => '')
-        // 换号途中撞上的内容级拒绝：同样不能报成认证失败。
-        if (isContentRejection(detail)) throw contentRejectionError(this.product.id, response.status, detail)
+        // 换号途中撞上的安全策略拦截：报专门的提示（指向账号，而非内容）。
+        if (sawContentRejection || isContentRejection(detail)) {
+          throw contentRejectionError(this.product.id, authStatus, detail)
+        }
         throw new LlmError(
           `${this.product.id}: 所有账号均被拒绝`
           + `（HTTP ${authStatus}${authStatus === 401 ? '，请在 Jet Hub 重新登录' : ''}）：${errorDetail(detail)}`,
