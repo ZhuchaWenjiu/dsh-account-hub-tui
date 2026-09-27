@@ -3,9 +3,23 @@
 dst（dsh-TUI）桥接插件：把 [dsh-account-hub](https://github.com/gurio-wine/dsh-account-hub)
 的账号管理能力接到斜杠命令 `/account_hub` 上，在终端里完成 web「账号中心」面板的核心操作。
 
-纯桥接，零构建，不引入任何 @deepseek-ai 依赖（全部通过 cordis 上下文延迟访问
-`accountPool`、各 `*Auth` 与 `userQuestions` 服务）；dsh-account-hub 缺席时命令报友好错误，
-不影响 profile 启动。
+## 项目来源
+
+本插件是在 [**dsh-account-hub**](https://github.com/gurio-wine/dsh-account-hub)（GitHub 上游，
+早期代码源自 Gitee 的 [iJetLi/deepseek-harness-codearts](https://gitee.com/iJetLi/deepseek-harness-codearts)）
+基础上做的**伴生扩展**，不是它的分支：
+
+- **不改 dsh-account-hub 的任何代码**——账号池、七个 provider 的登录/凭据、
+  LLM 模型路由全部来自上游插件，运行时通过 cordis 上下文直接使用它的服务
+  （`accountPool` 与各 `*Auth` 实例），积分/签到则加载它的
+  `lib/account-hub-rpc.js` 模块级函数（`collectProviderBalances` / `performCheckinSweep`）；
+- 本仓库只新增**桥接层**：`/account_hub` 命令（交互式菜单 + 参数式）、
+  dst 问卷弹窗的接入、浏览器拉起、余额/签到的文本渲染；
+- 运行环境：[DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)（dsh）
+  + [dsh-TUI](https://github.com/ccch1mneyyy/dsh-TUI)（dst）。
+
+依赖关系：**必须先安装 dsh-account-hub**（本插件的账号数据与服务都由它提供），
+`install.sh` 会一并装好。
 
 ## 交互式流程
 
