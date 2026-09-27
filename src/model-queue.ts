@@ -36,6 +36,63 @@
 export const QUEUE_BUSINESS_CODE = '10605'
 
 /**
+ * Qoder 的**额度用尽**业务码（`Billing daily count exceeded`）。
+ *
+ * ## 为什么必须与排队**分开**处理（真实缺陷，用户报障 2026-09-27）
+ *
+ * 排队修好后，会话继续自动执行目标时出现：
+ * ```
+ * 重试延迟：7220毫秒
+ * 失败原因：qoder: Billing daily count exceeded (110/model_error)
+ * ```
+ * 它原先被归成 **`SERVER`**，而 `SERVER` **在** harness 的
+ * `DEFAULT_RETRYABLE_CODES` 里 → **白重试 5 次**（≈15.5 秒），
+ * 用户看到的 `7220毫秒` 就是其中一步。
+ *
+ * ## 客户端权威依据（obf 产物原文，已用探针取证）
+ *
+ * ```js
+ * function vpt(e){
+ *   let t = e === "authentication_failed" || e === "billing_error" ? "permission"
+ *         : e === "rate_limit"      ? "rate_limited"
+ *         : e === "invalid_request" ? "invalid_request"
+ *         : "unavailable";
+ *   return new Tt(t, `Qoder assistant failed: ${e}`)
+ * }
+ * ```
+ * **`billing_error` → `permission`**（不可重试），与 **`rate_limit` → `rate_limited`**
+ * （可重试）**明确分开**。
+ *
+ * ⚠️ 语义差异是本质的，不是风格问题：
+ * - `10605` 排队：**暂时**受阻 —— 等待若干秒即可通过（故内部等待重试）；
+ * - `110` 额度：**当天耗尽** —— 立刻重试、等 15 秒重试、等 30 分钟重试，
+ *   结果都一样（故**必须立即失败**，并把真实原因如实告诉用户）。
+ *
+ * 取证脚本：`scripts/probe-qoder-code-110b.mjs`（只读，打印上述客户端映射原文）。
+ */
+export const BILLING_BUSINESS_CODE = '110'
+
+/** 业务码是否命中**额度用尽**（兼容字符串与数字两种编码）。 */
+export function isBillingBusinessCode(code: unknown): boolean {
+  return code === BILLING_BUSINESS_CODE || code === Number(BILLING_BUSINESS_CODE)
+}
+
+/**
+ * 从错误体里提取**额度类**文案（客户端映射之外的兜底判据）。
+ *
+ * ⚠️ **为什么要文案兜底**：`110` 这个码值在客户端产物里**没有硬编码**
+ * （探针搜 `X="110"` 与 `daily count exceeded` 均未命中），说明它由服务端下发。
+ * 若上游哪天改用别的码值表达同一语义，只认码就会漏判 —— 故两者都认：
+ * **码值命中 110，或文案含 billing/额度语义**。
+ *
+ * ⚠️ 关键词必须**窄**：`balance` / `quota` 之类泛词会误伤正常内容（如模型正文
+ * 里恰好讨论「余额」）。故只认明确的英文错误短语。
+ */
+export function looksLikeBillingError(text: string): boolean {
+  return /billing\s+daily\s+count\s+exceeded|daily\s+count\s+exceeded|billing_error/i.test(text)
+}
+
+/**
  * 单次排队等待的**封顶**（毫秒）。
  *
  * 用户要求：服务端给的排队时间 **< 10 秒按它的值**，**≥ 10 秒按 10 秒** ——

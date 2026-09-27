@@ -51,7 +51,7 @@ import {
   stripCourseLeakIfEnabled,
 } from './sse.js'
 import { normalizeHarnessMessages } from './message-shape.js'
-import { parseQueueError, queueDelayMs } from './model-queue.js'
+import { isBillingBusinessCode, looksLikeBillingError, parseQueueError, queueDelayMs } from './model-queue.js'
 
 /** 将消息内容载荷展平为纯文本字符串。 */
 export function contentToText(content: unknown): string {
@@ -629,6 +629,22 @@ export async function* consumeOpenAiSse(
               },
             )
           }
+          // ⚠️ **额度用尽必须归为不可重试**（真实缺陷，用户报障 2026-09-27）：
+          // 帧形如 `{code:110, message:"Billing daily count exceeded",
+          // type:"model_error"}`，原先落到下面的 `SERVER` —— 而 `SERVER` **在**
+          // harness 的 `DEFAULT_RETRYABLE_CODES` 里，于是「今日额度已用尽」这种
+          // **确定性**错误被**白重试 5 次**（≈15.5 秒，用户看到 `重试延迟：7220毫秒`）。
+          //
+          // 客户端权威映射（obf 产物）：`billing_error` → `permission`（不重试），
+          // 与 `rate_limit` → `rate_limited`（可重试）**明确分开**。
+          // 故这里抛 `QUOTA_EXCEEDED`（harness 不将其列入可重试集合）。
+          if (isBillingBusinessCode(data.code) || looksLikeBillingError(data.message)) {
+            throw new LlmError(
+              `${label}: ${data.message}`,
+              'QUOTA_EXCEEDED',
+              { ...(typeof data.code === 'number' ? { status: data.code } : {}) },
+            )
+          }
           const detail = [String(data.code), data.type].filter(Boolean).join('/')
           throw new LlmError(
             `${label}: ${data.message}${detail.length > 0 ? ` (${detail})` : ''}`,
@@ -666,6 +682,13 @@ export async function* consumeOpenAiSse(
                   ...(retryAfterMs === undefined ? {} : { retryAfterMs }),
                 },
               )
+            }
+            // ⚠️ 额度用尽同样要归为**不可重试**（与上面那条分支一致 ——
+            // 两处判据必须同源，否则会重演「只修了一条通道」的缺陷）。
+            if (looksLikeBillingError(data.message)) {
+              throw new LlmError(`${label}: ${data.message}`, 'QUOTA_EXCEEDED', {
+                ...(status === undefined ? {} : { status }),
+              })
             }
             const suffix = status === undefined ? '' : ` (status=${status})`
             throw new LlmError(`${label}: ${data.message}${suffix}`, 'SERVER', {

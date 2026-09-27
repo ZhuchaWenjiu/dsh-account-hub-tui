@@ -209,6 +209,68 @@
    「认证失败不误判为排队」）。sleep 可注入，全部毫秒级完成。
    ⚠️ 已做**反向验证**：把封顶改回 30s → 3 条失败；去掉二次解析 → 6 条失败。
 
+9. **额度用尽（业务码 `110` `Billing daily count exceeded`）必须归为**
+   **不可重试**，不能落在 `SERVER` —— **真实缺陷**（用户报障 2026-09-27，
+   排队修好后继续自动执行目标时出现）：
+
+   ```
+   重试延迟：7220毫秒
+   失败原因：qoder: Billing daily count exceeded (110/model_error)
+   ```
+
+   ⚠️ 后缀 **`(110/model_error)`** 与排队那次那个 `(403/model_error)` **同源**
+   （都由「顶层 code + message」分支的 `[code, type].join('/')` 产出），
+   即帧是 `{code:110, message:"Billing daily count exceeded", type:'model_error'}`。
+   它原先归 **`SERVER`**，而 `SERVER` **在** harness 的 `DEFAULT_RETRYABLE_CODES`
+   （`[EMPTY_RESPONSE, RATE_LIMIT, SERVER, TIMEOUT, TRANSPORT]`）里 ——
+   于是「**今日额度已用尽**」这种**确定性**错误被**白重试 5 次**
+   （500/1000/2000/4000/8000 ≈ 15.5 秒；用户看到的 `7220毫秒` 就是其中一步）。
+
+   ⚠️ **这与排队是同一个病根**：**用错误码的默认归类代替了对业务语义的判断**。
+
+   **客户端权威依据**（obf 产物原文，`scripts/probe-qoder-code-110b.mjs` 可复现）：
+   ```js
+   function vpt(e){
+     let t = e === "authentication_failed" || e === "billing_error" ? "permission"
+           : e === "rate_limit"      ? "rate_limited"
+           : e === "invalid_request" ? "invalid_request"
+           : "unavailable";
+     return new Tt(t, `Qoder assistant failed: ${e}`)
+   }
+   ```
+   **`billing_error` → `permission`（不可重试）**，与 **`rate_limit` →
+   `rate_limited`（可重试）明确分开**。
+
+   ⚠️ **语义差异是本质的**（两者的处理**必须不同**）：
+   | | 排队 `10605` | 额度 `110` |
+   |---|---|---|
+   | 语义 | **暂时**受阻（等待可通过） | **当天耗尽**（等到明天） |
+   | 客户端归类 | `rate_limited`（可重试） | `permission`（**不重试**） |
+   | 我们的处理 | 内部按服务端延迟等待 | **立即失败**（抛 `QUOTA_EXCEEDED`） |
+
+   ⇒ 实现：两条错误分支（顶层 `code` / 网关形态）都判
+   `isBillingBusinessCode(data.code) || looksLikeBillingError(data.message)`
+   → 抛 **`QUOTA_EXCEEDED`**。
+
+   ⚠️ **必须带文案兜底**（`looksLikeBillingError`）：`110` 这个**码值在本地产物里
+   没有硬编码**（探针搜 `X="110"` 与 `daily count exceeded` 均未命中），
+   说明它由**服务端**下发 —— 若上游改用别的码值表达同一语义，只认码会漏判。
+   ⚠️ 兜底关键词必须**窄**（只认 `billing daily count exceeded` /
+   `daily count exceeded` / `billing_error`）：`balance` / `quota` 之类泛词会
+   误伤正常内容（模型正文里恰好讨论「余额」就会被误判为额度错误）。
+
+   ⚠️ **`QUOTA_EXCEEDED` 是既有惯例**（`buddy-adapter.ts` / `cline-adapter.ts` 同用），
+   且**不在** harness 的可重试集合里 —— 这正是我们要的「立即失败」。
+   验证脚本 `scripts/probe-dsh-retry-codes.mjs`（只读 harness 策略文件，断言
+   `SERVER` 在集合中、`QUOTA_EXCEEDED` 与 `QUEUE` 不在）。
+
+   回归用例在 `tests/unit/qoder-adapter.spec.ts` 的
+   「额度用尽（110 billing）归为不可重试」段（3 条：SSE 帧的 110 抛
+   `QUOTA_EXCEEDED` 且**不等待**、字符串 `"110"` 同样识别、
+   客户端映射 `billing→permission ≠ rate_limit` 被锁死防被改回 `SERVER`）。
+   ⚠️ 已做**反向验证**：移除该识别 → 2 条变红；还原后全绿。
+
+
 ⚠️ **`src/qoder-auth-wasm.wasm`（298 KB）随插件分发**，构建时由 `scripts/copy-assets.mjs` 复制到 `lib/`（`tsc` 不搬 `.wasm`）。`build:all` 已含该步骤。
 
 ⚠️ **WASM 提取自 Qoder `0.3.4`**（runtime `1.1.57`）。升级方式：

@@ -881,4 +881,95 @@ describe('QoderAdapter 排队错误（10605 model_queued）', () => {
       expect(sleeps).toEqual([2000])
     })
   })
+
+  /**
+   * ## 真实缺陷（用户报障 2026-09-27）：额度用尽被当成可重试的 `SERVER`
+   *
+   * 排队修好后，会话继续自动执行目标时出现**新错误**：
+   * ```
+   * 重试延迟：7220毫秒
+   * 失败原因：qoder: Billing daily count exceeded (110/model_error)
+   * ```
+   *
+   * ⚠️ 后缀 **`(110/model_error)`** 与排队那次那个 `(403/model_error)` **同源**，
+   * 由 `openai-compat.ts` 的「顶层 code + message」分支产出 —— 即帧是
+   * `{ code: 110, message: 'Billing daily count exceeded', type: 'model_error' }`。
+   * 它被归成 **`SERVER`**，而 `SERVER` **在** harness 的
+   * `DEFAULT_RETRYABLE_CODES` 里 → **白重试 5 次**（500…8000ms ≈ 15.5 秒，
+   * 用户看到的 `7220毫秒` 就是其中一步）。
+   *
+   * ## 客户端权威依据（obf 产物原文）
+   *
+   * ```js
+   * function vpt(e){
+   *   let t = e === "authentication_failed" || e === "billing_error" ? "permission"
+   *         : e === "rate_limit"      ? "rate_limited"
+   *         : e === "invalid_request" ? "invalid_request"
+   *         : "unavailable";
+   *   return new Tt(t, `Qoder assistant failed: ${e}`)
+   * }
+   * ```
+   * **`billing_error` 被归为 `permission`** —— 与 `rate_limit`（可重试）**明确分开**，
+   * 属**不可重试**。故我们必须返回不可重试的错误码（`QUOTA_EXCEEDED`）。
+   *
+   * ⚠️ 与 `10605`（排队）的区别：排队是**暂时**的（等待即可通过），
+   * 额度是**当天耗尽**（等到明天）。两者绝不能用同一套处理。
+   */
+  describe('额度用尽（110 billing）归为不可重试', () => {
+    /** 构造 HTTP 200 + 信封的 110 错误帧。 */
+    function billingFrame(inner) {
+      return () => new Response(
+        `data:${JSON.stringify({
+          headers: { 'Content-Type': ['application/json'] },
+          body: inner,
+          statusCodeValue: 200,
+          statusCode: 'OK',
+        })}\n\n`,
+        { status: 200, headers: { 'Content-Type': 'text/event-stream' } },
+      )
+    }
+
+    it('SSE 帧里的 110 抛 QUOTA_EXCEEDED（而不是可重试的 SERVER）', async () => {
+      const inner = JSON.stringify({ code: 110, message: 'Billing daily count exceeded', type: 'model_error' })
+      const fetchImpl = vi.fn(billingFrame(inner)) as unknown as typeof fetch
+
+      const sleeps: number[] = []
+      let thrown
+      try {
+        await collectWith(makeAdapter({
+          fetchImpl, sleep: async (ms) => { sleeps.push(ms) },
+        }), { model: 'qfmodel', messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }] })
+      } catch (error) { thrown = error }
+
+      // ⚠️ 核心断言：**不可重试** —— 不能让 harness 白退避 5 次
+      expect(thrown?.code, '110 必须归为不可重试的额度错误').toBe('QUOTA_EXCEEDED')
+      expect(sleeps, '额度用尽不该在适配器内部等待').toEqual([])
+      expect(String(thrown?.message)).toContain('Billing daily count exceeded')
+    })
+
+    it('业务码是字符串 "110" 同样识别', async () => {
+      const inner = JSON.stringify({ code: '110', message: 'Billing daily count exceeded', type: 'model_error' })
+      const fetchImpl = vi.fn(billingFrame(inner)) as unknown as typeof fetch
+
+      await expect(collectWith(makeAdapter({
+        fetchImpl, sleep: async () => {},
+      }), { model: 'qfmodel', messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }] }))
+        .rejects.toMatchObject({ code: 'QUOTA_EXCEEDED' })
+    })
+
+    it('客户端把 billing 归 permission 的**判据**用测试锁住（防被改回 SERVER）', async () => {
+      // 这条是「文档即测试」：把客户端权威映射写成可执行断言，
+      // 避免后人只看到注释而误以为 110 属可重试类。
+      const CLIENT_MAPPING = (e) => (
+        e === 'authentication_failed' || e === 'billing_error' ? 'permission'
+          : e === 'rate_limit' ? 'rate_limited'
+            : e === 'invalid_request' ? 'invalid_request'
+              : 'unavailable'
+      )
+      expect(CLIENT_MAPPING('billing_error')).toBe('permission')
+      // ⚠️ 与排队**不同类**：排队是 rate_limit（可重试），额度是 permission（不可重试）
+      expect(CLIENT_MAPPING('rate_limit')).toBe('rate_limited')
+      expect(CLIENT_MAPPING('billing_error')).not.toBe(CLIENT_MAPPING('rate_limit'))
+    })
+  })
 })
