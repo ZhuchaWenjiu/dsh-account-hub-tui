@@ -2177,6 +2177,170 @@ Let me write. / Writing. / Go. / OK. / Producing. / Let me output. / Final.
 `tests/unit/reasoning-loop-adapter.spec.ts`（各适配器中断行为）；
 fixture 为**真实会话文本**（`tests/fixtures/reasoning-*.txt`）。
 
+#### ⚠️ 思考标签泄漏与「引用 `</think>` 导致对话中断」
+
+**真实缺陷**（用户报障，2026-09-27，**在本会话实时复现**）：
+
+> 思考带着 `</think>` 原样输出到正文了，然后正文碰到 think 标签直接没输出就中断了
+
+**根因：上游把 `</think>` 当停止串（stop string）。** 两个症状同一根因，但**性质不同**：
+
+| # | 形态 | 机制 | 处理 |
+|---|---|---|---|
+| ① | 标签**单独**成块（`\n</think>\n\n`） | 服务端把停止串**含在**输出里 | **解析**切走标签（`splitThinkTaggedContent`）；另有过虑兜底（**默认关**）|
+| ② | 标签**跟在正文后** | 服务端在停止串处**掐断**，但仍报 `finish_reason:"stop"` | 改判 `max-tokens`（`isProseTruncatedByStopString`）|
+
+##### ⚠️⚠️ 首要原则：**先把解析做对，过滤只是兜底**
+
+用户明确纠正过设计优先级（2026-09-27）：
+
+> 我们应该正确处理这种**配对格式**的标签优先保证它正确解析，而不只是解析失败
+> 再从泄露的文本中过滤，**过滤只是兜底手段，更要强化做对**
+
+**分工（必须分清，别混）**：
+
+| 层 | 函数 | 开关 | 职责 |
+|---|---|---|---|
+| **解析** | `splitThinkTaggedContent` | **恒开**（不可关）| 认全形态，把标签**切**出去 |
+| **截断识别** | `isProseTruncatedByStopString` | 恒开 | 识别「上游掐断」→ 改判 `max-tokens` |
+| **过滤（兜底）** | `stripBareThinkCloseTag` | **默认关**（`DSH_THINK_LEAK_STRIP=1`）| 删切分没处理的**纯标签块** |
+
+⚠️ **过滤默认关闭是用户决定**（2026-09-27）：
+
+> 我们现在暂时不需要泄露过滤，代码可以保留，文档和注释记明白，后续再实际
+> 使用中看是否还有泄露问题，**加了过滤可能有思考解析失败但是被过滤我们发现不了**
+
+即：**兜底会掩盖解析层的失败**。当前阶段要让泄漏**如实呈现**（观测解析成功率），
+故默认不剥；确需应急再打开。代码保留，接线在（`stripBareThinkCloseTagIfEnabled`）。
+
+⚠️ **该开关语义与另两个开关相反**：`DSH_COURSE_LEAK_STRIP` /
+`DSH_REASONING_LOOP_GUARD` 是「默认开、显式假值才关」；
+`DSH_THINK_LEAK_STRIP` 是「**默认关、显式真值才开**」（`1`/`true`/`yes`/`on`）。
+故用独立的 `resolveThinkLeakStripFlag`，**绝不能与 `resolveCourseLeakStripFlag` 混用**
+（混了会让它默认开，正好与意图相反）。
+
+##### 解析器必须认全形态（旧判据漏 91%）
+
+旧判据只认 `</think:hex>`。普查 41 会话（`scripts/probe-think-forms.mjs`）：
+
+| 形态 | 块数 | 旧判据 | 现判据 |
+|---|---|---|---|
+| `close-only-bare`（裸闭标签）| **38** | ❌ | ✅ |
+| `close-only-hex` | 4 | ✅ | ✅ |
+| `mixed-hex-and-bare` | 2 | ❌ | ✅ |
+| **`paired`（开+闭）** | 2 | ❌ | ✅ |
+
+⇒ 旧判据漏 **42/46（91%）**。这正是「只靠事后过滤」的代价：这 42 处全都会
+把标签泄漏给用户。
+
+⚠️ **配对形态无需单独分支**：定界用**最后一个闭标签**，开标签由
+`THINK_ANY_TAG_RE` 作为「思考段内标签」剔除 ⇒
+`<think>思考</think>正文` → 思考=`思考`、正文=`正文`。
+故正则放宽为 `/<\/think(?::[0-9a-f]+)?>/g`（hex 后缀可选）。
+
+⚠️ **引用语境必须排除**（`isQuotedThinkTag`，四条件）：全库 46 处标签里
+**39 处处于引用语境**（反引号紧邻 / 反引号 span 内 / 单双引号内 / 代码围栏内），
+只有 7 处裸露。若不排除，模型**讨论**标签的正文会被拦腰切断
+（`'</think>无 hex</think>'` 这类）。判据 4（同行引号奇数）**故意偏保守**：
+误判只导致「该切分未切分」（标签留在正文，由兜底处理），
+而不是「把正文当思考移走」（不可逆的内容错位）。
+
+##### ⚠️⚠️ 绝不能用「逐帧探测」当解析门禁（跨帧必然漏判）
+
+**这是本次审计发现的真实缺陷**，我一度写过、后删除：
+
+```ts
+// ❌ 错误写法：逐帧探测，命中才在收尾切分
+if (!proseHasThinkTag && textDelta.includes('</think>')) proseHasThinkTag = true
+// ... 收尾
+if (proseHasThinkTag) { splitThinkTaggedContent(textBlock.text) }
+```
+
+**标签必然跨帧**（上游按 token 切分），该判据要求**完整** 8 字符标签。
+枚举全部分帧方式（`scripts/probe-think-flag-split.mjs`）：
+
+| 文本 | 分 2 帧时漏判 |
+|---|---|
+| `思考</think>正文` | **7/11** |
+| `<think>思考</think>正文` | 7/18 |
+| `思考</think:6124c78e>正文` | 5/20 |
+
+漏判 ⇒ 收尾不切分 ⇒ 标签原样落盘。这与该变量自己的注释
+（「标签可能跨帧到达，必须缓冲到收尾」）**自相矛盾** —— 门禁本身就是那个
+不该存在的逐帧判定。
+
+✅ **正确写法：收尾无条件解析**（现实现）：
+
+```ts
+let textOut = textBlock.text
+{
+  const split = splitThinkTaggedContent(textBlock.text)  // 无标签返回 undefined
+  if (split !== undefined) { /* 思考段并入 reasoning 块，textOut = split.text */ }
+}
+textOut = stripBareThinkCloseTagIfEnabled(textOut)       // 兜底，默认关
+```
+
+⚠️ **为什么不是「先组装再发给 DSH」**：DSH 协议**已经**提供该能力 ——
+`block-end` 的 `block.text` 是**权威覆盖**（`BlockAssembler`：`if (partial.block) return partial.block`；
+客户端 `case "block-end": blocks[i] = toAssistantBlock(chunk.block)`）。
+故**流式照发 delta**（保住首 token 延迟），**收尾用完整文本解析一次**，
+再靠 `block-end` 覆盖 UI。无需（也不应）在流式层攒文本。
+普通响应无标签时返回 `undefined` ⇒ **逐字节不变**（实测单次 1.5µs）。
+
+⚠️ **② 的判据是「反引号奇数 **且** 以反引号收尾」**，两条缺一不可：
+
+- 只有「奇数」不够 —— 未闭合的开引号可能在中间，无法证明是**末尾**被切断；
+- 只用「以反引号结尾」不够 —— 正常的 `` 运行 `pnpm test` `` 也以反引号结尾。
+  实测该粗判据命中 **9** 处（6 处假阳性），本判据命中 **3** 处**全部**为真截断。
+
+**三条实测证据**（`qoder/qfmodel`，正文尾部 + `outputTokens`）：
+
+| 行 | 正文尾部 | outTok | 正要写 |
+|---|---|---|---|
+| 5378 | ``…清洗器只认 ` `` | 369 | `` `</think:hex>` `` |
+| 5412 | ``…多吐了一个孤立的裸 ` `` | 643 | `` `</think>` `` |
+| 5600 | `` 找到了，`trae-adapter.ts` 还没补 ` `` | **37** | `` `</think>` `` |
+
+⚠️ **改判还必须要求「本步无可用工具调用」**：有工具调用说明模型是「写完就去调
+工具」，正文以反引号收尾只是碰巧（判据 B 的 3 个命中全是无工具调用的收尾步）。
+⚠️ 报 `max-tokens` 而非 `tool-calls`：本步没有工具调用，报后者会让 harness 空执行。
+
+⚠️ **停止串是服务端模板内置的，只能防御、不能协商**。注意区分两个层面：
+- **我们从不主动下发它**：`options.stop` 只有**调用方（DSH）**可能传；本仓库
+  6 个适配器（`buddy` / `lobsterai` / `cline` / `loomy` / `raccoon` / `trae`）
+  只是**有则透传**（`if (options.stop !== undefined && options.stop.length > 0)`），
+  **没有一处主动构造** `</think>`；
+- ⚠️ `openai-compat.ts`（qoder / qodercn 路径）**根本不消费 `options.stop`** ——
+  即便如此仍会观察到停止串截断 ⇒ **它来自服务端会话模板，与我们的请求体无关**。
+
+⚠️ **不要在流式层逐帧剥离标签**：标签会**跨帧**到达（`` `<` `` / `` `/thi` `` / `` `nk>` ``），
+逐帧匹配不到完整标签；正确位置是**收尾**的 `block-end`（它是**权威覆盖**）。
+
+**接入范围（两处修复各自覆盖哪些 provider，别记混）**：
+
+| 修复落点 | 文件 | 覆盖的 provider |
+|---|---|---|
+| 共享协议层 | `openai-compat.ts` | **qoder / qodercn**（同类）+ **cline / loomy / raccoon**（各自 import 它） |
+| 独立实现 | `buddy-adapter.ts` | buddy / workbuddy（同产品配置） |
+| 独立实现 | `lobsterai-adapter.ts` | lobsterai |
+| 独立实现 | `trae-adapter.ts` | trae |
+
+⚠️ `src/llm-adapter.ts`（CodeArts）**不使用这两处判据**（它走 DSML / `<thought>`
+提取器，标签语义不同）—— 不要误以为「六份适配器都接了」。
+回归用例：`tests/unit/strip-bare-think.spec.ts`（8 条，剥离判据）、
+`tests/unit/think-stop-string.spec.ts`（12 条，截断判据 + 四类误报边界）。
+
+⚠️ **排查本缺陷时警惕「自己造成的假阳性」**：本会话排查期间我**一直在讨论这个
+标签**，正文里合法地写过 `` `</think>` ``、`'</think>'`、裸 `</think>`（为说明形态）。
+按「裸露 = 泄漏」的粗判据会数出 42 处，其中 **70 处是语法引用、4 处是排查自我指涉**，
+真正的模型泄漏只有 **1 处**（`lilishop-go` 行 21908 的纯标签块）。
+**判据必须排除反引号/单双引号/围栏三种引用语境**，否则会把自己的分析当成模型缺陷。
+
+⚠️ **上游在两个通道各发一遍同一段文字**（本会话实测行 5298：`reasoning-chunks`
+与 `text-chunks` 相隔 348ms、逐字相同、`outputTokens` 两者都计入）。
+**这是上游行为，不是我们的重复发射**（帧是独立的两条，非同一帧二次发射），
+**不需要处理**。
+
 #### ⚠️ 正文（text 通道）死循环：必须**独立实例**且**绝不 `cancel()`**
 
 **真实缺陷**（用户报障，2026-09-25）：唯一活动 session（`lilishop-go` /

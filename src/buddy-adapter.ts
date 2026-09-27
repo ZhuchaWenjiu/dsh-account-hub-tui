@@ -32,7 +32,7 @@ import {
 import type { BuddyCredential, BuddyRemoteModel } from './buddy.js'
 import { CODEBUDDY, resolveUserAgent, type BuddyFallbackModel, type BuddyProduct } from './product.js'
 import { normalizeHarnessMessages } from './message-shape.js'
-import { createBlankReasoningSuppressor, createReasoningLoopDetector, hasUsableToolName, isReasoningLoopGuardEnabled, isTruncatedArguments, normalizeToolArguments, readWithIdleTimeout, resolveEmptyResponseReason, resolveToolPairing, splitThinkTaggedContent, stripCourseLeakFromHistoryContent, stripCourseLeakIfEnabled } from './sse.js'
+import { createBlankReasoningSuppressor, createReasoningLoopDetector, hasUsableToolName, isProseTruncatedByStopString, isReasoningLoopGuardEnabled, isTruncatedArguments, normalizeToolArguments, readWithIdleTimeout, resolveEmptyResponseReason, resolveToolPairing, splitThinkTaggedContent, stripBareThinkCloseTagIfEnabled, stripCourseLeakFromHistoryContent, stripCourseLeakIfEnabled } from './sse.js'
 
 /**
  * CodeBuddy（中国版）的 chat completions 基址。
@@ -1355,13 +1355,10 @@ export class BuddyAdapter extends LlmAdapter {
      */
     const proseLoopGuard = isReasoningLoopGuardEnabled() ? createReasoningLoopDetector() : undefined
     let proseLoopDetected = false
-    /**
-     * `</think:hex>` 泄漏的待定正文（见 `splitThinkTaggedContent`）。
-     *
-     * 标签可能**跨帧**到达（`</think:612` + `4c78e>`），故不能逐帧判定，
-     * 必须缓冲到收尾时一次性切分。
-     */
-    let proseHasThinkTag = false
+    // ⚠️ 此处**曾有** `proseHasThinkTag` 门禁变量，2026-09-27 **删除**。
+    // 它逐帧匹配标签来决定收尾是否切分，而标签**必然跨帧**（上游可切成任意片段），
+    // 实测二分帧时 7/11 种切法漏判 → 标签落盘泄漏。现改为收尾**无条件**调用
+    // `splitThinkTaggedContent`（无标签时返回 undefined，普通响应逐字节不变）。
     /**
      * 纯空白思考抑制器（见 `createBlankReasoningSuppressor`）。与 `blocks` /
      * `loopGuard` 同生命周期：**每个 `stream()` 调用建一个实例**。
@@ -1481,9 +1478,11 @@ export class BuddyAdapter extends LlmAdapter {
             if (proseLoopGuard !== undefined) {
               if (proseLoopGuard.observe(delta.content)) proseLoopDetected = true
             }
-            // `</think:hex>` 泄漏探测：标签可能跨帧，故只做廉价子串判定，
-            // 真正切分放在收尾（见文件末尾 text 段）。
-            if (!proseHasThinkTag && delta.content.includes('think:')) proseHasThinkTag = true
+            // ⚠️ **不要在这里逐帧探测 think 标签**（2026-09-27 移除）。
+            // 逐帧探测在跨帧时必然漏判（标签可被切成任意片段，实测二分帧时
+            // 7/11 种切法漏判）→ 收尾不切分 → 标签落盘泄漏。
+            // 现改为收尾**无条件**调用 `splitThinkTaggedContent`
+            // （无标签时返回 undefined，普通响应逐字节不变）。
             if (!proseLoopDetected) {
               block.text += delta.content
               yield { type: 'text-delta', index: block.index, text: delta.content }
@@ -1622,6 +1621,11 @@ export class BuddyAdapter extends LlmAdapter {
      * 故此处**在每个 `block-end` 的发射点自增**，与下面三段发射逻辑逐条对齐。
      */
     let blockCount = 0
+    /**
+     * 本步**最终发出的正文**（`block-end` 的权威文本），供 finish 归类判定
+     * 「是否被上游停止串截断」（见 `isProseTruncatedByStopString`）。
+     */
+    let emittedProse = ''
     // 按创建顺序关闭每个块
     const textBlock = blocks.find(block => block.kind === 'text')
     for (const index of toolOrder) {
@@ -1648,11 +1652,16 @@ export class BuddyAdapter extends LlmAdapter {
       }
     }
     if (textBlock !== undefined) {
-      // ── `</think:hex>` 泄漏归位（见 `splitThinkTaggedContent`）──
+      // ── think 标签归位（见 `splitThinkTaggedContent`）──
       // 标签**前**的内心独白 → reasoning 块；标签**后**的真正文 → 本 text 块。
       // 无标签时**逐字节不变**。
+      //
+      // ⚠️ **必须无条件调用，不得加「先探测有没有标签」的门禁**（2026-09-27 修）：
+      // 标签会**跨帧**到达，任何逐帧探测都会漏判（实测二分帧 7/11 漏），
+      // 漏了就不切分、标签原样泄漏。无标签时本函数返回 undefined，故普通响应
+      // 逐字节不变（仅多一次字符串扫描）。
       let textOut = textBlock.text
-      if (proseHasThinkTag) {
+      {
         const split = splitThinkTaggedContent(textBlock.text)
         if (split !== undefined) {
           // ⚠️ **必须同时喂 `suppressor`**：收尾以 `suppressor.text()` 为
@@ -1669,6 +1678,19 @@ export class BuddyAdapter extends LlmAdapter {
           textOut = split.text
         }
       }
+      // ── 残留标签**兜底剥离**（见 `stripBareThinkCloseTag`）──
+      //
+      // ⚠️ **默认关闭**（`DSH_THINK_LEAK_STRIP=1` 才启用）。用户决定（2026-09-27）：
+      // > 暂时不需要泄露过滤……**加了过滤可能有思考解析失败但是被过滤我们发现不了。**
+      // 即兜底会**掩盖解析层的失败**；当前要让泄漏如实呈现以便观测。
+      //
+      // ⚠️ **必须在切分之后**：切分负责「解析」，本行只兜底纯标签块。
+      //
+      // ⚠️ **必须在 hex 切分之后**（顺序不可颠倒）：若放在切分之前，
+      // `思考</think:6124c78e></think>` 这类「hex 后跟裸标签」的形态会漏 ——
+      // 切分把裸标签留在正文侧，直接泄漏进 UI（审计实测到的真实缺陷）。
+      // 放在末尾同时覆盖两种形态：切分产物再剥一次、纯裸标签块（无 hex）也在此剥离。
+      textOut = stripBareThinkCloseTagIfEnabled(textOut)
       // 正文死循环截断：只保留循环前的干净前缀（与思考守卫同一覆盖机制）。
       // ⚠️ **不改 finish reason**：工具调用仍要被执行。
       const truncated = proseLoopDetected && proseLoopGuard?.cutAt !== undefined
@@ -1681,6 +1703,7 @@ export class BuddyAdapter extends LlmAdapter {
       // 故本响应仍有产出，不会被误判为零块。
       if (cleaned !== '') {
         blockCount += 1
+        emittedProse = cleaned
         yield { type: 'block-end', index: textBlock.index, block: { type: 'text', text: cleaned } }
       }
     }
@@ -1724,6 +1747,17 @@ export class BuddyAdapter extends LlmAdapter {
      * （不完整、可重试）。同批若还有可用调用，则照常报 tool-calls。
      */
     const droppedUnnamedCalls = [...toolCalls.values()].some(block => !block.announced)
+    /**
+     * 正文是否被**上游停止串**掐断（见 `isProseTruncatedByStopString`）。
+     *
+     * 上游把 `</think>` 当停止串：模型在正文里写它（哪怕包在反引号里）就会被
+     * 掐断，但仍报 `finish_reason:"stop"` —— 我们据此判「正常答完」会让本轮
+     * **没有任何报错就停住**。判据三条同时成立：上游报 `stop`、本步无可用工具
+     * 调用、正文止于未闭合的行内代码。
+     */
+    const proseCutByStopString = finishReason === 'stop'
+      && toolOrder.length === 0
+      && isProseTruncatedByStopString(emittedProse)
     const reason = loopDetected
       // 思考死循环：截断并报可重试。**优先级最高** —— 循环中生成的工具调用
       // 参数不可信；且若无可用调用，落到 `stop` 会让任务静默中断。
@@ -1731,6 +1765,7 @@ export class BuddyAdapter extends LlmAdapter {
       : finishReason === 'length'
         || finishReason === undefined && toolOrder.length > 0
         || argsTruncated
+        || proseCutByStopString
         || droppedUnnamedCalls && toolOrder.length === 0
         ? { kind: 'max-tokens' as const }
         : finishReason === 'tool_calls' || toolOrder.length > 0

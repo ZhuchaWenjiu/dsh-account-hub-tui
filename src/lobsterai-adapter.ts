@@ -52,7 +52,7 @@ import {
   type LobsteraiErrorKind,
 } from './lobsterai-errors.js'
 import { normalizeHarnessMessages } from './message-shape.js'
-import { createBlankReasoningSuppressor, createReasoningLoopDetector, hasUsableToolName, isReasoningLoopGuardEnabled, isTruncatedArguments, normalizeToolArguments, readWithIdleTimeout, resolveEmptyResponseReason, resolveToolPairing, splitThinkTaggedContent, stripCourseLeakFromHistoryContent, stripCourseLeakIfEnabled } from './sse.js'
+import { createBlankReasoningSuppressor, createReasoningLoopDetector, hasUsableToolName, isProseTruncatedByStopString, isReasoningLoopGuardEnabled, isTruncatedArguments, normalizeToolArguments, readWithIdleTimeout, resolveEmptyResponseReason, resolveToolPairing, splitThinkTaggedContent, stripBareThinkCloseTagIfEnabled, stripCourseLeakFromHistoryContent, stripCourseLeakIfEnabled } from './sse.js'
 
 /** 本适配器注册的 provider 路由名（历史常量，等价于 `LOBSTERAI.id`）。 */
 export const PROVIDER = 'lobsterai'
@@ -1215,8 +1215,9 @@ export class LobsteraiAdapter extends LlmAdapter {
      */
     const proseLoopGuard = isReasoningLoopGuardEnabled() ? createReasoningLoopDetector() : undefined
     let proseLoopDetected = false
-    /** `</think:hex>` 泄漏探测（跨帧，收尾再切分）。 */
-    let proseHasThinkTag = false
+    // ⚠️ 此处**曾有** `proseHasThinkTag` 门禁变量，2026-09-27 **删除**。
+    // 逐帧探测在跨帧时必然漏判（实测二分帧 7/11 漏）→ 收尾不切分 → 标签泄漏。
+    // 现改为收尾**无条件**调用 `splitThinkTaggedContent`。
     /**
      * 纯空白思考抑制器（见 `createBlankReasoningSuppressor`）。与 `blocks` /
      * `loopGuard` 同生命周期：**每个 `stream()` 调用建一个实例**。
@@ -1359,8 +1360,9 @@ export class LobsteraiAdapter extends LlmAdapter {
             if (proseLoopGuard !== undefined) {
               if (proseLoopGuard.observe(textDelta)) proseLoopDetected = true
             }
-            // `</think:hex>` 泄漏探测（跨帧，故只做子串判定，收尾再切分）。
-            if (!proseHasThinkTag && textDelta.includes('think:')) proseHasThinkTag = true
+            // ⚠️ **不要在这里逐帧探测 think 标签**（2026-09-27 移除）：
+            // 跨帧必然漏判（实测二分帧 7/11 漏）→ 收尾不切分 → 标签泄漏。
+            // 改为收尾无条件调用 `splitThinkTaggedContent`。
             if (!proseLoopDetected) {
               block.text += textDelta
               yield { type: 'text-delta', index: block.index, text: textDelta }
@@ -1493,6 +1495,8 @@ export class LobsteraiAdapter extends LlmAdapter {
      * 故此处**在每个 `block-end` 的发射点自增**，与下面三段发射逻辑逐条对齐。
      */
     let blockCount = 0
+    /** 本步**最终发出的正文**，供 finish 归类判定「是否被上游停止串截断」。 */
+    let emittedProse = ''
     // 按创建顺序关闭每个块
     const textBlock = blocks.find(block => block.kind === 'text')
     for (const index of toolOrder) {
@@ -1515,11 +1519,16 @@ export class LobsteraiAdapter extends LlmAdapter {
       }
     }
     if (textBlock !== undefined) {
-      // ── `</think:hex>` 泄漏归位（见 `splitThinkTaggedContent`）──
+      // ── think 标签归位（见 `splitThinkTaggedContent`）──
       // 标签**前**的内心独白 → reasoning 块；标签**后**的真正文 → 本 text 块。
       // 无标签时**逐字节不变**。
+      //
+      // ⚠️ **必须无条件调用，不得加「先探测有没有标签」的门禁**（2026-09-27 修）：
+      // 标签会**跨帧**到达，任何逐帧探测都会漏判（实测二分帧 7/11 漏），
+      // 漏了就不切分、标签原样泄漏。无标签时本函数返回 undefined，故普通响应
+      // 逐字节不变（仅多一次字符串扫描）。
       let textOut = textBlock.text
-      if (proseHasThinkTag) {
+      {
         const split = splitThinkTaggedContent(textBlock.text)
         if (split !== undefined) {
           // ⚠️ **必须同时喂 `suppressor`**：收尾以 `suppressor.text()` 为
@@ -1536,6 +1545,19 @@ export class LobsteraiAdapter extends LlmAdapter {
           textOut = split.text
         }
       }
+      // ── 残留标签**兜底剥离**（见 `stripBareThinkCloseTag`）──
+      //
+      // ⚠️ **默认关闭**（`DSH_THINK_LEAK_STRIP=1` 才启用）。用户决定（2026-09-27）：
+      // > 暂时不需要泄露过滤……**加了过滤可能有思考解析失败但是被过滤我们发现不了。**
+      // 即兜底会**掩盖解析层的失败**；当前要让泄漏如实呈现以便观测。
+      //
+      // ⚠️ **必须在切分之后**：切分负责「解析」，本行只兜底纯标签块。
+      //
+      // ⚠️ **必须在 hex 切分之后**（顺序不可颠倒）：若放在切分之前，
+      // `思考</think:6124c78e></think>` 这类「hex 后跟裸标签」的形态会漏 ——
+      // 切分把裸标签留在正文侧，直接泄漏进 UI（审计实测到的真实缺陷）。
+      // 放在末尾同时覆盖两种形态：切分产物再剥一次、纯裸标签块（无 hex）也在此剥离。
+      textOut = stripBareThinkCloseTagIfEnabled(textOut)
       // 正文死循环截断：只保留循环前的干净前缀。
       // ⚠️ **不改 finish reason**：工具调用仍要被执行。
       const truncated = proseLoopDetected && proseLoopGuard?.cutAt !== undefined
@@ -1547,6 +1569,7 @@ export class LobsteraiAdapter extends LlmAdapter {
       // `EMPTY_RESPONSE` 契约禁止产出空内容块。思考段已归位，故仍有产出。
       if (cleaned !== '') {
         blockCount += 1
+        emittedProse = cleaned
         yield { type: 'block-end', index: textBlock.index, block: { type: 'text', text: cleaned } }
       }
     }
@@ -1583,6 +1606,16 @@ export class LobsteraiAdapter extends LlmAdapter {
     // 而非 stop（否则模型本意调工具、harness 却认为「正常答完了」）。
     const argsTruncated = [...toolCalls.values()].some(block => isTruncatedArguments(block.text))
     const droppedUnnamedCalls = [...toolCalls.values()].some(block => !block.announced)
+    /**
+     * 正文是否被**上游停止串**掐断（见 `isProseTruncatedByStopString`）。
+     *
+     * 上游把 `</think>` 当停止串：模型在正文里写它（哪怕包在反引号里）就会被
+     * 掐断，但仍报 `finish_reason:"stop"` —— 我们据此判「正常答完」会让本轮
+     * **没有任何报错就停住**。
+     */
+    const proseCutByStopString = finishReason === 'stop'
+      && toolOrder.length === 0
+      && isProseTruncatedByStopString(emittedProse)
     const reason = loopDetected
       // 思考死循环：截断并报可重试。**优先级最高** —— 循环中生成的工具调用
       // 参数不可信；且若无可用调用，落到 `stop` 会让任务静默中断。
@@ -1590,6 +1623,7 @@ export class LobsteraiAdapter extends LlmAdapter {
       : finishReason === 'length'
         || (finishReason === undefined && toolOrder.length > 0)
         || argsTruncated
+        || proseCutByStopString
         || (droppedUnnamedCalls && toolOrder.length === 0)
         ? { kind: 'max-tokens' as const }
         : finishReason === 'tool_calls' || toolOrder.length > 0

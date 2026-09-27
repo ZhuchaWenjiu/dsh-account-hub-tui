@@ -40,6 +40,7 @@ import {
   createBlankReasoningSuppressor,
   createReasoningLoopDetector,
   hasUsableToolName,
+  isProseTruncatedByStopString,
   isReasoningLoopGuardEnabled,
   isTruncatedArguments,
   normalizeToolArguments,
@@ -47,6 +48,7 @@ import {
   resolveEmptyResponseReason,
   resolveToolPairing,
   splitThinkTaggedContent,
+  stripBareThinkCloseTagIfEnabled,
   stripCourseLeakFromHistoryContent,
   stripCourseLeakIfEnabled,
 } from './sse.js'
@@ -434,14 +436,11 @@ export async function* consumeOpenAiSse(
    */
   const proseLoopGuard = isReasoningLoopGuardEnabled() ? createReasoningLoopDetector() : undefined
   let proseLoopDetected = false
-  /**
-   * `</think:hex>` 泄漏的**待定正文**（见 `splitThinkTaggedContent`）。
-   *
-   * 实测 `hy4-preview-f` 把思考写进 `content` 通道，只在思考段末尾留一个闭标签。
-   * 由于标签**可能跨帧到达**（`</think:612` + `4c78e>`），不能逐帧判定 ——
-   * 必须缓冲到收尾时一次性切分。故这里只累积，`block-end` 时再归位。
-   */
-  let proseHasThinkTag = false
+  // ⚠️ 此处**曾有** `proseHasThinkTag` 门禁变量，2026-09-27 **删除**。
+  // 它逐帧匹配标签来决定收尾是否切分，而标签**必然跨帧**（上游可切成任意片段），
+  // 实测二分帧时 7/11 种切法漏判 → 标签落盘泄漏。现改为收尾**无条件**调用
+  // `splitThinkTaggedContent`（无标签时返回 undefined，普通响应逐字节不变）。
+  // 详见收尾处的说明。
   /**
    * 纯空白思考抑制器（见 `createBlankReasoningSuppressor`）。与 `blocks` /
    * `loopGuard` 同生命周期：**每个 `stream()` 调用建一个实例**。
@@ -731,11 +730,20 @@ export async function* consumeOpenAiSse(
           if (proseLoopGuard !== undefined) {
             if (proseLoopGuard.observe(textDelta)) proseLoopDetected = true
           }
-          // `</think:hex>` 泄漏探测（见 `splitThinkTaggedContent`）：标签可能
-          // **跨帧**到达，故只做「是否出现过」的廉价判定，真正切分放在收尾。
-          // 判据用 `think` 子串而非完整正则：跨帧时正则匹配不到，
-          // 但完整子串判定能可靠地把「本步需切分」标记出来。
-          if (!proseHasThinkTag && textDelta.includes('think:')) proseHasThinkTag = true
+          // ⚠️ **不要在这里逐帧探测 think 标签**（2026-09-27 移除）。
+          //
+          // 历史实现用一个 `proseHasThinkTag` 布尔量当**门禁**，逐帧判
+          // `textDelta.includes('</think>')`，命中才在收尾调切分。
+          // 该门禁**在跨帧时必然漏判**：标签会被上游切成任意片段
+          // （`思考<` + `/think>正文`、`思考</thi` + `nk>正文` …），
+          // 实测（`scripts/probe-think-flag-split.mjs`）裸闭标签二分帧时
+          // **7/11 种切法漏判** → 收尾不切分 → 标签原样落盘泄漏。
+          // 这与本变量注释里自己写明的「标签可能跨帧到达，必须缓冲到收尾」
+          // **自相矛盾** —— 门禁本身就是那个不该存在的逐帧判定。
+          //
+          // 现改为**收尾无条件调用** `splitThinkTaggedContent`：
+          // 它无闭标签时返回 `undefined`，调用方走原路径，
+          // 故普通响应仍**逐字节不变**（功能等价，只是多一次字符串扫描）。
           if (!proseLoopDetected) {
             block.text += textDelta
             yield { type: 'text-delta', index: block.index, text: textDelta }
@@ -894,6 +902,14 @@ export async function* consumeOpenAiSse(
    * 故此处**在每个 `block-end` 的发射点自增**，与下面三段发射逻辑逐条对齐。
    */
   let blockCount = 0
+  /**
+   * 本步**最终发出的正文**（`block-end` 的权威文本），供 finish 归类判定
+   * 「是否被上游停止串截断」（见 `isProseTruncatedByStopString`）。
+   *
+   * ⚠️ 必须取**清洗后**的值：`stripBareThinkCloseTag` 可能把纯标签块清成空串，
+   * 那种块**不会发射**，也就不是「被截断的正文」。
+   */
+  let emittedProse = ''
   // 按创建顺序关闭每个块
   const textBlock = blocks.find(block => block.kind === 'text')
   for (const index of toolOrder) {
@@ -926,15 +942,20 @@ export async function* consumeOpenAiSse(
     }
   }
   if (textBlock !== undefined) {
-    // ── `</think:hex>` 泄漏归位（见 `splitThinkTaggedContent`）──
+    // ── think 标签归位（见 `splitThinkTaggedContent`）──
     //
-    // ⚠️ 必须在**收尾**做，不能逐帧做：标签会跨帧到达
-    // （`</think:61` + `24c78e>`），逐帧匹配不到完整标签。
+    // ⚠️ **必须无条件调用，不得加「先探测有没有标签」的门禁**（2026-09-27 修）。
+    // 标签会**跨帧**到达（`</think:61` + `24c78e>`，甚至 `思考<` + `/think>正文`），
+    // 任何逐帧探测都会漏判 —— 实测二分帧时裸闭标签 **7/11 种切法漏判**，
+    // 漏了就不切分、标签原样落盘泄漏给用户。
+    //
+    // 无标签时 `splitThinkTaggedContent` 返回 `undefined`，此处整段跳过，
+    // 故普通响应**逐字节不变**（只是多一次字符串扫描，代价可忽略）。
     //
     // 归位语义：标签**前**的内心独白 → 既有 reasoning 块（或新建一个），
-    // 标签**后**的真正文 → 本 text 块。无标签时**逐字节不变**。
+    // 标签**后**的真正文 → 本 text 块。覆盖配对/hex/裸三种形态。
     let textOut = textBlock.text
-    if (proseHasThinkTag) {
+    {
       const split = splitThinkTaggedContent(textBlock.text)
       if (split !== undefined) {
         // 思考段并入既有 reasoning 块（实测有 3 步两者同时存在），
@@ -955,6 +976,17 @@ export async function* consumeOpenAiSse(
         textOut = split.text
       }
     }
+    // ── 残留标签**兜底剥离**（见 `stripBareThinkCloseTag`）──
+    //
+    // ⚠️ **默认关闭**（`DSH_THINK_LEAK_STRIP=1` 才启用）。用户决定（2026-09-27）：
+    // > 暂时不需要泄露过滤……**加了过滤可能有思考解析失败但是被过滤我们发现不了。**
+    // 即：兜底会**掩盖解析层的失败**。当前阶段要让泄漏**如实呈现**，
+    // 才能观测「解析是否真的做对了」；确需应急再打开。
+    //
+    // ⚠️ **必须放在切分之后**（顺序不可颠倒）：切分负责「解析」，
+    // 本行只兜底删掉切分没处理的**纯标签块**（无正文可解析的那种）。
+    // 判据只认纯标签块 → 含正文的块原样返回，故模型**讨论**标签的正文不受影响。
+    textOut = stripBareThinkCloseTagIfEnabled(textOut)
     // 正文死循环截断：只保留循环前的干净前缀（与思考守卫同一机制 ——
     // `block-end` 的 block 是**权威覆盖**，见 scripts/verify-blockend-override.ts）。
     //
@@ -971,6 +1003,7 @@ export async function* consumeOpenAiSse(
     // 但**思考段已归位**，故本响应仍有内容产出，不会被误判为零块。
     if (cleanedText !== '') {
       blockCount += 1
+      emittedProse = cleanedText
       yield { type: 'block-end', index: textBlock.index, block: { type: 'text', text: cleanedText } }
     }
   }
@@ -1052,6 +1085,29 @@ export async function* consumeOpenAiSse(
    */
   const truncatedStream = finishReason === undefined && !streamEnded
 
+  /**
+   * 正文是否被**上游停止串**掐断（见 `isProseTruncatedByStopString`）。
+   *
+   * ⚠️ **用户报障的真实缺陷**（2026-09-27）：「正文引用 `</think>` 导致对话中断」。
+   * 上游把 `</think>` 当停止串，模型在正文里写它（哪怕包在反引号里）就会被掐断，
+   * 但服务端仍报 `finish_reason:"stop"` —— 我们据此判「模型正常答完」，
+   * harness 认为本轮已完成 → **没有任何报错就停住**（与 AGENTS.md 记的
+   * 「静默中断」同一类）。
+   *
+   * 判据收紧为**三条同时成立**，避免误伤正常回答：
+   *   1. 上游报 `stop`（`length` / 中途断流已被上面的分支覆盖，不必重复）；
+   *   2. **本步没有可执行的工具调用** —— 有工具调用说明模型是「写完就去调工具」，
+   *      正文以反引号收尾只是碰巧（实测判据 B 的 3 个命中全都是无工具调用的收尾步）；
+   *   3. 正文止于**未闭合的行内代码**（反引号奇数且以反引号收尾）。
+   *
+   * 报 `max-tokens`（不完整、可重试）而非 `stop`：DSH 收到 `max-tokens` 会
+   * 结束本轮并提示用户，**不会**把半句话当成完整答复 —— 用户可据此继续。
+   * ⚠️ 不可报 `tool-calls`：本步没有工具调用，报它会让 harness 空执行。
+   */
+  const proseCutByStopString = finishReason === 'stop'
+    && toolOrder.length === 0
+    && isProseTruncatedByStopString(emittedProse)
+
   const reason = loopDetected
     // 思考死循环：截断并报可重试。优先级最高 —— 循环中生成的工具调用
     // 参数不可信，且若无任何可用调用，落到 `stop` 会让任务静默中断。
@@ -1060,6 +1116,7 @@ export async function* consumeOpenAiSse(
     || incompleteTools
     || truncatedStream
     || argsTruncated
+    || proseCutByStopString
     // 丢弃了无名 tool-call、且**没有**任何可用调用留下来时，本步否则会以
     // `stop` 收场 —— 模型本意要调工具、harness 却认为「正常答完了」，
     // 又是一次无报错中断。报 max-tokens 让它重试。
