@@ -208,10 +208,13 @@ export function apply(ctx: Context): void {
   const buddy = new BuddyAuth(ctx)
   const buddyAdapter = registerBuddyLlm(ctx, {
     credentialRef: credentialRef(BUDDY_CREDENTIAL_REF),
-    resolveCredential: async () => {
+    resolveCredential: async (modelId?: string) => {
       // 优先使用账号池获取可用账号，回退到单凭据解析
       if (pool) {
-        const available = await pool.getAvailableAccount('buddy', '')
+        // ⚠️ `modelId` 必须透传：限流按**模型**记（`modelRateLimits[model]`），
+        // 传空串会让 `getAvailableAccount` 的限流过滤整体短路
+        //（`if (modelId.length === 0) return true`）→ 被标记限流的账号仍被选中。
+        const available = await pool.getAvailableAccount('buddy', modelId ?? '')
         if (available) return available.credential as BuddyCredential
       }
       const resolved = await ctx.credentials.resolve(credentialRef(BUDDY_CREDENTIAL_REF))
@@ -240,10 +243,11 @@ export function apply(ctx: Context): void {
   const workbuddy = new BuddyAuth(ctx, { product: WORKBUDDY })
   const workbuddyAdapter = registerBuddyLlm(ctx, {
     credentialRef: credentialRef(WORKBUDDY.defaultCredentialRef),
-    resolveCredential: async () => {
+    resolveCredential: async (modelId?: string) => {
       // 只从 workbuddy 的账号池取账号，回退到 WorkBuddy 自己的单凭据 ref，
       // 保证不会串用 CodeBuddy 的凭据。
-      const available = await pool.getAvailableAccount('workbuddy', '')
+      // ⚠️ `modelId` 透传：否则模型级限流标记被忽略（详见 buddy 处说明）。
+      const available = await pool.getAvailableAccount('workbuddy', modelId ?? '')
       if (available) return available.credential as BuddyCredential
       const resolved = await ctx.credentials.resolve(credentialRef(WORKBUDDY.defaultCredentialRef))
       if (!resolved) return undefined
@@ -270,12 +274,13 @@ export function apply(ctx: Context): void {
   const lobsterai = new LobsteraiAuth(ctx)
   const lobsteraiAdapter = registerLobsteraiLlm(ctx, {
     credentialRef: credentialRef(LOBSTERAI.defaultCredentialRef),
-    resolveCredential: async () => {
+    resolveCredential: async (modelId?: string) => {
       // 只从 LobsterAI 自己的账号池取账号，回退到自己的单凭据 ref，
       // 保证不会串用 CodeBuddy / WorkBuddy / CodeArts 的凭据。
       // provider 实参用 LOBSTERAI.id 而非字面量 'lobsterai'：写死字面量在
       // 改名/多产品场景下会静默查不到账号（本插件在 workbuddy 上踩过同类坑）。
-      const available = await pool.getAvailableAccount(LOBSTERAI.id, '')
+      // ⚠️ `modelId` 透传：否则模型级限流标记被忽略（详见 buddy 处说明）。
+      const available = await pool.getAvailableAccount(LOBSTERAI.id, modelId ?? '')
       if (available) return available.credential as LobsteraiCredential
       const resolved = await ctx.credentials.resolve(credentialRef(LOBSTERAI.defaultCredentialRef))
       if (!resolved) return undefined
@@ -333,12 +338,15 @@ export function apply(ctx: Context): void {
   const activeQoderAccountId = new Map<string, string | undefined>()
   const qoderAdapter = registerQoderLlm(ctx, {
     credentialRef: credentialRef(QODER.defaultCredentialRef),
-    resolveCredential: async () => {
+    resolveCredential: async (modelId?: string) => {
       // 只从 Qoder 自己的账号池取账号，回退到自己的单凭据 ref，
       // 保证不会串用其它 provider 的凭据。
       // provider 实参用 QODER.id 而非字面量 'qoder'：写死字面量在
       // 改名/多产品场景下会静默查不到账号（本插件在 workbuddy 上踩过同类坑）。
-      const available = await pool.getAvailableAccount(QODER.id, '')
+      // ⚠️ `modelId` 透传：Qoder 的额度是「模型 + 账号」维度（见
+      // `qoder-adapter.ts` 的 `switchAccountOnQuota`），传空串会让它刚写下的
+      // 当日额度标记在下次选号时被忽略。
+      const available = await pool.getAvailableAccount(QODER.id, modelId ?? '')
       if (available) {
         activeQoderAccountId.set(QODER.id, available.entry.id)
         return available.credential as QoderCredential
@@ -385,11 +393,12 @@ export function apply(ctx: Context): void {
   const qoderCn = new QoderAuth(ctx, { product: QODER_CN })
   const qoderCnAdapter = registerQoderLlm(ctx, {
     credentialRef: credentialRef(QODER_CN.defaultCredentialRef),
-    resolveCredential: async () => {
+    resolveCredential: async (modelId?: string) => {
       // 只取中国版自己账号池的账号，回退到 QODERCN_ACCESS_TOKEN。
       // ⚠️ provider 实参必须是 QODER_CN.id：写死 'qoder' 会让中国版
       // 永远查不到自己的账号（本插件在 workbuddy 上踩过同类坑）。
-      const available = await pool.getAvailableAccount(QODER_CN.id, '')
+      // ⚠️ `modelId` 透传：与 QODER.id 同因（当日额度是「模型 + 账号」维度）。
+      const available = await pool.getAvailableAccount(QODER_CN.id, modelId ?? '')
       if (available) {
         activeQoderAccountId.set(QODER_CN.id, available.entry.id)
         return available.credential as QoderCredential
@@ -430,8 +439,12 @@ export function apply(ctx: Context): void {
   const trae = new TraeAuth(ctx)
   const traeAdapter = registerTraeLlm(ctx, {
     credentialRef: credentialRef(TRAE.defaultCredentialRef),
-    resolveCredential: async () => {
-      const available = await pool.getAvailableAccount(TRAE.id, '')
+    resolveCredential: async (modelId?: string) => {
+      // ⚠️ `modelId` 必须透传：限流是**按模型**记的（`modelRateLimits[model]`），
+      // 传空串会让 `getAvailableAccount` 的限流过滤整体短路
+      //（`if (modelId.length === 0) return true`）→ 被标记限流的账号仍被选中，
+      // 换号形同虚设（用户报障「没有切换」的根因之一）。
+      const available = await pool.getAvailableAccount(TRAE.id, modelId ?? '')
       if (available) return available.credential as TraeCredential
       const resolved = await ctx.credentials.resolve(credentialRef(TRAE.defaultCredentialRef))
       if (!resolved) return undefined
@@ -463,12 +476,13 @@ export function apply(ctx: Context): void {
   const cline = new ClineAuth(ctx)
   const clineAdapter = registerClineLlm(ctx, {
     credentialRef: credentialRef(CLINE.defaultCredentialRef),
-    resolveCredential: async () => {
+    resolveCredential: async (modelId?: string) => {
       // 只从 Cline 自己的账号池取账号，回退到自己的单凭据 ref，
       // 保证不会串用其它 provider 的凭据。
       // provider 实参用 CLINE.id 而非字面量 'cline'：写死字面量在
       // 改名/多产品场景下会静默查不到账号（本插件在 workbuddy 上踩过同类坑）。
-      const available = await pool.getAvailableAccount(CLINE.id, '')
+      // ⚠️ `modelId` 透传：否则模型级限流标记被忽略（详见 buddy 处说明）。
+      const available = await pool.getAvailableAccount(CLINE.id, modelId ?? '')
       if (available) return available.credential as ClineCredential
       const resolved = await ctx.credentials.resolve(credentialRef(CLINE.defaultCredentialRef))
       if (!resolved) return undefined
@@ -650,12 +664,13 @@ export function apply(ctx: Context): void {
   const raccoon = new RaccoonAuth(ctx)
   const raccoonAdapter = registerRaccoonLlm(ctx, {
     credentialRef: credentialRef(RACCOON.defaultCredentialRef),
-    resolveCredential: async () => {
+    resolveCredential: async (modelId?: string) => {
       // 只从 raccoon 自己的账号池取账号，回退到自己的单凭据 ref，
       // 保证不会串用其它 provider 的凭据。
       // provider 实参用 RACCOON.id 而非字面量：写死字面量在改名/多产品场景下
       // 会静默查不到账号（本插件在 workbuddy 上踩过同类坑）。
-      const available = await pool.getAvailableAccount(RACCOON.id, '')
+      // ⚠️ `modelId` 透传：否则模型级限流标记被忽略（详见 buddy 处说明）。
+      const available = await pool.getAvailableAccount(RACCOON.id, modelId ?? '')
       // `getAvailableAccount` 的凭据类型是 `CodeArtsCredential | BuddyCredential`
       // 联合（历史遗留），与 `RaccoonCredential` 无充分重叠，故经 `unknown` 转换。
       // 运行时安全性由 provider 过滤保证：查询用 `RACCOON.id`，取到的必是 raccoon 凭据。

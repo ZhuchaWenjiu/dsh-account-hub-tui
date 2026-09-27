@@ -171,7 +171,7 @@ export interface BuddyAdapterOptions {
   /** 前缀缓存会话标识（prompt_cache_key）；未提供时随机生成一个。 */
   sessionId?: string
   /** 从凭据存储解析凭据。 */
-  resolveCredential: () => Promise<BuddyCredential | undefined>
+  resolveCredential: (modelId?: string) => Promise<BuddyCredential | undefined>
   /** 静默续期凭据。 */
   refresh: () => Promise<void>
   /** 动态拉取远端模型列表（含上下文窗口与能力，若远端下发）；失败时调用方回退到静态列表。 */
@@ -957,10 +957,10 @@ export class BuddyAdapter extends LlmAdapter {
 
   async *stream(options: GenerateOptions): AsyncIterable<StreamChunk> {
     // 1. 获取凭据（过期则先静默续期）
-    let credential = await this.options.resolveCredential()
+    let credential = await this.options.resolveCredential(options.model)
     if (credential === undefined || isCredentialExpired(credential)) {
       await this.options.refresh()
-      credential = await this.options.resolveCredential()
+      credential = await this.options.resolveCredential(options.model)
     }
     if (credential === undefined || credential.access_token.length === 0) {
       throw new LlmError('buddy: no usable credential; log in first with /buddy-login', 'MISSING_CREDENTIAL')
@@ -1151,7 +1151,7 @@ export class BuddyAdapter extends LlmAdapter {
       let refreshedCredential: BuddyCredential | undefined
       try {
         await this.options.refresh()
-        refreshedCredential = await this.options.resolveCredential()
+        refreshedCredential = await this.options.resolveCredential(options.model)
       } catch (error) {
         // 刷新失败**不致命**：换号仍有机会，单个账号故障不该让整轮陪葬。
         console.warn(`[${this.product.id}] 刷新当前账号凭据失败，改用换号重试：${String(error)}`)

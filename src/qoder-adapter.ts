@@ -337,7 +337,7 @@ export interface QoderAdapterOptions {
   /** 默认凭据 ref（仅用于类型/日志，实际解析走 `resolveCredential`）。 */
   credentialRef: CredentialRef
   /** 从凭据存储解析凭据。 */
-  resolveCredential: () => Promise<QoderCredential | undefined>
+  resolveCredential: (modelId?: string) => Promise<QoderCredential | undefined>
   /** 静默续期凭据。 */
   refresh: () => Promise<void>
   /** 多账号池（用于限流时切换账号与模型黑名单）。 */
@@ -551,10 +551,10 @@ export class QoderAdapter extends LlmAdapter {
     }
 
     // 1. 获取凭据（过期则先静默续期）
-    let credential = await this.options.resolveCredential()
+    let credential = await this.options.resolveCredential(options.model)
     if (credential === undefined || isQoderExpired(credential)) {
       await this.options.refresh()
-      credential = await this.options.resolveCredential()
+      credential = await this.options.resolveCredential(options.model)
     }
     if (credential === undefined || credential.access_token.length === 0) {
       throw new LlmError('qoder: no usable credential; log in first', 'MISSING_CREDENTIAL')
@@ -723,7 +723,7 @@ export class QoderAdapter extends LlmAdapter {
         if (!authRefreshed) {
           authRefreshed = true
           await this.options.refresh()
-          const refreshed = await this.options.resolveCredential()
+          const refreshed = await this.options.resolveCredential(options.model)
           if (refreshed === undefined || refreshed.access_token.length === 0) {
             throw new LlmError('qoder: credential expired and refresh failed', 'AUTH', { status: response.status })
           }

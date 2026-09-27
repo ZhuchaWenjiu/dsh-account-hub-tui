@@ -1271,6 +1271,137 @@ describe('TRAE 适配器 · 限流换号', () => {
   })
 })
 
+/**
+ * 流内错误的换号（真实缺陷回归）。
+ *
+ * ## 为什么需要这一组（用户报障「没有切换」）
+ *
+ * 换号逻辑**整体位于 `if (!response.ok)` 分支内**，只在 HTTP 非 2xx 时执行。
+ * 而上游确实会用 **HTTP 200 + SSE `event:error`** 下发错误（实测依据：
+ * `tests/unit/trae-adapter.spec.ts` 里 4001「param is invalid」的记录，
+ * 见「剔除 is_custom_model 的模型」用例的注释）—— 此时换号代码**一行都不执行**，
+ * 直接抛 `QUOTA_EXCEEDED`，而它**不在 DSH 的可重试集合**里，用户看到的就是
+ * 「不会切换」。
+ *
+ * 实测（2026-09-28，真实 TraeAdapter + 桩池）：
+ * | 错误通道 | 发送次数 | 换号次数 |
+ * |---|---|---|
+ * | 流内 `event:error code=4008` | 1 | **0** |
+ * | HTTP 429 | 2 | 1 |
+ */
+describe('TRAE 适配器 · 流内错误换号（真实缺陷回归）', () => {
+  it('流内 event:error 4008 且未产出内容时换号重发', async () => {
+    const pool = {
+      findAccountIdByCredential: async () => 'trae-1',
+      updateModelRateLimit: vi.fn(async () => {}),
+      getAvailableAccount: vi.fn(async () => ({
+        entry: { id: 'trae-2', credentialRef: 'TRAE_ACCOUNT_2' },
+        credential: makeCredential({ access_token: 'AT2' }),
+      })),
+    }
+    const { adapter, fetcher } = makeAdapter({
+      accountPool: pool,
+      responses: [
+        // 第一次：HTTP 200 + 流内额度错误（不是 HTTP 4xx）
+        sseResponse(soloSse(['error', { code: 4008, message: 'ide_credits 耗尽' }])),
+        // 第二次：第二个账号正常返回
+        sseResponse(soloSse(
+          ['output', { response: '从第二个账号返回' }],
+          ['done', { finish_reason: 'stop' }],
+        )),
+      ],
+    })
+
+    const chunks = await collect(adapter, BASIC_OPTIONS)
+
+    // 枢轴断言：必须真的重发到第二个账号
+    expect(fetcher).toHaveBeenCalledTimes(2)
+    expect(pool.getAvailableAccount).toHaveBeenCalled()
+    expect(chunks.some((c) => c.type === 'text-delta')).toBe(true)
+  })
+
+  it('流内 event:error 1005 同样换号（plan 权益不足）', async () => {
+    const pool = {
+      findAccountIdByCredential: async () => 'trae-1',
+      updateModelRateLimit: vi.fn(async () => {}),
+      getAvailableAccount: vi.fn(async () => ({
+        entry: { id: 'trae-2', credentialRef: 'TRAE_ACCOUNT_2' },
+        credential: makeCredential({ access_token: 'AT2' }),
+      })),
+    }
+    const { adapter, fetcher } = makeAdapter({
+      accountPool: pool,
+      responses: [
+        sseResponse(soloSse(['error', { code: 1005, message: 'plan 权益不足' }])),
+        sseResponse(soloSse(
+          ['output', { response: 'ok' }],
+          ['done', { finish_reason: 'stop' }],
+        )),
+      ],
+    })
+
+    await collect(adapter, BASIC_OPTIONS)
+    expect(fetcher).toHaveBeenCalledTimes(2)
+  })
+
+  /**
+   * ⚠️ **安全边界**：已经产出正文后**绝不重发**。
+   *
+   * 重放会让上游**重复计费**，并且若已发出工具调用还会**重复执行工具**。
+   * 与既有「空响应只在首个模型事件之前重试」同一条约束。
+   */
+  it('已产出正文后流内报错不重发（防重复计费）', async () => {
+    const pool = {
+      findAccountIdByCredential: async () => 'trae-1',
+      updateModelRateLimit: vi.fn(async () => {}),
+      getAvailableAccount: vi.fn(async () => ({
+        entry: { id: 'trae-2', credentialRef: 'TRAE_ACCOUNT_2' },
+        credential: makeCredential({ access_token: 'AT2' }),
+      })),
+    }
+    const { adapter, fetcher } = makeAdapter({
+      accountPool: pool,
+      responses: [
+        // 先吐正文，再报错 —— 此时重发会重复计费
+        sseResponse(soloSse(
+          ['output', { response: '已经发出的一半内容' }],
+          ['error', { code: 4008, message: 'ide_credits 耗尽' }],
+        )),
+        sseResponse(soloSse(['output', { response: '不该出现' }], ['done', { finish_reason: 'stop' }])),
+      ],
+    })
+
+    const error = await collect(adapter, BASIC_OPTIONS).catch((e: unknown) => e)
+
+    expect(error).toBeInstanceOf(Error)
+    // 只发了一次：绝不重放已有输出的请求
+    expect(fetcher).toHaveBeenCalledTimes(1)
+    expect(pool.getAvailableAccount).not.toHaveBeenCalled()
+  })
+
+  it('全部账号流内失败时如实抛错，不无限循环', async () => {
+    // 池里没有其它账号了
+    const pool = {
+      findAccountIdByCredential: async () => 'trae-1',
+      updateModelRateLimit: vi.fn(async () => {}),
+      getAvailableAccount: vi.fn(async () => null),
+    }
+    const { adapter, fetcher } = makeAdapter({
+      accountPool: pool,
+      responses: [
+        sseResponse(soloSse(['error', { code: 4008, message: '耗尽' }])),
+        sseResponse(soloSse(['error', { code: 4008, message: '耗尽' }])),
+        sseResponse(soloSse(['error', { code: 4008, message: '耗尽' }])),
+      ],
+    })
+
+    const error = await collect(adapter, BASIC_OPTIONS).catch((e: unknown) => e)
+    expect(error).toBeInstanceOf(Error)
+    // 有上限，不会无限重试（TRAE_MAX_ROTATE = 3）
+    expect(fetcher.mock.calls.length).toBeLessThanOrEqual(3)
+  })
+})
+
 describe('TRAE 适配器 · prepareCall', () => {
   it('返回模型信息与绑定的 stream 函数', async () => {
     const { adapter } = makeAdapter()

@@ -363,7 +363,7 @@ export class LoomyAdapter extends LlmAdapter {
     // 但保留该路径以便将来上游开放续期时自动受益）。
     if (response.status === 401 || response.status === 403) {
       await this.options.refresh()
-      const refreshed = await this.options.resolveCredential()
+      const refreshed = await this.options.resolveCredential(options.model)
       if (refreshed === undefined || refreshed.access_token.length === 0) {
         throw new LlmError('loomy: credential expired and refresh failed', 'AUTH', { status: response.status })
       }

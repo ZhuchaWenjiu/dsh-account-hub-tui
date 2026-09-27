@@ -144,7 +144,7 @@ export interface ClineAdapterOptions {
   /** 默认凭据 ref（仅用于类型/日志，实际解析走 `resolveCredential`）。 */
   credentialRef: CredentialRef
   /** 从凭据存储解析凭据。 */
-  resolveCredential: () => Promise<ClineCredential | undefined>
+  resolveCredential: (modelId?: string) => Promise<ClineCredential | undefined>
   /** 静默续期凭据。 */
   refresh: () => Promise<void>
   /** 多账号池（用于限流时切换账号与模型黑名单）。 */
@@ -229,6 +229,8 @@ export class ClineAdapter extends LlmAdapter {
     }
     this.loading = (async () => {
       try {
+        // 目录加载路径**没有**目标模型（它要一次列出全部模型），故不传 modelId：
+        // 空串在 `getAvailableAccount` 里是「不按模型过滤」的合法语义，正是这里要的。
         const credential = await this.options.resolveCredential()
         const load = this.options.loadModels ?? ((opts: { credential?: ClineCredential }) =>
           loadClineModels(this.product, {
@@ -400,10 +402,10 @@ export class ClineAdapter extends LlmAdapter {
     }
 
     // 1. 获取凭据（过期则先静默续期）
-    let credential = await this.options.resolveCredential()
+    let credential = await this.options.resolveCredential(options.model)
     if (credential === undefined || isClineExpired(credential)) {
       await this.options.refresh()
-      credential = await this.options.resolveCredential()
+      credential = await this.options.resolveCredential(options.model)
     }
     if (credential === undefined || credential.access_token.length === 0) {
       throw new LlmError('cline: no usable credential; log in first', 'MISSING_CREDENTIAL')
@@ -464,7 +466,7 @@ export class ClineAdapter extends LlmAdapter {
         )
       }
       await this.options.refresh()
-      const refreshed = await this.options.resolveCredential()
+      const refreshed = await this.options.resolveCredential(options.model)
       if (refreshed === undefined || refreshed.access_token.length === 0) {
         throw new LlmError('cline: credential expired and refresh failed', 'AUTH', { status: response.status })
       }
