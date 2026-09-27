@@ -554,10 +554,12 @@ describe('Cline 接线（源码级回归）', () => {
     // Jet Hub「显示列表」需要适配器实例
     expect(source).toContain('cline: clineAdapter')
     // ⚠️ 形参是**位置参数**，新增 provider 会插在 cline 与 modelAdapters 之间。
-    // 只断言「cline 在正确位置、末尾是 modelAdapters」，不要写死整串
-    // —— 那会让每加一个 provider 都假失败（加 Loomy 时踩过一次）。
+    // 只断言「cline 在 modelAdapters 之前」，**不要**写死整串前缀
+    // —— 那会让每加一个 provider 都假失败（加 Loomy、Raccoon、QoderCN 时各踩一次）。
+    // 之前的正则把 `…lobsterai, qoder, trae, cline,` 整段写死了，与这条注释矛盾，
+    // 故改为只检查「cline 出现在 modelAdapters 之前」这一不变式。
     expect(source).toMatch(
-      /registerJetHubRpc\(ctx, pool, service, buddy, workbuddy, lobsterai, qoder, trae, cline, [\w, ]*modelAdapters\)/,
+      /registerJetHubRpc\([\s\S]*?cline,[\s\S]*?modelAdapters\)/,
     )
     // 老契约下的 settings namespace
     expect(source).toContain("'llm-cline'")

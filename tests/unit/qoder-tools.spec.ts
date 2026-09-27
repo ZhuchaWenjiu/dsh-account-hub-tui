@@ -152,6 +152,104 @@ describe('buildQoderHistory：保留 assistant 的 tool_calls 与 tool 的 tool_
     const history = buildQoderHistory([{ content: 'no role' }, { role: 'user', content: 'ok' }])
     expect(history).toEqual([{ role: 'user', content: 'ok' }])
   })
+
+  /**
+   * ## 真实缺陷（用户报障）：「给 qodercn 的 qwen3.8-flash 发送图片，说没读到图片」
+   *
+   * 根因**不在** `chat_context.imageUrls` —— 客户端官方实现 `Hyc()` 就把那个字段
+   * **恒置 `null`**（obf 产物原文：
+   * `function Hyc(A,e,t){return{text:A,features:[],extra:{…},chatPrompt:"",imageUrls:null}}`），
+   * 我们那行是忠实复刻。图片的正确通道是 **`messages[].content` 的多模态数组**：
+   * 客户端 `eQc()` 把 `{type:'base64',media_type,data}` 转成
+   * `{type:'image_url',image_url:{url:'data:…'}}`，`bJc()` 再转成 `input_image`。
+   *
+   * 而 `buildQoderHistory` 用 `qoderContentText()` 把 content **压成纯文本**，
+   * 图片块因此在下游全部消失。上游 `serializeMessages` 明明已经产出了正确的
+   * 多模态数组（见下方用例第 1 段断言），是这里把它吃掉的。
+   *
+   * ⚠️ 这是本文件第三个同型缺陷（前两个：`tools` 不下发、工具历史丢
+   * `tool_calls`）—— 都是「序列化层没保留多模态结构」。
+   */
+  it('带图片的 user 消息必须保留 content 数组（图片不能被压成纯文本）', () => {
+    const wire = [
+      {
+        role: 'user',
+        content: [
+          { type: 'text', text: '这个图片描述了什么内容' },
+          { type: 'image_url', image_url: { url: 'data:image/png;base64,AAAA' } },
+        ],
+      },
+    ]
+    const history = buildQoderHistory(wire)
+    expect(history).toHaveLength(1)
+    // 关键：content 必须仍是数组，且图片块原样保留。
+    expect(Array.isArray(history[0]!.content), '图片消息的 content 被压成了字符串').toBe(true)
+    expect(history[0]!.content).toEqual([
+      { type: 'text', text: '这个图片描述了什么内容' },
+      { type: 'image_url', image_url: { url: 'data:image/png;base64,AAAA' } },
+    ])
+  })
+
+  it('纯文本消息仍输出字符串（不要为了图片把既有形态一起改掉）', () => {
+    // 上游对字符串 content 的兼容性最好，且既有用例锁死了这一形态。
+    // 只让**含图**的消息升级为数组，纯文本保持原样。
+    const history = buildQoderHistory([
+      { role: 'user', content: [{ type: 'text', text: 'hello' }] },
+      { role: 'assistant', content: 'world' },
+    ])
+    expect(history).toEqual([
+      { role: 'user', content: 'hello' },
+      { role: 'assistant', content: 'world' },
+    ])
+  })
+
+  it('多张图片与图片在文本之前都按原顺序保留', () => {
+    const wire = [
+      {
+        role: 'user',
+        content: [
+          { type: 'image_url', image_url: { url: 'data:image/png;base64,AAA' } },
+          { type: 'text', text: '对比这两张' },
+          { type: 'image_url', image_url: { url: 'data:image/png;base64,BBB' } },
+        ],
+      },
+    ]
+    const history = buildQoderHistory(wire)
+    expect(history[0]!.content).toEqual([
+      { type: 'image_url', image_url: { url: 'data:image/png;base64,AAA' } },
+      { type: 'text', text: '对比这两张' },
+      { type: 'image_url', image_url: { url: 'data:image/png;base64,BBB' } },
+    ])
+  })
+
+  it('只有图片、没有文本的消息不能被当成空消息丢掉', () => {
+    // 旧实现按「压平后的文本长度 + tool 字段」判空，纯图片消息会被判空而整条丢弃。
+    const history = buildQoderHistory([
+      {
+        role: 'user',
+        content: [{ type: 'image_url', image_url: { url: 'data:image/png;base64,AAA' } }],
+      },
+    ])
+    expect(history, '纯图片消息被丢弃了').toHaveLength(1)
+    expect(history[0]!.content).toEqual([
+      { type: 'image_url', image_url: { url: 'data:image/png;base64,AAA' } },
+    ])
+  })
+
+  it('图片块里的未知/畸形字段被剔除（只留协议认识的形态）', () => {
+    // 与「逐字段搬运」的既有约定一致：不要把调用方的内部字段发给上游。
+    const history = buildQoderHistory([
+      {
+        role: 'user',
+        content: [
+          { type: 'image_url', image_url: { url: 'data:image/png;base64,AAA' }, internalId: 'x', source: 'y' },
+        ],
+      },
+    ])
+    expect(history[0]!.content).toEqual([
+      { type: 'image_url', image_url: { url: 'data:image/png;base64,AAA' } },
+    ])
+  })
 })
 
 describe('buildQoderInferPayload：tools 必须真的进入请求体', () => {

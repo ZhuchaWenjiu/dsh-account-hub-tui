@@ -29,6 +29,8 @@ const STYLES = `
 .dim-jh-providerIcon.workbuddy { background: white; }
 .dim-jh-providerIcon.lobsterai { background: white; }
 .dim-jh-providerIcon.qoder { background: white; }
+/* Qoder 中国版：官方 ICO 缩图，白底容器中对比度足够。 */
+.dim-jh-providerIcon.qodercn { background: white; }
 .dim-jh-providerIcon.trae { background: white; }
 /* Raccoon Work（商汤）：官方图标是深蓝底白色面具，白底容器中显示清晰。 */
 .dim-jh-providerIcon.raccoon { background: white; }

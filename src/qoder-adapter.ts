@@ -98,6 +98,69 @@ function qoderContentText(content: unknown): string {
 }
 
 /**
+ * 把 wire 消息的 content 数组**逐字段搬运**成多模态 parts。
+ *
+ * ## 为什么必须保留数组（真实缺陷，用户报障）
+ *
+ * 「给 qodercn 的 qwen3.8-flash 发送图片，模型说没读到图片」。
+ *
+ * 根因**不在** `chat_context.imageUrls` —— 客户端官方实现 `Hyc()` 就把那个字段
+ * **恒置 `null`**（obf 产物原文：`function Hyc(A,e,t){return{text:A,features:[],
+ * extra:{…},chatPrompt:"",imageUrls:null}}`），我们那行是忠实复刻。
+ * 图片的正确通道是 **`messages[].content` 的多模态数组**：客户端 `eQc()` 把
+ * `{type:'base64',media_type,data}` 转成 `{type:'image_url',image_url:{url}}`，
+ * `bJc()` 再转成 `{type:'input_image',image_url:…}` 后发出。
+ *
+ * 而上游 `serializeMessages`（`src/openai-compat.ts`）**已经**把图片正确转成了
+ * `{type:'image_url',image_url:{url:'data:…'}}` 放进 content 数组 ——
+ * 是 `buildQoderHistory` 用 `qoderContentText()` 把它压成纯文本吃掉的。
+ *
+ * ⚠️ 这是本文件第三个同型缺陷（前两个：`tools` 不下发、工具历史丢
+ * `tool_calls`）—— 都是「序列化层没保留多模态结构」。改动时务必三者一起想。
+ *
+ * ⚠️ **只保留协议认识的两个键**（与 `buildQoderInferPayload` 的「逐字段搬运」
+ * 同一原则）：不要把 DSH 的内部字段（`id` / `source` / `attachment` 等）
+ * 原样发给上游。
+ *
+ * @returns 规范化后的 parts；**无图或全部畸形**时返回 undefined（调用方据此
+ *          决定是否降级为字符串，以免把纯文本消息也改成数组形态）。
+ */
+function qoderContentParts(content: unknown): Array<Record<string, unknown>> | undefined {
+  if (!Array.isArray(content)) return undefined
+  const parts: Array<Record<string, unknown>> = []
+  let hasImage = false
+  for (const raw of content) {
+    if (typeof raw !== 'object' || raw === null) continue
+    const block = raw as { type?: unknown; text?: unknown; image_url?: { url?: unknown } }
+    if (block.type === 'text') {
+      const text = String(block.text ?? '')
+      if (text.length > 0) parts.push({ type: 'text', text })
+      continue
+    }
+    if (block.type === 'image_url') {
+      // ⚠️ 只搬 `url`：`image_url` 里可能还有 `detail` 等字段，客户端 `bJc()`
+      // 只在存在时透传 `detail`，这里与它对齐（缺省不写该键）。
+      const url = block.image_url?.url
+      if (typeof url !== 'string' || url.length === 0) continue
+      const detail = (block.image_url as { detail?: unknown }).detail
+      parts.push({
+        type: 'image_url',
+        image_url: {
+          url,
+          ...(typeof detail === 'string' && detail.length > 0 ? { detail } : {}),
+        },
+      })
+      hasImage = true
+      continue
+    }
+    // 其余类型（如 Anthropic 风格的 `image`、`tool_result` 内层块）不由本函数处理：
+    // 它们要么已被 `serializeMessages` 转成 image_url，要么不属于推理载荷。
+  }
+  // 无图时返回 undefined，让调用方继续用字符串形态（上游对字符串兼容性最好）。
+  return hasImage ? parts : undefined
+}
+
+/**
  * 把 `serializeMessages` 的 wire 消息转成加密端点的 `messages[]`。
  *
  * ## 真实缺陷（本次修复）
@@ -122,14 +185,24 @@ export function buildQoderHistory(messages: readonly QoderWireMessage[]): QoderI
   const history: QoderInferMessage[] = []
   for (const message of messages) {
     if (typeof message.role !== 'string') continue
-    const content = qoderContentText(message.content)
+    // ⚠️ 含图消息必须保留 content **数组**（见 `qoderContentParts` 的缺陷说明）；
+    // 纯文本仍走字符串，保持与既有形态和上游兼容性逐字节一致。
+    const parts = qoderContentParts(message.content)
+    const content = parts === undefined ? qoderContentText(message.content) : parts
     const toolCalls = Array.isArray(message.tool_calls) && message.tool_calls.length > 0
       ? (message.tool_calls as QoderInferToolCall[])
       : undefined
     const toolCallId = typeof message.tool_call_id === 'string' ? message.tool_call_id : undefined
     // 三者皆空的消息没有承载意义（如只有 reasoning 的帧），跳过以免发出
     // 「空 assistant」这种会让上游困惑的条目。
-    if (content.length === 0 && toolCalls === undefined && toolCallId === undefined) continue
+    //
+    // ⚠️ 判空必须把**图片**算作内容：`parts` 为非空数组（含 image_url）时
+    // 即便 `qoderContentText` 结果为空串也不能丢弃 —— 否则「只发一张图、
+    // 不带文字」的消息会被整条吃掉（用户报障场景之一）。
+    const isEmpty = parts === undefined
+      ? content.length === 0
+      : (content as Array<Record<string, unknown>>).length === 0
+    if (isEmpty && toolCalls === undefined && toolCallId === undefined) continue
     history.push({
       role: message.role,
       content,
@@ -366,7 +439,18 @@ export class QoderAdapter extends LlmAdapter {
     /** 最后一条 user 消息即本轮提问；其余作为历史。 */
     const userMessages = messages.filter((m) => m.role === 'user')
     const lastUser = userMessages.at(-1)
-    const userText = typeof lastUser?.content === 'string' ? lastUser.content : ''
+    // ⚠️ 带图消息的 content 是**多模态数组**（见 `qoderContentParts`），
+    // 只判 `typeof === 'string'` 会让 `chat_context.text` / `originalContent`
+    // 退化成空串 —— 那会让模型收到「一张没有配文的图」，与用户实际输入不符。
+    // 故两种形态都要取文本（数组时取其中的 text 块）。
+    const userText = typeof lastUser?.content === 'string'
+      ? lastUser.content
+      : (Array.isArray(lastUser?.content)
+          ? (lastUser.content as Array<{ type?: unknown; text?: unknown }>)
+              .filter((block) => block.type === 'text')
+              .map((block) => String(block.text ?? ''))
+              .join('')
+          : '')
     // ⚠️ 必须走 buildQoderHistory：早期内联的「只留 content 为字符串」过滤器
     // 会丢掉 assistant 的 tool_calls（content 为 null）与 tool 的 tool_call_id，
     // 使多步工具调用彻底坏掉（模型看不到自己调用过什么）。

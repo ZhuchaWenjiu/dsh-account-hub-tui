@@ -95,6 +95,14 @@ declare module '@deepseek-ai/cordis' {
      * `service "..." has been registered`，故每个 provider 各占一个服务名。
      */
     qoderAuth: QoderAuth
+    /**
+     * Qoder **中国版**的认证服务实例。
+     *
+     * 与 `qoderAuth` 是**两个独立实例**（同一 `QoderAuth` 类，不同 `product`），
+     * 正如 `buddyAuth` 与 `workbuddyAuth`。服务名由 `${product.id}Auth` 派生，
+     * 故不会与国际版撞名 —— 这也是 `id` 必须区分两站的原因。
+     */
+    qoderCnAuth: QoderAuth
   }
 }
 

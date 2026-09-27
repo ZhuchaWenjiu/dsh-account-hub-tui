@@ -69,6 +69,20 @@ export const CREDITS_CAPABILITIES = Object.freeze({
   // 2026-09-21 由 keylog 解密抓包解出）。
   // 显式登记而非省略 —— 单测要求本表与 PROVIDERS 同步。
   qoder: Object.freeze({ balance: true, dailyCheckin: true }),
+  // Qoder **中国版**（`qodercn`）：两项都有，与国际版同形。
+  //
+  // 依据（设计文档 E7/E10）：CN 的 `/sash/api/v2/me/usage` 与
+  // `/sash/api/v1/me/campaigns` 零凭据实测返回 `401 {"code":"TOKEN_INVALID",
+  // "message":"missing authorization token"}`，与国际版**逐字节同形**；
+  // CN asar 里同样是 `Fh = Object.freeze({ clientType: 10, … })`，
+  // 即桌面 app 身份这个值两站共用。
+  //
+  // ⚠️ 「端点存在」不等于「活动一定下发」—— 真实领取由
+  // `pnpm test:e2e:qodercn-credits` 验证。若将来确认 CN 无签到，改这里时
+  // 必须换成强证据（扫 CN asar 无 claim 端点），不要写「某次没看到」：
+  // 国际版正是凭一次 `campaigns:[]` 误判成「无签到」，而真相是那天已领
+  //（活动每日 10:00 UTC+8 刷新）。
+  qodercn: Object.freeze({ balance: true, dailyCheckin: true }),
   // TRAE：余额与签到都有（`/trae/api/v2/pay/ide_user_ent_usage` +
   // `checkin_credits/status` → `checkin_credits/claim`，见 `src/trae-credits.ts`）。
   trae: Object.freeze({ balance: true, dailyCheckin: true }),

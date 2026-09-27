@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { QODER, ALL_QODER_PRODUCTS, qoderProductById } from '../../src/qoder-product.js'
+import { QODER, QODER_CN, type QoderProduct, ALL_QODER_PRODUCTS, qoderProductById } from '../../src/qoder-product.js'
 import { promotionActiveNow, qoderDisplayName } from '../../src/qoder-adapter.js'
 
 describe('Qoder 产品配置', () => {
@@ -110,7 +110,8 @@ describe('Qoder 产品配置', () => {
   it('qoderProductById 命中与未命中', () => {
     expect(qoderProductById('qoder')).toBe(QODER)
     expect(qoderProductById('nope')).toBeUndefined()
-    expect(ALL_QODER_PRODUCTS).toHaveLength(1)
+    // 中国版加入后是两个同族产品（国际版 + 中国版）。
+    expect(ALL_QODER_PRODUCTS).toHaveLength(2)
   })
 
   /**
@@ -192,6 +193,15 @@ describe('Qoder 错峰时段判定（本地推算）', () => {
     const bad = { active: true, windowStart: 'xx', windowEnd: 'yy' }
     expect(promotionActiveNow(bad, at('2026-09-21T12:00:00+08:00'))).toBe(true)
   })
+
+  it('id 联合类型可容纳同族的中国版（类型回归）', () => {
+    // 拓宽之前，下面这一行会让 `pnpm typecheck` 报
+    // `Type '"qodercn"' is not assignable to type '"qoder"'`。
+    // ⚠️ 本用例的红/绿判据是 **typecheck**，不是 vitest —— 拓宽之后它运行时恒真，
+    // 存在的意义是「让那一行不被当作未使用变量删掉」，并锁住联合类型的形状。
+    const id: QoderProduct['id'] = 'qodercn'
+    expect(id).toBe('qodercn')
+  })
 })
 
 describe('Qoder 展示名', () => {
@@ -232,5 +242,165 @@ describe('Qoder 展示名', () => {
   it('无促销的模型直接用 priceFactor（无箭头）', () => {
     expect(qoderDisplayName(byId.get('smodel')!, inWindow)).toBe('Sonus · x8')
     expect(qoderDisplayName(byId.get('dmodel')!, inWindow)).toBe('DeepSeek-V4-Pro · x0.5')
+  })
+})
+
+describe('Qoder 中国版产品配置（qodercn）', () => {
+  // 全部取值来自设计文档 §2 的取证表 E1–E13，不是推测。
+
+  it('域名与中国版实测一致（E4）', () => {
+    expect(QODER_CN.authBase).toBe('https://qoder.cn')
+    expect(QODER_CN.openApiBase).toBe('https://openapi.qoder.com.cn')
+    expect(QODER_CN.encryptedInferBase).toBe('https://gateway.qoder.com.cn')
+  })
+
+  it('client_id 是 CN 自己的值，与国际版不同（E2 —— 本任务最高风险字段）', () => {
+    // 取自 CN asar 的 `Vpe.authClientIds.prod`。国际版两个 id 在 CN asar 里
+    // **命中 0 次**，故「沿用国际版」是错的。
+    // ⚠️ 国际版的教训：client_id 用错时**入口 302 完全正常**，只在授权回调阶段
+    // 才报「参数无效」，所以不能靠探测 302 验证 —— 必须真实登录闭环。
+    expect(QODER_CN.clientId).toBe('732aef47-9cf2-46a2-95fe-4cebb5d0d1fa')
+    expect(QODER_CN.clientId).not.toBe(QODER.clientId)
+  })
+
+  it('CN 的 prod 与 test client_id 同值，不存在国际版读反的风险（E2）', () => {
+    // 国际版有 J_a / G_a 两个常量且曾被读反（真实缺陷）。CN asar 里
+    // `authClientIds: { prod: X, test: X }` 是同一个值，故无此风险。
+    // 两字段仍保留是为了不改 `QoderProduct` 形状、也便于将来 CN 拆出 test。
+    expect(QODER_CN.testClientId).toBe(QODER_CN.clientId)
+  })
+
+  it('provider id / 凭据 ref 与国际版完全隔离', () => {
+    // 不同 ref 前缀 ⇒ 不同凭据条目 ⇒ 两站账号不会串用。
+    expect(QODER_CN.id).toBe('qodercn')
+    expect(QODER_CN.defaultCredentialRef).toBe('QODERCN_ACCESS_TOKEN')
+    expect(QODER_CN.defaultCredentialRef).not.toBe(QODER.defaultCredentialRef)
+  })
+
+  it('sashClientType 与国际版同为 10（E10：CN asar 常量 Fh.clientType === 10）', () => {
+    expect(QODER_CN.sashClientType).toBe('10')
+  })
+
+  it('注册进 ALL_QODER_PRODUCTS 且可按 id 取回', () => {
+    expect(ALL_QODER_PRODUCTS.map((p) => p.id)).toEqual(['qoder', 'qodercn'])
+    expect(qoderProductById('qodercn')).toBe(QODER_CN)
+    expect(qoderProductById('nope')).toBeUndefined()
+  })
+
+  it('两产品的 id 与默认 ref 互不重复', () => {
+    const ids = ALL_QODER_PRODUCTS.map((p) => p.id)
+    const refs = ALL_QODER_PRODUCTS.map((p) => p.defaultCredentialRef)
+    expect(new Set(ids).size).toBe(ids.length)
+    expect(new Set(refs).size).toBe(refs.length)
+  })
+})
+
+describe('Qoder 中国版兜底模型表（E6：catalog-v6 的 chat 场景 14 条）', () => {
+  it('表内容与本机 CN catalog 逐条一致（顺序即目录原序）', () => {
+    // ⚠️ 这张 id 列表**与国际版不同**：CN 独有 `q37fmodel` / `gm51model`，
+    // 且**没有**国际版的 `ultimate` / `performance` / `efficient` / `smodel` /
+    // `cmodel` 五条 —— 沿用国际版表会让菜单出现 5 个 CN 端点不认的模型。
+    expect(QODER_CN.fallbackModels.map((m) => m.id)).toEqual([
+      'auto',
+      'qmodel_38max', 'qfmodel',
+      'qmodel_latest', 'qmodel', 'q37fmodel',
+      'dmodel', 'dfmodel',
+      'gmodel', 'gfmodel', 'gm51model',
+      'kmodel_latest', 'kmodel',
+      'mmodel',
+    ])
+  })
+
+  it('展示名含模型名与版本，不只写厂商（AGENTS.md 用户报障）', () => {
+    const byId = new Map(QODER_CN.fallbackModels.map((m) => [m.id, m.name]))
+    expect(byId.get('gmodel')).toBe('GLM-5.3')
+    expect(byId.get('gm51model')).toBe('GLM-5.2')
+    expect(byId.get('dmodel')).toBe('DeepSeek-V4-Pro')
+    // ⚠️ CN 的 mmodel 是 **M2.7**，国际版是 M3 —— 版本必须照目录原值，不能对齐。
+    expect(byId.get('mmodel')).toBe('MiniMax-M2.7')
+    expect(byId.get('q37fmodel')).toBe('Qwen3.7-Flash')
+  })
+
+  it('倍率逐条对照 catalog，不凭印象填（国际版曾有 14 处偏差被报障）', () => {
+    const byId = new Map(QODER_CN.fallbackModels.map((m) => [m.id, m]))
+    expect(byId.get('auto')?.priceFactor).toBe(0.5)
+    expect(byId.get('qmodel_38max')?.priceFactor).toBe(0.2)
+    expect(byId.get('qmodel_latest')?.priceFactor).toBe(0.1)
+    expect(byId.get('qmodel')?.priceFactor).toBe(0.04)
+    expect(byId.get('dmodel')?.priceFactor).toBe(0.5)
+    expect(byId.get('gmodel')?.priceFactor).toBe(0.8)
+    expect(byId.get('gm51model')?.priceFactor).toBe(0.6)
+    expect(byId.get('kmodel_latest')?.priceFactor).toBe(1.4)
+    expect(byId.get('mmodel')?.priceFactor).toBe(0.2)
+  })
+
+  it('priceFactor 为 0 是「免费」，必须保留而不是当缺失丢掉', () => {
+    // 实测 `qfmodel`（Qwen3.8-Flash）price_factor = 0、original_price_factor = 0.1。
+    // 用 `> 0` 过滤会恰好漏掉用户最关心的免费模型。
+    const qf = QODER_CN.fallbackModels.find((m) => m.id === 'qfmodel')
+    expect(qf?.priceFactor).toBe(0)
+    expect(qf?.originalPriceFactor).toBe(0.1)
+    expect(qf?.isFree).toBe(true)
+  })
+
+  it('免费额度模型标 isFree，供 e2e 探针默认取用以免消耗积分', () => {
+    const free = QODER_CN.fallbackModels.filter((m) => m.isFree === true).map((m) => m.id)
+    expect(free).toEqual(['qmodel_38max', 'qfmodel'])
+  })
+
+  it('错峰促销与国际版同形（窗口 22:00–08:00，active 只作回退）', () => {
+    const byId = new Map(QODER_CN.fallbackModels.map((m) => [m.id, m]))
+    expect(byId.get('qmodel_38max')?.promotion).toMatchObject({
+      discountFactor: 0.4, beforePromotionPriceFactor: 0.5,
+      windowStart: '22:00', windowEnd: '08:00',
+    })
+    expect(byId.get('qmodel_latest')?.promotion?.discountFactor).toBe(0.2)
+    expect(byId.get('qmodel')?.promotion?.discountFactor).toBe(0.4)
+    // 生效价 = 原价 × 折扣（实测三条全部吻合）
+    for (const id of ['qmodel_38max', 'qmodel_latest', 'qmodel']) {
+      const m = byId.get(id)!
+      expect(m.priceFactor).toBeCloseTo(
+        (m.promotion!.beforePromotionPriceFactor! * m.promotion!.discountFactor!), 10)
+    }
+  })
+
+  it('上下文窗口取 CN 实解值，不套用国际版的 1M', () => {
+    // 国际版把这几条记成 1_000_000；CN catalog 给的是 180K / 96K。
+    const byId = new Map(QODER_CN.fallbackModels.map((m) => [m.id, m]))
+    expect(byId.get('qmodel_latest')?.contextWindow).toBe(180_000)
+    expect(byId.get('qmodel')?.contextWindow).toBe(180_000)
+    expect(byId.get('dmodel')?.contextWindow).toBe(96_000)
+    expect(byId.get('dfmodel')?.contextWindow).toBe(180_000)
+    expect(byId.get('kmodel')?.contextWindow).toBe(180_000)
+    // gfmodel 才是 CN 里唯一的 1M
+    expect(byId.get('gfmodel')?.contextWindow).toBe(1_000_000)
+  })
+
+  it('思考档位标记按 CN catalog，与国际版相反的几条要照 CN', () => {
+    const byId = new Map(QODER_CN.fallbackModels.map((m) => [m.id, m]))
+    // CN 里这几条 is_reasoning 为 true（国际版表记的是 false）
+    expect(byId.get('auto')?.supportsThinking).toBe(true)
+    expect(byId.get('qmodel_latest')?.supportsThinking).toBe(true)
+    expect(byId.get('kmodel')?.supportsThinking).toBe(true)
+    // 而 dfmodel 在 CN 是 false（国际版为 true）
+    expect(byId.get('dfmodel')?.supportsThinking).toBeFalsy()
+    expect(byId.get('kmodel_latest')?.supportsThinking).toBeFalsy()
+    // mmodel 在 CN 连图片都不支持（国际版 is_vl 为 true）
+    expect(byId.get('mmodel')?.supportsImage).toBeFalsy()
+  })
+
+  it('CN 表不含国际版独有的那 5 个模型', () => {
+    const ids = QODER_CN.fallbackModels.map((m) => m.id)
+    for (const intlOnly of ['ultimate', 'performance', 'efficient', 'smodel', 'cmodel']) {
+      expect(ids, `CN 目录里没有 ${intlOnly}`).not.toContain(intlOnly)
+    }
+  })
+
+  it('两站重叠模型的倍率一致（除 auto 外实测逐条相同）', () => {
+    const intl = new Map(QODER.fallbackModels.map((m) => [m.id, m.priceFactor]))
+    for (const m of QODER_CN.fallbackModels) {
+      if (!intl.has(m.id) || m.id === 'auto') continue
+      expect(m.priceFactor, `${m.id} 倍率与国际版不符`).toBe(intl.get(m.id))
+    }
   })
 })

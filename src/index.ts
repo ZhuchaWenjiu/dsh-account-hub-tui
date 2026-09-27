@@ -25,7 +25,7 @@ import { hasLegacyNamespaceRegistration, settingsOf, suppressAutoSettingsPage } 
 import { buildRaccoonNickname, registerJetHubRpc } from './jet-hub-rpc.js'
 import { CODEBUDDY, WORKBUDDY } from './product.js'
 import { LOBSTERAI } from './lobsterai-product.js'
-import { QODER } from './qoder-product.js'
+import { QODER, QODER_CN } from './qoder-product.js'
 import { TRAE } from './trae-product.js'
 import { CLINE } from './cline-product.js'
 import type { CodeArtsCredential, BuddyCredential } from './types.js'
@@ -154,7 +154,7 @@ export function apply(ctx: Context): void {
   // `settingsNamespaceFor()` 解析为本插件条目 id。
   registerProviderSettings(
     ctx, 'llm-buddy', 'llm-workbuddy', 'llm-codearts', 'llm-lobsterai',
-    'llm-qoder', 'llm-trae', 'llm-cline', 'llm-loomy', 'llm-raccoon',
+    'llm-qoder', 'llm-qodercn', 'llm-trae', 'llm-cline', 'llm-loomy', 'llm-raccoon',
   )
   const service = new CodeArtsAuth(ctx)
   const pool = new AccountPool(ctx)
@@ -349,6 +349,45 @@ export function apply(ctx: Context): void {
     readImage: makeReadImage(ctx),
     accountPool: pool,
     product: QODER,
+  })
+
+  // ===== Qoder 中国版（qodercn）=====
+  // 与上面的国际版是**同一套协议实现**的第二个实例（差异全在 QODER_CN 配置里：
+  // 域名 qoder.cn / openapi.qoder.com.cn / gateway.qoder.com.cn、client_id
+  // 732aef47-…、以及一张自己的 14 条模型表）。刻意**不复制**任何 qoder*.ts
+  // 实现文件 —— 协议同源，复制会让同类缺陷（tools 不下发、工具历史丢
+  // tool_calls、错误帧不抛错）修两遍。
+  // 服务名由 `${product.id}Auth` 派生，注册为 ctx.qoderCnAuth。
+  // 不注册斜杠命令：入口在 Jet Hub 的「Qoder (中国版)」面板。
+  const qoderCn = new QoderAuth(ctx, { product: QODER_CN })
+  const qoderCnAdapter = registerQoderLlm(ctx, {
+    credentialRef: credentialRef(QODER_CN.defaultCredentialRef),
+    resolveCredential: async () => {
+      // 只取中国版自己账号池的账号，回退到 QODERCN_ACCESS_TOKEN。
+      // ⚠️ provider 实参必须是 QODER_CN.id：写死 'qoder' 会让中国版
+      // 永远查不到自己的账号（本插件在 workbuddy 上踩过同类坑）。
+      const available = await pool.getAvailableAccount(QODER_CN.id, '')
+      if (available) return available.credential as QoderCredential
+      const resolved = await ctx.credentials.resolve(credentialRef(QODER_CN.defaultCredentialRef))
+      if (!resolved) return undefined
+      try {
+        return JSON.parse(resolved.value) as QoderCredential
+      } catch {
+        return undefined
+      }
+    },
+    refresh: async () => {
+      // ⚠️ 必须刷新**解析凭据时所用的那一个**账号，而不是默认单凭据 ref。
+      // 理由与国际版那条真实缺陷完全同因：resolveCredential 优先取池内凭据，
+      // 而 refresh() 读写 QODERCN_ACCESS_TOKEN，两者错配会让日志里续期全成功、
+      // 用户却「刚登录却一直认证失败」。
+      const available = await pool.getAvailableAccount(QODER_CN.id, '')
+      if (available) await qoderCn.refreshAccountCredential(available.entry.credentialRef)
+      else await qoderCn.refresh()
+    },
+    readImage: makeReadImage(ctx),
+    accountPool: pool,
+    product: QODER_CN,
   })
 
   // ===== TRAE（字节 TRAE IDE）服务 =====
@@ -698,6 +737,9 @@ export function apply(ctx: Context): void {
       await qoder.refreshAll(pool)
     } catch { /* 静默 */ }
     try {
+      await qoderCn.refreshAll(pool)
+    } catch { /* 静默 */ }
+    try {
       await trae.refreshAll(pool)
     } catch { /* 静默 */ }
     try {
@@ -731,6 +773,7 @@ export function apply(ctx: Context): void {
         workbuddy.stop()
         lobsterai.stop()
         qoder.stop()
+        qoderCn.stop()
         trae.stop()
         cline.stop()
         loomy.stop()
@@ -745,6 +788,7 @@ export function apply(ctx: Context): void {
     workbuddy.stop()
     lobsterai.stop()
     qoder.stop()
+    qoderCn.stop()
     trae.stop()
     cline.stop()
     loomy.stop()
@@ -762,12 +806,13 @@ export function apply(ctx: Context): void {
     workbuddy: workbuddyAdapter,
     lobsterai: lobsteraiAdapter,
     qoder: qoderAdapter,
+    qodercn: qoderCnAdapter,
     trae: traeAdapter,
     cline: clineAdapter,
     loomy: loomyAdapter,
     raccoon: raccoonAdapter,
   }
 
-  registerJetHubRpc(ctx, pool, service, buddy, workbuddy, lobsterai, qoder, trae, cline, loomy, raccoon, modelAdapters)
+  registerJetHubRpc(ctx, pool, service, buddy, workbuddy, lobsterai, qoder, qoderCn, trae, cline, loomy, raccoon, modelAdapters)
   ctx.provide('accountPool', pool)
 }

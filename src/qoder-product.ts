@@ -124,8 +124,15 @@ export interface QoderModelPromotion {
  * 与 `BuddyProduct` / `LobsteraiProduct` 平行，字段全部为 Qoder 实际需要的。
  */
 export interface QoderProduct {
-  /** provider 标识：注册到 `ctx.llm` 的路由名，也是账号列表的 provider 字段值。 */
-  id: 'qoder'
+  /**
+   * provider 标识：注册到 `ctx.llm` 的路由名，也是账号列表的 provider 字段值。
+   *
+   * ⚠️ 两个取值**共用同一套协议实现**（`qoder.ts` / `qoder-oauth.ts` /
+   * `qoder-credits.ts` / `qoder-adapter.ts` / `qoder-wasm.ts`）—— 中国版与国际版
+   * 的差异全部是本配置里的字段值，不存在「CN 要另写一份协议」的情况。
+   * 新增同族产品时只加本联合类型的值与一份配置，**不要**复制实现文件。
+   */
+  id: 'qoder' | 'qodercn'
   /** 设置页 / 模型选择器展示名。 */
   displayName: string
   /** 登录与 OAuth 基址。 */
@@ -361,8 +368,125 @@ export const QODER: QoderProduct = {
   fallbackModels: QODER_FALLBACK_MODELS,
 }
 
-/** 全部 Qoder 产品配置（当前只有一个，保留数组以便将来扩展中国版）。 */
-export const ALL_QODER_PRODUCTS: readonly QoderProduct[] = [QODER]
+/**
+ * 中国版模型目录（**实测数据**，2026-09-27，设计文档 E6）。
+ *
+ * 来源：本机 `~/.qoder-cn/.models/{uid}/catalog-v6` 的 `chat` 场景，
+ * 用**国际版那份** WASM 解密（见 E5），共 14 条。
+ *
+ * ⚠️ **不能沿用国际版那张 17 条的表**：
+ * - CN 独有 `q37fmodel` / `gm51model`；
+ * - CN **没有** `ultimate` / `performance` / `efficient` / `smodel` / `cmodel`
+ *   —— 沿用会让菜单出现 5 个 CN 端点根本不认的模型，点了就报错；
+ * - 5 条上下文窗口、4 条思考标记、1 条 vl 标记不同；
+ * - `mmodel` 在 CN 是 **MiniMax-M2.7**（国际版 M3）。
+ *
+ * ⚠️ CN 目录条目的标识字段名是 **`key`**，国际版是 `model_key` —— 只影响
+ * 重新采集时的解析（`scripts/probe-qodercn-catalog.mjs` 两个名字都认），
+ * 不影响本表（本表已是扁平结构）。
+ *
+ * 字段口径与国际版表完全一致，见 `QoderFallbackModel` 的注释。
+ */
+const QODER_CN_FALLBACK_MODELS: readonly QoderFallbackModel[] = [
+  // ⚠️ 全部数值逐条对照本机 CN catalog-v6 的 chat 场景实解值（2026-09-27）。
+  // 国际版曾因为「手工估值 + 单测只断言 id 列表」让价格漂移长期未被发现
+  // （14 个模型有偏差，用户报障）。改本表必须重新跑探针对照。
+  { id: 'auto', name: 'Auto', contextWindow: 200_000, supportsImage: true, supportsThinking: true, priceFactor: 0.5 },
+  // 免费额度模型（isFree=true）：e2e 探针默认用它们，以免消耗积分。
+  {
+    id: 'qmodel_38max', name: 'Qwen3.8-Max', contextWindow: 180_000, supportsImage: true, supportsThinking: true,
+    isFree: true, priceFactor: 0.2, efforts: ['xhigh', 'low', 'medium'],
+    promotion: { active: true, discountFactor: 0.4, beforePromotionPriceFactor: 0.5, windowStart: '22:00', windowEnd: '08:00', badgeZh: '错峰 4 折' },
+  },
+  {
+    // ⚠️ `priceFactor: 0` 是**免费**，不是缺失 —— 0 是合法值，不能用 `> 0` 过滤。
+    id: 'qfmodel', name: 'Qwen3.8-Flash', contextWindow: 180_000, supportsImage: true, supportsThinking: true,
+    isFree: true, priceFactor: 0, originalPriceFactor: 0.1, efforts: ['xhigh', 'low', 'medium'],
+  },
+  {
+    id: 'qmodel_latest', name: 'Qwen3.7-Max', contextWindow: 180_000, supportsImage: true, supportsThinking: true,
+    priceFactor: 0.1,
+    promotion: { active: true, discountFactor: 0.2, beforePromotionPriceFactor: 0.5, windowStart: '22:00', windowEnd: '08:00', badgeZh: '错峰2折' },
+  },
+  {
+    id: 'qmodel', name: 'Qwen3.7-Plus', contextWindow: 180_000, supportsImage: true, supportsThinking: true,
+    priceFactor: 0.04,
+    promotion: { active: true, discountFactor: 0.4, beforePromotionPriceFactor: 0.1, windowStart: '22:00', windowEnd: '08:00', badgeZh: '错峰4折' },
+  },
+  // CN 独有：Qwen3.7-Flash（国际版目录无此 key）
+  { id: 'q37fmodel', name: 'Qwen3.7-Flash', contextWindow: 180_000, supportsImage: true, supportsThinking: true, priceFactor: 0.1 },
+  // ⚠️ 上下文窗口 96K，比国际版表记的 1M 小得多 —— 照 CN 目录实值。
+  { id: 'dmodel', name: 'DeepSeek-V4-Pro', contextWindow: 96_000, supportsImage: true, supportsThinking: true, priceFactor: 0.5, efforts: ['high', 'max'] },
+  // ⚠️ CN 的 `is_reasoning` 为 false（国际版为 true），故不声明 supportsThinking。
+  { id: 'dfmodel', name: 'DeepSeek-Flash', contextWindow: 180_000, supportsImage: true, priceFactor: 0.1, efforts: ['high', 'max', 'low'] },
+  { id: 'gmodel', name: 'GLM-5.3', contextWindow: 180_000, supportsImage: true, supportsThinking: true, priceFactor: 0.8, efforts: ['high', 'low', 'max'] },
+  { id: 'gfmodel', name: 'GLM-5.3-Flash', contextWindow: 1_000_000, supportsImage: true, supportsThinking: true, priceFactor: 0.1, efforts: ['high', 'max'] },
+  // CN 独有：GLM-5.2（国际版目录无此 key）
+  { id: 'gm51model', name: 'GLM-5.2', contextWindow: 180_000, supportsImage: true, supportsThinking: true, priceFactor: 0.6, efforts: ['high', 'max'] },
+  { id: 'kmodel_latest', name: 'Kimi-K3', contextWindow: 180_000, supportsImage: true, priceFactor: 1.4, efforts: ['high', 'low', 'max'] },
+  { id: 'kmodel', name: 'Kimi-K2.8-Preview', contextWindow: 180_000, supportsImage: true, supportsThinking: true, priceFactor: 0.8, efforts: ['high', 'low', 'max'] },
+  // ⚠️ 版本是 **M2.7**（国际版 M3），且 CN 的 `is_vl` 为 false，故两个标记都不写。
+  { id: 'mmodel', name: 'MiniMax-M2.7', contextWindow: 180_000, priceFactor: 0.2 },
+]
+
+/** Qoder provider 配置（**中国版**）。 */
+export const QODER_CN: QoderProduct = {
+  // ⚠️ id 不带连字符：它同时是 cordis 服务名（`qodercnAuth`）、LLM 路由名
+  // （`llm-qodercn`）与凭据 ref 前缀（`QODERCN_ACCESS_TOKEN`）的组成部分，
+  // 带连字符会让服务名不符合 camelCase 惯例。
+  id: 'qodercn',
+  displayName: 'Qoder (中国版)',
+  // E4：CN endpoint-cache.json + asar `environments.prod`（website/auth/collaboration
+  // 三个都指向 qoder.cn，openApi 指向 openapi.qoder.com.cn）。
+  authBase: 'https://qoder.cn',
+  openApiBase: 'https://openapi.qoder.com.cn',
+  // ⚠️ CN **没有**可用的公开 OpenAI 兼容端点：实测
+  // `gateway.qoder.com.cn/model/v1/chat/completions` 与
+  // `openapi.qoder.com.cn/model/v1/chat/completions` 都回 503（alb 无上游路由）。
+  // 而 `inferBase` 在本代码里**没有任何调用方**（公开端点方案早已被加密
+  // 端点取代，见 `QODER_CHAT_PATH` 同样无人使用），故这里填成与
+  // `encryptedInferBase` 同值仅表示「没有独立公开端点」，**不要**据此发请求。
+  // 不删该字段：删除属于与本任务无关的重构，且会牵动国际版注释。
+  inferBase: 'https://gateway.qoder.com.cn',
+  // E4 + E9：`algo` 网关在 CN 换域名，路径与协议同形
+  // （零凭据 POST 的错误响应形态与国际版逐字节一致）。
+  encryptedInferBase: 'https://gateway.qoder.com.cn',
+  // E2：取自 CN asar 的 `Vpe.authClientIds.prod`。
+  // ⚠️ **与国际版完全不同** —— 国际版两个 id 在 CN asar 里命中 0 次。
+  // 用错的症状是「授权页 302 正常、点击授权后报参数无效」，
+  // 故**不能**靠探测入口验证，必须真实登录闭环（tests/e2e/qodercn-probe）。
+  clientId: '732aef47-9cf2-46a2-95fe-4cebb5d0d1fa',
+  // E2：CN 的 `authClientIds.test` 与 `prod` **同一个值**，因此不存在国际版
+  // `J_a` / `G_a` 被读反的那类风险。字段仍保留以免改动 `QoderProduct` 形状。
+  testClientId: '732aef47-9cf2-46a2-95fe-4cebb5d0d1fa',
+  // 沿用国际版的 **CLI** 身份（源码 `Fp()` 默认值）。
+  // ⚠️ CN 桌面端自己用的是 `Fh`（clientType 10 / businessProduct 'app' /
+  // sessionType 'app' / scene 'app'）。插件走 CLI 身份在国际版实测可用；
+  // CN 是否接受由 e2e 对话探针验证 —— 若被拒，改这一组值，
+  // 但**不要**顺手把下面 `sashClientType` 一起改（那是两个不同身份，
+  // 见 `QoderProduct.sashClientType` 的注释）。
+  clientMetadata: {
+    client_type: '5',
+    business_product: 'cli',
+    business_type: 'agent',
+    scene: 'assistant',
+  },
+  // E10：CN asar 里同样是 `Fh = Object.freeze({ clientType: 10, … })`。
+  sashClientType: '10',
+  // E11：CN asar 的 sash 请求头 UA 恒为 `"Qoder"`，与国际版一致。
+  userAgentPrefix: 'qoder',
+  defaultCredentialRef: 'QODERCN_ACCESS_TOKEN',
+  fallbackModels: QODER_CN_FALLBACK_MODELS,
+}
+
+/**
+ * 全部 Qoder 产品配置（国际版 + 中国版）。
+ *
+ * 顺序即 `qoderProductById()` 的查找顺序，也是续期调度遍历的顺序。
+ * 新增同族产品（如将来的其它区域版本）只在此追加一项 + 一份配置，
+ * **不要**复制 `src/qoder*.ts` 的任何实现文件。
+ */
+export const ALL_QODER_PRODUCTS: readonly QoderProduct[] = [QODER, QODER_CN]
 
 /**
  * 按 provider id 取 Qoder 产品配置；未知 id 返回 undefined。

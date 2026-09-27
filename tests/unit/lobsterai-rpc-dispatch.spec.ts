@@ -88,6 +88,7 @@ async function callRefresh(
     makeServiceStub('workbuddy', calls) as never,
     makeServiceStub('lobsterai', calls) as never,
     makeServiceStub('qoder', calls) as never,
+    makeServiceStub('qodercn', calls) as never,
     makeServiceStub('trae', calls) as never,
   )
   const response = await getHandler()(new Request('http://127.0.0.1/api/jet-hub', {
@@ -166,6 +167,34 @@ describe('account.refresh 分派（T7 回归）', () => {
     expect(calls).toEqual([{ service: 'qoder', credentialRef: 'QODER_ACCOUNT_FFFF6666' }])
   })
 
+  it('qodercn 账号刷新分派到**中国版实例**，不串到国际版（同族注册表的核心风险）', async () => {
+    // 国际版与中国版共用一个 switch case（`case QODER.id: case QODER_CN.id:`），
+    // 靠 `requireQoderFamily(entry.provider)` 查注册表取实例。
+    // 若哪天有人把它写死成 `qoder.refreshAccountCredential(...)`，
+    // 症状是「中国版账号点刷新，实际续期了国际版的凭据」—— 两站 token
+    // 不通用，于是 CN 续期永远失败而国际版被无谓地刷了一次。
+    // 这条用例用**行为**（哪个 stub 被调用）而非字符串锁住这件事。
+    const { calls, value } = await callRefresh(
+      [entry('qodercn', 'QODERCN_ACCOUNT_GGGG7777')], 'qodercn-1',
+    )
+    expect(value.success).toBe(true)
+    expect(value.error).toBeUndefined()
+    expect(calls).toEqual([{ service: 'qodercn', credentialRef: 'QODERCN_ACCOUNT_GGGG7777' }])
+    // 关键：国际版实例必须**没有**被碰过。
+    expect(calls.some((c) => c.service === 'qoder'), '中国版账号串到了国际版实例').toBe(false)
+  })
+
+  it('两站账号同时在池时各刷各的（互不串用）', async () => {
+    const accounts = [
+      entry('qoder', 'QODER_ACCOUNT_H1'),
+      entry('qodercn', 'QODERCN_ACCOUNT_H2'),
+    ]
+    const intl = await callRefresh(accounts, 'qoder-1')
+    expect(intl.calls).toEqual([{ service: 'qoder', credentialRef: 'QODER_ACCOUNT_H1' }])
+    const cn = await callRefresh(accounts, 'qodercn-1')
+    expect(cn.calls).toEqual([{ service: 'qodercn', credentialRef: 'QODERCN_ACCOUNT_H2' }])
+  })
+
   it('codearts 账号刷新自己的 credentialRef', async () => {
     const { calls, value } = await callRefresh(
       [entry('codearts', 'CODEARTS_ACCOUNT_DDDD4444')], 'codearts-1',
@@ -174,13 +203,14 @@ describe('account.refresh 分派（T7 回归）', () => {
     expect(calls).toEqual([{ service: 'codearts', credentialRef: 'CODEARTS_ACCOUNT_DDDD4444' }])
   })
 
-  it('六个 provider 各自分派到对应服务（互不串用）', async () => {
+  it('七个 provider 各自分派到对应服务（互不串用）', async () => {
     const accounts = [
       entry('codearts', 'CODEARTS_ACCOUNT_1'),
       entry('buddy', 'BUDDY_ACCOUNT_1'),
       entry('workbuddy', 'WORKBUDDY_ACCOUNT_1'),
       entry('lobsterai', 'LOBSTERAI_ACCOUNT_1'),
       entry('qoder', 'QODER_ACCOUNT_1'),
+      entry('qodercn', 'QODERCN_ACCOUNT_1'),
       entry('trae', 'TRAE_ACCOUNT_1'),
     ]
     for (const target of accounts) {

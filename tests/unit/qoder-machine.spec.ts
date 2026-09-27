@@ -25,11 +25,12 @@
  * 故所有用例都把 `QODER_RUNTIME_INFO` 指向不存在或受控的路径。
  */
 
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import {
+  findRuntimeInfoExecutable,
   resetQoderMachineIdentityCache,
   resolveQoderMachineIdentity,
   resolveQoderMachineIdentityAsync,
@@ -218,5 +219,88 @@ describe('runtimeInfoArgs（参数形态回归）', () => {
     expect(args.length, '漏了 environment 位置参数').toBeGreaterThan(1)
     expect(args[0], '第一参不能是 --account-stdin（那是漏 environment 的形态）')
       .not.toBe('--account-stdin')
+  })
+})
+
+describe('runtime-info.exe 的多数据目录定位（设计文档 §9 缺陷修复）', () => {
+  // 真实缺陷（复发风险）：`locateRuntimeInfo` 原先写死 `~/.qoder/.bin`。
+  // 只装了中国版、没装国际版的用户没有 `~/.qoder`，于是找不到 exe →
+  // 退到陈旧磁盘缓存 → 拿不到 machine 头 → `/sash/api/v1/me/campaigns`
+  // 只回 VIEW_DETAILS → 插件误报「今天已领」。那正是 2026-09-25 修过的缺陷。
+  //
+  // ⚠️ 目录列表**不在** QoderProduct 上：实测两站同一 environment 返回同一身份
+  // （两份 exe SHA256 相同），身份由「设备 + environment」决定、与产品无关。
+
+  /** 造一个 `<home>/<dirName>/.bin/umid-<hash>/runtime-info(.exe)`。 */
+  function fakeExe(home: string, dirName: string, hash: string): string {
+    const exeDir = join(home, dirName, '.bin', `umid-win32-x64-${hash}`)
+    mkdirSync(exeDir, { recursive: true })
+    const exe = join(exeDir, process.platform === 'win32' ? 'runtime-info.exe' : 'runtime-info')
+    writeFileSync(exe, '')
+    return exe
+  }
+
+  it('只有中国版目录时也能找到（这是修复的核心场景）', () => {
+    const home = mkdtempSync(join(tmpdir(), 'qoder-cn-only-'))
+    try {
+      const exe = fakeExe(home, '.qoder-cn', 'aaaa')
+      expect(findRuntimeInfoExecutable(home)).toBe(exe)
+    } finally {
+      rmSync(home, { recursive: true, force: true })
+    }
+  })
+
+  it('两个目录都有时按默认顺序取国际版（顺序即优先级）', () => {
+    const home = mkdtempSync(join(tmpdir(), 'qoder-both-'))
+    try {
+      const intl = fakeExe(home, '.qoder', 'bbbb')
+      fakeExe(home, '.qoder-cn', 'cccc')
+      expect(findRuntimeInfoExecutable(home)).toBe(intl)
+    } finally {
+      rmSync(home, { recursive: true, force: true })
+    }
+  })
+
+  it('可显式指定目录顺序（把中国版排前即取中国版）', () => {
+    const home = mkdtempSync(join(tmpdir(), 'qoder-order-'))
+    try {
+      fakeExe(home, '.qoder', 'dddd')
+      const cn = fakeExe(home, '.qoder-cn', 'eeee')
+      expect(findRuntimeInfoExecutable(home, ['.qoder-cn', '.qoder'])).toBe(cn)
+    } finally {
+      rmSync(home, { recursive: true, force: true })
+    }
+  })
+
+  it('两个目录都不存在时返回 undefined（正常降级，不抛错）', () => {
+    const home = mkdtempSync(join(tmpdir(), 'qoder-none-'))
+    try {
+      expect(findRuntimeInfoExecutable(home)).toBeUndefined()
+    } finally {
+      rmSync(home, { recursive: true, force: true })
+    }
+  })
+
+  it('目录存在但没有 umid-* 子目录时返回 undefined', () => {
+    const home = mkdtempSync(join(tmpdir(), 'qoder-noumid-'))
+    try {
+      mkdirSync(join(home, '.qoder', '.bin'), { recursive: true })
+      mkdirSync(join(home, '.qoder-cn', '.bin', 'something-else'), { recursive: true })
+      expect(findRuntimeInfoExecutable(home)).toBeUndefined()
+    } finally {
+      rmSync(home, { recursive: true, force: true })
+    }
+  })
+
+  it('命中第一个目录但 exe 文件缺失时继续试下一个目录', () => {
+    // 场景：`.qoder/.bin/umid-x/` 存在但里面没有 exe（半安装/清理残留）。
+    const home = mkdtempSync(join(tmpdir(), 'qoder-partial-'))
+    try {
+      mkdirSync(join(home, '.qoder', '.bin', 'umid-win32-x64-ffff'), { recursive: true })
+      const cn = fakeExe(home, '.qoder-cn', 'gggg')
+      expect(findRuntimeInfoExecutable(home)).toBe(cn)
+    } finally {
+      rmSync(home, { recursive: true, force: true })
+    }
   })
 })

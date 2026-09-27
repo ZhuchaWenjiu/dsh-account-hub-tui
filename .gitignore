@@ -15,6 +15,7 @@ stderr.log']
 commit-msg.tmp
 
 ide-models.json
+scripts
 
 # Qoder 私有签名体系的复现脚本（研究工具，仅本地保留）
 #

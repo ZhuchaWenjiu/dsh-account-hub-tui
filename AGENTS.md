@@ -8,7 +8,7 @@
 
 ## 项目概述
 
-本项目是 DeepSeek Harness 的一个插件（`dsh-codearts-auth`），提供华为云 CodeArts 浏览器登录与凭据管理功能。插件还附带 `buddy`（腾讯 CodeBuddy 中国版）、`workbuddy`（腾讯 WorkBuddy **国际版** / WorkBuddy AI）、`lobsterai`（有道 **LobsterAI** / 龙虾）、`qoder`（阿里系 **Qoder**）、`trae`（字节跳动 **TRAE**）、`cline`（**Cline** 桌面端 / Cline API）与 `loomy`（讯飞 **Loomy** 办公助手）七个 LLM provider 路由。
+本项目是 DeepSeek Harness 的一个插件（`dsh-codearts-auth`），提供华为云 CodeArts 浏览器登录与凭据管理功能。插件还附带 `buddy`（腾讯 CodeBuddy 中国版）、`workbuddy`（腾讯 WorkBuddy **国际版** / WorkBuddy AI）、`lobsterai`（有道 **LobsterAI** / 龙虾）、`qoder`（阿里系 **Qoder**）、`qodercn`（**Qoder 中国版**，与 `qoder` 同协议族、共用同一份 WASM）、`trae`（字节跳动 **TRAE**）、`cline`（**Cline** 桌面端 / Cline API）、`loomy`（讯飞 **Loomy** 办公助手）与 `raccoon`（商汤 **Raccoon Work** / 小浣熊）九个 LLM provider 路由。
 
 `buddy` 与 `workbuddy` 同源：共用同一 CLI 内核与同一认证协议，差异全部收敛在 `src/product.ts` 的产品配置中。关键差异是 **`endpoint`**：中国版为 `copilot.tencent.com`，国际版为 `www.workbuddy.ai`，两者返回不同模型池，因此 endpoint 必须随产品切换、不可当作全局常量。此外 `platform` 分别为 `ide` 与 `workbuddy-ai`，国际版登录 URL 还追加 `version` / `loginSessionId`。
 
@@ -60,6 +60,40 @@
    ⚠️ 解码函数名与 XOR 密钥**随版本会变**，脚本会自行探测）。回归用例
    `tests/unit/qoder-tools.spec.ts`。
 
+7. **图片必须走 `messages[].content` 的多模态数组，`chat_context.imageUrls` 是死的**
+   —— **真实缺陷**（用户报障：「给 qodercn 的 qwen3.8-flash 发送图片，说没读到图片」）。
+   ⚠️ 这不是配置问题，也不是「`imageUrls` 忘了填」：
+
+   - 客户端官方实现 `Hyc()` **就把 `chat_context.imageUrls` 恒置 `null`**。
+     obf 产物原文（`qoder-worker-runtime.obf.mjs`，明文可搜）：
+     `function Hyc(A,e,t){return{text:A,features:[],extra:{…},chatPrompt:"",imageUrls:null}}`
+     —— 我们 `src/qoder-wasm.ts` 里那行 `imageUrls: null` 是**忠实复刻，不是缺陷**。
+     排查时**别再盯着这个字段**（我第一轮就盯错过）。
+   - 图片的**正确通道是 `messages[].content` 的多模态数组**：客户端 `eQc()` 把
+     `{type:'base64',media_type,data}` 转成
+     `{type:'image_url',image_url:{url:'data:<media_type>;base64,<data>'}}`，
+     `bJc()` 再转成 `{type:'input_image',…}`。
+   - 真正的丢失点在 `buildQoderHistory`（`src/qoder-adapter.ts`）：它原先用
+     `qoderContentText()` 把 content **压成纯文本**，而**上游
+     `serializeMessages` 早已正确产出多模态数组** —— 图片是在这一跳被吃掉的。
+   - 修法（`qoderContentParts()`）：**含图消息保留 content 数组**（逐字段只搬
+     `type` / `text` / `image_url.url`（+ 可选 `detail`）），**纯文本仍输出字符串**
+     （上游对字符串兼容性最好，且既有用例锁死了该形态）；
+     判空必须把图片算作内容，否则「只发图不带字」的消息会被整条丢弃。
+     ⚠️ 同时别忘了 `userText`（写进 `chat_context.text` / `originalContent`）：
+     带图时 content 是数组，只判 `typeof === 'string'` 会让配文退化成空串。
+   - ⚠️ **这是本文件第三个同型缺陷**（前两个：`tools` 不下发、工具历史丢
+     `tool_calls`）—— 都是**序列化层没保留多模态结构**。改 Qoder 序列化时，
+     把「tools / tool_calls / 图片」三者一起过一遍。
+   - ⚠️ **两站同时受影响**：`qoder` 与 `qodercn` 共用同一个 `QoderAdapter` 类与
+     同一个 `buildQoderHistory`，故国际版的图片此前同样是坏的（本次一并修好）。
+   - 排查脚本 `scripts/probe-qoder-image-loss.mjs`（只读、离线、零额度：按
+     `serializeMessages → buildQoderHistory → buildQoderInferPayload` 真实路径
+     逐步打印，直接指出丢失点）。回归用例在 `tests/unit/qoder-tools.spec.ts`
+     （5 条，含「纯图片消息不被丢弃」「纯文本仍输出字符串」「未知字段被剔除」）。
+     ⚠️ 已做**反向验证**：让 `qoderContentParts` 恒返回 undefined（= 修复前行为）
+     时其中 4 条会失败，故不是同义反复。
+
 ⚠️ **`src/qoder-auth-wasm.wasm`（298 KB）随插件分发**，构建时由 `scripts/copy-assets.mjs` 复制到 `lib/`（`tsc` 不搬 `.wasm`）。`build:all` 已含该步骤。
 
 ⚠️ **WASM 提取自 Qoder `0.3.4`**（runtime `1.1.57`）。升级方式：
@@ -74,6 +108,72 @@ pnpm build:assets          # 同步到 lib/
 （实测 IDE 跑 0.3.4）。刷新后**必须实测一次对话**（`qfmodel` / `qmodel_38max`）确认签名仍被接受。
 
 它**积分余额与每日领取都有**（能力矩阵登记为 `{balance:true, dailyCheckin:true}`），并复用 `src/openai-compat.ts` 的 OpenAI 协议层共享实现（消息序列化 / SSE 消费 / 错误归类）。详见 README 的「Qoder provider」章节与 `docs/superpowers/specs/2026-09-19-qoder-provider-design.md`。
+
+### ⚠️ Qoder **中国版**（`qodercn`）：同协议、异配置，五个必须记住的点
+
+中国版与国际版**共用同一套 `src/qoder*.ts` 实现**（含**同一份 WASM**），差异全在
+`src/qoder-product.ts` 的 `QODER_CN`；服务端 `src/jet-hub-rpc.ts` 里四处 Qoder 分支
+通过 `qoderFamily` 注册表分派，两个产品共用同一组回调。
+新增同族产品时**不要复制实现文件** —— 那会让上面记着的每一处缺陷修两遍。
+取证见 `docs/superpowers/specs/2026-09-27-qodercn-provider-design.md`（证据编号 E1–E13）。
+
+1. **`client_id` 与国际版不同，且不能靠探测验证**：CN 是
+   `732aef47-9cf2-46a2-95fe-4cebb5d0d1fa`（取自 CN asar 的 `Vpe.authClientIds.prod`），
+   国际版两个 id 在 CN asar 里**命中 0 次**。CN 的 `prod` 与 `test` **同值**，
+   所以不存在国际版 `J_a`/`G_a` 读反的那类风险 —— 但**入口 302 依然不能证明
+   id 正确**（对任一 client_id 都回 302），必须真实登录闭环。
+   ✅ 已实测通过（2026-09-27，`scripts/verify-qodercn-live.mjs`）：授权成功，
+   拿到 uid `01a0df0a-…`（与本机 `~/.qoder-cn/.models/` 目录名一致，交叉印证）。
+2. **模型表不能沿用国际版**：CN 是 **14 条**，独有 `q37fmodel`(Qwen3.7-Flash) /
+   `gm51model`(GLM-5.2)，**没有** `ultimate` / `performance` / `efficient` /
+   `smodel` / `cmodel` 五条（沿用会让菜单出现 5 个 CN 端点根本不认的模型）；
+   另有 5 条上下文窗口不同（`dmodel` 在 CN 是 **96K**）、4 条思考标记不同、
+   `mmodel` 在 CN 是 **MiniMax-M2.7** 不是 M3 且 `is_vl` 为 false。
+   ⚠️ 改表同样必须逐个实发验证，且 `qoder-product.spec.ts` 对 CN 有**逐条数值断言**。
+   ⚠️ CN 目录条目的标识字段名是 **`key`**，国际版是 `model_key` —— 重新采集时
+   两个名字都要认（`scripts/probe-qodercn-catalog.mjs` 已如此实现），
+   否则会得到「0 个模型」的**假阴性**（首跑真踩过）。
+3. **CN 没有公开的 OpenAI 兼容端点**：`gateway.qoder.com.cn` 与
+   `openapi.qoder.com.cn` 上的 `/model/v1/chat/completions` 实测都回 **503**。
+   故 `QODER_CN.inferBase` 填成与 `encryptedInferBase` 同值，仅表示「无独立公开端点」，
+   **不要**据此发请求。（`inferBase` 与 `QODER_CHAT_PATH` 在整个代码库里本就
+   **无任何调用方** —— 是公开端点方案被加密端点取代后留下的死配置，
+   删除属于越界重构故保留，但新增代码不得再依赖它。）
+4. **machine 身份与产品无关，但目录要遍历两个**：实测两站 `runtime-info.exe`
+   （**SHA256 相同**）在同一 `environment`（仍为 `'3'`）下返回**逐字节相同**的
+   `machineType` / `machineCode`（`env=0` 则两站同为另一套值）—— 身份由
+   「设备 + environment」决定，**与产品无关**。
+   所以**不需要**按产品分别缓存（那只会多一次 3.8 秒的无意义 spawn），
+   也**不要**把目录列表放进 `QoderProduct`（没人读它 = 死配置，且会让人误以为
+   「一产品认一目录」）；它落在 `src/qoder-machine.ts` 的模块常量
+   `QODER_DATA_DIR_NAMES = ['.qoder', '.qoder-cn']`。
+   ⚠️ 原实现把 `~/.qoder/.bin` 写死，**只装了中国版**的用户因而找不到 exe →
+   退到陈旧磁盘缓存 → 拿不到 machine 头 → 积分误报「今天已领」 ——
+   这正是 2026-09-25 那次修复的**复发路径**（已修，反向验证过用例会红）。
+5. **加密推理可共用那份 WASM，已实证**：用国际版（从 0.3.4 / runtime 1.1.57 提取）
+   那份 `src/qoder-auth-wasm.wasm` ① 成功解密 CN（runtime 1.1.64）下发的
+   `catalog-v6`；② 签出的推理请求被 `gateway.qoder.com.cn` 接受
+   （**HTTP 200 + 15 个 SSE 帧**）。故**不分发第二份产物**，
+   `scripts/copy-assets.mjs` 与 `scripts/extract-qoder-wasm.mjs` 均无需 CN 变体。
+   ⚠️ 顺带纠正 `qoder-wasm.ts` 里「`session_type` 国内版是 `qoder_work`」那条注释：
+   它**不适用于推理载荷** —— CN 实测接受默认值 `qodercli`；
+   CN asar 里 `qoder_work` 的唯一命中属于 `integrationMode → --ide-type`，另一回事。
+   ⚠️ `clientMetadata` 沿用国际版的 **CLI** 身份（`client_type:'5'`）在 CN 也可用，
+   不必换成 CN 桌面端的 `Fh` 那组 —— 但仍**不要**把 `sashClientType`（`'10'`）
+   与它合并，那仍是两个不同身份（见上文）。
+
+积分链路（`/sash/`）在 CN **整套复用成立**，实测：余额 `total=400`
+（套餐额度 300 + 资源包 100，多包累加口径与国际版一致）、
+`active=true / todayCheckedIn=false / dailyCredit=100`、
+真实领取 `claimed +100` 且余额 `400 → 500`。
+CN asar 里同样是 `Fh = Object.freeze({ clientType: 10, … })`，
+且 sash 请求头 UA 恒为 `"Qoder"`。
+
+排查脚本（均只读、零额度）：`scripts/probe-qodercn-clientid.mjs`（asar 里的
+`authClientIds` 与授权 URL 构造 `Sft()`）、`scripts/probe-qodercn-catalog.mjs`
+（用**国际版** WASM 解 CN 目录并输出可粘贴的 TS 兜底表条目）、
+`scripts/verify-qodercn-live.mjs`（一次性「登录→推理→积分」，**token 不落盘**）。
+e2e：`pnpm test:e2e:qodercn`（只读）/ `:qodercn-chat` / `:qodercn-credits`。
 
 ### ⚠️ Qoder 积分余额：路径在 `/sash/` 下，且只需 Bearer
 
@@ -189,7 +289,12 @@ native 另有 `rl = Object.freeze({ clientType: 10, businessProduct: 'app' })`�
 
 `trae` 同样**完全独立**（第五个脉系，独立一套 `src/trae*.ts`），且差异点与其他四者都不一样：认证用 **ExchangeToken 轮换 refreshToken**（不是轮询、也不是 authCode 交换）；鉴权头是 `Cloud-IDE-JWT <token>` 加十余个 `X-*` 身份头；**请求体需要从 OpenAI 格式转换为 SOLO 格式**（`function` / `config_name` / `tools.parameters` 序列化等）；**响应是 SOLO 自定义 SSE 事件**（`output` / `token_usage` / `done` / `error`），必须自行解析并转成 OpenAI chunk；凭据还必须持久化 `machine_id` 与 `device_id`（均为 **32 位 hex**，分别用作设备指纹与签到设备号，后者账号间必须互异）。**登录回调默认直接回传 token**（`auth_callback_url` 参数，老流程没有 `code`；但也并存 PKCE 新流程，两套都要认），详见下「TRAE 协议要点」。实现见 `docs/trae-integration-plan.md`。
 
-Jet Hub 设置页（`plugin-src/client/jet-hub.js`）提供多账号管理与限流自动切换；「一键领取积分」按钮（每日签到）**CodeBuddy、LobsterAI、CodeArts、Qoder 与 TRAE 五个面板提供** —— 只有国际版 WorkBuddy 与 Cline 不提供（两者的后端都没有签到接口）。各面板是**互不相同的协议**（见下「积分领取」）。
+Jet Hub 设置页（`plugin-src/client/jet-hub.js`）提供多账号管理与限流自动切换；「一键领取积分」按钮（每日签到）**CodeBuddy、LobsterAI、CodeArts、Qoder、Qoder 中国版与 TRAE 六个面板提供** —— 国际版 WorkBuddy 与 Cline 不提供（两者的后端都没有签到接口）。各面板是**互不相同的协议**（见下「积分领取」）。
+
+⚠️ Qoder 国际版与中国版**共用同一组领取实现**（`src/qoder-credits.ts` 的函数一律
+接收 `product` 参数），RPC 侧通过 `jet-hub-rpc.ts` 的 `qoderFamily` 注册表分派。
+新增同族产品**不要**在四处分支各加一条平行 case —— 平行 case 越多，漏接概率越高
+（`workbuddy` 的「刷新」按钮就是这么一直坏着的）。
 
 - **包名**：`dsh-codearts-auth`
 - **入口**：`lib/index.js`（宿主侧）、`lib/client/jet-hub.js`（客户端 bundle）
@@ -232,14 +337,14 @@ Jet Hub 设置页（`plugin-src/client/jet-hub.js`）提供多账号管理与限
 
 ## 工作方式
 
-本插件定义的所有 `ctx.xxxAuth` 服务（`codeartsAuth`、`buddyAuth`、`workbuddyAuth`、`lobsteraiAuth`、`qoderAuth`、`traeAuth`、`clineAuth`）均遵循统一接口：
+本插件定义的所有 `ctx.xxxAuth` 服务（`codeartsAuth`、`buddyAuth`、`workbuddyAuth`、`lobsteraiAuth`、`qoderAuth`、`qoderCnAuth`、`traeAuth`、`clineAuth`）均遵循统一接口：
 
 - `login(options?)` — 执行浏览器登录流程
 - `startLogin(options?)` — 两步式登录（先返回 loginUrl，Jet Hub 据此弹窗）
 - `refreshAccountCredential(refName)` — 按凭据 ref 续期**指定账号**（账号卡片「刷新」按钮）
 - `refreshAll(pool)` — 批量续期全部账号（定时调度器）
 
-⚠️ **不注册任何斜杠命令**：七个 provider 的登录/状态/续期**全部**在 Jet Hub 设置页完成。
+⚠️ **不注册任何斜杠命令**：九个 provider 的登录/状态/续期**全部**在 Jet Hub 设置页完成。
 
 ⚠️ **CodeArts 只支持账号池，单凭据模式已移除**（用户要求）：
 
@@ -251,7 +356,7 @@ Jet Hub 设置页（`plugin-src/client/jet-hub.js`）提供多账号管理与限
   移除单凭据后会恒返回空列表。
 - `codearts-login` / `codearts-status` / `codearts-refresh` 三个命令**已删除**
   （注意代码里**从来没有** `codearts-logout` 命令，logout 只是服务方法）。
-- 七个 provider 的门控判据因此**完全一致**：都只看账号池，
+- 九个 provider 的门控判据因此**完全一致**：都只看账号池，
   `providerCatalogVisible` 的 `extraCredentialRefs` 参数已随之删除。
 - 老用户影响：若此前只用固定 ref 登录过，模型列表会变空，需在 Jet Hub 重新登录一次
   （用户已确认接受该行为，不做自动迁移）。
@@ -272,11 +377,19 @@ Jet Hub 设置页（`plugin-src/client/jet-hub.js`）提供多账号管理与限
 - `src/index.ts` 的 `accounts.some(a => a.refreshable && a.enabled)`
   → **所有账号都停用时续期定时器根本不启动**。
 
-用户重新启用后拿到的是死凭据，只能重新登录。七个 provider 的
+用户重新启用后拿到的是死凭据，只能重新登录。九个 provider 的
 `refreshAll`（`buddy-auth.ts` / `service.ts` / `lobsterai-auth.ts` / `qoder-auth.ts` / `trae-auth.ts`）与调度器
 **都必须保持只看 `refreshable`**。
 
-服务名由产品 id 派生（`${product.id}Auth`）：两个 `BuddyAuth` 实例分别注册为 `buddyAuth` 与 `workbuddyAuth`，`LobsteraiAuth` 注册为 `lobsteraiAuth`，`QoderAuth` 注册为 `qoderAuth`，`TraeAuth` 注册为 `traeAuth`，`ClineAuth` 注册为 `clineAuth`，互不覆盖。
+⚠️ Qoder 中国版**复用同一个 `QoderAuth` 类**（`src/qoder-auth.ts`），故它的
+`refreshAll` 判据**天然与国际版一致** —— 不存在「CN 那份实现忘了改」的可能，
+这正是「差异收敛到产品配置」这个模式的价值。
+
+服务名由产品 id 派生（`${product.id}Auth`）：两个 `BuddyAuth` 实例分别注册为 `buddyAuth` 与 `workbuddyAuth`，`LobsteraiAuth` 注册为 `lobsteraiAuth`，两个 `QoderAuth` 实例（同一类、不同 `product`）分别注册为 `qoderAuth` 与 `qoderCnAuth`，`TraeAuth` 注册为 `traeAuth`，`ClineAuth` 注册为 `clineAuth`，互不覆盖。
+
+⚠️ 服务名撞车会**在构造时抛** `service "..." has been registered`，故新增同族产品时
+**provider id 必须互不相同** —— 这也是 `qodercn` 这个 id 不带连字符的原因
+（`qoder-cnAuth` 不符合 camelCase 惯例）。
 
 各 provider 的登录/续期机制不同（详见 README.md），但均通过 `ctx.credentials` 统一管理凭据生命周期。
 
@@ -1040,7 +1153,7 @@ groups: catalog.flatMap(...).filter(group => group.models.length > 0)
 | 判据是**凭据可解析** | 服务层的 `logout()` **只 unset 凭据、保留账号条目**（删条目是另一条路径 `removeAccount`）。若只看「有条目」，用户登出后模型仍然显示，门控形同虚设 |
 | **不看 `enabled`** | 停用只影响「自动选号」，与「是否已登录」无关。若过滤 `enabled`，把所有账号停用的用户会发现整个 provider 的模型凭空消失。与「续期只看 `refreshable`、不看 `enabled`」是同一条既有约定 |
 
-⚠️ **七个 provider 判据完全一致，没有例外**：早期 CodeArts 曾额外接受固定单凭据
+⚠️ **九个 provider 判据完全一致，没有例外**：早期 CodeArts 曾额外接受固定单凭据
 ref（`CODEARTS_ACCESS_TOKEN`），该模式**已移除**，`extraCredentialRefs` 参数一并
 删除。老用户若只用固定 ref 登录过，模型列表会变空 —— 需在 Jet Hub 重新登录一次
 （用户已确认接受，不做自动迁移）。
@@ -2720,9 +2833,9 @@ CN 项目每 3~5 次请求主动换 `machine_id` 以「降低 IDE 端点风控�
 - 工具结果内嵌图片（`read_image`）不能留在 `role:'tool'` 消息里（该角色 content 只能是字符串），须提升为**其后的独立 user 消息**；`userContentParts` 与 `collectImages` 必须**对称递归**，否则深层图片会被静默吞掉
 - 只声明 `inputModalities` 而不实现比不声明**更糟**：DSH 在 `LlmRuntime` 里按它决定是否把图片投影成文本占位符，声明支持就必须真支持
 
-## 「+ 新建账号」必须两步式返回 loginUrl（六个 provider 一致）
+## 「+ 新建账号」必须两步式返回 loginUrl（七个 provider 一致）
 
-`account.create` 对**全部六个 provider** 都必须在**用户完成授权之前**返回
+`account.create` 对**全部七个 provider** 都必须在**用户完成授权之前**返回
 `loginUrl`，由前端立即 `window.open`，后台再异步等回调。
 
 这不是风格偏好，而是浏览器硬约束：`window.open` 只在用户点击后的
@@ -2736,6 +2849,10 @@ CN 项目每 3~5 次请求主动换 `machine_id` 以「降低 IDE 端点风控�
 - `codearts`：`CodeArtsAuth.startLogin()`（`src/service.ts`），底层 `startOAuthFlow`（`src/login.ts`）
 - `lobsterai`：`LobsteraiAuth.startLogin()`（`src/lobsterai-auth.ts`），底层 `startLobsteraiLoginFlow`（`src/lobsterai-oauth.ts`）
 - `qoder`：`QoderAuth.startLogin()`（`src/qoder-auth.ts`），底层 `startQoderLoginFlow`（`src/qoder-oauth.ts`）—— 它是**设备码轮询**，不起本地回调服务器，故没有端口/超时收尾问题
+- `qodercn`：**同一个 `QoderAuth.startLogin()`**，只是实例带 `product: QODER_CN`。
+  RPC 侧由 `jet-hub-rpc.ts` 的 `qoderFamily` 注册表分派，`isQoderFamily(provider)`
+  命中即走这一条 —— 故**不存在「中国版忘了接」的可能**（这正是改用注册表的目的：
+  `workbuddy` 的「刷新」按钮当年就是因为漏接一条平行 case 而一直坏着）
 - `trae`：`TraeAuth.startLogin()`（`src/trae-auth.ts`），底层 `startTraeLoginFlow`（`src/trae-oauth.ts`）。默认回调 `http://127.0.0.1:18080/authorize`；该端口被占用时**自动回退到随机端口**（`redirect_uri` 随之重算，服务端原样回跳，故功能不受影响）。登录 URL 需带 `client_id` / `machine_id` / `device_id`
 
 要点：

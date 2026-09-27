@@ -4,6 +4,7 @@ import { fileURLToPath } from 'node:url'
 import { dirname, resolve } from 'node:path'
 import {
   CREDITS_CAPABILITIES,
+  checkinProviders,
   supportsCreditBalance,
   supportsDailyCheckin,
   supportsOnboardingTasks,
@@ -64,6 +65,29 @@ describe('积分能力矩阵', () => {
     expect(CREDITS_CAPABILITIES.qoder).toEqual({ balance: true, dailyCheckin: true })
     expect(supportsCreditBalance('qoder')).toBe(true)
     expect(supportsDailyCheckin('qoder')).toBe(true)
+  })
+
+  it('Qoder 中国版：余额与签到都支持，与国际版同形', () => {
+    // 依据（设计文档 E7/E10）：CN 的 `/sash/api/v2/me/usage` 与
+    // `/sash/api/v1/me/campaigns` 零凭据实测返回 `401 {"code":"TOKEN_INVALID",
+    // "message":"missing authorization token"}`，与国际版**逐字节同形**；
+    // CN asar 里同样是 `Fh = Object.freeze({ clientType: 10, … })`。
+    //
+    // ⚠️ 「端点存在」不等于「活动一定下发」—— 真实领取由
+    // `pnpm test:e2e:qodercn-credits` 验证。若将来确认 CN 无签到，改这里时
+    // 必须换成强证据（扫 CN asar 无 claim 端点），**不要**写「某次没看到」
+    // —— 上面那条 qoder 用例的教训正是这样来的。
+    expect(CREDITS_CAPABILITIES.qodercn).toEqual({ balance: true, dailyCheckin: true })
+    expect(supportsCreditBalance('qodercn')).toBe(true)
+    expect(supportsDailyCheckin('qodercn')).toBe(true)
+  })
+
+  it('中国版出现在一键签到的遍历渠道里（由能力表推导，非硬编码）', () => {
+    // 页头「一键签到」遍历 `checkinProviders()`；漏登记的表现是
+    // 「新渠道永远不被签到」，而不是报错 —— 故必须显式断言在里面。
+    expect(checkinProviders()).toContain('qodercn')
+    // 顺序紧跟国际版（本表声明顺序即请求顺序）。
+    expect(checkinProviders().indexOf('qodercn')).toBe(checkinProviders().indexOf('qoder') + 1)
   })
 
   it('Loomy 三项能力：余额 + 每日签到 + 新手任务', () => {

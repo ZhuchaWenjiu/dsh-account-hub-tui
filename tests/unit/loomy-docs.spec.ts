@@ -123,8 +123,28 @@ describe('Loomy 文档覆盖', () => {
     expect(agents).toContain('registerJetHubRpc')
   })
 
-  it('AGENTS.md 概述行把 provider 数量更新为七个', () => {
-    expect(agents).toMatch(/七个 LLM provider 路由/)
+  it('AGENTS.md 概述行的 provider 数量与它自己列出的 id 一致', () => {
+    // ⚠️ 原实现把「七个」这个字面量写死在断言里，于是**每加一个 provider 都要
+    // 回来改这条用例** —— 与 `registerJetHubRpc` 的位置参数是同一类脆弱点。
+    // 改成自校验：数出概述行里反引号包裹的 provider id 个数，与句中声称的
+    // 中文数量词比对。这样它既能抓住「改了列表忘了改数字」，也能抓住
+    // 「改了数字忘了改列表」，且新增 provider 时**无需修改本用例**。
+    const line = agents.split('\n').find((l) => l.includes('LLM provider 路由'))
+    expect(line, '找不到 AGENTS.md 的 provider 概述行').toBeDefined()
+    const ids = [...line!.matchAll(/`([a-z]+)`（/g)].map((m) => m[1])
+    expect(ids.length, '概述行列出的 provider id 数量异常').toBeGreaterThan(0)
+    const CN_DIGITS: Record<string, number> = {
+      一: 1, 二: 2, 三: 3, 四: 4, 五: 5, 六: 6, 七: 7, 八: 8, 九: 9, 十: 10,
+    }
+    // ⚠️ 数字与「个」之间**没有**空格（「九个」），空格在「个」之后。
+    const stated = /([一二三四五六七八九十]+)个\s*LLM provider 路由/.exec(line!)
+    expect(stated, '概述行未声明 provider 数量').not.toBeNull()
+    expect(
+      CN_DIGITS[stated![1]!],
+      `概述行声称 ${stated![1]} 个 provider，但实际列出了 ${ids.length} 个`,
+    ).toBe(ids.length)
+    // 中国版必须在列（它是本次新增的 provider）
+    expect(ids).toContain('qodercn')
   })
 
   /**

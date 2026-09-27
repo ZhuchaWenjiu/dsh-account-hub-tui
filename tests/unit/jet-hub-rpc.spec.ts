@@ -636,11 +636,15 @@ describe('account.create 必须立即返回 loginUrl（两步式登录回归）'
     }
 
     registerJetHubRpc(
+      // ⚠️ 位置参数：中国版 `qoderCn` 紧跟 `qoder`，漏补占位会让后续形参整体错位。
+      // （加 Loomy 踩过一次、加 Raccoon 又踩一次、加 QoderCN 第三次 —— 见计划末尾
+      //  「把 registerJetHubRpc 改成具名参数对象」的后续项建议。）
       ctx as never, pool as never,
       makeAuth('codearts') as never,
       {} as never, {} as never,
       makeAuth('lobsterai') as never,
       makeAuth('qoder') as never,
+      {} as never, // qoderCn（本组用例不触发）
       makeAuth('trae') as never,
       makeAuth('cline') as never,
     )
@@ -722,7 +726,8 @@ describe('account.create 必须立即返回 loginUrl（两步式登录回归）'
         }
       },
     }
-    registerJetHubRpc(ctx as never, pool as never, auth as never, {} as never, {} as never, {} as never, {} as never, {} as never, {} as never, undefined)
+    // ⚠️ 位置参数：`qoderCn` 槽位补 `{}`（本用例只走 codearts，不触发它）。
+    registerJetHubRpc(ctx as never, pool as never, auth as never, {} as never, {} as never, {} as never, {} as never, {} as never, /* qoderCn */ {} as never, {} as never, {} as never, undefined)
     const response = await handler!(new Request('http://localhost/api/jet-hub', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
@@ -779,6 +784,7 @@ describe('account.create 必须立即返回 loginUrl（两步式登录回归）'
       {} as never, // workbuddy
       {} as never, // lobsterai
       {} as never, // qoder
+      {} as never, // qoderCn
       failingAuth as never, // trae
       {} as never, // cline
       {} as never, // loomy
@@ -952,13 +958,14 @@ describe('model.list / model.setDisabled 端点', () => {
     registerJetHubRpc(
       // ⚠️ 位置参数：每新增一个 provider 都要在这里补一个 `{}` 占位，
       // 否则 `modelAdapters` 会错位落到最后一个 auth 形参上
-      // （加 Loomy 时踩过一次，加 Raccoon 时又踩了一次）。
+      // （加 Loomy 时踩过一次，加 Raccoon 时又踩了一次，加 QoderCN 是第三次）。
       ctx as never, pool,
       {} as never, // codearts
       {} as never, // buddy
       {} as never, // workbuddy
       {} as never, // lobsterai
       {} as never, // qoder
+      {} as never, // qoderCn
       {} as never, // trae
       {} as never, // cline
       {} as never, // loomy
@@ -1474,7 +1481,8 @@ describe('积分端点的 provider 能力边界', () => {
     // 而不会因为抛 TypeError 变成误导性的 handler-failed。
     const pool = { listAccounts: async () => [] }
 
-    registerJetHubRpc(ctx as never, pool as never, {} as never, {} as never, {} as never, {} as never, {} as never, {} as never, {} as never, {} as never)
+    // ⚠️ 位置参数：`qoderCn` 槽位补 `{}`（加 QoderCN 时第三次踩这个坑）。
+    registerJetHubRpc(ctx as never, pool as never, {} as never, {} as never, {} as never, {} as never, {} as never, /* qoderCn */ {} as never, {} as never, {} as never, {} as never, {} as never)
     if (handler === undefined) throw new Error('endpoint handler was not registered')
 
     return async (method: string, payload: unknown) => {
@@ -1648,7 +1656,8 @@ describe('account.reorder 端点', () => {
       logger: { warn: () => {}, info: () => {} },
       credentials: { resolve: async () => undefined },
     }
-    registerJetHubRpc(ctx as never, pool as never, {} as never, {} as never, {} as never, {} as never, {} as never, {} as never, {} as never, {} as never)
+    // ⚠️ 位置参数：`qoderCn` 槽位补 `{}`（加 QoderCN 时第三次踩这个坑）。
+    registerJetHubRpc(ctx as never, pool as never, {} as never, {} as never, {} as never, {} as never, {} as never, /* qoderCn */ {} as never, {} as never, {} as never, {} as never, {} as never)
     if (handler === undefined) throw new Error('endpoint handler was not registered')
 
     const call = async (method: string, payload: unknown) => {

@@ -31,7 +31,7 @@ import type { RaccoonCredential } from './raccoon.js'
 import type { StartedRaccoonLoginFlow } from './raccoon-login-page.js'
 import { LOOMY_TASK_POINTS, LOOMY_TASK_TITLES } from './loomy-onboarding.js'
 import { LOBSTERAI } from './lobsterai-product.js'
-import { QODER } from './qoder-product.js'
+import { QODER, QODER_CN, type QoderProduct } from './qoder-product.js'
 import { TRAE } from './trae-product.js'
 import { CLINE } from './cline-product.js'
 import {
@@ -609,6 +609,8 @@ export function registerJetHubRpc(
   workbuddy: BuddyAuth,
   lobsterai: LobsteraiAuth,
   qoder: QoderAuth,
+  /** Qoder **中国版**实例（与 `qoder` 同协议、不同 product；RPC 分支按注册表分派）。 */
+  qoderCn: QoderAuth,
   trae: TraeAuth,
   cline: ClineAuth,
   loomy: LoomyAuth,
@@ -625,7 +627,7 @@ export function registerJetHubRpc(
   ctx.inject(['connection'], (connectionCtx) => {
     registerJetHubEndpoints(
       connectionCtx as Context, pool, codearts, buddy, workbuddy, lobsterai,
-      qoder, trae, cline, loomy, raccoon, modelAdapters,
+      qoder, qoderCn, trae, cline, loomy, raccoon, modelAdapters,
     )
   })
 }
@@ -679,6 +681,7 @@ function registerJetHubEndpoints(
   workbuddy: BuddyAuth,
   lobsterai: LobsteraiAuth,
   qoder: QoderAuth,
+  qoderCn: QoderAuth,
   trae: TraeAuth,
   cline: ClineAuth,
   loomy: LoomyAuth,
@@ -690,6 +693,40 @@ function registerJetHubEndpoints(
   if (!connection || typeof connection.fetch?.register !== 'function') {
     ctx.logger.warn('[jet-hub] connection.fetch not available, RPC endpoints not registered')
     return
+  }
+
+  /**
+   * Qoder **同协议族**成员：国际版与中国版共用同一组 RPC 实现，只换 `product`
+   * 与 `auth` 实例。
+   *
+   * 为什么用注册表而不是给每个 provider 各加一条 `|| provider === X.id`：
+   * 本文件里 Qoder 相关分支有**四处**（登录 / 单账号续期 / 余额 / 领取）。
+   * 平行 case 的数量与「漏接一处」的概率同向增长 —— 本插件在 `workbuddy` 上
+   * 就真漏过一次（账号卡片的「刷新」按钮一直报 `Unknown provider`）。
+   * 注册表把「同族」这件事表达成数据结构，加第 N 个同族产品只改这一处。
+   */
+  interface QoderFamilyMember {
+    readonly product: QoderProduct
+    readonly auth: QoderAuth
+  }
+  const qoderFamily: readonly QoderFamilyMember[] = [
+    { product: QODER, auth: qoder },
+    { product: QODER_CN, auth: qoderCn },
+  ]
+  /** 该 provider 是否属于 Qoder 同族（国际版或中国版）。 */
+  const isQoderFamily = (provider: string): boolean =>
+    qoderFamily.some((member) => member.product.id === provider)
+  /**
+   * 取同族成员；不存在时抛错。
+   *
+   * ⚠️ 调用方**必须**先用 `isQoderFamily()` 判定。这里抛错而不是返回
+   * `undefined`，是为了让分支内部不必写 `!` 或 `as` —— 那两类断言会在
+   * 将来有人把判定改成别的条件时静默失效。
+   */
+  const requireQoderFamily = (provider: string): QoderFamilyMember => {
+    const member = qoderFamily.find((item) => item.product.id === provider)
+    if (member === undefined) throw new Error(`Unknown Qoder family provider: ${provider}`)
+    return member
   }
 
   /**
@@ -876,16 +913,20 @@ function registerJetHubEndpoints(
             void pool.removeAccount(id).catch(() => {})
           })
           return { ok: true, value: { accountId: id, loginUrl: started.loginUrl } }
-        } else if (provider === QODER.id) {
-          // Qoder 与 codearts / lobsterai 同款两步式，但登录机制不同：
-          // 它是**设备码轮询**（不开本地回调服务器，见 src/qoder-oauth.ts），
+        } else if (isQoderFamily(provider)) {
+          // Qoder 同族（国际版 / 中国版）与 codearts / lobsterai 同款两步式，
+          // 但登录机制不同：它是**设备码轮询**（不开本地回调服务器，见 src/qoder-oauth.ts），
           // 同样必须在用户授权前返回 loginUrl，理由见上面的 codearts 分支。
-          const started = await qoder.startLogin({ refName })
+          //
+          // ⚠️ 分支内一律用 `product` / `auth`，**不要**出现 `QODER` 字面量 ——
+          // 否则中国版会拿国际版的域名与 client_id 发请求。
+          const { product, auth } = requireQoderFamily(provider)
+          const started = await auth.startLogin({ refName })
           // 先登记启用的占位条目（无凭据），使前端 login.poll 能立即看到该账号；
           // 登录成功后再回填昵称/有效期等真实字段。
           await pool.addAccount({
             id,
-            provider: QODER.id,
+            provider: product.id,
             nickname: id,
             enabled: true,
             credentialRef: refName,
@@ -896,13 +937,13 @@ function registerJetHubEndpoints(
             const credential = parseQoderCredential(loginResult.access)
             // ⚠️ 设备码轮询响应**不带 `user_name`**，故 `credential.nickname` 恒为空
             // —— 必须补一次 userinfo 才能拿到真实名字，否则账号卡片只能显示
-            // `qoder-xxxx`（多账号无法区分）。见 `fetchQoderUserNickname` 的说明。
+            // `qodercn-xxxx`（多账号无法区分）。见 `fetchQoderUserNickname` 的说明。
             //
             // ⚠️ **失败不阻塞登录**：昵称只是展示信息，拿不到就退回账号 id
             //（与 `toLoginFlowResult` 对过期时间的处理同原则）。
             let nickname = credential?.nickname
             if ((nickname === undefined || nickname.length === 0) && credential !== undefined) {
-              nickname = await fetchQoderUserNickname(credential, QODER)
+              nickname = await fetchQoderUserNickname(credential, product)
               // 写回**凭据**（不只账号条目）：账号条目会随 Jet Hub 的账号操作
               // 整体重写，而凭据里存一份才能在续期后与其它面板都稳定拿到。
               if (nickname !== undefined && loginResult.access.length > 0) {
@@ -916,7 +957,7 @@ function registerJetHubEndpoints(
               refreshable: credential !== undefined && isQoderRefreshable(credential),
             })
           }).catch((error: unknown) => {
-            ctx.logger.warn(`[jet-hub] background ${QODER.id} login failed for ${id}: ${String(error)}`)
+            ctx.logger.warn(`[jet-hub] background ${product.id} login failed for ${id}: ${String(error)}`)
             // 登录失败：移除占位条目，避免留下无凭据的幽灵账号
             void pool.removeAccount(id).catch(() => {})
           })
@@ -1179,7 +1220,14 @@ function registerJetHubEndpoints(
               await lobsterai.refreshAccountCredential(entry.credentialRef)
               break
             case QODER.id:
-              await qoder.refreshAccountCredential(entry.credentialRef)
+            case QODER_CN.id:
+              // 同协议族：按 provider 找到对应实例。
+              // ⚠️ 只刷传入的这个 ref，不碰默认单凭据 ref（历史缺陷同因）。
+              // ⚠️ **不要**图省事写 `qoder.refreshAccountCredential(...)` ——
+              // 那会让中国版账号的「刷新」去续国际版的凭据（两站 token 不通用，
+              // CN 永远续不动而国际版被无谓刷一次）。该串用由
+              // `lobsterai-rpc-dispatch.spec.ts` 的行为级用例锁死（已做反向验证）。
+              await requireQoderFamily(entry.provider).auth.refreshAccountCredential(entry.credentialRef)
               break
             case TRAE.id:
               await trae.refreshAccountCredential(entry.credentialRef)
@@ -1589,7 +1637,8 @@ function registerJetHubEndpoints(
       case 'credits.claimAll': {
         const req = payload as RpcCreditsClaimAllRequest
         const accounts = await pool.listAccounts(req.provider)
-        if (req.provider === QODER.id) {
+        if (isQoderFamily(req.provider)) {
+          const { product } = requireQoderFamily(req.provider)
           // Qoder 的领取流程**自带活动列表查询**（loadCampaigns → 逐个 claim），
           // 故 precheckStatus: false 跳过外部那次检查 —— 否则会重复发一次 GET
           // （与 LobsterAI 传 false 的理由同类）。
@@ -1598,7 +1647,7 @@ function registerJetHubEndpoints(
           // HTTP 200），已在 claimQoderCampaign 内部处理。
           const value = await collectClaimResults<QoderCredential, undefined>(accounts, undefined, {
             resolve: (ref) => ctx.credentials.resolve(ref),
-            claim: (credential) => claimQoderDailyCheckin(credential, QODER),
+            claim: (credential) => claimQoderDailyCheckin(credential, product),
             precheckStatus: false,
             warn: (msg) => ctx.logger?.warn?.(msg),
           })
@@ -1782,9 +1831,10 @@ function registerJetHubEndpoints(
           })
           return { ok: true, value: { accounts: values } satisfies RpcCreditsBalancesResponse }
         }
-        if (req.provider === QODER.id) {
-          // 余额来自 `GET /sash/api/v2/me/usage`（实测只需 Bearer +
-          // Cosy-ClientType，**不需要**模型列表那样的 WASM 签名）。
+        if (isQoderFamily(req.provider)) {
+          const { product } = requireQoderFamily(req.provider)
+          // 余额来自 `GET {product.openApiBase}/sash/api/v2/me/usage`（实测只需
+          // Bearer + Cosy-ClientType，**不需要**模型列表那样的 WASM 签名）。
           // `fetchQoderCreditBalance` 只吃 QoderCredential，故这里不用
           // collectCreditBalances 的泛型（它会把产品配置转发给 fetchBalance）。
           const values: RpcCreditsBalancesResponse['accounts'] = []
@@ -1807,7 +1857,7 @@ function registerJetHubEndpoints(
               })
               continue
             }
-            const balance = await fetchQoderCreditBalance(credential, QODER)
+            const balance = await fetchQoderCreditBalance(credential, product)
             values.push({
               accountId: account.id,
               nickname: account.nickname,

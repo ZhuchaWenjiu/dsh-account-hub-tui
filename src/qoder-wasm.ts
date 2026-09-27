@@ -123,7 +123,11 @@ export interface QoderInferToolCall {
 /**
  * 加密推理请求里，单条待发送消息。
  *
- * - `content` 客户端**恒为字符串**（`udn(r, '')`）；工具调用消息的正文是 `''`。
+ * - `content` 通常是**字符串**（客户端 `udn(r, '')`；工具调用消息的正文是 `''`）。
+ * - ⚠️ **带图片的消息 `content` 是多模态数组**（`{type:'image_url',…}`）。
+ *   客户端 `eQc()` / `bJc()` 就是这么把它放进 `messages[]` 的 ——
+ *   图片**不走** `chat_context.imageUrls`（官方 `Hyc()` 把那个字段恒置 `null`）。
+ *   早期实现把 content 压成纯文本，导致图片在下游全部消失（真实缺陷，用户报障）。
  * - `tool_calls` 只出现在 assistant 上。
  * - `tool_call_id` 只出现在 `role: 'tool'` 上（客户端 `A2c()` 的 `tool_result` 分支）。
  *
@@ -132,7 +136,7 @@ export interface QoderInferToolCall {
  */
 export interface QoderInferMessage {
   role: string
-  content: string
+  content: string | ReadonlyArray<Record<string, unknown>>
   tool_calls?: readonly QoderInferToolCall[]
   tool_call_id?: string
 }

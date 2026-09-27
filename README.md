@@ -112,13 +112,16 @@ Tokens 福利）。
 凭据来自默认的新式 IAM OAuth 流程（含 `refresh_token`）。请求发起时会解析最新
 凭据，若已过期则先静默续期，再用新 AK/SK/SecurityToken 签名，无需重新打开浏览器。
 
-除 `codearts` 外，插件另注册六个独立的 provider 路由：`buddy`（见
+除 `codearts` 外，插件另注册九个独立的 provider 路由：`buddy`（见
 [buddy provider](#buddy-provider)）、`workbuddy`（见
 [WorkBuddy provider](#workbuddy-provider)）、`lobsterai`（见
 [LobsterAI provider](#lobsterai-provider有道龙虾)）、`qoder`（见
-[Qoder provider](#qoder-provider)）、`trae`（见
-[TRAE provider](#trae-provider字节跳动-trae)）与 `cline`（见
-[Cline provider](#cline-provider)）。七者互不覆盖，可同时使用。
+[Qoder provider](#qoder-provider)）、`qodercn`（见
+[Qoder CN provider](#qoder-cn-providerqoder-中国版)）、`trae`（见
+[TRAE provider](#trae-provider字节跳动-trae)）、`cline`（见
+[Cline provider](#cline-provider)）、`loomy`（见
+[Loomy provider](#loomy-provider讯飞办公助手)）与 `raccoon`（见
+[Raccoon Work provider](#raccoon-work-provider商汤小浣熊)）。十者互不覆盖，可同时使用。
 
 ## 凭证
 
@@ -1104,8 +1107,74 @@ POST https://openapi.qoder.sh/sash/api/v1/me/campaigns/{campaignId}/claim   ← 
 
 ### 适用范围
 
-**仅支持国际版**（`qoder.com` / `qoder.sh`）。中国版（`qoder.com.cn`）的
-端点与 client id 不同，本实现未覆盖。
+本章节描述的是**国际版**（`qoder.com` / `qoder.sh`）。
+中国版（`qoder.cn` / `qoder.com.cn`）的端点与 `client_id` 都不同，
+已作为独立 provider 实现，见下一节
+[Qoder CN provider](#qoder-cn-providerqoder-中国版)。
+
+## Qoder CN provider（Qoder 中国版）
+
+第九个 provider，id `qodercn`，面板显示为 **Qoder (中国版)**。
+与国际版 `qoder` **共用同一套协议实现**（PKCE 设备码轮询 + 加密推理 + `/sash/` 积分，
+含**同一份 WASM**），差异全部收敛在 `src/qoder-product.ts` 的 `QODER_CN`。
+新增同族产品时**不要**复制 `src/qoder*.ts` —— 那会让 tools 不下发、工具历史丢
+`tool_calls`、错误帧不抛错这类缺陷修两遍。
+
+### 前提
+
+装过 Qoder 中国版桌面端（`%LOCALAPPDATA%\Programs\Qoder CN`）**不是必需的** ——
+登录与推理都由插件自给自足。
+但**积分每日领取**依赖本机 `runtime-info.exe` 生成设备身份
+（`~/.qoder/.bin/umid-*/` 或 `~/.qoder-cn/.bin/umid-*/`，**任一存在即可**，
+两站同 `environment` 返回同一身份）。两者都没有时不带 machine 头，
+服务端就不会下发可领取的活动 —— 症状是「报今日已领，但官方能领」。
+
+### 与国际版的差异
+
+| 项 | 国际版 | 中国版 |
+|---|---|---|
+| 授权 / 网站 | `qoder.com` | `qoder.cn` |
+| OpenAPI | `openapi.qoder.sh` | `openapi.qoder.com.cn` |
+| 加密推理 | `api2.qoder.sh` | `gateway.qoder.com.cn` |
+| 公开推理 | `api2-v2.qoder.sh` | **无**（实测 503） |
+| `client_id` | `e883ade2-…` | `732aef47-9cf2-46a2-95fe-4cebb5d0d1fa`（**不同**） |
+| 模型数 | 17 | 14 |
+| 凭据 ref | `QODER_ACCESS_TOKEN` / `QODER_ACCOUNT_*` | `QODERCN_ACCESS_TOKEN` / `QODERCN_ACCOUNT_*` |
+| 服务名 / 路由 | `qoderAuth` / `llm-qoder` | `qoderCnAuth` / `llm-qodercn` |
+| WASM | `src/qoder-auth-wasm.wasm` | **同一份**（实测可解 CN 目录、可签 CN 请求） |
+
+### 中国版独有的模型
+
+`q37fmodel`（Qwen3.7-Flash · x0.1）、`gm51model`（GLM-5.2 · x0.6）。
+
+### 中国版没有的模型
+
+`ultimate` / `performance` / `efficient` / `smodel`(Sonus) / `cmodel`(Cantus) ——
+CN 目录不下发，故中国版面板里看不到也选不了。
+
+另外几条同名模型在 CN 的参数**不同**，不是简单取子集：
+`dmodel` 上下文 96K（国际版 1M）、`qmodel_latest` / `qmodel` / `dfmodel` / `kmodel`
+都是 180K、`mmodel` 是 **MiniMax-M2.7**（国际版 M3）且不支持图片。
+
+### 积分
+
+与国际版同：`GET /sash/api/v2/me/usage` 查余额，
+`GET /sash/api/v1/me/campaigns` → `POST …/{campaignId}/claim` 每日领取。
+活动每日 10:00（UTC+8）刷新，幂等判据是响应体的 `replayed`。
+实测（2026-09-27）CN 账号余额由**套餐额度 + 资源包**两部分累加，
+领取一次得 100 分且余额确实增加 —— 与国际版的多包累加口径一致。
+
+### 验证命令
+
+```bash
+pnpm test:e2e:qodercn          # 只读：授权 URL 构造 + 四个端点存在性（零额度）
+pnpm test:e2e:qodercn-chat     # 真实加密对话（默认免费模型 qfmodel）
+pnpm test:e2e:qodercn-credits  # 余额 + 活动 + 真实领取一次
+node scripts/verify-qodercn-live.mjs   # 一次性：登录→推理→积分，token 不落盘
+```
+
+设计依据与全部取证：`docs/superpowers/specs/2026-09-27-qodercn-provider-design.md`
+（该目录按仓库约定不入库）。
 
 ## TRAE provider（字节跳动 TRAE）
 
