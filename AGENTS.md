@@ -424,6 +424,75 @@ function zX(A,e){let t=jiA(e);if(void 0===t)return!1;
 把兜底表与目录档位表逐条对账。
 
 ⚠️ **改了本表必须重跑**这些脚本对照，不要凭印象填。
+
+### 2.2 ⚠️ 思考档位：此前**根本没声明**，现已按远端目录给出
+
+**用户报障**：「qoder中国版可以设置思考档位，我们应该按照他的设置给出可设置的
+档位选择」。根因是 `QoderAdapter.resolveModel()` **只声明 `context`，从不声明
+`reasoning`** —— DSH 的思考强度选择器**只会**从 `resolveModel().reasoning` 渲染
+（`dsh-client-ui-model-selection`：`reasoning === undefined ? [] : …reasoning.efforts`），
+所以两个站点的档位选择器**从来没有出现过**，尽管目录早就下发了 `thinking_config`。
+
+**远端确实给了**（三个站的截图与 5 个账号的 catalog 逐条吻合）。**取值口径四条**：
+
+| 项 | 来源 | 规则 |
+|---|---|---|
+| `efforts` | 目录 `thinking_config.enabled.efforts` 的**键** | 按目录原序（客户端也按键序渲染） |
+| `defaultEffort` | 该对象里 `is_default: true` 的键 | **必须落在 `efforts` 内**，否则不发 |
+| `supportsDisable` | 目录存在 `thinking_config.disabled` 分支 | 为真时**追加** `none`（复刻客户端 `gU()`） |
+| `contextWindow` | `context_config` 最大档 | 见 2.1 节 |
+
+⚠️ **「关闭思考」不在 `efforts` 数组里，靠 `supportsDisable` 表达**。客户端是在
+`gU()` 里追加的：`… || e.includes("none") ? e : [...e,"none"]`。两者是**独立维度** ——
+实测 `gfmodel`/`gmodel`/`kmodel`/`smodel`/`cmodel` **有档位但不能关闭**（无 `disabled`
+分支），而 CN 的 `qmodel`/`qmodel_latest` **没有档位但能关闭**。**不要**用一个标志表达两件事。
+
+⚠️ **展示名必须用官方中文**（否则与 IDE 不一致）。权威来源是 **IDE 自己的 i18n**
+（asar `settings.efforts`，`scripts/probe-qoder-effort-i18n2.mjs` 可取）：
+```
+none:关闭思考  minimal:最小  low:低  medium:中  high:高  xhigh:极高  max:最大
+```
+DSH 的档位选择器**直接渲染 `efforts[].name`**（不本地化、不查字典），故给中文即中文界面。
+
+⚠️ **档位值必须在白名单内**，否则会被客户端**静默丢弃**。asar 常量：
+- 白名单 `Qj = ['none','low','medium','high','xhigh','max']`；
+- 别名 `_lc = { disabled: 'none', off: 'none' }`；
+- 归一化器 `ao()`：先查别名，再看白名单，都不在则丢弃。
+
+⚠️⚠️ **`qmodel` / `qmodel_latest` 只有「关闭思考」一项 —— 这是远端事实，不是遗漏**。
+它们的 `thinking_config.enabled` **没有 `efforts` 键**，只有 `description` + `is_default`：
+```json
+{"disabled":{"description":"Disable thinking"},
+ "enabled":{"description":"Enable thinking","is_default":true}}
+```
+用户 2026-09-28 明确：「上面两个没有思考档位就是关闭的意思」。
+**不要**给它们补默认档位（我曾按截图猜「关/低/中/极高+默认中」，那是错的）。
+同理 `auto` / `q37fmodel` / `mmodel` **连 `thinking_config` 都没有** → 不声明
+`reasoning`，UI 显示「当前模型未提供推理等级」（对应 IDE 的「不支持」）。
+
+⚠️ **两个站的档位表必须分别采集，不能互相套用**：同一个 key 的默认档可能不同 ——
+`qmodel_38max` 在 **CN 是 `medium`、国际版是 `xhigh`**；国际版 `ultimate` 是
+`xhigh/high/low/max/medium`（默认 high），CN 无此模型。
+
+**取证脚本**（均离线、零额度）：
+- `scripts/probe-qoder-effort-matrix.mjs`：逐模型打印档位/窗口/可关闭/默认；
+- `scripts/probe-qoder-effort-fields.mjs`：按客户端 `$lc` + `Qj` **完整复刻**算法；
+- `scripts/probe-qoder-effort-i18n2.mjs`：从 asar 取官方中文名；
+- `scripts/verify-qoder-model-meta.mjs`：**兜底表 vs 目录实值逐条对账**
+  （档位/默认档/可关闭/窗口 四项，当前 31 条全绿）——**改表后必须重跑**。
+
+回归用例在 `tests/unit/qoder-adapter.spec.ts` 的「resolveModel 的思考档位」段
+（7 条，含「官方中文名」「只有关闭思考的两个模型」「不提供关闭的模型不追加 none」
+「无 thinking_config 的不声明 reasoning」「defaultEffort 必须落在 efforts 内」）。
+⚠️ 已做**反向验证**：去掉 `dmodel.supportsDisable` → 1 条变红；给 `qmodel_latest`
+补上猜测档位 → 1 条变红；`defaultEffort` 改成 `max`（不在 efforts 内）→ 1 条变红。
+⚠️ **写用例时注意 `makeAdapter()` 默认用国际版表**（`QODER`）——测 CN 必须显式传
+`product: QODER_CN`，否则会拿错默认档（我第一版就这么错过）。
+
+⚠️ **端到端字段已验**（`scripts/verify-qoder-effort-wire.mjs`，离线）：
+`reasoningEffort: 'max'` → `parameters.reasoning_effort='max'` + `enable_thinking=true`；
+`'none'` → `enable_thinking=false`（真正关闭）；不发档位时两个字段都不写。
+
 3. **CN 没有公开的 OpenAI 兼容端点**：`gateway.qoder.com.cn` 与
    `openapi.qoder.com.cn` 上的 `/model/v1/chat/completions` 实测都回 **503**。
    故 `QODER_CN.inferBase` 填成与 `encryptedInferBase` 同值，仅表示「无独立公开端点」，

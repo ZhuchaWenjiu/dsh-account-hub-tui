@@ -24,7 +24,7 @@
 
 import type { Context } from '@deepseek-ai/cordis'
 import type { CredentialRef } from '@deepseek-ai/dsh-credentials'
-import { LlmAdapter, LlmError } from '@deepseek-ai/dsh-llm'
+import { LlmAdapter, LlmError, ReasoningEffortId } from '@deepseek-ai/dsh-llm'
 import type { GenerateOptions, LlmModelInfo, LlmProviderInfo, LlmResolvedModelInfo, StreamChunk } from '@deepseek-ai/dsh-llm'
 import { randomUUID } from 'node:crypto'
 import { AccountPool, providerCatalogVisible } from './account-pool.js'
@@ -109,6 +109,51 @@ function isQuotaExceededError(error: unknown): boolean {
 
 /** 本适配器注册的 provider 路由名（历史常量，等价于 `QODER.id`）。 */
 export const PROVIDER = 'qoder'
+
+/**
+ * 思考档位 id → 中文展示名。
+ *
+ * ⚠️ **必须与官方 IDE 一致**，取证是 asar 里的 i18n 表
+ * （`settings.efforts`，`scripts/probe-qoder-effort-i18n2.mjs` 可取）：
+ * ```
+ * none:关闭思考  minimal:最小  low:低  medium:中  high:高  xhigh:极高  max:最大
+ * ```
+ * 用户截图里的「关闭思考 / 低 / 中 / 极高 / 最大」正是这套。
+ *
+ * ⚠️ DSH 的档位选择器**直接渲染 `efforts[].name`**（不本地化），
+ * 所以这里给中文就是中文界面 —— 与 Qoder IDE 逐字一致。
+ * ⚠️ `minimal` 当前目录未下发，但白名单 `Qj` 里有，保留以备上游启用。
+ */
+const QODER_EFFORT_NAMES: Readonly<Record<string, string>> = {
+  none: '关闭思考',
+  minimal: '最小',
+  low: '低',
+  medium: '中',
+  high: '高',
+  xhigh: '极高',
+  max: '最大',
+}
+
+/**
+ * 该模型在 UI 上可选的思考档位（复刻客户端 `gU()` 的行为）。
+ *
+ * 三条口径：
+ * 1. `efforts` 原样取用（目录顺序保持 —— 官方客户端也按对象键序渲染）；
+ * 2. `supportsDisable` 为真时**追加** `none`（即「关闭思考」）；
+ *    客户端 `gU()`：`… || e.includes('none') ? e : [...e, 'none']`。
+ * 3. 两者皆无 → 返回空数组，调用方**不声明 `reasoning`**
+ *    （UI 显示「当前模型未提供推理等级」，对应 IDE 的「不支持」）。
+ *
+ * ⚠️ **`qmodel` / `qmodel_latest` 这类「有 `disabled` 但无 `efforts`」的模型
+ * 会得到 `['none']`** —— 即只提供「关闭思考」一项。这是**远端事实**
+ * （用户 2026-09-28 确认「上面两个没有思考档位就是关闭的意思」），
+ * **不要**给它们补默认档位。
+ */
+export function qoderEffortsFor(model: QoderFallbackModel): string[] {
+  const efforts = [...(model.efforts ?? [])]
+  if (model.supportsDisable === true && !efforts.includes('none')) efforts.push('none')
+  return efforts
+}
 
 /**
  * 排队总时长上限（毫秒），可用 `DSH_QODER_QUEUE_TIMEOUT_MS` 覆盖。
@@ -504,6 +549,15 @@ export class QoderAdapter extends LlmAdapter {
     }))
   }
 
+  /**
+   * 解析模型元信息。
+   *
+   * ⚠️ **`reasoning` 是「思考强度」选择器出现在模型菜单里的唯一入口**
+   * （composer 读 `resolveModel().reasoning`）。此前本适配器**只声明了
+   * `context`，从不声明 `reasoning`** → 中国版/国际版全都看不到档位选择器，
+   * 尽管目录早已下发 `thinking_config`（用户报障「qoder中国版可以设置思考档位，
+   * 我们应该按照他的设置给出可设置的档位选择」）。
+   */
   async resolveModel(provider: string, model: string, _signal?: AbortSignal): Promise<LlmResolvedModelInfo> {
     const entry = this.fallbackIndex.get(model)
     const resolved: LlmResolvedModelInfo = {
@@ -515,6 +569,25 @@ export class QoderAdapter extends LlmAdapter {
     // 上下文窗口：兜底表是**本地估计值**。未知模型不编造 context
     // （宁可让 DSH 用默认值，也不要报一个假的窗口大小）。
     if (entry !== undefined) resolved.context = { contextWindow: entry.contextWindow }
+    // 思考档位：见 `qoderEffortsFor` 的三条口径（含「关闭思考」的追加规则）。
+    if (entry !== undefined) {
+      const efforts = qoderEffortsFor(entry)
+      if (efforts.length > 0) {
+        const fallback = entry.defaultEffort
+        resolved.reasoning = {
+          efforts: efforts.map((id) => ({
+            id: ReasoningEffortId(id),
+            name: QODER_EFFORT_NAMES[id] ?? id,
+          })),
+          // ⚠️ `defaultEffort` 必须落在 `efforts` 内 —— DSH 会直接拿它发请求，
+          // 给一个不存在的档位会抛 `UNSUPPORTED_REASONING_EFFORT`
+          // （同 `trae-adapter.ts` 的教训）。
+          ...fallback !== undefined && efforts.includes(fallback)
+            ? { defaultEffort: ReasoningEffortId(fallback) }
+            : {},
+        }
+      }
+    }
     return resolved
   }
 

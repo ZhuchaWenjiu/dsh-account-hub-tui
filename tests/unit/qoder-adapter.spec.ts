@@ -9,7 +9,7 @@ import {
   parseQoderQueueError,
   qoderQueueDelayMs,
 } from '../../src/qoder-adapter.js'
-import { QODER } from '../../src/qoder-product.js'
+import { QODER, QODER_CN } from '../../src/qoder-product.js'
 import { buildQoderCredential, parseQoderTokenPayload, type QoderCredential } from '../../src/qoder.js'
 
 /** 源码级断言的路径基准（与 `jet-hub-rpc.spec.ts` 同款）。 */
@@ -219,6 +219,92 @@ describe('QoderAdapter resolveModel', () => {
     expect((await adapter.resolveModel('qoder', 'qmodel_38max')).inputModalities).toEqual(['text', 'image'])
     // 未知模型保守报 text（宁可少报能力）
     expect((await adapter.resolveModel('qoder', 'unknown-x')).inputModalities).toEqual(['text'])
+  })
+})
+
+/**
+ * ⚠️ **真实缺陷**（用户报障）：「qoder 中国版可以设置思考档位，我们应该按照他的设置
+ * 给出可设置的档位选择」。此前本适配器**只声明 `context`，从不声明 `reasoning`**
+ * → composer 的思考强度选择器**根本不出现**，尽管目录早已下发 `thinking_config`。
+ *
+ * 展示名必须与官方 IDE 一致（asar i18n `settings.efforts`）：
+ * `none:关闭思考 / minimal:最小 / low:低 / medium:中 / high:高 / xhigh:极高 / max:最大`。
+ */
+describe('QoderAdapter resolveModel 的思考档位', () => {
+  it('档位取自目录 efforts，展示名为官方中文名', async () => {
+    const resolved = await makeAdapter().resolveModel('qoder', 'dmodel')
+    // 目录：efforts = { high, max(is_default) }，且有 disabled 分支 → 追加「关闭思考」
+    expect(resolved.reasoning?.efforts).toEqual([
+      { id: 'high', name: '高' },
+      { id: 'max', name: '最大' },
+      { id: 'none', name: '关闭思考' },
+    ])
+    expect(resolved.reasoning?.defaultEffort).toBe('max')
+  })
+
+  it('CN 的 qmodel_38max 是「极高/低/中 + 关闭思考」，默认中', async () => {
+    // ⚠️ 必须显式传 CN 产品：`makeAdapter()` 默认用国际版表（`QODER`），
+    // 而两者的 `qmodel_38max` 默认档**不同**（CN = medium、国际版 = xhigh）。
+    const adapter = makeAdapter({ product: QODER_CN })
+    const resolved = await adapter.resolveModel('qodercn', 'qmodel_38max')
+    expect(resolved.reasoning?.efforts.map((e) => e.id)).toEqual(['xhigh', 'low', 'medium', 'none'])
+    expect(resolved.reasoning?.efforts.map((e) => e.name)).toEqual(['极高', '低', '中', '关闭思考'])
+    expect(resolved.reasoning?.defaultEffort).toBe('medium')
+  })
+
+  it('国际版同名的 qmodel_38max 默认档是 xhigh（与 CN 不同，勿混用）', async () => {
+    const resolved = await makeAdapter().resolveModel('qoder', 'qmodel_38max')
+    expect(resolved.reasoning?.defaultEffort).toBe('xhigh')
+  })
+
+  it('不提供「关闭思考」的模型不追加 none（gfmodel / gmodel / kmodel）', async () => {
+    // 目录里这几条**没有 `disabled` 分支** → 用户不能关掉思考。
+    const adapter = makeAdapter({ product: QODER_CN })
+    for (const id of ['gfmodel', 'gmodel', 'kmodel']) {
+      const resolved = await adapter.resolveModel('qodercn', id)
+      expect(resolved.reasoning?.efforts.map((e) => e.id), id).not.toContain('none')
+    }
+  })
+
+  it('只有「关闭思考」的模型：qmodel / qmodel_latest（目录无 efforts）', async () => {
+    // ⚠️ 这是**远端事实**，不是遗漏：目录 `enabled` 里没有 `efforts` 键，
+    // 只有 `disabled` + `enabled.is_default`（用户 2026-09-28 确认
+    // 「上面两个没有思考档位就是关闭的意思」）。
+    const adapter = makeAdapter({ product: QODER_CN })
+    for (const id of ['qmodel', 'qmodel_latest']) {
+      const resolved = await adapter.resolveModel('qodercn', id)
+      expect(resolved.reasoning?.efforts.map((e) => e.id), id).toEqual(['none'])
+      // 无档位可默认 → **不设** defaultEffort（DSH 显示「Default」）
+      expect(resolved.reasoning?.defaultEffort, id).toBeUndefined()
+    }
+  })
+
+  it('目录里没有 thinking_config 的模型不声明 reasoning', async () => {
+    // CN：q37fmodel / mmodel / auto 完全没有 thinking_config →
+    // UI 显示「当前模型未提供推理等级」，与 IDE 的「不支持」一致。
+    const adapter = makeAdapter({ product: QODER_CN })
+    for (const id of ['q37fmodel', 'mmodel', 'auto']) {
+      const resolved = await adapter.resolveModel('qodercn', id)
+      expect(resolved.reasoning, id).toBeUndefined()
+    }
+  })
+
+  it('defaultEffort 必须落在 efforts 内（否则 DSH 会抛 UNSUPPORTED_REASONING_EFFORT）', async () => {
+    for (const [provider, product] of [['qoder', QODER], ['qodercn', QODER_CN]] as const) {
+      const adapter = makeAdapter({ product })
+      for (const entry of product.fallbackModels) {
+        const resolved = await adapter.resolveModel(provider, entry.id)
+        const r = resolved.reasoning
+        if (r === undefined) continue
+        const ids = r.efforts.map((e) => e.id as string)
+        expect(ids.length, `${provider}/${entry.id} 的 efforts 不能为空`).toBeGreaterThan(0)
+        if (r.defaultEffort !== undefined) {
+          expect(ids, `${provider}/${entry.id} 的 defaultEffort 必须在 efforts 内`).toContain(r.defaultEffort)
+        }
+        // 展示名不得缺失（缺了会显示裸 id）
+        for (const e of r.efforts) expect(e.name, `${entry.id}/${e.id} 缺展示名`).toBeTruthy()
+      }
+    }
   })
 })
 
