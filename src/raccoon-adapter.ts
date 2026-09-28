@@ -21,7 +21,7 @@
 
 import type { Context } from '@deepseek-ai/cordis'
 import type { CredentialRef } from '@deepseek-ai/dsh-credentials'
-import { LlmAdapter, LlmError } from '@deepseek-ai/dsh-llm'
+import { LlmAdapter, LlmError, ReasoningEffortId } from '@deepseek-ai/dsh-llm'
 import type {
   GenerateOptions,
   LlmModelInfo,
@@ -32,7 +32,16 @@ import type {
 import { AccountPool, providerCatalogVisible } from './account-pool.js'
 import { settingsNamespaceFor } from './settings-compat.js'
 import { isRaccoonExpired, type RaccoonCredential } from './raccoon.js'
-import { RACCOON, type RaccoonFallbackModel, type RaccoonProduct } from './raccoon-product.js'
+import {
+  RACCOON,
+  RACCOON_DEFAULT_EFFORT,
+  RACCOON_EFFORT_NAMES,
+  RACCOON_EFFORT_OFF,
+  RACCOON_EFFORT_ON,
+  RACCOON_REASONING_EFFORTS,
+  type RaccoonFallbackModel,
+  type RaccoonProduct,
+} from './raccoon-product.js'
 import { projectRequestImage, type ImageRequestTarget } from './image-budget.js'
 import {
   collectImages,
@@ -45,6 +54,74 @@ import {
 
 /** 本适配器注册的 provider 路由名（等价于 `RACCOON.id`）。 */
 export const PROVIDER = 'raccoon'
+
+/**
+ * 把 DSH 的档位 id 映射成请求体的 `extra_body.thinking` 字段。
+ *
+ * ## 为什么是这个形态（实测确证，别改）
+ *
+ * 唯一**有效**的思考控制通道是 **`extra_body.thinking`**（Anthropic 风格对象），
+ * 服务端报错原文确认其枚举：``expected one of `adaptive`, `enabled`, `disabled` ``。
+ *
+ * 实测（判据为服务端上报的 `reasoning_tokens`）：
+ *
+ * | 请求 | 结果 |
+ * |---|---|
+ * | `extra_body.thinking={type:'disabled'}` | **6/6、8/8 全为 0** → 真关闭 |
+ * | `extra_body.thinking={type:'enabled'}` | 均值 218 ≈ 基线 222 → 与默认等价 |
+ *
+ * ⚠️ **`reasoning_effort` 虽然被服务端接受（8 个枚举值），但实测无效果** ——
+ * 8 轮配对实验里 `max - minimal` 正差 4 次 / 负差 4 次（纯随机），
+ * 且 `none` 不关闭思考（均值 301 vs `disabled` 的 0）。
+ * 故**不用它**表达档位，详见 `raccoon-product.ts` 的常量注释。
+ *
+ * ⚠️ **无效的写法**（都实测过）：`extra_body.enable_thinking`、
+ * 双层 `extra_body.extra_body.*`、把 `thinking` 放**顶层**（不在 `extra_body` 内）、
+ * `thinking.budget_tokens`（仅被格式校验）。
+ *
+ * ## 语义
+ *
+ * - 档位为 `off` → `{ thinking: { type: 'disabled' } }`（真的不产生思考内容）
+ * - 其余（含 `on`）→ `{ thinking: { type: 'enabled' } }`
+ *
+ * ⚠️ **不传档位时返回 `undefined`**（不发该字段），保持服务端默认行为 ——
+ * 实测默认就是开启，故与 `on` 等价，但**少发一个字段**更稳。
+ *
+ * @returns 要写进 `extra_body` 的对象；`undefined` 表示不发该字段。
+ */
+export function raccoonThinkingExtraBody(
+  effort: string | undefined,
+): { thinking: { type: 'enabled' | 'disabled' } } | undefined {
+  if (effort === undefined || effort.length === 0) return undefined
+  // 只有明确的「关闭」才关；未知档位一律按开启处理（宁可多思考，不可静默关掉
+  // —— 用户看不到思考内容会以为模型坏了）。
+  const type = effort === RACCOON_EFFORT_OFF ? 'disabled' : 'enabled'
+  return { thinking: { type } }
+}
+
+/**
+ * 该模型在 UI 上可选的思考档位。
+ *
+ * ⚠️ **所有模型都返回同样两档** —— 实测 `extra_body.thinking` 是 **provider 级
+ * 方言**，与模型无关。故不做 per-model 分派（那会是凭空猜测）。
+ *
+ * ⚠️ `defaultEffort` 必须落在 `efforts` 内 —— DSH 会直接拿它发请求，
+ * 给一个不存在的档位会抛 `UNSUPPORTED_REASONING_EFFORT`。
+ */
+export function raccoonReasoningInfo(): {
+  efforts: Array<{ id: ReturnType<typeof ReasoningEffortId>; name: string }>
+  defaultEffort: ReturnType<typeof ReasoningEffortId>
+} {
+  const efforts = RACCOON_REASONING_EFFORTS.map((id) => ({
+    id: ReasoningEffortId(id),
+    name: RACCOON_EFFORT_NAMES[id] ?? id,
+  }))
+  // ⚠️ 默认档必须确实在列表里（防御：常量被改乱时不至于抛错）
+  const defaultEffort = RACCOON_REASONING_EFFORTS.includes(RACCOON_DEFAULT_EFFORT)
+    ? ReasoningEffortId(RACCOON_DEFAULT_EFFORT)
+    : ReasoningEffortId(RACCOON_REASONING_EFFORTS[0] ?? RACCOON_EFFORT_ON)
+  return { efforts, defaultEffort }
+}
 
 /** 远端模型条目（已归一）。 */
 export interface RaccoonRemoteModel {
@@ -218,6 +295,9 @@ export class RaccoonAdapter extends LlmAdapter {
     // ⚠️ 远端非法值必须过滤（见 positiveMaxTokens）：不声明就让 DSH 用默认值。
     const maxTokens = positiveMaxTokens(entry?.maxTokens ?? fallback?.maxTokens)
     if (maxTokens !== undefined) resolved.defaultMaxTokens = maxTokens
+    // 思考档位（两态：深度思考 / 关闭思考）。实测确证见 `raccoonReasoningInfo`。
+    // ⚠️ 所有模型一致 —— `extra_body.thinking` 是 provider 级方言，与模型无关。
+    resolved.reasoning = raccoonReasoningInfo()
     return resolved
   }
 
@@ -296,6 +376,14 @@ export class RaccoonAdapter extends LlmAdapter {
       ? [{ role: 'system', content: options.system }, ...messages]
       : messages
 
+    /**
+     * 思考档位 → `extra_body` 内容。
+     *
+     * ⚠️ 在 `buildBody` **之外**算一次：`buildBody` 会在重试时被多次调用，
+     * 每次重算虽无害但没必要。
+     */
+    const thinking = raccoonThinkingExtraBody(options.reasoningEffort)
+
     /** 构造请求体。 */
     const buildBody = (): string => JSON.stringify({
       model: options.model,
@@ -318,6 +406,9 @@ export class RaccoonAdapter extends LlmAdapter {
             })),
           }
         : {},
+      // 思考档位（开 / 关）。⚠️ **必须在 `extra_body` 内** —— 实测放顶层会被忽略
+      //（连非法值都不报错）。不传档位时不发该字段，保持服务端默认（= 开）。
+      ...thinking !== undefined ? { extra_body: thinking } : {},
     })
 
     const headers = (): Record<string, string> => ({
