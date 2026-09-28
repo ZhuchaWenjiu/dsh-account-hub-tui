@@ -549,7 +549,9 @@ describe('Cline 接线（源码级回归）', () => {
     const source = read('src/index.ts')
     expect(source).toContain('registerClineLlm')
     expect(source).toContain('new ClineAuth(ctx)')
-    expect(source).toContain('cline.refreshAll(pool)')
+    // 只断言「cline 在续期调度里、且真的被传了池」—— 用 `(pool|p)` 同时接受
+    // 逐个 await 与表驱动两种写法，避免每次重构调度器都假失败。
+    expect(source).toMatch(/cline\.refreshAll\((?:pool|p)\)/)
     expect(source).toContain('cline.stop()')
     // Jet Hub「显示列表」需要适配器实例
     expect(source).toContain('cline: clineAdapter')
@@ -568,7 +570,9 @@ describe('Cline 接线（源码级回归）', () => {
   it('jet-hub-rpc.ts 为 cline 接上登录、续期与余额三个分派点', () => {
     const source = read('src/jet-hub-rpc.ts')
     expect(source).toContain('cline.startLogin({ refName })')
-    expect(source).toContain('cline.refreshAccountCredential(entry.credentialRef)')
+    // `[^)]*` 容忍签名扩展：续期成功后要把新 `expiresAt` 写回账号池，
+    // 故调用点带着 `pool, entry.id`（issue !IKIRTT）—— 写死整串会一改签名就假失败。
+    expect(source).toMatch(/cline\.refreshAccountCredential\(entry\.credentialRef[^)]*\)/)
     expect(source).toContain('fetchClineCreditBalance(credential, CLINE)')
     // 签到必须显式拒绝（而不是落到 unsupported provider 的泛化文案）
     expect(source).toContain('Cline 不支持每日签到')

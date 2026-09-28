@@ -46,6 +46,23 @@ import {
   startRaccoonLoginFlow,
   type StartedRaccoonLoginFlow,
 } from './raccoon-login-page.js'
+import {
+  syncAccountExpiry,
+  type ExpiryAccessors,
+} from './expiry-sync.js'
+
+/**
+ * Raccoon 凭据 → 账号池有效期的提取器。
+ *
+ * 本 provider 是这套回写的**原产地**：早期它是唯一漏掉回写的实现（用户报障后
+ * 修好），现把那份逻辑抽到 `src/expiry-sync.ts` 供九个 provider 共用 ——
+ * 留两份必然漂移，故这里改为调用共享实现。
+ */
+const RACCOON_EXPIRY_ACCESSORS: ExpiryAccessors<RaccoonCredential> = {
+  expiresAtOf: raccoonCredentialExpiresAtMs,
+  refreshableOf: isRaccoonRefreshable,
+  identityOf: (credential) => credential.access_token ?? '',
+}
 
 /** 默认凭据 ref 名称（与 `RaccoonProduct.defaultCredentialRef` 一致）。 */
 export const RACCOON_CREDENTIAL_REF = 'RACCOON_ACCESS_TOKEN'
@@ -342,7 +359,15 @@ export class RaccoonAuth extends Service {
     try {
       const next = await refreshRaccoonCredential(this.product, credential, this.fetchImpl)
       await this.ctx.credentials.set(ref, JSON.stringify(next))
-      await this.syncAccountExpiry(pool, refName, accountId, next)
+      await syncAccountExpiry({
+        pool,
+        provider: this.product.id,
+        credential: next,
+        accessors: RACCOON_EXPIRY_ACCESSORS,
+        accountId,
+        tag: '[raccoon]',
+        warn: (message) => this.ctx.logger?.warn?.(message),
+      })
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error)
       if (message.includes('重新登录')) throw new RefreshTokenExpiredError(message)
@@ -351,43 +376,11 @@ export class RaccoonAuth extends Service {
   }
 
   /**
-   * 把续期后的过期时间同步回账号池（供 UI 显示）。
-   *
-   * ⚠️ **失败只记日志、不上抛**：凭据**已经续期成功**了，
-   * 此时因为「写索引失败」而报错，会让用户以为续期失败、
-   * 甚至触发不必要的重新登录。索引是展示层数据，不该反噬凭据本身。
-   *
-   * ⚠️ **优先用调用方给的 `accountId`**：`refreshAll` 手里本来就有，
-   * 无需反查。只有在缺失时才退化为按 ref 反查 —— 而
-   * `findAccountIdByCredential` 的第二个参数语义是「**凭据内容**」
-   * （access_token）而非 ref 名，故这里必须先解析出 token 再传，
-   * 传 ref 名会**恒匹配失败**（静默，无任何报错）。
+   * 说明：原先这里有一份私有的 `syncAccountExpiry`（把续期后的过期时间写回
+   * 账号池，失败只记日志不上抛）。它已被抽到 `src/expiry-sync.ts` 成为九个
+   * provider 共用的实现 —— 三条硬规矩（失败不反噬、优先用调用方的 accountId、
+   * 反查要传**凭据内容**而非 ref 名）都随之外移并记在那份文件的注释里。
    */
-  private async syncAccountExpiry(
-    pool: AccountPool | undefined,
-    refName: string,
-    accountId: string | undefined,
-    credential: RaccoonCredential,
-  ): Promise<void> {
-    if (pool === undefined) return
-    try {
-      let id = accountId
-      if (id === undefined || id.length === 0) {
-        // 反查：注意第二个参数是**凭据内容**（access_token），不是 ref 名
-        id = await pool.findAccountIdByCredential(this.product.id, credential.access_token)
-      }
-      if (id === undefined || id.length === 0) return
-      await pool.updateAccount(id, {
-        expiresAt: raccoonCredentialExpiresAtMs(credential) ?? undefined,
-        refreshable: isRaccoonRefreshable(credential),
-      })
-    } catch (error) {
-      this.ctx.logger?.warn?.(
-        `[raccoon] 续期成功但回写账号池的过期时间失败（不影响使用）：`
-        + `${error instanceof Error ? error.message : String(error)}`,
-      )
-    }
-  }
 
   /**
    * 批量续期本产品的账号。
@@ -405,24 +398,26 @@ export class RaccoonAuth extends Service {
       // ⚠️ 判据只看 refreshable
       if (!entry.refreshable) continue
 
-      // 未过期的凭据无需续期（access_token 寿命约 3 小时，
-      // 30 分钟的定时器会把已过期的都覆盖到）。
       const resolved = await this.ctx.credentials.resolve(credentialRef(entry.credentialRef))
       if (!resolved) continue
       const credential = parseRaccoonCredential(resolved.value)
       if (credential === undefined) continue
 
-      // ⚠️ **凭据未过期时也要校正账号池的 `expiresAt`**（真实缺陷的完整修法）：
+      // ⚠️ **凭据仍在有效期内时也要校正账号池的 `expiresAt`**（真实缺陷的完整修法）：
       //
       // 早期版本续期后不回写账号池，于是账号池停留在旧值（已过期），
       // 而 UI 读的正是账号池 → 一直显示「已过期」但功能完全正常。
       // 修复「续期时回写」之后，**存量账号**仍然是坏的：它们的凭据
-      // 早已续期成功（JWT exp 在未来），故上面的 `isRaccoonExpired` 为 false、
+      // 早已续期成功（JWT exp 在未来），故这里的判据为 false、
       // 这条 `continue` 会**永远跳过它们** —— 账号池的值再也无人更正。
       //
       // 故这里主动比对：凭据的过期时间与账号池记录**不一致**时以凭据为准回写。
       // 判据用「不一致」而不是「账号池已过期」：后者会漏掉「账号池值偏小但
       // 尚未过期」的情形（同样会让 UI 显示错误的剩余时间）。
+      //
+      // 判据沿用本 provider 原有的「**已过期**才刷」（不是共享的 1 小时 lead）：
+      // raccoon 的 access_token 寿命约 3 小时，30 分钟的定时器足以覆盖，
+      // 提前 1 小时刷只会多打请求 —— lead-time 过滤的目的恰恰是**减少**无谓请求。
       if (!isRaccoonExpired(credential)) {
         const actual = raccoonCredentialExpiresAtMs(credential)
         // 容忍 1 秒误差（毫秒时间戳来自 JWT 的秒级 exp，换算后可能有舍入）

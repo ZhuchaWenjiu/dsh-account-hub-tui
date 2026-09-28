@@ -47,6 +47,25 @@ import {
 import { classifyTraeError, isTraeTerminalError } from './trae-errors.js'
 import { RefreshScheduler } from './refresh.js'
 import { AccountPool } from './account-pool.js'
+import {
+  refreshAccountWithReconcile,
+  syncAccountExpiry,
+  type ExpiryAccessors,
+} from './expiry-sync.js'
+
+/**
+ * TRAE 凭据 → 账号池有效期所需的提取器（`refreshAll` 与按需续期共用一份）。
+ *
+ * ⚠️ `identityOf` 必须是 `access_token`：`AccountPool.findAccountIdByCredential`
+ * 对非 codearts 的 provider 比对的就是这个字段（见其 `identifierKey`），
+ * 传 ref 名会恒匹配失败且**静默无报错**。TRAE 的 `ExchangeToken` 每次都会
+ * 轮换 token，故反查用的正是**新**凭据里的 `access_token`。
+ */
+const TRAE_EXPIRY_ACCESSORS: ExpiryAccessors<TraeCredential> = {
+  expiresAtOf: traeCredentialExpiresAtMs,
+  refreshableOf: isTraeRefreshable,
+  identityOf: (credential) => credential.access_token ?? '',
+}
 
 /**
  * TRAE 的默认凭据 ref。
@@ -307,8 +326,31 @@ export class TraeAuth extends Service {
 
   /**
    * 按凭据 ref 续期指定账号的凭据。
+   *
+   * 与 {@link refresh} 的区别（与 `BuddyAuth.refreshAccountCredential` 同因）：
+   * `refresh()` 读写本实例的默认单凭据 ref（`TRAE_ACCESS_TOKEN`），
+   * 而 Jet Hub 账号卡片对应的是 `TRAE_ACCOUNT_XXX` ——
+   * 用 `refresh()` 刷账号池里的账号，实际刷的是另一个凭据。
+   *
+   * 同样**不触碰** `refreshTokenInvalid` / `lastRefreshError` / 调度器：
+   * 那些状态属于单凭据路径，被多账号操作污染会让 UI 显示错误的失效提示。
+   *
+   * ⚠️ **必须回写账号池的 `expiresAt`**（issue !IKIRTT 的真实缺陷）：
+   * UI 账号卡片的「有效期」读的正是池里的值，而不是凭据里 access_token 的真实
+   * 过期时间。早期这里只 `credentials.set`，于是用户点「刷新」后凭据确实续好了、
+   * 界面却**一直显示「已过期」**，且没有任何自救手段（「重测」按钮的 refresh
+   * 是刻意的 no-op）。TRAE 用 ExchangeToken 轮换 refreshToken，不回写还会让
+   * 池里的 `refreshable` 与实际凭据脱节。
+   *
+   * @param pool 账号池；提供时会把新 `expiresAt` / `refreshable` 写回。
+   * @param accountId 账号 id。**调用方已知时请显式传入** ——
+   *   否则只能按凭据内容反查（代价高，且反查会跳过已停用账号）。
    */
-  async refreshAccountCredential(refName: string): Promise<void> {
+  async refreshAccountCredential(
+    refName: string,
+    pool?: AccountPool,
+    accountId?: string,
+  ): Promise<void> {
     const ref = credentialRef(refName)
     const resolved = await this.ctx.credentials.resolve(ref)
     if (!resolved) throw new Error('凭据未配置')
@@ -319,6 +361,15 @@ export class TraeAuth extends Service {
     }
     const refreshed = await this.refreshCredential(credential)
     await this.ctx.credentials.set(ref, JSON.stringify(refreshed))
+    await syncAccountExpiry({
+      pool,
+      provider: this.product.id,
+      credential: refreshed,
+      accessors: TRAE_EXPIRY_ACCESSORS,
+      accountId,
+      tag: '[trae]',
+      warn: (message) => this.ctx.logger?.warn?.(message),
+    })
   }
 
   /**
@@ -384,6 +435,12 @@ export class TraeAuth extends Service {
    * 批量续期本产品的所有账号。
    *
    * **包含已停用账号**（只按 `refreshable` 过滤）。
+   *
+   * ⚠️ **lead-time 过滤**（issue !IKIRTT）：早先这里是**无条件全量续期** ——
+   * 定时器每 30 分钟就把每个账号的 refreshToken 轮换一次，与「凭据还剩多久」
+   * 无关。现复用单凭据时代 `REFRESH_LEAD_MS` 的语义：**距过期不足 1 小时才刷**。
+   * 跳过的账号仍会做一次**有效期对账**（见 `refreshAccountWithReconcile`），
+   * 因为「不刷」与「不回写池值」正是 UI 假过期的两个来源，必须分开处理。
    */
   async refreshAll(pool: AccountPool): Promise<void> {
     const accounts = await pool.listAccounts(this.product.id)
@@ -401,11 +458,17 @@ export class TraeAuth extends Service {
           await pool.updateAccount(entry.id, { refreshable: false })
           continue
         }
-        const refreshed = await this.refreshCredential(credential)
-        await this.ctx.credentials.set(ref, JSON.stringify(refreshed))
-        await pool.updateAccount(entry.id, {
-          expiresAt: traeCredentialExpiresAtMs(refreshed) ?? undefined,
-          refreshable: isTraeRefreshable(refreshed),
+        await refreshAccountWithReconcile({
+          pool,
+          provider: this.product.id,
+          tag: '[trae]',
+          accountId: entry.id,
+          credential,
+          accessors: TRAE_EXPIRY_ACCESSORS,
+          current: entry,
+          refresh: (c) => this.refreshCredential(c),
+          save: (c) => this.ctx.credentials.set(ref, JSON.stringify(c)),
+          warn: (message) => this.ctx.logger?.warn?.(message),
         })
       } catch (error) {
         if (error instanceof RefreshTokenExpiredError) {

@@ -655,7 +655,7 @@ Jet Hub 设置页（`plugin-src/client/jet-hub.js`）提供多账号管理与限
 
 - `login(options?)` — 执行浏览器登录流程
 - `startLogin(options?)` — 两步式登录（先返回 loginUrl，Jet Hub 据此弹窗）
-- `refreshAccountCredential(refName)` — 按凭据 ref 续期**指定账号**（账号卡片「刷新」按钮）
+- `refreshAccountCredential(refName, pool?, accountId?)` — 按凭据 ref 续期**指定账号**（账号卡片「刷新」按钮）。⚠️ 后两个参数**必须传**：只有拿到池与账号 id，续期后的新 `expiresAt` 才能回写账号池（见下）
 - `refreshAll(pool)` — 批量续期全部账号（定时调度器）
 
 ⚠️ **不注册任何斜杠命令**：九个 provider 的登录/状态/续期**全部**在 Jet Hub 设置页完成。
@@ -698,6 +698,84 @@ Jet Hub 设置页（`plugin-src/client/jet-hub.js`）提供多账号管理与限
 ⚠️ Qoder 中国版**复用同一个 `QoderAuth` 类**（`src/qoder-auth.ts`），故它的
 `refreshAll` 判据**天然与国际版一致** —— 不存在「CN 那份实现忘了改」的可能，
 这正是「差异收敛到产品配置」这个模式的价值。
+
+### ⚠️ 续期三件事缺一不可：启动先跑一轮、lead-time 判据、回写账号池
+
+**真实缺陷**（Gitee issue !IKIRTT，用户报障）：重启后 cline / codearts / raccoon
+的账号卡片**最长 30 分钟**显示红色「有效期：已过期 · 自动续期」，积分行报
+`账户信息查询失败：HTTP 401`，而凭据其实是好的（`refresh_token` 到 10 月）。
+点「刷新」按钮凭据续成功了、**界面纹丝不动**，点「重测」也不救急
+（`src/account-probe.ts` 的 `refresh` 是**刻意**的 no-op，探测不该触发全局续期）。
+
+根因是多账号改造丢了三条语义，三者**必须同时在**（缺任何一条都还会看到症状）：
+
+1. **启动首轮**：`src/index.ts` 的调度器原先只有 `setInterval`，第一次处理要等满
+   一个周期。短寿命令牌（cline 1h / codearts 约 2h / raccoon 3h，对照 buddy 系 720h）
+   在宿主关闭期间早已到期 → 只有这三个 provider 会暴露出来。
+   现在 `pool.listAllAccounts()` 门控通过后**立刻** `void refreshAllCredentials()`。
+   ⚠️ 那条链原本**没有 `.catch()`**：`listAllAccounts()` 一 reject，定时器永不武装
+   且日志零字 —— 「30 分钟」会恶化成「永不自愈」。
+2. **lead-time 判据**：`shouldRefreshNow()`（`src/expiry-sync.ts`）复用单凭据时代
+   `REFRESH_LEAD_MS`（1 小时）—— 距过期不足 1 小时才发续期请求。
+   这既让启动首轮只打 0~3 个请求（39 账号的池不会在启动时突发几十个请求），
+   也终结了「八个 provider 的 `refreshAll` 没有任何过期判据、每 30 分钟全量轮换」。
+   ⚠️ **判据必须用凭据自己的 `exp`，不能用账号池的 `expiresAt`** ——
+   池值正是本缺陷里可能陈旧的那份数据，拿它当尺子会漏刷真正快过期的账号
+   （读凭据只是本地存储访问，不花网络也不花模型额度）。
+   ⚠️ **raccoon 保留更严的「已过期才刷」**（`isRaccoonExpired`，lead=0）：
+   它 3 小时寿命 + 30 分钟定时器已足够，提前 1 小时刷只会多打请求 ——
+   lead-time 的目的是**减少**请求，不是增加。别「为统一」把它改成 1 小时。
+3. **回写账号池**：UI 读的**只**是池里的 `expiresAt`
+   （`plugin-src/client/jet-hub.js` 的 `account.expiresAt <= Date.now()`）。
+   原先九个 provider 里只有 raccoon 回写，其余七个（含 `createPoolRefresh` ——
+   CodeBuddy 系**发消息途中**按需续期的路径，触发频率远高于点按钮）
+   只 `credentials.set` → 「数据源分叉」，功能完全正常但界面永远错。
+   现统一走 `src/expiry-sync.ts` 的 `syncAccountExpiry` / `refreshAccountWithReconcile`。
+
+⚠️ **`refreshAll` 里「本轮不刷」的分支绝不能直接 `continue`** —— 必须仍做一次
+有效期对账。只修「续期时回写」是不够的：**存量账号**的凭据早已在别处（IDE /
+上一轮）续好，判据必然为「不用刷」，池里的旧值就**永远无人更正**。
+判据用「与凭据不一致」（不是「池值已过期」），否则漏掉「池值偏小但尚未过期」。
+一致时不写盘（账号列表是整体落盘的），容差 1 秒（JWT 的 `exp` 是秒级）。
+
+四个必须记住的实现约束：
+
+- ⚠️ **`isLoomyRefreshable` 恒为 `false`**（Loomy 没有 refresh 端点，是诚实标记）。
+  故 `ExpiryAccessors.refreshableOf` 是**可选**的，Loomy 那份不提供 ——
+  否则共享实现会把池里的 `refreshable` 写成 false，与该产品的设计自相矛盾。
+- ⚠️ `findAccountIdByCredential` 的第二参是**凭据内容**不是 ref 名（传 ref 名会
+  恒匹配失败且**静默**）；且 codearts 比对的字段是 **`access_key_id`**（它的凭据里
+  根本没有 `access_token`）；它还**跳过 `enabled === false`** 的账号。
+  ⇒ 调用方已知 `entry.id` 时**必须显式传**，反查只是兜底。
+- ⚠️ 回写失败**只记日志、不上抛**：凭据已经续期成功了，因写索引失败而报错会让
+  用户以为续期失败、甚至触发无谓的重新登录。
+- ⚠️ 凭据里读不到过期时间时**不覆盖**池内旧值：`updateAccount` 做的是
+  `{ ...entry, ...patch }`，写 `undefined` 落盘会被 `JSON.stringify` 整个丢弃，
+  UI 于是从「已过期」变成「未知」—— 保留旧信息更有价值。
+
+⚠️ 边界（别夸大这类缺陷）：**功能一直是好的** —— 适配器发现凭据过期会按需
+`refresh()` 再发请求；定时器跑过一轮后 UI 也会自愈。受影响的是「启动到首轮之间」
+的界面与积分行，以及窗口内点「刷新」看不到变化。
+
+可观测性（同一 issue 的第 5.4 条）：`src/index.ts` 原先有**十个**
+`catch { /* 静默 */ }`，把 provider 内部告警与异常一起吞掉。现收成
+`refreshTargets` 表驱动 + 一处 `ctx.logger.warn`。
+⚠️ `src/service.ts`（codearts）此前**整份文件零 logger**，而它的令牌最短命 ——
+续期失败将完全无痕，现已补 `refreshAll` 两个分支的日志。
+
+测试：`tests/unit/expiry-sync.spec.ts`（19 条：lead 边界含 `<=`、一致不写盘、
+1 秒容差、不传 refreshableOf、反查传凭据内容、回写失败不反噬、
+「有效期内仍须对账」、续期返回 undefined 时绝不落盘）+
+`tests/unit/refresh-bootstrap-wiring.spec.ts`（19 条：启动首轮排在定时器前、
+十个 provider 都在表里、九个 auth 的 `refreshAccountCredential` 都带
+pool/accountId 且真调共享回写、RPC 与 `createPoolRefresh` 都传 id）。
+⚠️ 已做**反向验证**：去掉 lead 过滤 + 去掉「一致不写盘」→ 7 条变红；
+去掉启动首轮 + 去掉 cline 回写 → 3 条变红（含行为用例「刷新后池内
+`expiresAt` 指向未来」，非同义反复）。
+⚠️ 接线类断言一律用 `(pool|p)` / `[^)]*` 容忍重构与签名扩展 ——
+写死整串会让每加一个 provider 或每补一个参数都假失败（该教训已记在
+`cline-adapter.spec.ts` 的注释里）。
+
 
 服务名由产品 id 派生（`${product.id}Auth`）：两个 `BuddyAuth` 实例分别注册为 `buddyAuth` 与 `workbuddyAuth`，`LobsteraiAuth` 注册为 `lobsteraiAuth`，两个 `QoderAuth` 实例（同一类、不同 `product`）分别注册为 `qoderAuth` 与 `qoderCnAuth`，`TraeAuth` 注册为 `traeAuth`，`ClineAuth` 注册为 `clineAuth`，互不覆盖。
 

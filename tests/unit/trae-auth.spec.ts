@@ -57,11 +57,19 @@ function newService(ctx: Context, options: { fetcher?: typeof fetch } = {}): Tra
   return service
 }
 
+/**
+ * 默认**距过期 50 分钟**的凭据。
+ *
+ * ⚠️ 不能默认给「2 小时后过期」：`refreshAll` 现在带 lead-time 过滤
+ * （`src/expiry-sync.ts` 的 `shouldRefreshNow`，与单凭据时代 `REFRESH_LEAD_MS`
+ * 同语义 —— 距过期超过 1 小时的账号本轮只与账号池对账、**不发续期请求**），
+ * 而本文件的 `refreshAll` 用例问的正是「该刷的账号有没有被刷」。
+ */
 function makeCredential(overrides: Partial<TraeCredential> = {}): TraeCredential {
   return {
     access_token: 'AT',
     refresh_token: 'RT',
-    expires_at: String(Date.now() + 7_200_000),
+    expires_at: String(Date.now() + 3_000_000),
     uid: 'uid-1',
     nickname: '测试账号',
     machine_id: 'a'.repeat(32),

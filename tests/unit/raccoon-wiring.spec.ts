@@ -58,7 +58,8 @@ describe('Raccoon 在 index.ts 的接线', () => {
   })
 
   it('加入批量续期调度', () => {
-    expect(indexSource).toMatch(/await raccoon\.refreshAll\(pool\)/)
+    // `(pool|p)`：逐个 await 与表驱动两种写法都接受，避免重构调度器时假失败。
+    expect(indexSource).toMatch(/raccoon\.refreshAll\((?:pool|p)\)/)
   })
 
   it('modelAdapters 里登记了 raccoon', () => {

@@ -28,7 +28,9 @@ describe('Loomy 在 index.ts 的接线', () => {
   })
 
   it('refresh 走 refreshAccountCredential（刷新解析凭据所用的那个账号）', () => {
-    expect(indexSource).toMatch(/loomy\.refreshAccountCredential\(available\.entry\.credentialRef\)/)
+    // `[^)]*` 容忍签名扩展：续期成功后要把新 `expiresAt` 回写账号池，
+    // 故实际调用还带 `pool` + `available.entry.id`（见 issue !IKIRTT）。
+    expect(indexSource).toMatch(/loomy\.refreshAccountCredential\(available\.entry\.credentialRef[^)]*\)/)
   })
 
   /**
@@ -70,7 +72,9 @@ describe('Loomy 在 index.ts 的接线', () => {
   })
 
   it('加入批量续期调度', () => {
-    expect(indexSource).toMatch(/await loomy\.refreshAll\(pool\)/)
+    // 只断言「loomy 在续期调度里且真被传了池」：`(pool|p)` 同时接受逐个
+    // `await x.refreshAll(pool)` 与表驱动 `(p) => x.refreshAll(p)` 两种写法。
+    expect(indexSource).toMatch(/loomy\.refreshAll\((?:pool|p)\)/)
   })
 
   it('cleanup 调用 loomy.stop()', () => {

@@ -43,12 +43,20 @@ function newService(
   return service
 }
 
-/** 构造一个可刷新的凭据（默认 2 小时后过期）。 */
+/**
+ * 构造一个可刷新的凭据（默认**距过期 50 分钟**）。
+ *
+ * ⚠️ 不能默认给「2 小时后过期」：`refreshAll` 现在带 lead-time 过滤
+ * （`src/expiry-sync.ts` 的 `shouldRefreshNow`，与单凭据时代 `REFRESH_LEAD_MS`
+ * 同语义 —— 距过期超过 1 小时的账号本轮只与账号池对账、**不发续期请求**）。
+ * 本文件的用例问的是「该刷的账号有没有被刷」，所以凭据必须落在 lead 窗口内。
+ * 个别专测「不会立即刷 / 有效期解析」的用例各自显式覆盖 `expires_at`。
+ */
 function makeCredential(overrides: Partial<LobsteraiCredential> = {}): LobsteraiCredential {
   return {
     access_token: 'AT',
     refresh_token: 'RT',
-    expires_at: String(Date.now() + 7_200_000),
+    expires_at: String(Date.now() + 3_000_000),
     uid: 'uid-1',
     user_id: 'yid-1',
     nickname: '测试账号',

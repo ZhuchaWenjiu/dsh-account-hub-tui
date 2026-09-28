@@ -78,6 +78,28 @@ const credJson = JSON.stringify(buildClineCredential(
   CLINE,
 ))
 
+/**
+ * 「**已进入 lead 窗口**」的凭据（距过期 5 分钟）。
+ *
+ * `refreshAll` 现在带 lead-time 过滤（`src/expiry-sync.ts` 的 `shouldRefreshNow`，
+ * 与单凭据时代 `REFRESH_LEAD_MS` 同语义）：距过期**超过 1 小时**的账号本轮
+ * 只与账号池对账、不发续期请求。上面的 `credJson` 过期时间在 2030 年，
+ * 用它做「会不会被续期」的用例必然得到 0 次请求 —— 那是判据在生效，
+ * 不是缺陷。所以这类用例必须拿一份「该刷了」的凭据。
+ */
+const dueCredJson = JSON.stringify(buildClineCredential(
+  parseClineTokenPayload({
+    success: true,
+    data: {
+      accessToken: 'workos:tok-1',
+      refreshToken: 'ref-1',
+      expiresAt: String(Date.now() + 300_000),
+      userInfo: { clineUserId: 'usr-1', email: 'a@b.c' },
+    },
+  }),
+  CLINE,
+))
+
 /** 成功的续期响应（与注册同构的 `{success, data}` 信封）。 */
 function refreshOk(accessToken = 'workos:tok-2', refreshToken = 'ref-2'): Response {
   return new Response(JSON.stringify({
@@ -221,8 +243,8 @@ describe('ClineAuth refreshAll', () => {
 
   it('只按 refreshable 过滤，**不看 enabled**（停用账号也要保持凭据新鲜）', async () => {
     const { ctx, credentials, pool } = makePoolCtx()
-    await credentials.set('CLINE_ACCOUNT_ENABLED', credJson)
-    await credentials.set('CLINE_ACCOUNT_DISABLED', credJson)
+    await credentials.set('CLINE_ACCOUNT_ENABLED', dueCredJson)
+    await credentials.set('CLINE_ACCOUNT_DISABLED', dueCredJson)
     await pool.addAccount({
       id: 'acc-enabled', provider: 'cline', nickname: 'a', enabled: true,
       credentialRef: 'CLINE_ACCOUNT_ENABLED', createdAt: 1, refreshable: true,
@@ -244,7 +266,7 @@ describe('ClineAuth refreshAll', () => {
 
   it('终态失败把该账号标记为不可续期（不再重试）', async () => {
     const { ctx, credentials, pool } = makePoolCtx()
-    await credentials.set('CLINE_ACCOUNT_X', credJson)
+    await credentials.set('CLINE_ACCOUNT_X', dueCredJson)
     await pool.addAccount({
       id: 'acc-x', provider: 'cline', nickname: 'x', enabled: true,
       credentialRef: 'CLINE_ACCOUNT_X', createdAt: 1, refreshable: true,
@@ -259,8 +281,8 @@ describe('ClineAuth refreshAll', () => {
 
   it('单账号失败不中断其余账号', async () => {
     const { ctx, credentials, pool } = makePoolCtx()
-    await credentials.set('CLINE_ACCOUNT_1', credJson)
-    await credentials.set('CLINE_ACCOUNT_2', credJson)
+    await credentials.set('CLINE_ACCOUNT_1', dueCredJson)
+    await credentials.set('CLINE_ACCOUNT_2', dueCredJson)
     await pool.addAccount({
       id: 'a1', provider: 'cline', nickname: '1', enabled: true,
       credentialRef: 'CLINE_ACCOUNT_1', createdAt: 1, refreshable: true,
@@ -282,6 +304,59 @@ describe('ClineAuth refreshAll', () => {
     // 第一个失败（可重试），第二个仍被处理
     expect(fetcher).toHaveBeenCalledTimes(2)
     expect(readCred(credentials, 'CLINE_ACCOUNT_2').access_token).toBe('workos:second')
+  })
+
+  it('⚠️ 距过期还有 2 小时的账号本轮**不**被续期（lead-time 过滤）', async () => {
+    // 多账号调度器早期是「每 30 分钟无脑全量刷」。现恢复单凭据时代的
+    // `REFRESH_LEAD_MS` 语义：距过期不足 1 小时才刷 —— 长寿命 provider
+    // （buddy / lobsterai / qoder / qodercn 的令牌寿命 720 小时）从此不再
+    // 每半小时被无谓轮换一次。
+    const { ctx, credentials, pool } = makePoolCtx()
+    await credentials.set('CLINE_ACCOUNT_1', credJson)
+    await pool.addAccount({
+      id: 'a1', provider: 'cline', nickname: '1', enabled: true,
+      credentialRef: 'CLINE_ACCOUNT_1', createdAt: 1, refreshable: true,
+    })
+    const fetcher = vi.fn(async () => refreshOk('workos:new', 'ref-new')) as unknown as typeof fetch
+    const auth = newService(ctx, fetcher)
+
+    await auth.refreshAll(pool)
+
+    expect(fetcher, '凭据还很新鲜，不该发续期请求').not.toHaveBeenCalled()
+    expect(readCred(credentials, 'CLINE_ACCOUNT_1').access_token).toBe('workos:tok-1')
+  })
+
+  it('⚠️ 按需续期（账号卡片「刷新」）成功后把新 expiresAt 写回账号池', async () => {
+    // issue !IKIRTT 的连带缺陷：UI 读的正是账号池的 `expiresAt`。
+    // 早先 cline 只 `credentials.set`，于是用户点了「刷新」、凭据也续好了，
+    // 卡片却**一直显示「已过期」**，且「重测」按钮不救急 —— 没有任何自救手段。
+    const { ctx, credentials, pool } = makePoolCtx()
+    await credentials.set('CLINE_ACCOUNT_ABC', dueCredJson)
+    await pool.addAccount({
+      id: 'acc-abc', provider: 'cline', nickname: 'abc', enabled: true,
+      credentialRef: 'CLINE_ACCOUNT_ABC', createdAt: 1, refreshable: true,
+      expiresAt: Date.now() - 60_000,
+    })
+    const auth = newService(ctx, vi.fn(async () => refreshOk()) as unknown as typeof fetch)
+
+    await auth.refreshAccountCredential('CLINE_ACCOUNT_ABC', pool, 'acc-abc')
+
+    const [entry] = await pool.listAccounts('cline')
+    expect(entry?.expiresAt, '刷新后账号池仍是旧值 → UI 会继续挂「已过期」')
+      .toBeGreaterThan(Date.now())
+  })
+
+  it('回写账号池失败**不反噬**已成功的续期（只记日志）', async () => {
+    const { ctx, credentials, pool } = makePoolCtx()
+    await credentials.set('CLINE_ACCOUNT_ABC', dueCredJson)
+    const auth = newService(ctx, vi.fn(async () => refreshOk()) as unknown as typeof fetch)
+    // 让索引写入抛错：凭据已经续好了，不该因为写索引失败而要求用户重新登录。
+    vi.spyOn(pool, 'updateAccount').mockRejectedValue(new Error('账号池写入失败'))
+
+    await expect(
+      auth.refreshAccountCredential('CLINE_ACCOUNT_ABC', pool, 'missing-id'),
+    ).resolves.toBeUndefined()
+    expect(readCred(credentials, 'CLINE_ACCOUNT_ABC').access_token).toBe('workos:tok-2')
   })
 
   it('凭据缺失时把账号标记为不可续期（避免永远刷不动）', async () => {

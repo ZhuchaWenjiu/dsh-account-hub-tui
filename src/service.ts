@@ -10,6 +10,32 @@ import {
 import type { CodeArtsCredential, LoginFlowOptions, LoginFlowResult, ProviderAccountEntry } from './types.js'
 import { AccountPool } from './account-pool.js'
 import {
+  refreshAccountWithReconcile,
+  syncAccountExpiry,
+  type ExpiryAccessors,
+} from './expiry-sync.js'
+
+/**
+ * CodeArts 凭据 → 账号池有效期的提取器（`refreshAll` 与按需续期共用）。
+ *
+ * ⚠️ `identityOf` 用 **`access_key_id`** 而非 access_token：CodeArts 凭据里
+ * 根本没有 `access_token` 字段（它是 AK/SK + security_token），而
+ * `AccountPool.findAccountIdByCredential` 对 codearts 比对的正是 `access_key_id`。
+ * 选错字段会让反查恒失败且**静默无报错**。
+ */
+const CODEARTS_EXPIRY_ACCESSORS: ExpiryAccessors<CodeArtsCredential> = {
+  expiresAtOf: (credential) => {
+    const parsed = credential.expires_at ? Date.parse(credential.expires_at) : Number.NaN
+    return Number.isFinite(parsed) ? parsed : undefined
+  },
+  refreshableOf: (credential) => Boolean(
+    credential.refresh_token
+    && credential.code_verifier
+    && credential.dpop_private_key_jwk,
+  ),
+  identityOf: (credential) => credential.access_key_id ?? '',
+}
+import {
   fetchCodeArtsRemoteModels,
   saveModelsCache,
   setMemoryCache,
@@ -179,8 +205,18 @@ export class CodeArtsAuth extends Service {
    * `CODEARTS_ACCESS_TOKEN`，**已随单凭据模式一并移除**。当时用 `refresh()`
    * 去刷账号池里的账号会刷到另一个凭据上（真实缺陷），这也是 `account.refresh`
    * RPC 一定要按 `entry.credentialRef` 分派的原因。现在只剩本方法这一条路径。
+   *
+   * ⚠️ **必须回写账号池的 `expiresAt`**（issue !IKIRTT）：UI 读的是池值，
+   * 只更新凭据会让「已过期」的红字在续期成功后**依然挂着**。
+   *
+   * @param pool 账号池；提供时把新 `expiresAt` / `refreshable` 写回。
+   * @param accountId 账号 id，调用方已知时显式传入（反查会跳过已停用账号）。
    */
-  async refreshAccountCredential(refName: string): Promise<void> {
+  async refreshAccountCredential(
+    refName: string,
+    pool?: AccountPool,
+    accountId?: string,
+  ): Promise<void> {
     const ref = credentialRef(refName)
     const resolved = await this.ctx.credentials.resolve(ref)
     if (!resolved) throw new Error('凭据未配置')
@@ -188,15 +224,43 @@ export class CodeArtsAuth extends Service {
     if (!credential?.refresh_token || !credential.code_verifier || !credential.dpop_private_key_jwk) {
       throw new Error('无 refresh_token，请重新登录')
     }
-    const keyPair = keyPairFromStoredJwk(credential.dpop_private_key_jwk)
-    const token = await exchangeRefreshToken(credential.refresh_token, credential.code_verifier, keyPair, this.fetchImpl)
-    const refreshed = credentialFromTokenResponse(token, { codeVerifier: credential.code_verifier, codeChallenge: '' }, keyPair)
+    const refreshed = await this.refreshCredential(credential)
+    await this.ctx.credentials.set(ref, JSON.stringify(refreshed))
+    await syncAccountExpiry({
+      pool,
+      provider: 'codearts',
+      credential: refreshed,
+      accessors: CODEARTS_EXPIRY_ACCESSORS,
+      accountId,
+      tag: '[codearts]',
+      warn: (message) => this.ctx.logger?.warn?.(message),
+    })
+  }
+
+  /**
+   * 用 refresh_token 换取一份新凭据（**不触碰存储**）。
+   *
+   * 抽出来供 `refreshAccountCredential()` 与 `refreshAll()` 共用 ——
+   * 两处原先各写一遍「取密钥对 → 换取 → 合并无变化字段」，
+   * 一旦字段合并逻辑分叉就会出现「某条路径丢了 `model_rate_limits`」。
+   */
+  private async refreshCredential(credential: CodeArtsCredential): Promise<CodeArtsCredential> {
+    const refreshToken = credential.refresh_token
+    const codeVerifier = credential.code_verifier
+    const dpopJwk = credential.dpop_private_key_jwk
+    // 三样缺一即不可静默续期（与调用方的 `refreshableOf` 判据同源）。
+    if (!refreshToken || !codeVerifier || !dpopJwk) {
+      throw new Error('无 refresh_token，请重新登录')
+    }
+    const keyPair = keyPairFromStoredJwk(dpopJwk)
+    const token = await exchangeRefreshToken(refreshToken, codeVerifier, keyPair, this.fetchImpl)
+    const refreshed = credentialFromTokenResponse(token, { codeVerifier, codeChallenge: '' }, keyPair)
     // 保留无变化字段（domain_id/user_id/user_name 等）。
     refreshed.domain_id = credential.domain_id
     refreshed.user_id = credential.user_id
     refreshed.user_name = credential.user_name
     if (credential.model_rate_limits) refreshed.model_rate_limits = credential.model_rate_limits
-    await this.ctx.credentials.set(ref, JSON.stringify(refreshed))
+    return refreshed
   }
 
   /**
@@ -206,7 +270,13 @@ export class CodeArtsAuth extends Service {
    * 选号，不该让凭据烂掉 —— 否则用户重新启用时只能重新登录。
    * 详见 `BuddyAuth.refreshAll` 的注释（同一缺陷）。
    *
-   * 单账号失败不影响其他账号。
+   * 单账号失败不影响其他账号，但**必须留日志**：CodeArts 是九个 provider 里
+   * 唯一整份文件没有一处 `logger` 的（issue !IKIRTT 的可观测性条目），
+   * 而它的 access_token 只有约 2 小时寿命、最容易撞过期，失败无痕最难查。
+   *
+   * ⚠️ **lead-time 过滤**：距过期不足 1 小时才真的发续期请求（与单凭据时代
+   * `REFRESH_LEAD_MS` 同语义），跳过的账号只做有效期对账。详见
+   * `refreshAccountWithReconcile`。
    */
   async refreshAll(pool: AccountPool): Promise<void> {
     const accounts = await pool.listAccounts('codearts')
@@ -221,27 +291,24 @@ export class CodeArtsAuth extends Service {
           continue
         }
         const credential = parseCredential(resolved.value)
-        if (!credential?.refresh_token || !credential.code_verifier || !credential.dpop_private_key_jwk) {
+        // `refreshableOf` 在这里是必需的（CodeArts 能续期），`?? false` 只是
+        // 因为该字段在 `ExpiryAccessors` 里是可选的（Loomy 不提供）。
+        if (credential === undefined
+          || !(CODEARTS_EXPIRY_ACCESSORS.refreshableOf?.(credential) ?? false)) {
           await pool.updateAccount(entry.id, { refreshable: false })
           continue
         }
-        const keyPair = keyPairFromStoredJwk(credential.dpop_private_key_jwk)
-        const token = await exchangeRefreshToken(credential.refresh_token, credential.code_verifier, keyPair, this.fetchImpl)
-        const refreshed = credentialFromTokenResponse(token, { codeVerifier: credential.code_verifier, codeChallenge: '' }, keyPair)
-        // 保留无变化字段
-        refreshed.domain_id = credential.domain_id
-        refreshed.user_id = credential.user_id
-        refreshed.user_name = credential.user_name
-        // 保留模型重置时间
-        if (credential.model_rate_limits) {
-          refreshed.model_rate_limits = credential.model_rate_limits
-        }
-        await this.ctx.credentials.set(ref, JSON.stringify(refreshed))
-        // 更新 account entry 的过期时间与 refreshable
-        const expiresAt = refreshed.expires_at ? Date.parse(refreshed.expires_at) : undefined
-        await pool.updateAccount(entry.id, {
-          expiresAt: expiresAt !== undefined && !Number.isNaN(expiresAt) ? expiresAt : undefined,
-          refreshable: Boolean(refreshed.refresh_token),
+        await refreshAccountWithReconcile({
+          pool,
+          provider: 'codearts',
+          tag: '[codearts]',
+          accountId: entry.id,
+          credential,
+          accessors: CODEARTS_EXPIRY_ACCESSORS,
+          current: entry,
+          refresh: (c) => this.refreshCredential(c),
+          save: (c) => this.ctx.credentials.set(ref, JSON.stringify(c)),
+          warn: (message) => this.ctx.logger?.warn?.(message),
         })
       } catch (error) {
         if (error instanceof RefreshTokenExpiredError) {
@@ -250,6 +317,16 @@ export class CodeArtsAuth extends Service {
           } catch {
             // 忽略 updateAccount 本身的错误
           }
+          this.ctx.logger?.warn?.(
+            `[codearts] 账号 ${entry.id} 的 refresh_token 已失效，已标记为不可续期（需重新登录）`,
+          )
+        } else {
+          // 非终态失败（网络抖动、5xx、429…）也必须留日志：静默会让账号
+          // 在 UI 上永远显示「可续期」却刷不动，无从排查。
+          this.ctx.logger?.warn?.(
+            `[codearts] 账号 ${entry.id} 续期失败：`
+            + `${error instanceof Error ? error.message : String(error)}`,
+          )
         }
         // 单账号失败不中断循环
       }

@@ -29,7 +29,8 @@ describe('Qoder 宿主侧接线（src/index.ts）', () => {
   })
 
   it('续期调度包含 qoder', () => {
-    expect(index).toContain('qoder.refreshAll(pool)')
+    // `(pool|p)`：逐个 await 与表驱动两种写法都接受，避免重构调度器时假失败。
+    expect(index).toMatch(/qoder\.refreshAll\((?:pool|p)\)/)
   })
 
   it('清理钩子包含 qoder.stop()', () => {
@@ -82,8 +83,10 @@ describe('Qoder Jet Hub RPC 分支（src/jet-hub-rpc.ts）', () => {
   it('account.refresh 分派包含 qoder', () => {
     // 重构后走同族注册表：实例由 `requireQoderFamily(entry.provider).auth` 取得，
     // 两个 provider id 共用同一个 case（见下面的注册表 describe）。
-    expect(codeOnly(rpc)).toContain(
-      'requireQoderFamily(entry.provider).auth.refreshAccountCredential(entry.credentialRef)',
+    // `[^)]*` 容忍签名扩展：现在还要传 `pool` + `entry.id`，
+    // 续期成功后才能把新 `expiresAt` 回写账号池（issue !IKIRTT）。
+    expect(codeOnly(rpc)).toMatch(
+      /requireQoderFamily\(entry\.provider\)\.auth\.refreshAccountCredential\(entry\.credentialRef[^)]*\)/,
     )
   })
 
@@ -155,12 +158,15 @@ describe('QoderCN 宿主侧接线（src/index.ts）', () => {
 
   it('CN 的续期回写刷的是解析凭据时所用的那一个 ref', () => {
     // 与 qoder-auth 那条真实缺陷同因：刷默认单凭据 ref 会导致「刚登录却认证失败」。
+    // 关键不变式是 **`qoderCn.` 前缀 + `available.entry.credentialRef`**；
+    // `[^)]*` 容忍后面追加的 `pool` + `available.entry.id`（回写有效期用）。
     const code = codeOnly(index)
-    expect(code).toContain('qoderCn.refreshAccountCredential(available.entry.credentialRef)')
+    expect(code).toMatch(/qoderCn\.refreshAccountCredential\(available\.entry\.credentialRef[^)]*\)/)
   })
 
   it('续期调度包含 qoderCn.refreshAll(pool)', () => {
-    expect(index).toContain('qoderCn.refreshAll(pool)')
+    // `(pool|p)`：逐个 await 与表驱动两种写法都接受。
+    expect(index).toMatch(/qoderCn\.refreshAll\((?:pool|p)\)/)
   })
 
   it('两处清理钩子都包含 qoderCn.stop()', () => {

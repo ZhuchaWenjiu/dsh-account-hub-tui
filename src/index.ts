@@ -196,7 +196,7 @@ export function apply(ctx: Context): void {
     // 单凭据 ref —— 那会刷到另一个（不存在的）凭据上。
     refresh: async () => {
       const available = await pool.getAvailableAccount('codearts', '')
-      if (available) await service.refreshAccountCredential(available.entry.credentialRef)
+      if (available) await service.refreshAccountCredential(available.entry.credentialRef, pool, available.entry.id)
     },
     fetchRemoteModels: () => service.refreshModels(pool),
     accountPool: pool,
@@ -304,7 +304,7 @@ export function apply(ctx: Context): void {
       // 与 Go 一致：`handler.go:197-209` 也是先 Pick 出账号、再对该账号
       // `RefreshToken(acct)`（而非某个全局单例）。
       const available = await pool.getAvailableAccount(LOBSTERAI.id, '')
-      if (available) await lobsterai.refreshAccountCredential(available.entry.credentialRef)
+      if (available) await lobsterai.refreshAccountCredential(available.entry.credentialRef, pool, available.entry.id)
       else await lobsterai.refresh()
     },
     fetchRemoteModels: () => lobsterai.fetchModels(pool),
@@ -372,7 +372,7 @@ export function apply(ctx: Context): void {
       // 用户看到的是「刚在 Jet Hub 登录好，却一直认证失败」，
       // 而日志里续期全是成功的，极难排查。
       const available = await pool.getAvailableAccount(QODER.id, '')
-      if (available) await qoder.refreshAccountCredential(available.entry.credentialRef)
+      if (available) await qoder.refreshAccountCredential(available.entry.credentialRef, pool, available.entry.id)
       else await qoder.refresh()
     },
     readImage: makeReadImage(ctx),
@@ -418,7 +418,7 @@ export function apply(ctx: Context): void {
       // 而 refresh() 读写 QODERCN_ACCESS_TOKEN，两者错配会让日志里续期全成功、
       // 用户却「刚登录却一直认证失败」。
       const available = await pool.getAvailableAccount(QODER_CN.id, '')
-      if (available) await qoderCn.refreshAccountCredential(available.entry.credentialRef)
+      if (available) await qoderCn.refreshAccountCredential(available.entry.credentialRef, pool, available.entry.id)
       else await qoderCn.refresh()
     },
     readImage: makeReadImage(ctx),
@@ -456,7 +456,7 @@ export function apply(ctx: Context): void {
     },
     refresh: async () => {
       const available = await pool.getAvailableAccount(TRAE.id, '')
-      if (available) await trae.refreshAccountCredential(available.entry.credentialRef)
+      if (available) await trae.refreshAccountCredential(available.entry.credentialRef, pool, available.entry.id)
       else await trae.refresh()
     },
     fetchRemoteModels: () => trae.fetchModels(pool),
@@ -503,7 +503,7 @@ export function apply(ctx: Context): void {
       // 用户看到的是「刚在 Jet Hub 登录好，却一直认证失败」，
       // 而日志里续期全是成功的，极难排查。
       const available = await pool.getAvailableAccount(CLINE.id, '')
-      if (available) await cline.refreshAccountCredential(available.entry.credentialRef)
+      if (available) await cline.refreshAccountCredential(available.entry.credentialRef, pool, available.entry.id)
       else await cline.refresh()
     },
     // 图片字节桥接：Cline 内嵌目录的 `capabilities` 含 `images`，
@@ -618,7 +618,7 @@ export function apply(ctx: Context): void {
       // 仍须刷新**解析凭据时所用的那一个**账号，而不是默认单凭据 ref ——
       // 否则探测的是另一份凭据，用户会看到「刚登录好却一直认证失败」。
       const available = await pool.getAvailableAccount(LOOMY.id, '')
-      if (available) await loomy.refreshAccountCredential(available.entry.credentialRef)
+      if (available) await loomy.refreshAccountCredential(available.entry.credentialRef, pool, available.entry.id)
       else await loomy.refresh()
     },
     // 远端模型目录：GET /api/v1/models。
@@ -766,39 +766,40 @@ export function apply(ctx: Context): void {
   // 替代原有的单账号 scheduleRefresh()，使用 refreshAll() 遍历所有账号续期
   const REFRESH_INTERVAL_MS = 30 * 60 * 1000  // 每 30 分钟检查一次
 
+  /**
+   * 十个 provider 实例的续期入口（`buddy` 与 `workbuddy` 是两个实例、同一个类）。
+   *
+   * 收成一张表是为了让「失败必须留日志」这条规则**只写一遍** —— 原先这里是
+   * 十个空 catch（注释写着「静默」），把 provider 内部的告警与异常一起吞掉，
+   * 「凭据一直刷不动」在日志里完全无痕（issue !IKIRTT 的可观测性条目）。
+   */
+  const refreshTargets: ReadonlyArray<readonly [string, (pool: AccountPool) => Promise<void>]> = [
+    ['codearts', (p) => service.refreshAll(p)],
+    ['buddy', (p) => buddy.refreshAll(p)],
+    ['workbuddy', (p) => workbuddy.refreshAll(p)],
+    ['lobsterai', (p) => lobsterai.refreshAll(p)],
+    ['qoder', (p) => qoder.refreshAll(p)],
+    ['qodercn', (p) => qoderCn.refreshAll(p)],
+    ['trae', (p) => trae.refreshAll(p)],
+    ['cline', (p) => cline.refreshAll(p)],
+    // ⚠️ Loomy 不可续期：这里只探测**已过期**的账号（见 LoomyAuth.refreshAll）。
+    ['loomy', (p) => loomy.refreshAll(p)],
+    // raccoon **可续期**：只按 refreshable 过滤，且只续进入 lead 窗口的账号。
+    ['raccoon', (p) => raccoon.refreshAll(p)],
+  ]
+
   async function refreshAllCredentials(): Promise<void> {
-    try {
-      await service.refreshAll(pool)
-    } catch { /* 静默 */ }
-    try {
-      await buddy.refreshAll(pool)
-    } catch { /* 静默 */ }
-    try {
-      await workbuddy.refreshAll(pool)
-    } catch { /* 静默 */ }
-    try {
-      await lobsterai.refreshAll(pool)
-    } catch { /* 静默 */ }
-    try {
-      await qoder.refreshAll(pool)
-    } catch { /* 静默 */ }
-    try {
-      await qoderCn.refreshAll(pool)
-    } catch { /* 静默 */ }
-    try {
-      await trae.refreshAll(pool)
-    } catch { /* 静默 */ }
-    try {
-      await cline.refreshAll(pool)
-    } catch { /* 静默 */ }
-    try {
-      // ⚠️ Loomy 不可续期：这里只探测**已过期**的账号（见 LoomyAuth.refreshAll）。
-      await loomy.refreshAll(pool)
-    } catch { /* 静默 */ }
-    try {
-      // raccoon **可续期**：只按 refreshable 过滤，且只续期已过期的账号。
-      await raccoon.refreshAll(pool)
-    } catch { /* 静默 */ }
+    for (const [tag, refreshAll] of refreshTargets) {
+      try {
+        await refreshAll(pool)
+      } catch (error) {
+        // 单个 provider 抛错不得中断其余九个（各 refreshAll 内部本就逐账号
+        // try，能冒到这里的已是「整批失败」级别的异常）。
+        ctx.logger?.warn?.(
+          `[jet-hub] ${tag} 批量续期失败：${error instanceof Error ? error.message : String(error)}`,
+        )
+      }
+    }
   }
 
   // 启动时如果有任何可续期账号，安排定期续期。
@@ -807,24 +808,40 @@ export function apply(ctx: Context): void {
   // 选号，不该让凭据停止续期。早期这里写成 `a.refreshable && a.enabled`，
   // 于是「所有账号都被停用」时续期定时器**根本不启动**，凭据一路过期到
   // refresh_token 失效，用户重新启用后只能重新登录（真实缺陷）。
+  //
+  // ⚠️ **必须立刻先跑一轮**（issue !IKIRTT 的主缺陷）：早先这里只有
+  // `setInterval`，第一次处理要等满一个周期。短寿命 provider（cline 1 小时、
+  // codearts 约 2 小时、raccoon 3 小时）的凭据在宿主关闭期间早就到期了，
+  // 于是重启后**最长 30 分钟**一直显示「已过期」、积分行一直 401。
+  // 现在这一轮与 lead-time 过滤配合（`src/expiry-sync.ts` 的 `shouldRefreshNow`），
+  // 只对「距过期不足 1 小时」的账号发续期请求，其余只做一次本地对账 ——
+  // 既补上了首轮，又不会在启动时打出几十个无谓请求。
   pool.listAllAccounts().then(accounts => {
     const hasRefreshable = accounts.some(a => a.refreshable)
-    if (hasRefreshable) {
-      const refreshTimer = setInterval(() => void refreshAllCredentials(), REFRESH_INTERVAL_MS)
-      refreshTimer.unref?.()
-      ctx.effect(() => () => {
-        clearInterval(refreshTimer)
-        service.stop()
-        buddy.stop()
-        workbuddy.stop()
-        lobsterai.stop()
-        qoder.stop()
-        qoderCn.stop()
-        trae.stop()
-        cline.stop()
-        loomy.stop()
-      }, 'jet-hub: multi-account refresh scheduler')
-    }
+    if (!hasRefreshable) return
+    void refreshAllCredentials()
+    const refreshTimer = setInterval(() => void refreshAllCredentials(), REFRESH_INTERVAL_MS)
+    refreshTimer.unref?.()
+    ctx.effect(() => () => {
+      clearInterval(refreshTimer)
+      service.stop()
+      buddy.stop()
+      workbuddy.stop()
+      lobsterai.stop()
+      qoder.stop()
+      qoderCn.stop()
+      trae.stop()
+      cline.stop()
+      loomy.stop()
+    }, 'jet-hub: multi-account refresh scheduler')
+  }).catch((error: unknown) => {
+    // ⚠️ 原来这个 `.then()` **没有** `.catch()`：`listAllAccounts()` 一旦 reject
+    // （存储层异常），续期定时器就**永远不武装**，且日志里一个字都没有 ——
+    // 那时上面的「最长 30 分钟」会恶化成「永不自愈」。
+    ctx.logger?.warn?.(
+      `[jet-hub] 多账号续期调度器启动失败（本次会话不会自动续期）：`
+      + `${error instanceof Error ? error.message : String(error)}`,
+    )
   })
 
   // 保留旧的 stop scheduler（兼容旧命令）

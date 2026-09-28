@@ -23,6 +23,23 @@ import { RefreshScheduler } from './refresh.js'
 import type { BuddyCredential, BuddyRemoteModel } from './buddy.js'
 import { AccountPool } from './account-pool.js'
 import { CODEBUDDY, type BuddyProduct } from './product.js'
+import {
+  refreshAccountWithReconcile,
+  syncAccountExpiry,
+  type ExpiryAccessors,
+} from './expiry-sync.js'
+
+/**
+ * CodeBuddy 系凭据 → 账号池有效期的提取器。
+ *
+ * `BuddyAuth` 一个类服务两个产品（buddy / workbuddy），故 tag 取
+ * `this.product.id`，日志里能区分是哪个面板。
+ */
+const BUDDY_EXPIRY_ACCESSORS: ExpiryAccessors<BuddyCredential> = {
+  expiresAtOf: credentialExpiresAtMs,
+  refreshableOf: isRefreshable,
+  identityOf: (credential) => credential.access_token ?? '',
+}
 
 /**
  * CodeBuddy 的登录结果存储所用的凭据引用。
@@ -276,8 +293,15 @@ export class BuddyAuth extends Service {
    *   用 `refresh()` 去刷账号池里的账号，实际刷的是另一个凭据；
    * - 本方法也**不触碰** `refreshTokenInvalid` / `lastRefreshError` / 调度器：
    *   那些状态属于「单凭据路径」，被多账号操作污染会让 UI 显示错误的失效提示。
+   *
+   * ⚠️ **必须回写账号池的 `expiresAt`**（issue !IKIRTT）：UI 卡片读的是池值，
+   * 只更新凭据会让「已过期」的红字在续期成功后依然挂着，用户无处自救。
    */
-  async refreshAccountCredential(refName: string): Promise<void> {
+  async refreshAccountCredential(
+    refName: string,
+    pool?: AccountPool,
+    accountId?: string,
+  ): Promise<void> {
     const ref = credentialRef(refName)
     const resolved = await this.ctx.credentials.resolve(ref)
     if (!resolved) throw new Error('凭据未配置')
@@ -288,6 +312,15 @@ export class BuddyAuth extends Service {
     }
     const refreshed = await this.refreshCredential(credential)
     await this.ctx.credentials.set(ref, JSON.stringify(refreshed))
+    await syncAccountExpiry({
+      pool,
+      provider: this.product.id,
+      credential: refreshed,
+      accessors: BUDDY_EXPIRY_ACCESSORS,
+      accountId,
+      tag: `[${this.product.id}]`,
+      warn: (message) => this.ctx.logger?.warn?.(message),
+    })
   }
 
   /**
@@ -303,7 +336,11 @@ export class BuddyAuth extends Service {
    * 时用过期凭据打腾讯接口，服务端回 HTML 错误页 → 前端报
    * `Unexpected token '<'`。续期不该依赖「是否参与自动选号」。
    *
-   * 单账号失败不影响其他账号。
+   * 单账号失败不影响其他账号，但失败**必须留日志**：静默的实现会让账号
+   * 在 UI 上永远显示「可续期」却刷不动，用户与开发者都拿不到线索。
+   *
+   * ⚠️ **lead-time 过滤**（issue !IKIRTT）：距过期不足 1 小时才发续期请求，
+   * 跳过的账号只做有效期对账。详见 `refreshAccountWithReconcile`。
    */
   async refreshAll(pool: AccountPool): Promise<void> {
     const accounts = await pool.listAccounts(this.product.id)
@@ -322,12 +359,17 @@ export class BuddyAuth extends Service {
           await pool.updateAccount(entry.id, { refreshable: false })
           continue
         }
-        const refreshed = await this.refreshCredential(credential)
-        await this.ctx.credentials.set(ref, JSON.stringify(refreshed))
-        const expiresAt = credentialExpiresAtMs(refreshed)
-        await pool.updateAccount(entry.id, {
-          expiresAt: expiresAt ?? undefined,
-          refreshable: isRefreshable(refreshed),
+        await refreshAccountWithReconcile({
+          pool,
+          provider: this.product.id,
+          tag: `[${this.product.id}]`,
+          accountId: entry.id,
+          credential,
+          accessors: BUDDY_EXPIRY_ACCESSORS,
+          current: entry,
+          refresh: (c) => this.refreshCredential(c),
+          save: (c) => this.ctx.credentials.set(ref, JSON.stringify(c)),
+          warn: (message) => this.ctx.logger?.warn?.(message),
         })
       } catch (error) {
         if (error instanceof RefreshTokenExpiredError) {
@@ -336,6 +378,15 @@ export class BuddyAuth extends Service {
           } catch {
             // 忽略 updateAccount 本身的错误
           }
+          this.ctx.logger?.warn?.(
+            `[${this.product.id}] 账号 ${entry.id} 的 refresh_token 已失效，`
+            + '已标记为不可续期（需重新登录）',
+          )
+        } else {
+          this.ctx.logger?.warn?.(
+            `[${this.product.id}] 账号 ${entry.id} 续期失败：`
+            + `${error instanceof Error ? error.message : String(error)}`,
+          )
         }
         // 单账号失败不中断循环
       }
@@ -429,13 +480,20 @@ export class BuddyAuth extends Service {
  * 老数据）。与 LobsterAI / Qoder / TRAE 的既有实现同形。
  */
 export function createPoolRefresh(
-  pool: Pick<AccountPool, 'getAvailableAccount'>,
+  pool: AccountPool,
   productId: string,
   auth: Pick<BuddyAuth, 'refreshAccountCredential' | 'refresh'>,
 ): () => Promise<void> {
   return async () => {
     const available = await pool.getAvailableAccount(productId, '')
-    if (available) await auth.refreshAccountCredential(available.entry.credentialRef)
-    else await auth.refresh()
+    // ⚠️ 必须传 `pool` + `entry.id`（issue !IKIRTT）：这条是**发消息途中**按需续期
+    // 的路径（比账号卡片点「刷新」触发得频繁得多），不回写有效期就会让 UI 继续
+    // 挂着「已过期」—— 早先七个 provider 的 `refreshAccountCredential` 没有
+    // 回写能力时这里也无从传起，现在补全。
+    if (available) {
+      await auth.refreshAccountCredential(available.entry.credentialRef, pool, available.entry.id)
+    } else {
+      await auth.refresh()
+    }
   }
 }

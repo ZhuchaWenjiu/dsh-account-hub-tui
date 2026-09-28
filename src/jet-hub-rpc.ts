@@ -1189,7 +1189,7 @@ function registerJetHubEndpoints(
           if (!entry) throw new Error(`Account ${req.accountId} not found`)
 
           // 按 **entry.provider** 分派到对应服务，并调用**按凭据 ref 的**
-          // 续期入口 —— 两处都是修复既有缺陷的关键：
+          // 续期入口 —— 三处都是修复既有缺陷的关键：
           //
           // 1. 原实现只处理 codearts / buddy，`workbuddy` 会落到 else 抛
           //    `Unknown provider`，即 WorkBuddy 账号卡片的「刷新」按钮一直是坏的；
@@ -1197,27 +1197,22 @@ function registerJetHubEndpoints(
           //    **默认单凭据 ref**（如 BUDDY_ACCESS_TOKEN），而账号卡片对应的是
           //    BUDDY_ACCOUNT_XXX —— 于是「刷新这个账号」实际刷的是另一个凭据，
           //    结果要么报错要么静默改了错的对象。
-          // 按 **entry.provider** 分派到对应服务，并调用**按凭据 ref 的**
-          // 续期入口 —— 两处都是修复既有缺陷的关键：
-          //
-          // 1. 原实现只处理 codearts / buddy，`workbuddy` 会落到 else 抛
-          //    `Unknown provider`，即 WorkBuddy 账号卡片的「刷新」按钮一直是坏的；
-          // 2. 原实现调的是 `service.refresh()`，它读写的是该 provider 的
-          //    **默认单凭据 ref**（如 BUDDY_ACCESS_TOKEN），而账号卡片对应的是
-          //    BUDDY_ACCOUNT_XXX —— 于是「刷新这个账号」实际刷的是另一个凭据，
-          //    结果要么报错要么静默改了错的对象。
+          // 3. ⚠️ **每个分支都必须传 `pool` + `entry.id`**（issue !IKIRTT）：
+          //    续期成功后要把新的 `expiresAt` 写回账号池，UI 才不再显示
+          //    「已过期」。早先只有 raccoon 分支传了，其余七个「刷新」下去
+          //    凭据续好了、界面纹丝不动，用户没有任何自救手段。
           switch (entry.provider) {
             case 'codearts':
-              await codearts.refreshAccountCredential(entry.credentialRef)
+              await codearts.refreshAccountCredential(entry.credentialRef, pool, entry.id)
               break
             case 'buddy':
-              await buddy.refreshAccountCredential(entry.credentialRef)
+              await buddy.refreshAccountCredential(entry.credentialRef, pool, entry.id)
               break
             case 'workbuddy':
-              await workbuddy.refreshAccountCredential(entry.credentialRef)
+              await workbuddy.refreshAccountCredential(entry.credentialRef, pool, entry.id)
               break
             case LOBSTERAI.id:
-              await lobsterai.refreshAccountCredential(entry.credentialRef)
+              await lobsterai.refreshAccountCredential(entry.credentialRef, pool, entry.id)
               break
             case QODER.id:
             case QODER_CN.id:
@@ -1227,18 +1222,18 @@ function registerJetHubEndpoints(
               // 那会让中国版账号的「刷新」去续国际版的凭据（两站 token 不通用，
               // CN 永远续不动而国际版被无谓刷一次）。该串用由
               // `lobsterai-rpc-dispatch.spec.ts` 的行为级用例锁死（已做反向验证）。
-              await requireQoderFamily(entry.provider).auth.refreshAccountCredential(entry.credentialRef)
+              await requireQoderFamily(entry.provider).auth.refreshAccountCredential(entry.credentialRef, pool, entry.id)
               break
             case TRAE.id:
-              await trae.refreshAccountCredential(entry.credentialRef)
+              await trae.refreshAccountCredential(entry.credentialRef, pool, entry.id)
               break
             case CLINE.id:
-              await cline.refreshAccountCredential(entry.credentialRef)
+              await cline.refreshAccountCredential(entry.credentialRef, pool, entry.id)
               break
             case LOOMY.id:
               // ⚠️ Loomy **没有 refresh 端点**：这里只能做**有效性探测**，
               // 失效时抛「请重新登录」。见 LoomyAuth.refreshAccountCredential。
-              await loomy.refreshAccountCredential(entry.credentialRef)
+              await loomy.refreshAccountCredential(entry.credentialRef, pool, entry.id)
               break
             case RACCOON.id:
               // raccoon **有** refresh 端点（refresh_token 轮换），这里是真续期。
