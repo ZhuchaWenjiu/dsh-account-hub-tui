@@ -710,6 +710,83 @@ Jet Hub 设置页（`plugin-src/client/jet-hub.js`）提供多账号管理与限
 | `tsconfig.json` | TypeScript 配置 |
 | `vitest.config.ts` | Vitest 配置 |
 
+## ⚠️ dsh peer 范围必须**枚举并集**，不能用 `^0.1.2-rc.1` 或 `<0.3.0-0`（Issue IKIZ36）
+
+**真实缺陷**（用户报障，Gitee issue !IKIZ36「peer 声明问题，建议版本要求改为左闭右开，
+不会因为声明问题而无法在新版本安装」）：dsh 升到 `0.2.0-rc.1` 后插件装不上。
+
+**根因是 semver 对 `0.x` 的 `^` 语义**：`^0.1.2-rc.1` 等价于 `>=0.1.2-rc.1 <0.2.0`
+（0.x 的 `^` **只锁次版本**），所以 `0.2.0-rc.1` 判定为 **false**。
+
+⚠️ **但「改成左闭右开」并不够 —— 有两个陷阱，只改一半仍会装不上或过度放行**：
+
+**陷阱 1：dsh 门禁与 npm 默认语义不同，必须让两边都通过。**
+dsh 的安装门禁 `evaluatePluginCompatibility`
+（`packages/boot/app-boot/src/plugin-compatibility.ts`）用
+`semver.satisfies(runtimeVersion, range, { includePrerelease: true })` —— **开了
+`includePrerelease`**，故 prerelease 一律参与匹配；而 **npm/pnpm 默认语义更严**
+（range 里必须出现**同 tuple** 的 prerelease 才允许匹配该 tuple）。实测：
+
+| range | dsh 门禁（inclPre）对 `0.1.7-rc.2` | npm 默认对 `0.1.7-rc.2` |
+|---|---|---|
+| `^0.1.2-rc.1` | ✅ | ❌ |
+| `>=0.1.2-rc.1 <0.3.0-0` | ✅ | ❌（`0.2.0-rc.1` 同样 ❌） |
+| `^0.1.2-rc.1 \|\| ^0.1.7-rc.2 \|\| ^0.2.0-rc.1` | ✅ | ✅ |
+
+⇒ 纯区间写法（`>=x <y`）在 npm 默认语义下**仍然装不上 prerelease**。**必须枚举出
+每个要支持的 prerelease tuple**。
+
+⚠️ **已用 `npm pack` 打的 tarball 实测证实**（`file:` 目录依赖会绕过 npm 的 peer
+校验，**必须用 tarball 才测得出来** —— 我第一次用 `file:` 探针得到了假的「都通过」）：
+
+| 插件 peer 声明 | `npm install` 装 `dsh-llm@0.2.0-rc.1` |
+|---|---|
+| `^0.1.2-rc.1`（旧，issue 报障形态） | ❌ `ERESOLVE` |
+| `>=0.1.2-rc.1 <0.3.0-0`（**纯左闭右开**，即 issue 的建议） | ❌ `ERESOLVE` |
+| `^0.1.2-rc.1 \|\| ^0.1.7-rc.2 \|\| ^0.2.0-rc.1`（**本次采用**） | ✅ 装上 |
+
+⚠️ **所以 issue 里「改为左闭右开」的建议单独并不充分** —— 在 npm 下仍会
+`ERESOLVE`。必须枚举 prerelease tuple。
+
+**陷阱 2：`<0.3.0-0` 里的 `-0` 是必需的**（若要写区间）。`<0.3.0` 在
+`includePrerelease` 下会**放进 `0.3.0-rc.1`** —— 那正是下一个不兼容的破坏性版本。
+`-0` 后缀表示「低于该版本的任何 prerelease」，把 prerelease 挡在门外。
+
+**当前采用的写法**（`package.json` 的 `peerDependencies` 与 `devDependencies`
+**必须一致**，这是 dsh 的 package 不变式）：
+
+```
+"@deepseek-ai/dsh-llm": "^0.1.2-rc.1 || ^0.1.7-rc.2 || ^0.2.0-rc.1"
+```
+
+`@deepseek-ai/dsh-commands` / `@deepseek-ai/dsh-credentials` / `@deepseek-ai/dsh-llm`
+三个 dsh 包同款。⚠️ `@deepseek-ai/cordis`（`^4.0.2`）与 `@deepseek-ai/schemastery`
+（`^3.18.4`）**不参与该门禁**（门禁只校验 `@deepseek-ai/dsh` 与 `@deepseek-ai/dsh-*`
+前缀），且它们本就在 0.2.0 里仍是 4.0.4 / 3.18.4，故维持 `^` 即可。
+
+⚠️ **加新支持的 dsh 版本时，往并集里追加一条 `|| ^<新版本>`** ——
+不要图省事换成 `*` 或 `>=0.1.2-rc.1`（后者会放行未来所有破坏性版本）。
+
+**验证方式**（离线，别只靠肉眼看 range）：
+
+```js
+const s = require('semver')
+const R = '^0.1.2-rc.1 || ^0.1.7-rc.2 || ^0.2.0-rc.1'
+for (const v of ['0.1.2-rc.1', '0.1.7-rc.2', '0.2.0-rc.1']) {
+  // dsh 门禁语义与 npm 默认语义都必须通过
+  console.log(v, s.satisfies(v, R, { includePrerelease: true }), s.satisfies(v, R))
+}
+// 且不得放行下一破坏性版本
+console.log('0.3.0-rc.1 must be false:', s.satisfies('0.3.0-rc.1', R, { includePrerelease: true }))
+```
+
+**0.2.0 的 API 兼容性已核对**（不只是改版本号）：0.2.0 把
+`PreparedAdapterCall` 改名为 `AdapterPreparedCall`，但本仓库**从未引用**该类型
+（八个适配器各自实现了 `prepareCall` 兼容层），故不受影响。
+`registerConfigurableProviders` / `registerAdapter` / `credentialRef` /
+`LlmAdapter` / `LlmError` / `ToolCallId` / `ReasoningEffortId` /
+`EMPTY_RESPONSE_CODE` 在 0.2.0 中**均存在**。
+
 ## DSH 插件契约
 
 - 插件使用 `@deepseek-ai/dsh` 的 `credentials`、`commands`、`llm` 服务注入
