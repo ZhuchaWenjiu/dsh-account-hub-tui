@@ -20,6 +20,10 @@ import { RaccoonAuth } from './raccoon-auth.js'
 import { LOOMY } from './loomy-product.js'
 import { LoomyBalanceSelector } from './loomy-balance-selector.js'
 import { RACCOON } from './raccoon-product.js'
+import { ZcodeAuth } from './zcode-auth.js'
+import { registerZcodeLlm } from './zcode-adapter.js'
+import { ZCODE } from './zcode-product.js'
+import { readBridgeDiscovery, type ZcodeCredential } from './zcode.js'
 import { AccountPool } from './account-pool.js'
 import { hasLegacyNamespaceRegistration, settingsOf, suppressAutoSettingsPage } from './settings-compat.js'
 import type { ImageRequestTarget } from './image-budget.js'
@@ -796,6 +800,75 @@ export function apply(ctx: Context): void {
     ctx.logger.warn(`[jet-hub] 修正 Raccoon 账号显示名失败：${String(error)}`)
   })
 
+// ===== ZCode（智谱 z.ai 免费额度通道）=====
+//
+// 形态与前面所有 provider **完全不同**：它不是「读凭据 → 直发远端」，
+// 而是把请求发给**本机 ZCode 实例的 HTTP 桥**，由那个实例代发上游。
+// captcha 与 3012 风控因此由实例自己处理 —— 本 provider 不实现任何求解器。
+//
+// ⚠ **不可续期**：凭据语义是「本机桥是否活着」，没有远端 token 可刷。
+// 端口与 token 随实例重启变化，由**每次请求重读发现文件**处理
+//（见 zcode-adapter.ts 里的说明）—— 那不是「续期」。
+//
+// 服务名注册为 ctx.zcodeAuth。不注册斜杠命令：入口在 Jet Hub 的 ZCode 面板。
+const zcode = new ZcodeAuth(ctx)
+const zcodeAdapter = registerZcodeLlm(ctx, {
+  credentialRef: credentialRef(ZCODE.defaultCredentialRef),
+  resolveCredential: async (modelId?: string) => {
+    // 只从 zcode 自己的账号池取账号，回退到自己的单凭据 ref，
+    // 保证不会串用其它 provider 的凭据。
+    // provider 实参用 ZCODE.id 而非字面量：写死字面量在改名/多产品场景下
+    // 会静默查不到账号（本插件在 workbuddy 上踩过同类坑）。
+    // ⚠ `modelId` 透传：否则模型级限流标记被忽略（详见 buddy 处说明）。
+    const available = await pool.getAvailableAccount(ZCODE.id, modelId ?? '')
+    // `getAvailableAccount` 的凭据类型是历史遗留的联合类型，
+    // 与 `ZcodeCredential` 无充分重叠，故经 `unknown` 转换。
+    // 运行时安全性由 provider 过滤保证：查询用 `ZCODE.id`，取到的必是 zcode 凭据。
+    if (available) return available.credential as unknown as ZcodeCredential
+    const resolved = await ctx.credentials.resolve(credentialRef(ZCODE.defaultCredentialRef))
+    if (!resolved) return undefined
+    try {
+      return JSON.parse(resolved.value) as ZcodeCredential
+    } catch {
+      return undefined
+    }
+  },
+  refresh: async () => {
+    // ⚠ ZCode **没有** refresh 端点（与 Loomy 恒 false 同类，但原因不同）：
+    // 凭据是「本机桥的访问信息」，它的变化由**重读发现文件**自然处理。
+    //
+    // 这里做的是「把发现文件里最新的端口写回账号条目的昵称」——
+    // 让账号卡片的展示值不会长期偏离实际。
+    // **真正的请求一律以文件为准**，不依赖这次回写是否成功。
+    const discovery = readBridgeDiscovery()
+    if (discovery === undefined) return
+    const available = await pool.getAvailableAccount(ZCODE.id, '')
+    // ⚠ `getAvailableAccount` 返回的可能是 `null`（本仓库该 API 的约定），
+    // 只判 `undefined` 会漏掉它 —— 用显式判空覆盖两者。
+    if (available === null || available === undefined) return
+    try {
+      const current = available.credential as unknown as ZcodeCredential
+      const next: ZcodeCredential = {
+        bridge_token: discovery.token,
+        bridge_port: discovery.port,
+        account_label: current.account_label ?? `127.0.0.1:${discovery.port}`,
+      }
+      await ctx.credentials.set(
+        credentialRef(available.entry.credentialRef),
+        JSON.stringify(next),
+      )
+    } catch {
+      // 回写失败不影响请求（请求走文件）。静默即可。
+    }
+  },
+  // 远端模型目录：委托给 ZcodeAuth.fetchModels（它负责冒号头与 `visible` 过滤）。
+  // 失败时返回空数组，由适配器回退兜底表。
+  fetchRemoteModels: () => zcode.fetchModels(),
+  accountPool: pool,
+  product: ZCODE,
+})
+
+
   // 一次性修复**老 TRAE 账号**的展示名（与上面 Raccoon 同类，同因）：
   // 服务端 ScreenName 是**按 uid 自动生成的默认名**（`用户26815487395`），
   // 多账号无法区分；`GetUserInfo` 的 `NonPlainTextMobile`（脱敏手机号）可区分。
@@ -852,6 +925,9 @@ export function apply(ctx: Context): void {
     ['loomy', (p) => loomy.refreshAll(p)],
     // raccoon **可续期**：只按 refreshable 过滤，且只续进入 lead 窗口的账号。
     ['raccoon', (p) => raccoon.refreshAll(p)],
+    // zcode **不可续期**（没有 refresh 端点）—— 但这个方法仍做实事：
+    // 把发现文件里的最新端口同步到账号昵称。它幂等，端口没变时不写。
+    ['zcode', (p) => zcode.refreshAll(p)],
   ]
 
   async function refreshAllCredentials(): Promise<void> {
@@ -899,6 +975,7 @@ export function apply(ctx: Context): void {
       trae.stop()
       cline.stop()
       loomy.stop()
+      zcode.stop()
     }, 'jet-hub: multi-account refresh scheduler')
   }).catch((error: unknown) => {
     // ⚠️ 原来这个 `.then()` **没有** `.catch()`：`listAllAccounts()` 一旦 reject
@@ -921,6 +998,7 @@ export function apply(ctx: Context): void {
     trae.stop()
     cline.stop()
     loomy.stop()
+      zcode.stop()
   }, 'codearts-auth.scheduler (legacy)')
 
   // ===== Jet Hub RPC 注册 =====
@@ -940,8 +1018,9 @@ export function apply(ctx: Context): void {
     cline: clineAdapter,
     loomy: loomyAdapter,
     raccoon: raccoonAdapter,
+      zcode: zcodeAdapter,
   }
 
-  registerJetHubRpc(ctx, pool, service, buddy, workbuddy, lobsterai, qoder, qoderCn, trae, cline, loomy, raccoon, modelAdapters)
+  registerJetHubRpc(ctx, pool, service, buddy, workbuddy, lobsterai, qoder, qoderCn, trae, cline, loomy, raccoon, zcode, modelAdapters)
   ctx.provide('accountPool', pool)
 }
