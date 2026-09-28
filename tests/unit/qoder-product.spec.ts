@@ -107,6 +107,27 @@ describe('Qoder 产品配置', () => {
     }
   })
 
+  /**
+   * 国际版与国际版**同一根因**（详见下方 CN 的 `上下文窗口取官方档位表的最大档` 用例）：
+   * 旧表照抄 `max_input_tokens`（`smodel`/`gmodel`/`kmodel_latest` 等写 180K），
+   * 但客户端 `LV()` 只要有档位表就只查成员资格。
+   * 实测档位表（`scripts/probe-qoder-windows.mjs intl`）：除 `auto` 外全部含 1M 档。
+   * ⚠️ 国际版**没有**服务端实发验证（`api2.qoder.sh` 在本机网络不通），
+   * 故这里锁的是「客户端逻辑 + 目录档位表」这条依据。
+   */
+  it('上下文窗口取官方档位表的最大档（除无档位表的 auto）', () => {
+    const byId = new Map(QODER.fallbackModels.map((m) => [m.id, m]))
+    for (const id of [
+      'ultimate', 'performance', 'efficient', 'smodel', 'cmodel',
+      'qmodel_38max', 'qfmodel', 'qmodel_latest', 'qmodel',
+      'kmodel_latest', 'kmodel', 'gmodel', 'gfmodel', 'dmodel', 'dfmodel', 'mmodel',
+    ]) {
+      expect(byId.get(id)?.contextWindow, `${id} 的 contextWindow`).toBe(1_000_000)
+    }
+    // `auto` 无档位表（客户端 `HV()` 会造出 128K/200K/max 三档），沿用 200K。
+    expect(byId.get('auto')?.contextWindow).toBe(200_000)
+  })
+
   it('qoderProductById 命中与未命中', () => {
     expect(qoderProductById('qoder')).toBe(QODER)
     expect(qoderProductById('nope')).toBeUndefined()
@@ -364,16 +385,37 @@ describe('Qoder 中国版兜底模型表（E6：catalog-v6 的 chat 场景 14 �
     }
   })
 
-  it('上下文窗口取 CN 实解值，不套用国际版的 1M', () => {
-    // 国际版把这几条记成 1_000_000；CN catalog 给的是 180K / 96K。
+  /**
+   * ⚠️ 用户报障「Qoder 中国版的上下文窗口显示不对」的直接根因就在这条。
+   *
+   * 旧表把 CN 的 `contextWindow` 填成目录的 `max_input_tokens`（`dmodel` 96K、
+   * 其余 180K）。但**官方客户端不读那个字段**：`isContextWindowSupportedByModel()`
+   * 换算后交给 `zX()`，而 `zX()` 只要发现 `context_config` 档位表存在，
+   * 就**只检查「是否为表内成员」**，`max_input_tokens` 兜底分支根本不执行
+   * （asar 证据：`let i=Yai(A);if(i)return i.includes(t);let n=…max_input_tokens`）。
+   *
+   * > 口径（用户 2026-09-27 定）：**档位表有 1M 档就填 1M**。
+   *
+   * ⚠️ `dmodel` 的**实测**只到 852,951（985,000 越界），但它是档位表成员
+   * `1M`，故仍填 1M —— **不要因为"实测没到 1M"就改小**：1M × 0.8 = 800K 的
+   * 压缩阈值低于 852,951 这个已证安全点。实测记录见
+   * `src/qoder-product.ts` 表头注释与 AGENTS.md 2.1 节。
+   */
+  it('档位表有 1M 档就填 1M；只有 200K 档的 mmodel 例外', () => {
     const byId = new Map(QODER_CN.fallbackModels.map((m) => [m.id, m]))
-    expect(byId.get('qmodel_latest')?.contextWindow).toBe(180_000)
-    expect(byId.get('qmodel')?.contextWindow).toBe(180_000)
-    expect(byId.get('dmodel')?.contextWindow).toBe(96_000)
-    expect(byId.get('dfmodel')?.contextWindow).toBe(180_000)
-    expect(byId.get('kmodel')?.contextWindow).toBe(180_000)
-    // gfmodel 才是 CN 里唯一的 1M
+    // 已实测逼近 1M 的两条（qfmodel 计入 983,490 / dfmodel 计入 999,991）。
+    expect(byId.get('qfmodel')?.contextWindow).toBe(1_000_000)
+    expect(byId.get('dfmodel')?.contextWindow).toBe(1_000_000)
+    // ⚠️ 真实缺陷（用户报障）：`dmodel` 的 `max_input_tokens` 是 **96000**，
+    // 旧表照抄 → DSH 在 76.8K 就压缩。档位表有 1M 档 → 填 1M。
+    expect(byId.get('dmodel')?.contextWindow).toBe(1_000_000)
+    // 其余档位表含 1M 档者。
+    expect(byId.get('qmodel_latest')?.contextWindow).toBe(1_000_000)
+    expect(byId.get('qmodel')?.contextWindow).toBe(1_000_000)
+    expect(byId.get('kmodel')?.contextWindow).toBe(1_000_000)
     expect(byId.get('gfmodel')?.contextWindow).toBe(1_000_000)
+    // ⚠️ 唯一例外：`mmodel` 的档位表只有 200K 一档，不要跟着改成 1M。
+    expect(byId.get('mmodel')?.contextWindow).toBe(200_000)
   })
 
   it('思考档位标记按 CN catalog，与国际版相反的几条要照 CN', () => {

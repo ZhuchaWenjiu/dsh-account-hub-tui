@@ -354,12 +354,76 @@ pnpm build:assets          # 同步到 lib/
 2. **模型表不能沿用国际版**：CN 是 **14 条**，独有 `q37fmodel`(Qwen3.7-Flash) /
    `gm51model`(GLM-5.2)，**没有** `ultimate` / `performance` / `efficient` /
    `smodel` / `cmodel` 五条（沿用会让菜单出现 5 个 CN 端点根本不认的模型）；
-   另有 5 条上下文窗口不同（`dmodel` 在 CN 是 **96K**）、4 条思考标记不同、
+   另有 5 条 `max_input_tokens` 不同、4 条思考标记不同、
    `mmodel` 在 CN 是 **MiniMax-M2.7** 不是 M3 且 `is_vl` 为 false。
+   ⚠️ **但那 5 条「上下文窗口不同」是假差异 —— 已推翻**（2026-09-27 实测）。
+   见下方第 2.1 条：`contextWindow` 要取 `context_config` 档位表的最大档，
+   两个版本的档位表**几乎相同**（除 `mmodel` 外都是 `{200K, 400K, 1M}`）。
    ⚠️ 改表同样必须逐个实发验证，且 `qoder-product.spec.ts` 对 CN 有**逐条数值断言**。
    ⚠️ CN 目录条目的标识字段名是 **`key`**，国际版是 `model_key` —— 重新采集时
    两个名字都要认（`scripts/probe-qodercn-catalog.mjs` 已如此实现），
    否则会得到「0 个模型」的**假阴性**（首跑真踩过）。
+
+### 2.1 ⚠️ 上下文窗口必须取 `context_config` 档位表，**不要**取 `max_input_tokens`
+
+**用户报障**：Qoder 的上下文窗口「显示得比官方小很多」（CN `dmodel` 只有 96K）。
+
+**根因**：目录里两个字段会自相矛盾 —— CN `dmodel` 的 `max_input_tokens` 是 **96000**，
+但 `context_config` 档位表是 `{200K, 400K, 1M}`。旧表照抄了前者。
+
+**官方客户端只认后者**（asar 证据，`qoder-worker-runtime.obf.mjs`）：
+
+```js
+function zX(A,e){let t=jiA(e);if(void 0===t)return!1;
+  let i=Yai(A);if(i)return i.includes(t);          // ← 档位表存在就只查成员资格
+  let n=jiA(A?.max_input_tokens??A?.maxInputTokens);return void 0===n||t<=n}  // ← 兜底分支
+```
+
+`isContextWindowSupportedByModel()` → `zX()`：**只要档位表存在，`max_input_tokens`
+那条分支根本不执行**。`max_input_tokens` 仅在「模型没有档位表」时才作兜底
+（`Mz()` 的默认值还是 1048576）。故它**不是**「这个模型只能吃这么多」的声明。
+
+**实测**（2026-09-27，CN 加密端点，`scripts/probe-qoder-context-needle.mjs`；
+针埋在提示**正中间**，命中即证明未被截断）：
+
+| 事实 | 证据 |
+|---|---|
+| `max_input_tokens` **不构成**服务端约束 | 声明 96K 的 `dmodel` 完整收下 **852,951** |
+| `parameters.context_length` **也不构成**约束 | 同一 400K 提示，声明 180K / 200K / 1M / **不发该字段** —— 四种都完整送达（`prompt_tokens` 一致） |
+| ⚠️ 真实上限**因模型而异**，**不是**网关统一值 | `dfmodel` 通过到 **999,991**；`qfmodel` 通过到 **983,490**、990,000 越界且**服务端明确回** `Range of input length should be [1, 983616]` |
+| `983,616`（`1M − 16K`）**只对报了它的模型成立** | `dfmodel` 实测 999,991 > 983,616，已证伪「全局上限」。引用时必须说明适用范围 |
+
+**逐模型实测记录**（用户 2026-09-27 据此定表）：
+
+| 模型 | 实测通过（目标 tokens） | 服务端实际计入 | 越界点 | 越界错误形态 | 表里填 |
+|---|---|---|---|---|---|
+| `dfmodel` | 938,000 | **999,991** | 939,000 起 | `Internal Server Error` | **1M** |
+| `qfmodel` | 984,000 | **983,490** | 990,000 | 参数错误 + `Range … [1, 983616]` | **1M** |
+| `dmodel` | 800,000 | **852,951** | 985,000 | `Internal Server Error`（**无区间**） | **1M** |
+
+⚠️ **`dmodel` 的实测只到 852,951，却仍填 1M —— 这是有意的**，别当成笔误：
+口径是「**档位表有 1M 档就填 1M**」（用户 2026-09-27 定）。它的天花板确实未探明
+（985,000 越界后只回 `Internal Server Error`，**不像 `qfmodel` 那样给出区间**，
+无法反推真限），但 1M × 0.8 = **800K** 的压缩阈值**低于 852,951 这个已证安全点**，
+故 1M 在 DSH 侧安全。⚠️ **不要因为"实测没到 1M"就把它改小**（改小会让 DSH
+远早于官方能力触发压缩，正是本次要修的缺陷）。
+⚠️ 其余 CN 模型（`qmodel` / `gmodel` / `kmodel` 等 9 条）**未逐个探顶**，
+沿用档位表最大档 1M。
+
+**所以取值口径（用户 2026-09-27 定）**：**档位表有 1M 档就填 1M**。
+
+- `qfmodel` / `dfmodel` / `dmodel` 等档位表含 1M 档者 → **1M**
+  （前两条实测逼近 1M；`dmodel` 依据档位表 + 800K 阈值安全）；
+- **其余未逐个探顶**者（`qmodel` / `gmodel` / `kmodel` 等 9 条）沿用档位表最大档 **1M**；
+- `mmodel` 档位表**只有 200K 一档** → **200K**；`auto` 无档位表 → **200K**。
+
+**取证脚本**（均可离线跑）：`scripts/probe-qoder-windows.mjs` 打印每个模型的
+档位表与 `max_input_tokens` 对照；`scripts/probe-qoder-context-limits.mjs`
+用一次越界请求逼出服务端硬上限（⚠️ 只对**回区间**的模型有效，回
+`Internal Server Error` 的探不出来）；`scripts/verify-qoder-context-fix.mjs`
+把兜底表与目录档位表逐条对账。
+
+⚠️ **改了本表必须重跑**这些脚本对照，不要凭印象填。
 3. **CN 没有公开的 OpenAI 兼容端点**：`gateway.qoder.com.cn` 与
    `openapi.qoder.com.cn` 上的 `/model/v1/chat/completions` 实测都回 **503**。
    故 `QODER_CN.inferBase` 填成与 `encryptedInferBase` 同值，仅表示「无独立公开端点」，
