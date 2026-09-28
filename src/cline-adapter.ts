@@ -46,6 +46,7 @@ import {
   CLINE_REASONING_EFFORTS,
   type ClineProduct,
 } from './cline-product.js'
+import { projectRequestImage, type ImageRequestTarget } from './image-budget.js'
 import {
   collectImages,
   consumeOpenAiSse,
@@ -156,6 +157,20 @@ export interface ClineAdapterOptions {
    * `UNSUPPORTED_CONTENT`（而不是静默丢弃）。
    */
   readImage?: (attachment: unknown) => Promise<{ data: Uint8Array; mediaType: string } | undefined>
+  /**
+   * 读取图片附件的**请求版本**（按像素预算与字节目标缩放后的字节）。
+   *
+   * ⚠️ 与 {@link readImage} 的错误契约**相反**：不可用时必须返回 `undefined`
+   * 而不是抛错。判据与回退都在共享的 `projectRequestImage` 里。
+   *
+   * 背景（issue !IKITT9）：Cline 撞的是**请求体体积**（实测 24 张原图全过、
+   * 32 张 ≈122 MiB 才 `TRANSPORT`），不是腾讯那道图片 token 预算 ——
+   * 但解法同样是缩放，且阈值余量最小，所以配一个宽松的字节目标。
+   */
+  readImageRequest?: (
+    attachment: unknown,
+    target: ImageRequestTarget,
+  ) => Promise<{ data: Uint8Array; mediaType: string } | undefined>
   /** 产品配置；默认 {@link CLINE}。 */
   product?: ClineProduct
   /** 注入的 fetch（测试用）。 */
@@ -394,8 +409,16 @@ export class ClineAdapter extends LlmAdapter {
       // 保留**空 Map**（而非降级为 undefined）：图片存在但全部读取失败时，
       // 空 Map 仍会让 userContentParts 产出 [image unavailable] 占位符。
       imageUrls = new Map()
+      const readImage = this.options.readImage
       for (const [id, ref] of imageRefs) {
-        const image = await this.options.readImage(ref)
+        // ⚠️ 先试**请求版本**（缩放），拿不到才发原图。
+        // ⚠️ 先试**请求版本**（缩放），拿不到才发原图。
+        const projected = await projectRequestImage(ref, {
+          readImageRequest: this.options.readImageRequest,
+          pixelBudget: this.product.imagePixelBudget,
+          maxBytes: this.product.imageMaxBytes,
+        })
+        const image = projected ?? await readImage(ref)
         if (image === undefined) continue
         imageUrls.set(id, `data:${image.mediaType};base64,${Buffer.from(image.data).toString('base64')}`)
       }

@@ -63,3 +63,13 @@ docs/loomy-protocol-notes.md
 # （即同一个 `cmd.exe`）作默认值，这条配置纯属冗余。
 # ⚠️ 确实要指定 shell 时写到**用户级** `~/.npmrc`（不进仓库、不随包分发）。
 .npmrc
+
+# 图片压力探针的测试素材：**不入库**（issue !IKITT9 的 e2e 用）。
+#
+# 理由不是体积（2.87 MiB 也确实会让仓库永久膨胀），而是**它是真人桌面截图**：
+# 含浏览器标签页用户名、搜索框检索词、整屏热搜。本仓库公开，一旦 commit
+# 就永久留在 git 历史里 —— 事后删文件、改写历史都清不干净，fork 副本收不回。
+#
+# 探针在缺该文件时整体跳过（见 tests/e2e/image-probe-shared.ts 的 hasFixture），
+# 要跑图片压力探测请自备一张 ≥2000×1200 且不含个人信息的截图放到这个路径。
+tests/fixtures/test.png

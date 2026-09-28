@@ -33,6 +33,7 @@ import { AccountPool, providerCatalogVisible } from './account-pool.js'
 import { settingsNamespaceFor } from './settings-compat.js'
 import { isRaccoonExpired, type RaccoonCredential } from './raccoon.js'
 import { RACCOON, type RaccoonFallbackModel, type RaccoonProduct } from './raccoon-product.js'
+import { projectRequestImage, type ImageRequestTarget } from './image-budget.js'
 import {
   collectImages,
   consumeOpenAiSse,
@@ -90,6 +91,22 @@ export interface RaccoonAdapterOptions {
   fetchRemoteModels?: () => Promise<RaccoonRemoteModel[]>
   /** 读取图片附件的原始字节（内联为 data URL 用）。 */
   readImage?: (attachment: unknown) => Promise<{ data: Uint8Array; mediaType: string } | undefined>
+  /**
+   * 读取图片附件的**请求版本**（按字节目标缩放后的字节）。
+   *
+   * ⚠️ 与 {@link readImage} 的错误契约相反：**不可用时要返回 `undefined`**
+   * 而不是抛错，适配器据此回退原图。理由与桥接实现见
+   * `src/index.ts` 的 `makeReadImageRequest`、`src/image-budget.ts` 的
+   * `projectRequestImage`。
+   *
+   * 背景（issue !IKITT9 的 raccoon 变体）：该网关按**请求体字节**设限，
+   * 实测 `HTTP_413: request body exceeds 10MB` —— 两张 2560×1600 的截图
+   *（base64 后各 ≈3.9 MB）再加别的内容就可能被拒。
+   */
+  readImageRequest?: (
+    attachment: unknown,
+    target: ImageRequestTarget,
+  ) => Promise<{ data: Uint8Array; mediaType: string } | undefined>
   /** 账号池（目录门控与黑名单）。 */
   accountPool?: AccountPool
   /** 产品配置；默认 {@link RACCOON}。 */
@@ -241,8 +258,17 @@ export class RaccoonAdapter extends LlmAdapter {
       // 保留**空 Map**（而非降级为 undefined）：图片存在但全部读取失败时，
       // 空 Map 仍会让 userContentParts 产出 [image unavailable] 占位符。
       imageUrls = new Map()
+      const readImage = this.options.readImage
       for (const [id, ref] of imageRefs) {
-        const image = await this.options.readImage(ref)
+        // ⚠️ 先试**请求版本**：这家网关按请求体字节设限（实测
+        // `HTTP_413: request body exceeds 10MB`），原图直发时两张大截图
+        // 就能把配额吃掉大半。拿不到（老宿主 / 拒绝投影 / 缺尺寸）就回退原图。
+        const projected = await projectRequestImage(ref, {
+          readImageRequest: this.options.readImageRequest,
+          pixelBudget: this.product.imagePixelBudget,
+          maxBytes: this.product.imageMaxBytes,
+        })
+        const image = projected ?? await readImage(ref)
         if (image === undefined) continue
         imageUrls.set(id, `data:${image.mediaType};base64,${Buffer.from(image.data).toString('base64')}`)
       }

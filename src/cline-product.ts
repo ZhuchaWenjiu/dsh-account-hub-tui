@@ -113,6 +113,18 @@ export interface ClineProduct {
   tokenPrefix: string
   /** 默认凭据 ref（无账号池时的单凭据回退）。 */
   defaultCredentialRef: string
+  /**
+   * 单张请求图片的像素预算（issue !IKITT9）。
+   *
+   * ⚠️ Cline **没有**腾讯那道「图片视觉 token 预算」—— 实测 24 张
+   * 2560×1600 原图（≈159K 图片 token，远超 100,000）全部成功，
+   * 直到 32 张（≈122 MiB）才因**请求体体积** `TRANSPORT` 失败。
+   * 所以这里的预算是为体积兜底，不是为了 token 配额；取值比其他家宽松。
+   * 未配置时适配器用 `DEFAULT_IMAGE_PIXEL_BUDGET`。
+   */
+  imagePixelBudget?: number
+  /** 单张请求图片的编码字节目标（未配置用 1 MiB，见 `src/image-budget.ts`）。 */
+  imageMaxBytes?: number
   /** 模型列表不可用时的兜底目录。 */
   fallbackModels: readonly ClineFallbackModel[]
 }

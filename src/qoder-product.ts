@@ -238,6 +238,23 @@ export interface QoderProduct {
   /** 默认凭据 ref（无账号池时的单凭据回退）。 */
   defaultCredentialRef: string
   /**
+   * 单张请求图片的像素预算（issue !IKITT9）。
+   *
+   * ⚠️ qoder 撞的**不是**腾讯那道「图片视觉 token 预算」，而是**请求体体积**：
+   * 实测 8 张 2560×1600 原图能过、15 张（≈57 MiB）直接 `TRANSPORT: fetch failed`。
+   * 两种约束只有「缩放图片」这一个共同解法，所以这里同样要配预算。
+   * 未配置时适配器用 `DEFAULT_IMAGE_PIXEL_BUDGET`。
+   */
+  imagePixelBudget?: number
+  /**
+   * 单张请求图片的编码字节目标。
+   *
+   * 未配置时用 `DEFAULT_BODY_LIMITED_IMAGE_MAX_BYTES`（1 MiB）——
+   * 取值的算术依据记在 `src/image-budget.ts`。
+   * ⚠️ 与 raccoon 的 512 KB 不同值是**有意的**（那家硬限 10 MB），别合并。
+   */
+  imageMaxBytes?: number
+  /**
    * 模型列表不可用时的兜底模型目录（本插件不发远端请求，恒用它）。
    *
    * ⚠️ **只有模型列表需要 WASM 签名**，不要据此推断其它端点：

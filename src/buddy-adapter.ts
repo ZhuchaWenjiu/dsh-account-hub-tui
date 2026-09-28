@@ -32,6 +32,7 @@ import {
 import type { BuddyCredential, BuddyRemoteModel } from './buddy.js'
 import { CODEBUDDY, resolveUserAgent, type BuddyFallbackModel, type BuddyProduct } from './product.js'
 import { normalizeHarnessMessages } from './message-shape.js'
+import { projectRequestImage, type ImageRequestTarget } from './image-budget.js'
 import { createBlankReasoningSuppressor, createReasoningLoopDetector, hasUsableToolName, isProseTruncatedByStopString, isReasoningLoopGuardEnabled, isTruncatedArguments, normalizeToolArguments, readWithIdleTimeout, resolveEmptyResponseReason, resolveToolPairing, splitThinkTaggedContent, stripBareThinkCloseTagIfEnabled, stripCourseLeakFromHistoryContent, stripCourseLeakIfEnabled } from './sse.js'
 
 /**
@@ -188,6 +189,22 @@ export interface BuddyAdapterOptions {
    * 「读不到」，调用方据此 `continue`，正是静默丢图的源头。
    */
   readImage?: (attachment: unknown) => Promise<{ data: Uint8Array; mediaType: string }>
+  /**
+   * 读取一张图片的**请求版本**（按目标尺寸缩放后的字节），用于替代裸原图。
+   *
+   * ⚠️ 与 {@link readImage} 的错误契约**刻意相反**：本回调**不可用时必须返回
+   * `undefined`**（而不是抛错），因为缩放是一项优化 —— 附件服务未装、版本过旧
+   * 没有 `readImageRequest`、或后端拒绝投影（`ATTACHMENT_PROJECTION_UNSUPPORTED`）
+   * 时，正确行为是**发原图**，而不是把一次本来能成功的请求打死。
+   * 桥接实现见 `src/index.ts` 的 `makeReadImageRequest`。
+   *
+   * 背景（issue !IKITT9）：原先恒发原图，36 张 1721×997 的截图就顶穿网关
+   * 「单次请求图片视觉 token ≈100,000」的上限，此后该会话每一轮都失败。
+   */
+  readImageRequest?: (
+    attachment: unknown,
+    target: ImageRequestTarget,
+  ) => Promise<{ data: Uint8Array; mediaType: string } | undefined>
   fetchImpl?: typeof fetch
   /** 多账号池（用于限流时切换账号） */
   accountPool?: AccountPool
@@ -599,12 +616,43 @@ function errorDetail(body: string): string {
  * 字样），而完整 body 因含 `extError.code = context_length_exceeded` 能稳定命中。
  * 判定看完整报文、展示用归一化文本，两者职责不同。
  */
+/**
+ * 腾讯网关「请求过大」的另一种措辞：`prompt is too long: 100001 tokens > 100000 maximum`。
+ *
+ * ⚠️ harness 的 `isContextWindowExceededError` **认不出这句话**（实测其五个分支
+ * 都要求出现 `context` / `for this model` / `maximum context` 之类字样，而这句
+ * 一个都没有）。报文若同时带 `extError.code = context_length_exceeded` 还能靠
+ * 结构化那条命中；**只带 `code`/`msg`/`displayMsg`** 时就漏判。
+ * 实测四种报文形态：带 extError ✅ 命中；仅 msg / 仅 msg+displayMsg / 拼给用户的
+ * 整行 ❌ 全部漏判 —— 这正是 issue !IKITT9 里「逐字相同的错误一会儿
+ * CONTEXT_WINDOW_EXCEEDED、一会儿 INVALID_REQUEST」的成因。
+ *
+ * ⚠️ 判据必须**同时**要求「prompt is too long」与「N tokens > M」两个特征：
+ * 只认前者的宽泛措辞会把别的内容类 400 误判成溢出。
+ */
+const GATEWAY_PROMPT_TOO_LONG = /\bprompt\s+is\s+too\s+long\b[\s\S]{0,40}?\b\d[\d,]*\s+tokens?\s*>/i
+
+/**
+ * 漏判为什么必须修（后果是**不对称**的）：
+ *
+ * - `INVALID_REQUEST` **不在** harness 的 `DEFAULT_RETRYABLE_CODES`
+ *   （`[EMPTY_RESPONSE, RATE_LIMIT, SERVER, TIMEOUT, TRANSPORT]`）→ 不重试；
+ * - 更关键的是它**不触发溢出压缩**：`dsh-compaction-basic` 的 request-error
+ *   listener 第一行就是 `if (failure.code !== CONTEXT_WINDOW_EXCEEDED_CODE) return next()`
+ *   → 连「试一次压缩」的机会都没有，用户直接看到裸错误、会话从此每轮报废。
+ *
+ * 归成溢出的最坏结果只是一次无效的压缩尝试；归错成 INVALID_REQUEST 的代价是
+ * 整个会话不可恢复。方向因此取「宁可多判一次溢出」。
+ */
 function httpErrorCode(status: number, body: string): string {
   if (status === 401 || status === 403) return 'AUTH'
   if (status === 429) return 'RATE_LIMIT'
   if (status === 400) {
     // 先判上下文超限，再退回通用 INVALID_REQUEST。
-    if (isContextWindowExceededError(body)) return CONTEXT_WINDOW_EXCEEDED_CODE
+    // 两条判据：harness 的通用分类器 + 本仓库补的网关措辞（见上）。
+    if (isContextWindowExceededError(body) || GATEWAY_PROMPT_TOO_LONG.test(body)) {
+      return CONTEXT_WINDOW_EXCEEDED_CODE
+    }
     return 'INVALID_REQUEST'
   }
   if (status >= 500) return 'SERVER'
@@ -785,6 +833,25 @@ export class BuddyAdapter extends LlmAdapter {
    * resolveModel 可能先于 listModels 被调用（如直接进入会话），此时同样
    * 触发一次远端拉取，保证 /v3/config 的 maxInputTokens 能生效。
    */
+  /**
+   * 按产品的像素预算派生一张图片的**请求版本**。
+   *
+   * 判据与回退都在共享的 `projectRequestImage` 里（raccoon 用的是同一份 ——
+   * 两个适配器各写一遍正是本仓库反复出缺陷的形态）。返回 `undefined`
+   * 表示本次发原图，四种正常情形见该函数的注释。
+   *
+   * ⚠️ 预算取 `product.imagePixelBudget`，未配置时用
+   * `DEFAULT_IMAGE_PIXEL_BUDGET`（640,000 px ≈ 1,037 视觉 token）。
+   */
+  private async projectRequestImage(
+    ref: unknown,
+  ): Promise<{ data: Uint8Array; mediaType: string } | undefined> {
+    return projectRequestImage(ref, {
+      readImageRequest: this.options.readImageRequest,
+      pixelBudget: this.product.imagePixelBudget,
+    })
+  }
+
   private async ensureRemoteModels(): Promise<void> {
     if (this.remoteModels !== undefined || this.options.fetchRemoteModels === undefined) return
     try {
@@ -1075,7 +1142,12 @@ export class BuddyAdapter extends LlmAdapter {
       credential = await this.options.resolveCredential(options.model)
     }
     if (credential === undefined || credential.access_token.length === 0) {
-      throw new LlmError('buddy: no usable credential; log in first with /buddy-login', 'MISSING_CREDENTIAL')
+      throw new LlmError(
+        // ⚠️ 文案里**不能**再提 `/buddy-login` —— 该斜杠命令已随单凭据模式一并移除
+        // （AGENTS.md「不注册任何斜杠命令」），入口在 Jet Hub 设置页。
+        `${this.product.id}: no usable credential; log in from the Jet Hub panel first`,
+        'MISSING_CREDENTIAL',
+      )
     }
 
     // Track current account for rate limit switching
@@ -1115,13 +1187,21 @@ export class BuddyAdapter extends LlmAdapter {
     let imageUrls: Map<string, string> | undefined
     if (imageRefs.size > 0) {
       if (!this.inputModalitiesFor(options.model).includes('image')) {
-        throw new LlmError(`buddy: model "${options.model}" does not accept image input.`, 'UNSUPPORTED_CONTENT')
+        throw new LlmError(`${this.product.id}: model "${options.model}" does not accept image input.`, 'UNSUPPORTED_CONTENT')
       }
       if (this.options.readImage === undefined) {
-        throw new LlmError('buddy: image input requires the attachment service.', 'UNSUPPORTED_CONTENT')
+        throw new LlmError(`${this.product.id}: image input requires the attachment service.`, 'UNSUPPORTED_CONTENT')
       }
       imageUrls = new Map()
       for (const [id, ref] of imageRefs) {
+        // ⚠️ 先试**请求版本**（按像素预算缩放），拿到就用它；拿不到才发原图。
+        // 这一步是本 issue 的正题：原图直发让 36 张截图顶穿网关的图片 token
+        // 上限（≈100,000），此后每轮都失败且压缩救不回来。
+        const projected = await this.projectRequestImage(ref)
+        if (projected !== undefined) {
+          imageUrls.set(id, `data:${projected.mediaType};base64,${Buffer.from(projected.data).toString('base64')}`)
+          continue
+        }
         let image: { data: Uint8Array; mediaType: string } | undefined
         try {
           image = await this.options.readImage(ref)
@@ -1129,7 +1209,7 @@ export class BuddyAdapter extends LlmAdapter {
           // 读取抛错必须冒泡成明确的 LlmError：早先这里会把异常吞掉，
           // 最终表现为「图片凭空消失、模型答非所问」，排查成本极高。
           throw new LlmError(
-            `buddy: 读取图片附件失败（${id}）：${errorMessage(error)}`,
+            `${this.product.id}: 读取图片附件失败（${id}）：${errorMessage(error)}`,
             'UNSUPPORTED_CONTENT',
             { cause: error as Error },
           )
@@ -1140,7 +1220,7 @@ export class BuddyAdapter extends LlmAdapter {
           // 若此处 continue，线上请求会退化成纯文本，用户只看到模型
           // 「看不到图」而没有任何错误提示。
           throw new LlmError(
-            `buddy: 图片附件读取不到内容（${id}）；附件服务可能未就绪，或该对象已不存在。`,
+            `${this.product.id}: 图片附件读取不到内容（${id}）；附件服务可能未就绪，或该对象已不存在。`,
             'UNSUPPORTED_CONTENT',
           )
         }
@@ -1456,7 +1536,7 @@ export class BuddyAdapter extends LlmAdapter {
           // ③ 其余非限流错误：请求本身有问题，换号无益，按原错误分类抛出。
           if (!isRateLimited(errorText)) {
             // 新账号失败但不是限流：按原错误分类抛出，不要再吞成"均受限"
-            throw new LlmError(`buddy: ${errorDetail(errorText)}`, httpErrorCode(response.status, errorText), { status: response.status })
+            throw new LlmError(`${this.product.id}: ${errorDetail(errorText)}`, httpErrorCode(response.status, errorText), { status: response.status })
           }
           // ④ 仍是限流 → 继续下一轮（重置时间已在上方记录）。
         }
@@ -1466,9 +1546,9 @@ export class BuddyAdapter extends LlmAdapter {
             this.product.id, contentRejectionStatus || 403, contentRejectionBody, true,
           )
         }
-        throw new LlmError(`buddy: 模型 ${options.model} 所有账号均受限，请稍后再试`, 'QUOTA_EXCEEDED')
+        throw new LlmError(`${this.product.id}: 模型 ${options.model} 所有账号均受限，请稍后再试`, 'QUOTA_EXCEEDED')
       }
-      throw new LlmError(`buddy: ${errorDetail(errorText)}`, httpErrorCode(response.status, errorText), { status: response.status })
+      throw new LlmError(`${this.product.id}: ${errorDetail(errorText)}`, httpErrorCode(response.status, errorText), { status: response.status })
     }
 
     // 5. 消费 SSE 流
@@ -1509,7 +1589,7 @@ export class BuddyAdapter extends LlmAdapter {
     } catch (error) {
       if (options.signal?.aborted) throw error
       if (isTransportError(error)) {
-        throw new LlmError(`buddy: transport error: ${errorMessage(error)}`, 'TRANSPORT', { cause: error as Error })
+        throw new LlmError(`${this.product.id}: transport error: ${errorMessage(error)}`, 'TRANSPORT', { cause: error as Error })
       }
       throw error
     }
@@ -1533,7 +1613,7 @@ export class BuddyAdapter extends LlmAdapter {
      */
     policyBlockedAccountId: string,
   ): AsyncIterable<StreamChunk> {
-    if (!response.body) throw new LlmError('buddy: empty model response body', 'EMPTY_RESPONSE')
+    if (!response.body) throw new LlmError(`${this.product.id}: empty model response body`, 'EMPTY_RESPONSE')
 
     const blocks: Array<{ index: number; kind: 'text' | 'reasoning'; text: string }> = []
     let nextIndex = 0
@@ -1614,7 +1694,7 @@ export class BuddyAdapter extends LlmAdapter {
           if (options.signal?.aborted) throw error
           if (error instanceof LlmError) throw error
           if (isTransportError(error)) {
-            throw new LlmError(`buddy: sse transport error: ${errorMessage(error)}`, 'TRANSPORT', { cause: error as Error })
+            throw new LlmError(`${this.product.id}: sse transport error: ${errorMessage(error)}`, 'TRANSPORT', { cause: error as Error })
           }
           throw error
         }
@@ -1692,7 +1772,7 @@ export class BuddyAdapter extends LlmAdapter {
             throw contentRejectionError(this.product.id, 200, payload, false)
           }
           if (data.error !== undefined) {
-            throw new LlmError(`buddy: ${data.error.message ?? 'unknown error'}`, 'SERVER')
+            throw new LlmError(`${this.product.id}: ${data.error.message ?? 'unknown error'}`, 'SERVER')
           }
           const choice = data.choices?.[0]
           const delta = choice?.delta

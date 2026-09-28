@@ -141,6 +141,18 @@ export interface BuddyProduct {
   appendSessionParams: boolean
   /** 追加到登录 URL 的版本号（appendSessionParams 为 true 时使用） */
   pluginVersion?: string
+  /**
+   * 单张请求图片的像素预算（issue !IKITT9）。
+   *
+   * 适配器据此把附件派生成**缩放后的请求版本**再内联，而不是直接发原图。
+   * 背景：网关对「单次请求的图片视觉 token 总量」另有约 100,000 的限制，
+   * 与模型上下文窗口（这里声明的是 1,000,000）是两回事 —— 一张 1721×997
+   * 的截图就值 ≈2,781 token，攒到 36 张顶穿后整个会话每轮都失败且不可恢复。
+   *
+   * 取值口径与「为什么是每张固定预算而非按张数分摊」记在 `src/image-budget.ts`。
+   * 未配置时适配器使用 `DEFAULT_IMAGE_PIXEL_BUDGET`（640,000 px）。
+   */
+  imagePixelBudget?: number
 }
 
 /**

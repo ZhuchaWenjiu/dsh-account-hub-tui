@@ -33,6 +33,7 @@ import { isQoderExpired, type QoderCredential } from './qoder.js'
 import { QoderEncryptedInfer, type QoderInferMessage, type QoderInferRequest, type QoderInferTool, type QoderInferToolCall } from './qoder-wasm.js'
 import { unwrapQoderEnvelopeStream } from './qoder-envelope.js'
 import { QODER, type QoderFallbackModel, type QoderModelPromotion, type QoderProduct } from './qoder-product.js'
+import { projectRequestImage, type ImageRequestTarget } from './image-budget.js'
 import {
   collectImages,
   consumeOpenAiSse,
@@ -363,6 +364,21 @@ export interface QoderAdapterOptions {
    * `UNSUPPORTED_CONTENT`（而不是静默丢弃）。
    */
   readImage?: (attachment: unknown) => Promise<{ data: Uint8Array; mediaType: string } | undefined>
+  /**
+   * 读取图片附件的**请求版本**（按像素预算与字节目标缩放后的字节）。
+   *
+   * ⚠️ 与 {@link readImage} 的错误契约**相反**：不可用时必须返回 `undefined`
+   * 而不是抛错 —— 缩放是优化，不能因为"想缩图"把一次本来能成功的请求打死。
+   * 判据与回退都在共享的 `projectRequestImage` 里（buddy / raccoon 用同一份）。
+   *
+   * 背景（issue !IKITT9）：qoder 撞的是**请求体体积**上限（实测 8 张原图能过、
+   * 15 张 ≈57 MiB 直接 `TRANSPORT: fetch failed`），与腾讯的图片 token 预算
+   * 是两种约束，但同样只能靠缩放解决。
+   */
+  readImageRequest?: (
+    attachment: unknown,
+    target: ImageRequestTarget,
+  ) => Promise<{ data: Uint8Array; mediaType: string } | undefined>
   /** 产品配置；默认 {@link QODER}。 */
   product?: QoderProduct
   /** 注入的 fetch（测试用）。 */
@@ -543,8 +559,15 @@ export class QoderAdapter extends LlmAdapter {
       // 保留**空 Map**（而非降级为 undefined）：图片存在但全部读取失败时，
       // 空 Map 仍会让 userContentParts 产出 [image unavailable] 占位符。
       imageUrls = new Map()
+      const readImage = this.options.readImage
       for (const [id, ref] of imageRefs) {
-        const image = await this.options.readImage(ref)
+        // ⚠️ 先试**请求版本**（缩放），拿不到才发原图 —— 见 projectRequestImage。
+        const projected = await projectRequestImage(ref, {
+          readImageRequest: this.options.readImageRequest,
+          pixelBudget: this.product.imagePixelBudget,
+          maxBytes: this.product.imageMaxBytes,
+        })
+        const image = projected ?? await readImage(ref)
         if (image === undefined) continue
         imageUrls.set(id, `data:${image.mediaType};base64,${Buffer.from(image.data).toString('base64')}`)
       }

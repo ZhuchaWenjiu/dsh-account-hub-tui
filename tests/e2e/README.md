@@ -13,6 +13,72 @@
 | `buddy-ratelimit-probe.e2e.spec.ts` | `DSH_BUDDY_RATELIMIT_E2E=1` + `DSH_BUDDY_RATELIMIT_E2E_CONFIRM=yes` | 对记录「限额重置」的账号实发一次请求，**判定是否真限流** |
 | `trae-channels-probe.e2e.spec.ts` | `DSH_TRAE_E2E=1` | 拉真实多通道目录，并用**真实适配器**对 `glm-5.1`（agent 通道）与 `glm-5-turbo`（work 通道）各发一条最短消息 —— **验证「模型只在列出它的通道里可调用」**。消耗 2 次极小额度 |
 | `cline-chat-probe.e2e.spec.ts` | `DSH_CLINE_CHAT_E2E=1` + `DSH_CLINE_CHAT_E2E_CONFIRM=yes` | **默认只请求 `cline-free/deepseek-v4.1-flash`**（用户指定的日常验证模型）。其余 4 个免费模型需 `DSH_CLINE_CHAT_E2E_ALL_FREE=1` 才遍历。**付费模型一律拒绝请求**（见下「Cline 探针的付费保护」） |
+| `image-burst-cross-provider.e2e.spec.ts`（`pnpm test:e2e:image-burst`） | `DSH_IMAGE_BURST_E2E=1` + `DSH_IMAGE_BURST_E2E_CONFIRM=yes` | **issue !IKITT9 的图片压力探测**（跨 provider）。腾讯两站各一组：原图 15 张必须报 `prompt is too long` 且归成 `CONTEXT_WINDOW_EXCEEDED`、缩放后同张数必须过、且**缩到 1011×632 后模型仍读得出截图地址栏**（这条是预算档位的正当性来源）。另含 qoder / cline / lobsterai / raccoon / trae / loomy 各一组。⚠️ 单次请求带十几张图，**消耗明显**（全跑约 8 分钟）；缺 fixture 时整体跳过（见下） |
+
+## ⚠️ 图片探针的 fixture 不入库
+
+`tests/fixtures/test.png`（2560×1600）被 `.gitignore` 忽略 —— 它是**真人桌面截图**
+（含浏览器标签页用户名、搜索框检索词、整屏热搜），而本仓库公开，
+一旦 commit 就**永久留在 git 历史**里，事后删文件/改写历史都清不干净。
+
+要跑这些探针：自备一张 **≥2000×1200 且不含个人信息**的截图放到该路径。
+尺寸决定撞墙张数（每图面积 ÷ ≈617 = 视觉 token），内容只用来验证
+「缩放后还认不认得出小字」。缺文件时探针**整体跳过**并打印指引（不会 ENOENT 崩）。
+
+
+## ⚠️ 图片探针的四条硬规矩（重测前必读）
+
+1. **必须先跑 0 张基线**。第一版探针直接上 15 张，qoder 报 `TRANSPORT`、
+   raccoon 报 `AUTH 200003`（那账号缺 `office_identity`）—— 两个都**不是**图片
+   问题，却被读成「撞墙了」。`image-probe-shared.ts` 的 `PROBE_COUNTS` 首位是 0，
+   且 `classifyFailure` 会把 `transport` / `auth` 与 `overflow` 分开，
+   **只有 `overflow` 才算图片预算**。别为了省时间把基线删掉。
+2. **要逐个账号验号**。实测本机 8 个 qoder 账号里 4 个 `refresh_token` 已失效、
+   3 个当日额度耗尽，只有 1 个可用。⚠️ 且**不能强制续期才肯用**
+   （第一版的真实 bug）：刚登录的新号续期反被拒 → 被跳过 → 落到一个签名有效
+   但额度耗尽的旧号上，于是把「探测做不了」误报成「网关没有上限」。
+   判据是「**先看是否过期**，未过期直接用；再用一次无图请求验号」。
+3. **张数必须用互不相同的 `attachmentId`**（`imageBlocks()` 已如此实现）。
+   `collectImages` 按 id 去重，复用同一 id 会把 15 张压成 1 张 ——
+   探针「顺利跑完」却一点图片压力都没造出来，是最难发现的空测。
+4. **断言结果之前，先断言「缩放真被调用了」**（`makeScaleBridge(...).stats.length > 0`）。
+   本轮真踩到：e2e 里把 `makeScaleBridge(fixture)`（`{bridge, stats}` 包装对象）
+   误当函数注入 `readImageRequest`，适配器一调用就抛错，而
+   `projectRequestImage` 的 `try/catch` 把异常兜成「**回退原图**」——
+   症状于是是「**缩放后照样 413**」，看起来像字节目标定小了，**实际是根本没缩放**，
+   白跑一轮 90 秒真机探测并得出错误结论。
+   ⇒ 凡是「失败就回退到旧行为」的兜底，旁边都必须有一条
+   「兜底是否被触发」的可观测证据；否则接线错误会伪装成产品缺陷。
+
+## 各家已实测的图片边界（fixture 2560×1600 ≈6,639 token/张）
+
+⚠️ **表里必须带「什么时候、哪个账号」**：下面 trae 那格就是**被下一轮推翻**的例子。
+
+| provider | 原图边界 | 缩放后 | 撞的是什么 |
+|---|---|---|---|
+| buddy / workbuddy | **15 张**（两站**同值**，实测均为 `100001 > 100000`） | 通过 | **图片视觉 token 预算** |
+| raccoon | **4 张** | **24 张全过** | **请求体字节**（10 MB 硬限） |
+| qoder | 8 过 / **15 张**（≈57 MiB） | **24 张全过** | 请求体体积 |
+| lobsterai | 12 过 / **13 张**（≈50 MiB，`SERVER code=500`） | **24 张全过** | 请求体体积（500 不是准入报文） |
+| cline | 24 全过 / **32 张**（≈122 MiB） | **32 张全过** | 请求体体积 |
+| loomy | **24 张全过** | 未测（无必要） | 本 fixture 下未撞墙 |
+| trae | ⚠️ **未探到边界**（本轮 1 张通过） | 24 张全过（探索性） | ⚠️ **上一轮的「1 张即 4001／仅可见但不可调用」已被推翻** |
+
+⚠️ **trae 那一格是本文件最该记住的教训**：上一轮同一账号对 `deepseek-v4.1-flash`
+与 `glm-5.3-flash` 都回 `4001 param is invalid`（适配器诊断「仅可见但不可调用」），
+于是登记成「探测无效」。**本轮同一账号、同一模型，1 张直接成功、缩放后 24 张也全过**
+—— 说明那是**账号/服务端的临时状态**，不是模型的固有属性。
+⇒ 与 Qoder「无签到」误判同型：**「某次实测没看到」不能推广成「不存在」**。
+引用否定性结论时必须带上当时条件，下次探测**先重验这条结论本身**。
+但**也不要因此给 trae 定预算值** —— 它的原图边界仍未探，「拿不到阈值就不定值」不变。
+
+> 结论与预算取值记在 AGENTS.md 的「图片必须按像素预算发请求版本」一节。
+> ⚠️ 只有腾讯系真有「图片 token 预算」；其余撞的是体积。**两种约束都只能靠缩放解决，
+> 但旋钮不同**（token 看像素、体积看编码字节），所以各家阈值**不能互相套用**。
+> ⚠️ 腾讯两站**共用同一个 `BuddyAdapter` 类**，但走不同 endpoint ——
+> 「buddy 过了」**推不出** workbuddy 也过，本表两站已分别实测。
+
+
 
 > LobsterAI **没有**发 chat 请求的 e2e —— 它的对话链路可在 Jet Hub 里人工验证
 > （选一个模型发一句话即可），单独写探针的边际价值低于维护成本。

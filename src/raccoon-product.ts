@@ -20,6 +20,7 @@
  */
 
 import { RACCOON_API_BASE, RACCOON_PHONE_CIPHER_SECRET } from './raccoon.js'
+import { RACCOON_REQUEST_IMAGE_MAX_BYTES } from './image-budget.js'
 
 /** 兜底模型目录中的一个条目。 */
 export interface RaccoonFallbackModel {
@@ -51,6 +52,26 @@ export interface RaccoonProduct {
   pointsApiPrefix: string
   /** 桌面端端点前缀。 */
   desktopApiPrefix: string
+  /**
+   * 单张请求图片的像素预算（issue !IKITT9 的 raccoon 变体）。
+   *
+   * ⚠️ **raccoon 的约束与腾讯不是一回事**：它按**请求体字节**卡 ——
+   * 实测 `HTTP_413: request body exceeds 10MB`，一张 2560×1600 的截图
+   *（原图 2.87 MiB → base64 后 ≈3.9 MB）过、四张必爆。
+   * 所以真正起作用的是下面的 `imageMaxBytes`；像素预算只是让图不至于
+   * 大到编码器压不进那个字节目标。
+   */
+  imagePixelBudget?: number
+  /**
+   * 单张请求图片的**编码字节目标**（base64 展开前）。
+   *
+   * 取 **512 KB**：base64 膨胀 4/3 → 每张约占 683 KB，
+   * 10 MB 的配额可放约 **14 张**（原图只能放 2 张）。
+   * ⚠️ 这是"每张固定预算"路线的固有上限：图再多仍会 413。
+   * 按张数分摊总配额会把每张压到 600×400 以下、UI 小字直接糊掉，
+   * 权衡后选择「保住可辨认性 + 覆盖到 14 张」（用户 2026-09-28 定，方案 A）。
+   */
+  imageMaxBytes?: number
   /** User-Agent（仅记录用；实测该端点不校验 UA）。 */
   userAgent: string
   /**
@@ -160,6 +181,10 @@ export const RACCOON: RaccoonProduct = {
   clientPlatform: 'desktop-windows',
   clientVersion: 'v1.0.35',
   defaultCredentialRef: 'RACCOON_ACCESS_TOKEN',
+  // 实测该网关按**请求体字节**卡（`HTTP_413: request body exceeds 10MB`），
+  // 所以字节目标是主约束；像素预算保证图不至于大到压不进那个字节目标。
+  imagePixelBudget: 640_000,
+  imageMaxBytes: RACCOON_REQUEST_IMAGE_MAX_BYTES,
   phoneCipherSecret: RACCOON_PHONE_CIPHER_SECRET,
   aliyunCaptcha: { sceneId: '1pkmy0x3', prefix: 'hk1r5l' },
   fallbackModels: RACCOON_FALLBACK_MODELS,

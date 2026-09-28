@@ -873,6 +873,208 @@ pool/accountId 且真调共享回写、RPC 与 `createPoolRefresh` 都传 id）�
   ⚠️ 已做**反向验证**：错误码退回 `AUTH` → **7 条**变红；禁用冷却标记 → **5 条**变红
   （含认证 / 限流 / 流内三条通道各自那条）；禁用流内识别 → **2 条**变红。
 
+## ⚠️ 图片必须按像素预算发**请求版本**，不能恒发原图（Issue !IKITT9）
+
+**真实缺陷**（用户报障）：带截图的会话攒到 **36 张**后**每轮都失败且不可恢复**，
+自动压缩试 3 次全灭，只能新建会话：
+
+```
+buddy: 内容过长，请精简或新建任务 prompt is too long: 100001 tokens > 100000 maximum
+```
+
+⚠️ **这个 `100000` 不是上下文窗口**（`src/product.ts` 给 `deepseek-v4.1-flash`
+声明的是 **1,000,000**）。报障者同一会话**纯文本 prompt 到 345,687 仍被正常接受**，
+且本机 11,351 次成功请求的图片 token **无一越过 10 万**（最大 96,537 = 35 张，
+36 张正好顶穿）。它是网关对**单次请求图片视觉 token 总量**的另一道限制，
+计价 ≈ **617 px / token**（1721×997 ≈ 2,781 token/张）。
+
+⇒ **排查这类"内容过长"先看数字对不对得上上下文窗口**：对不上就是别的预算，
+别去改 `contextWindow`（那只会让 DSH 更早触发压缩，反而更糟）。
+
+### 三条修复与其理由
+
+1. **按预算缩放**（`src/image-budget.ts`）：每张固定 **640,000 px**（≈1,037 token，
+   约 96 张才撞墙，且 1051×608 上 UI 小字仍可辨认 —— **不要调更小**）。
+   ⚠️ **为什么是"每张固定"而不是"按本次张数分摊"**：附件服务的请求版本
+   **按目标尺寸缓存**（`readImageRequest` 的缓存身份含附件 id、变换版本、
+   目标尺寸、字节目标）。尺寸若随"这条会话现在有几张图"浮动，
+   同一附件每次派生不同 `variantId` → 缓存反复击穿、每轮重编码，
+   而且用户无法预测一张图被缩成多大。
+2. **桥接 `ctx.attachments.readImageRequest(ref, target)`**（`src/index.ts` 的
+   `makeReadImageRequest`）：缩放/编码交给附件服务（alpha→WebP、不透明→JPEG、
+   85/75/60 质量阶梯），插件只选目标。
+   ⚠️ **不可用一律返回 `undefined` 而不是抛错**，适配器据此**回退原图**：
+   服务没装、老宿主没有该方法、后端拒绝投影
+   （`ATTACHMENT_PROJECTION_UNSUPPORTED`）、附件引用缺 `width`/`height` ——
+   四种都必须发原图。缩放是优化，**绝不能变成新的故障源**。
+   ⚠️ **两层都要兜异常**：写用例时实测到"只靠桥接层吞异常"不够
+   （桥接是运行时约定、类型系统不保证），适配器的 `projectRequestImage`
+   自己也 `try/catch` 返回 `undefined`。
+   ⚠️ 但**不得削弱原有护栏**：`readImage` 读不到字节仍必须抛
+   `UNSUPPORTED_CONTENT`（那是"静默丢图"回归防线）。
+3. **11115 的分类不得依赖 `extError` 是否存在**：harness 的
+   `isContextWindowExceededError` 五个分支都要求出现 `context` / `for this model`
+   之类字样，实测对以下三种形态**全部返回 false**（只有带
+   `extError.code=context_length_exceeded` 的那份才命中）：
+   `prompt is too long: N tokens > M maximum`／拼上中文文案的整行／
+   `{code,msg,displayMsg}` 三件套。于是报障者同一会话里逐字相同的错误
+   一会儿 `CONTEXT_WINDOW_EXCEEDED`、一会儿 `INVALID_REQUEST`。
+
+   ⚠️ **漏判的代价是不对称的**，所以方向取"宁可多判一次溢出"：
+   `INVALID_REQUEST` **不在** `DEFAULT_RETRYABLE_CODES`
+   （`[EMPTY_RESPONSE, RATE_LIMIT, SERVER, TIMEOUT, TRANSPORT]`）→ 不重试；
+   更关键的是 `dsh-compaction-basic` 的 request-error listener
+   **第一行就是** `if (failure.code !== CONTEXT_WINDOW_EXCEEDED_CODE) return next()`
+   → 连"试一次压缩"的机会都没有，会话每轮直接报废。归成溢出的最坏结果
+   只是一次无效的压缩尝试。
+   ⚠️ 补的判据必须**窄**：同时要求「prompt is too long」与「N tokens > M」，
+   只认前者会把别的内容类 400 误判成溢出（有用例锁着）。
+
+### 范围与**有意未做**项（别当成漏改）
+
+**实测过的九家**（2026-09-28，用 `tests/fixtures/test.png` 2560×1600 = 4.10M px/张
+≈6,639 token/张，逐级加张数、每次只加图片、文本固定）：
+
+| provider | 边界 | 失败形态 | 撞的是什么 |
+|---|---|---|---|
+| **buddy / workbuddy** | **15 张** | `prompt is too long: 100001 tokens > 100000 maximum` | **图片视觉 token 预算** |
+| **raccoon** | **4 张** | `HTTP_413: request body exceeds 10MB` | **请求体字节**（10 MB 硬限）→ 缩放后 **24 张全过** ✅ |
+| **qoder** | 8 张过 / **15 张** | `TRANSPORT: fetch failed`（≈57 MiB） | **请求体体积** → 缩放后 **24 张全过** ✅ |
+| **lobsterai** | 12 张过 / **13 张** | `SERVER code=500`（≈50 MiB） | **请求体体积**（不是预算 —— 500 不是准入报文）→ 缩放后 **24 张全过** ✅ |
+| **cline** | 24 张（≈159K token）全过 / **32 张** | `TRANSPORT` | **请求体体积** → 缩放后 **32 张全过** ✅ |
+| **loomy** | **24 张全过** | — | 未撞墙（本 fixture 下），故未接缩放 |
+| **trae** | **未探到边界**（本轮只测了 1 张，通过） | — | ⚠️ **上一轮的「1 张即 4001 仅可见但不可调用」已被推翻**，见下 |
+| codearts | 未测 | — | 其 `deepseek-v4` 系是华为云免费福利额度，非用户候选模型 |
+
+⚠️ **trae 那格是本轮最该记住的教训**：上一轮同一账号对
+`deepseek-v4.1-flash` 与 `glm-5.3-flash` 都回 `4001 param is invalid`
+（适配器诊断「仅可见但不可调用」），据此登记成「探测无效、拿不到阈值就不定值」。
+**本轮同一账号、同一模型，1 张直接成功，缩放后 24 张也全过** ——
+说明那是**账号/服务端的临时状态**，不是模型的固有属性。
+⇒ 与 Qoder「无签到」（!IKIRTT 之前的误判）同型：**「某次实测没看到」不能推广成
+「不存在」**。引用一条否定性结论时，必须带上「何时、哪个账号、什么形态」，
+并在下次探测时**先重验这条否定结论本身**，而不是把它当前提。
+⚠️ 但**也不要因此就给 trae 定预算值**：它的原图边界仍未探（本轮只测 1 张原图），
+**拿不到阈值就不定值**这条规矩不变。
+
+⇒ **只有腾讯系真有「图片 token 预算」这道约束**，其余各家撞的都是
+**请求体体积**（各家阈值不同：raccoon 10 MB、lobsterai ≈50 MiB、
+qoder ≈57 MiB、cline ≈122 MiB）。两种约束**只有缩放图片这一个共同解法**，
+但**旋钮不同**：token 预算看**像素**，体积限制看**编码字节**。所以：
+
+- **已接缩放的七处**：buddy / workbuddy（像素 640,000，字节默认 2 MiB）、
+  raccoon（像素 + **字节 512 KB**，因它硬限 10 MB）、
+  qoder 与 qodercn（**同一个 `QoderAdapter` 类**，像素 + 字节 1 MiB —— 改一处两站同时受益）、
+  lobsterai、cline（各 像素 + 1 MiB）。
+- ⚠️ **字节目标各不相同是有意的**：raccoon 512 KB（10 MB 配额要撑到 14 张）、
+  qoder / lobsterai / cline 1 MiB、buddy 2 MiB。**别合并成一个常量**，
+  也别把 buddy 的 640,000 当全局像素预算推给别家 ——
+  这正是本仓库 `endpoint` 那条教训的形状。
+- **未接的两家**：loomy（实测 24 张全过，无证据说明它有约束）、
+  trae（⚠️ **理由已变**：原来说「探测被『仅可见但不可调用』挡住」，
+  而本轮该账号同一模型已能正常收图 —— 旧理由失效，但**新理由仍然成立**：
+  它的**原图边界从未探过**（本轮只测了 1 张原图就通过），
+  **拿不到阈值就不定值**这条规矩不变）。
+  ⚠️ 别"为了统一"给它们塞一个猜出来的预算。
+- ⚠️ **接线漏改的教训**：本轮先改了适配器**却没在宿主桥接**，
+  结果 qoder / qodercn / lobsterai / cline 四家的修复**静默不生效**
+  （适配器有 `readImageRequest` 选项但 `index.ts` 没传 = 永远走原图路径）。
+  是 `tests/unit/image-budget.spec.ts` 里那条「宿主侧桥接计数」断言抓出来的。
+  ⇒ 接新 provider 时**适配器 + 宿主桥接两处都要改**，用例两处都锁。
+- ⚠️ **探针自身的接线错误会被「回退原图」掩盖**（本轮真踩到，代价是一轮 90 秒的
+  真机探测得出**错误结论**）：e2e 里把 `makeScaleBridge(fixture)`（一个
+  `{bridge, stats}` 包装对象）误当函数注入 `readImageRequest`，适配器调用它必然抛错，
+  而 `projectRequestImage` 的 `try/catch` 把异常兜成「**回退原图**」——
+  症状于是是「**缩放后照样 413**」，看起来像字节目标定小了，实际是根本没缩放。
+  ⇒ 因此 `makeScaleBridge` 返回 `stats` 记录每次派生，
+  **用例必须先断言 `stats.length > 0` 再断言结果**。
+  推而广之：**任何"回退到旧行为"的兜底都会把接线错误伪装成产品缺陷**，
+  这类兜底旁边必须有一条「兜底是否被触发」的可观测证据。
+
+⚠️ **探测方法论**（这轮踩出来的，重测时必须保持）：
+- **必须先跑 0 张基线**。第一版探针直接上 15 张，qoder 报 `TRANSPORT`、
+  raccoon 报 `AUTH 200003` —— 两个都不是图片问题（raccoon 那个账号缺
+  `office_identity`，qoder 是凭据过期），却被读成「撞墙了」。
+- **只有 `prompt is too long: N tokens > M maximum` 这种报文才算图片预算**；
+  `413` / `TRANSPORT` / `500` 都是体积或稳定性问题（`classifyFailure` 已分类）。
+- **要逐个账号验号**：实测本机 8 个 qoder 账号里 4 个 refresh_token 已失效、
+  3 个当日额度耗尽，只有 1 个可用 —— 拿 `[0]` 就用会得到假的「探测失败」。
+- **0 张基线的结论必须驱动「跳过」而不是「失败」**（`assertBaselineUsable`）。
+  本轮为省额度把几个用例改造成「只测缩放后」，**顺手把 0 张基线删了** ——
+  于是 cline 的当日免费额度耗尽（`429 Daily free limit reached … 19h 55m`）
+  被记成「缩放后仍被拒」，看起来像产品缺陷。基线一条请求几乎不花额度，
+  却能把「账号不可用」与「图片链路有问题」彻底分开。
+  ⚠️ 判据**只看基线**：基线通过后任何失败都算真失败，不许「一失败就跳过」
+  （那就成了静默空测，比误报更糟）。
+- ⚠️ **「失败就回退到旧行为」的兜底会把接线错误伪装成产品缺陷**（本轮真踩到）：
+  e2e 里把 `makeScaleBridge(fixture)`（`{bridge, stats}` 包装对象）误当函数注入
+  `readImageRequest`，适配器一调用就抛错，`projectRequestImage` 的 `try/catch`
+  把异常兜成「回退原图」→ 症状是「**缩放后照样 413**」，看着像字节目标定小了，
+  实际是**根本没缩放**，白跑一轮 90 秒真机探测并得出错误结论。
+  ⇒ 探针必须先断言 `stats.length > 0`（缩放真被调用），再断言结果。
+
+### ⚠️ 待观察：`cline-auth.spec.ts` 的一次无法复现的失败（别忽略，也别当成已修）
+
+本轮某次 `pnpm test` 出现过 2 条失败，都在
+`tests/unit/cline-auth.spec.ts > ClineAuth refreshAll`：
+
+- 「只按 refreshable 过滤，**不看 enabled**」
+- 「按需续期（账号卡片「刷新」）成功后把新 expiresAt 写回账号池」
+
+**当时的现场**：同一轮我正在并发跑真机图片 e2e（长跑、重负载）。
+**之后的验证**：单独跑该文件 26 条全过；全量连跑 3 次均 2833 全过；
+`--no-file-parallelism` 连跑 5 次全过。**未能复现**。
+
+**已排除的解释**（都查过，不成立）：
+- 不是本轮改动引起 —— `git status` 显示未触碰 `cline-auth.ts` 及其 spec；
+- 不是「5 分钟凭据到期」—— `shouldRefreshNow` 对 `now+300_000` 恒为「该刷」，
+  该值不会随墙钟翻转；且 `isClineRefreshable` 只看 `refresh_token` 存在性；
+- 不是文件系统/环境依赖 —— 该用例用全内存 `Context` + `FakeCredentials`
+  + `AccountPool`（`store.kind === 'memory'`）；
+- 不是 `services` 数组泄漏 —— 已有 `afterEach` 的 `splice(0)` 清理。
+
+**下次复现时要看的东西**（别再从零猜）：
+① 失败时 `fetcher` 的**实际调用次数**（期望 2，推测会得到 0）；
+② 两条失败是否**同时**出现（若是，指向 `refreshAll` 早退而非断言问题）；
+③ `pool.listAccounts('cline')` 返回的条目数；
+④ 当时是否在并发跑 e2e —— 若只在重负载下出现，方向是**测试的时序假设**
+   而非产品逻辑（该 spec 的 `AccountPool` 用 `void credentials.set(...)`
+   预热，见 `makeCtx`，这是目前唯一可疑但未证实的点）。
+
+⚠️ **不要因为"跑几次都过"就删掉这条记录**，也不要假装修好了 ——
+它可能是重负载下才暴露的真实竞态，记着现场比假装干净更有价值。
+  ⚠️ 且**不能强制续期才肯用**（第一版的 bug）：刚登录的新号续期反被拒，
+  于是被跳过，最后落到一个签名有效但额度耗尽的旧号上。判据是
+  「**先看是否过期**，未过期直接用；再用一次无图请求验号」。
+- **张数必须互不相同的 `attachmentId`**：`collectImages` 按 id 去重，
+  复用同一 id 会把 15 张压成 1 张，探针「顺利跑完」却一点压力没造出来。
+
+⚠️ **未实现 `imageRequestPricing`**（issue 建议的第 4 步，仍然不做）：
+它需要「网关每张图的视觉 token 计价公式」，而我们**只有从失败点反推的
+≈617 px/token**（buddy 15 张撞 100,000 时估算 99,579，差 0.4% —— 已足够
+用来定预算，但**不足以**用来喂压缩器：猜错方向会让压缩过早或过晚触发）。
+缩放已让 15 张从 100,038 降到约 46,903，触发条件本身消失了。
+⚠️ 顺带记一条已核实的机制：不实现它时 `dsh-token-meter` 对图片走
+`estimateStructuralBlock`（**只按引用 JSON 的字符数**计价，一张大图 ≈56 token），
+而压缩阈值是 `min(contextWindow×0.8, …)` = 800,000 —— 所以「图片压力」
+在 token meter 眼里几乎不可见，**指望自动压缩兜底是不成立的**
+（这正是报障会话里"压缩试了 3 次全失败"的机制解释）。
+
+测试：`tests/unit/image-budget.spec.ts`（29 条：几何含"小图不放大/细长图/非法输入"、
+四种回退路径、产品级预算、三条分类护栏、`projectRequestImage` 共用投影、
+raccoon 用**自己的** 512 KB 而非 buddy 的 2 MiB、**七处接线断言**）。
+⚠️ 已做**反向验证**：去掉 cline 缩放 → 接线断言变红（报「未走共享投影」）；
+去掉新增分类判据 → 1 条变红（报 `expected 'INVALID_REQUEST' to be
+'CONTEXT_WINDOW_EXCEEDED'`，非同义反复）。
+e2e：`tests/e2e/image-burst-cross-provider.e2e.spec.ts`（跨家探测 + 腾讯两站的
+复现/修复/可辨认性验证），**消耗真实积分**；闸门与 fixture 说明见
+`tests/e2e/README.md`。
+⚠️ 曾有一个 `image-request-probe.e2e.spec.ts` 专测腾讯系，已**并入**上面那个文件 ——
+它的 fixture 加载、YAML 凭据解析、缩放桥接与张数序列与后者**完全重复**
+（两份实现必然漂移，是本仓库反复告诫的形状），而它两条独特断言
+（buddy 的 `CONTEXT_WINDOW_EXCEEDED` 归类、缩放后仍可辨认）都已搬过去，
+且现在两站都覆盖（原来只测 buddy，**workbuddy 从未被端到端验证过**）。
+
 ## 单次输出上限（`maxOutputTokens`）必须下发，不能只用来过滤
 
 腾讯系两个端点（scoped `/console/enterprises/personal/models` 与 `/v3/config`）

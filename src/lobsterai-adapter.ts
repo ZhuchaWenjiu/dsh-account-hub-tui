@@ -44,6 +44,7 @@ import {
   type LobsteraiCredential,
 } from './lobsterai.js'
 import { LOBSTERAI, type LobsteraiFallbackModel, type LobsteraiProduct } from './lobsterai-product.js'
+import { projectRequestImage, type ImageRequestTarget } from './image-budget.js'
 import {
   classifyLobsteraiError,
   classifyLobsteraiStreamError,
@@ -331,6 +332,19 @@ export interface LobsteraiAdapterOptions {
    * `UNSUPPORTED_CONTENT`（而不是静默丢弃）。
    */
   readImage?: (attachment: unknown) => Promise<{ data: Uint8Array; mediaType: string } | undefined>
+  /**
+   * 读取图片附件的**请求版本**（按像素预算与字节目标缩放后的字节）。
+   *
+   * ⚠️ 与 {@link readImage} 的错误契约**相反**：不可用时必须返回 `undefined`
+   * 而不是抛错。判据与回退都在共享的 `projectRequestImage` 里。
+   *
+   * 背景（issue !IKITT9）：LobsterAI 撞的是**请求体体积**（实测 12 张原图能过、
+   * 13 张 ≈50 MiB 回 `SERVER code=500`），不是腾讯那道图片 token 预算。
+   */
+  readImageRequest?: (
+    attachment: unknown,
+    target: ImageRequestTarget,
+  ) => Promise<{ data: Uint8Array; mediaType: string } | undefined>
   /** 产品配置；默认 {@link LOBSTERAI}。 */
   product?: LobsteraiProduct
 }
@@ -928,8 +942,15 @@ export class LobsteraiAdapter extends LlmAdapter {
       // 保留**空 Map**（而非降级为 undefined）：图片存在但全部读取失败时，
       // 空 Map 仍会让 userContentParts 产出 [image unavailable] 占位符。
       imageUrls = new Map()
+      const readImage = this.options.readImage
       for (const [id, ref] of imageRefs) {
-        const image = await this.options.readImage(ref)
+        // ⚠️ 先试**请求版本**（缩放），拿不到才发原图 —— 见 projectRequestImage。
+        const projected = await projectRequestImage(ref, {
+          readImageRequest: this.options.readImageRequest,
+          pixelBudget: this.product.imagePixelBudget,
+          maxBytes: this.product.imageMaxBytes,
+        })
+        const image = projected ?? await readImage(ref)
         if (image === undefined) continue
         imageUrls.set(id, `data:${image.mediaType};base64,${Buffer.from(image.data).toString('base64')}`)
       }

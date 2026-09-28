@@ -1,3 +1,6 @@
+import { readFileSync } from 'node:fs'
+import { resolve } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import { LlmError } from '@deepseek-ai/dsh-llm'
 import { credentialRef } from '@deepseek-ai/dsh-credentials'
 import { describe, expect, it } from 'vitest'
@@ -1990,6 +1993,84 @@ describe('产品参数化', () => {
       signal: new AbortController().signal,
     } as never)
     expect(productCode).toBe('workbuddy')
+  })
+
+  /**
+   * ⚠️ **真实缺陷**（本轮 e2e 实测发现）：同一个类的错误文案里前缀**混用** ——
+   * 12 处硬编码 `buddy:`、7 处用 `${this.product.id}`。于是 WorkBuddy 用户
+   * 看到的报错自称「buddy: …」，日志与 UI 都指错产品，排查时容易找错面板
+   *（实测原话：`buddy: 对话内容超出模型长度上限，请精简对话或减少附件后重试。`）。
+   *
+   * 这里对**两个产品**都断言，因为只测写死的那一个就发现不了这种混用 ——
+   * 只有对比才看得出前缀没跟着产品走。
+   *
+   * ⚠️ 边界：本用例只走得到**「非换号路径」的那一处**（无账号池时 `stream()`
+   * 在首次请求失败后直接抛）。其余 11 处散在换号重试 / SSE / transport /
+   * 附件读取等分支上，逐个造场景代价很高且脆弱 —— 那部分交给下面那条
+   * 源码级不变量兜底（已反向验证：本用例对换号路径的变异**抓不到**）。
+   */
+  it('错误文案的前缀跟随产品（workbuddy 不得自称 buddy）', async () => {
+    for (const [product, expected] of [
+      [CODEBUDDY, 'buddy'],
+      [WORKBUDDY, 'workbuddy'],
+    ] as const) {
+      const adapter = new BuddyAdapter({
+        credentialRef: credentialRef(product.defaultCredentialRef),
+        resolveCredential: async () => makeCredential(),
+        refresh: async () => {},
+        product,
+        fetchImpl: async () => new Response(JSON.stringify({ code: 1, msg: 'boom' }), { status: 400 }),
+      })
+      const error = await collectChunks(adapter, {
+        model: DEFAULT_MODEL,
+        messages: [{ role: 'user', content: 'hi' }] as never,
+        signal: new AbortController().signal,
+      } as never).catch((e: unknown) => e)
+
+      expect(error).toBeInstanceOf(LlmError)
+      expect(
+        (error as LlmError).message.startsWith(`${expected}: `),
+        `${expected} 的报错前缀错了，实际是：${(error as LlmError).message}`,
+      ).toBe(true)
+    }
+  })
+
+  /**
+   * ⚠️ **源码级不变量**：`buddy-adapter.ts` 里**不允许**再出现硬编码的
+   * `buddy:` 错误前缀 —— 它必须写成 `${this.product.id}: `。
+   *
+   * 为什么不能只用行为用例：那 12 处散在「首次请求 / 换号重试 / 限流耗尽 /
+   * SSE / transport / 附件读取」六条互不相同的路径上，行为用例一次只能覆盖
+   * 一条。**已反向验证过这个缺陷**：把第 1539 行（换号路径）改回 `buddy: `
+   * 后，上面那条行为用例仍然全绿 —— 所以它挡不住其余 11 处。
+   *
+   * 这也是本仓库既有的取舍（见 `tests/unit/image-budget.spec.ts` 的
+   * 「五处同形代码」注释）：为这种重复形状搭多套适配器桩的成本，远高于
+   * 一条源码断言的维护成本，而共享实现本身已有行为用例。
+   */
+  it('源码里没有硬编码的 buddy: 错误前缀（必须跟随 product.id）', () => {
+    const file = resolve(fileURLToPath(new URL('.', import.meta.url)), '../../src/buddy-adapter.ts')
+    const source = readFileSync(file, 'utf8')
+    // 注释里会引用这句错误文案作证据（如实测原文），必须排除掉，
+    // 否则用例会因为「注释提到了 buddy:」而假失败。
+    //
+    // ⚠️ 块注释**替换成等量空白**而不是整体删除：直接删会把行数压掉，
+    // 于是下面报出的行号指向源文件里另一个位置（实测偏了 600+ 行，
+    // 排障时会被引到完全无关的代码上）。保留 `\n`、其余字符换成空格，
+    // 行号就与源文件一致了。`//` 行注释不含换行，直接删是安全的。
+    const code = source
+      .replace(/\/\*[\s\S]*?\*\//g, (block) => block.replace(/[^\n]/g, ' '))
+      .replace(/\/\/.*$/gm, '')
+
+    const offenders = [...code.matchAll(/(`|')buddy: /g)].map((m) => {
+      const line = code.slice(0, m.index).split('\n').length
+      return `第 ${line} 行：${source.split('\n')[line - 1]?.trim().slice(0, 80)}`
+    })
+    expect(
+      offenders,
+      '这些位置的错误前缀写死了 buddy:，WorkBuddy 用户会看到错的产品名；'
+      + '改成 ${this.product.id}: ',
+    ).toEqual([])
   })
 
   // ── 以下为补充用例：brief 的 4 条未能覆盖 UA、注册路由与默认回退 ──

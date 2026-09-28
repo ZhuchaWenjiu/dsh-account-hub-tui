@@ -152,6 +152,18 @@ export interface LobsteraiProduct {
   clientCapabilities: string
   /** 默认凭据 ref（无账号池时的单凭据回退）。 */
   defaultCredentialRef: string
+  /**
+   * 单张请求图片的像素预算（issue !IKITT9）。
+   *
+   * ⚠️ LobsterAI 撞的是**请求体体积**：实测 12 张 2560×1600 原图能过、
+   * 13 张（≈50 MiB）回 `SERVER code=500 服务器内部错误`。
+   * 那**不是**准入报文（腾讯会明确回 `prompt is too long: N tokens > M maximum`），
+   * 所以别把它当成「图片 token 预算」来定值 —— 它是体积压垮了上游。
+   * 未配置时适配器用 `DEFAULT_IMAGE_PIXEL_BUDGET`。
+   */
+  imagePixelBudget?: number
+  /** 单张请求图片的编码字节目标（未配置用 1 MiB，见 `src/image-budget.ts`）。 */
+  imageMaxBytes?: number
   /** 远端模型列表不可用时的兜底模型目录。 */
   fallbackModels: readonly LobsteraiFallbackModel[]
 }

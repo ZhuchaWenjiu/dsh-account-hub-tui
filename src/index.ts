@@ -22,6 +22,7 @@ import { LoomyBalanceSelector } from './loomy-balance-selector.js'
 import { RACCOON } from './raccoon-product.js'
 import { AccountPool } from './account-pool.js'
 import { hasLegacyNamespaceRegistration, settingsOf, suppressAutoSettingsPage } from './settings-compat.js'
+import type { ImageRequestTarget } from './image-budget.js'
 import { buildRaccoonNickname, registerJetHubRpc } from './jet-hub-rpc.js'
 import { CODEBUDDY, WORKBUDDY } from './product.js'
 import { LOBSTERAI } from './lobsterai-product.js'
@@ -136,6 +137,51 @@ export function makeReadImage(ctx: Context) {
   }
 }
 
+/**
+ * 图片「请求版本」桥接（issue !IKITT9）。
+ *
+ * 走 `ctx.attachments.readImageRequest(ref, target)`：由附件服务按目标尺寸与
+ * 字节目标产出**确定性、可缓存**的缩放版本（alpha 走 WebP、不透明走 JPEG、
+ * 85/75/60 质量阶梯），适配器只负责选目标。
+ *
+ * ⚠️ **任何不可用都返回 `undefined`，绝不抛错**，调用方据此回退原图。三种
+ * 真实成因都必须容忍，否则「加上缩放」本身会变成新的故障源：
+ *
+ * 1. 宿主 profile 没装附件服务，或该版本没有 `readImageRequest`（老契约）；
+ * 2. 附件后端明确拒绝投影（`ATTACHMENT_PROJECTION_UNSUPPORTED`）；
+ * 3. 派生过程中的其它错误（缓存不可写、字节校验失败…）。
+ *
+ * 回退方向是刻意选 conservative 的一侧：宁可发一张大图（顶多触发网关的
+ * 图片 token 上限），也不能因为「想缩图」而把一次本来能成功的请求打死。
+ */
+export function makeReadImageRequest(ctx: Context) {
+  return async (
+    attachment: unknown,
+    target: ImageRequestTarget,
+  ): Promise<{ data: Uint8Array; mediaType: string } | undefined> => {
+    const attachments = ctx.get('attachments') as {
+      readImageRequest?: (
+        ref: never,
+        requestTarget: never,
+      ) => Promise<{ data: Uint8Array; mediaType?: string; attachment?: { mediaType?: string } }>
+    } | undefined
+    if (attachments?.readImageRequest === undefined) return undefined
+    try {
+      const projected = await attachments.readImageRequest(attachment as never, target as never)
+      const mediaType = projected.mediaType ?? projected.attachment?.mediaType
+      if (mediaType === undefined) return undefined
+      return { data: projected.data, mediaType }
+    } catch (error) {
+      // 只记日志、随后回退原图：缩放是优化，不是请求的前置条件。
+      ctx.logger?.warn?.(
+        '[jet-hub] 图片请求版本派生失败，回退原图：'
+        + `${error instanceof Error ? error.message : String(error)}`,
+      )
+      return undefined
+    }
+  }
+}
+
 /** 注册 codeartsAuth 服务与 codearts LLM 路由（不注册斜杠命令）。 */
 export function apply(ctx: Context): void {
   // 本插件自带 Jet Hub 设置页，关闭 0.1.7 起由 Config schema 反渲染的自动表单
@@ -231,6 +277,8 @@ export function apply(ctx: Context): void {
     refresh: createPoolRefresh(pool, 'buddy', buddy),
     fetchRemoteModels: () => buddy.fetchModels(pool),
     readImage: makeReadImage(ctx),
+    // 图片请求版本（缩放）桥接：issue !IKITT9。不可用时适配器自动回退原图。
+    readImageRequest: makeReadImageRequest(ctx),
     accountPool: pool,
     product: CODEBUDDY,
   })
@@ -262,6 +310,7 @@ export function apply(ctx: Context): void {
     refresh: createPoolRefresh(pool, 'workbuddy', workbuddy),
     fetchRemoteModels: () => workbuddy.fetchModels(pool),
     readImage: makeReadImage(ctx),
+    readImageRequest: makeReadImageRequest(ctx),
     accountPool: pool,
     product: WORKBUDDY,
   })
@@ -310,6 +359,9 @@ export function apply(ctx: Context): void {
     fetchRemoteModels: () => lobsterai.fetchModels(pool),
     resolveClientVersion: () => lobsterai.resolveClientVersion(),
     readImage: makeReadImage(ctx),
+    // 图片请求版本（缩放）桥接：issue !IKITT9。该家实测 13 张原图（≈50 MiB）
+    // 就回 `SERVER code=500`，撞的是请求体体积。
+    readImageRequest: makeReadImageRequest(ctx),
     accountPool: pool,
     product: LOBSTERAI,
   })
@@ -376,6 +428,11 @@ export function apply(ctx: Context): void {
       else await qoder.refresh()
     },
     readImage: makeReadImage(ctx),
+    // 图片请求版本（缩放）桥接：issue !IKITT9。该家实测 15 张原图（≈57 MiB）
+    // 直接 `TRANSPORT: fetch failed`，撞的是请求体体积。
+    // ⚠️ qoder 与 qodercn **共用同一个 QoderAdapter 类**，故两站同时受益
+    //（与「差异收敛到产品配置」这个模式一致 —— 别以为只改了一站）。
+    readImageRequest: makeReadImageRequest(ctx),
     accountPool: pool,
     product: QODER,
     // 额度受限时标记「本次实际使用的账号」（理由见 `activeQoderAccountId` 注释）。
@@ -422,6 +479,9 @@ export function apply(ctx: Context): void {
       else await qoderCn.refresh()
     },
     readImage: makeReadImage(ctx),
+    // 同 QODER：两站共用同一个适配器类，缩放桥接也必须两边都接
+    //（只接一边会让中国版的截图照样撞 57 MiB）。
+    readImageRequest: makeReadImageRequest(ctx),
     accountPool: pool,
     product: QODER_CN,
     // 额度受限时用它标记「当前账号」（见 `QoderAdapter.switchAccountOnQuota`）。
@@ -509,6 +569,9 @@ export function apply(ctx: Context): void {
     // 图片字节桥接：Cline 内嵌目录的 `capabilities` 含 `images`，
     // 模态按模型判定（见 ClineAdapter.inputModalitiesFor）。
     readImage: makeReadImage(ctx),
+    // 图片请求版本（缩放）桥接：issue !IKITT9。该家实测 24 张原图全过、
+    // 32 张（≈122 MiB）才 `TRANSPORT` —— 余量比其他家大，但仍需兜住长会话。
+    readImageRequest: makeReadImageRequest(ctx),
     accountPool: pool,
     product: CLINE,
   })
@@ -707,6 +770,9 @@ export function apply(ctx: Context): void {
     fetchRemoteModels: () => raccoon.fetchModels(pool),
     // 图片字节桥接：按模型能力判定（远端 tags 含 vision）。
     readImage: makeReadImage(ctx),
+    // ⚠️ raccoon 尤其需要请求版本：该网关按**请求体字节**设限
+    // （实测 `HTTP_413: request body exceeds 10MB`，两张大截图就占掉大半配额）。
+    readImageRequest: makeReadImageRequest(ctx),
     accountPool: pool,
     product: RACCOON,
   })
