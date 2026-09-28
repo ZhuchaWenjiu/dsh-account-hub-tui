@@ -49,3 +49,17 @@ docs/qoder-encryption-notes.md
 # README / AGENTS.md 只保留行为契约（协议差异、坑点、能力矩阵），
 # 凭据值、解密口令、脚本清单一律放本文件。
 docs/loomy-protocol-notes.md
+
+# 本地 npm/pnpm 配置：不入库（issue !IKIRUB）
+#
+# 根目录那份 `.npmrc` 从首次提交起就带着一条 `script-shell=C:\Windows\System32\cmd.exe`
+# —— 那是**只在 Windows 上存在的路径**，却会随包分发到所有平台。
+# 从 git 安装本插件时（DSH 就是这么装的），pnpm 在**生命周期脚本**
+# （依赖的 `postinstall`、git 包的 `prepare`）里用它作 spawn shell，
+# 在 Android / Linux / macOS 上路径不存在 → 直接 `exit code -2` /
+# `ERR_PNPM_PREPARE_PACKAGE`（Exit status 254），插件装不上。
+#
+# ⚠️ 为什么删掉它对 Windows 无损：win32 下 pnpm 本来就用 `%ComSpec%`
+# （即同一个 `cmd.exe`）作默认值，这条配置纯属冗余。
+# ⚠️ 确实要指定 shell 时写到**用户级** `~/.npmrc`（不进仓库、不随包分发）。
+.npmrc
