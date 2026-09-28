@@ -17,7 +17,7 @@
 
 import type { Context } from '@deepseek-ai/cordis'
 import type { CredentialRef } from '@deepseek-ai/dsh-credentials'
-import { LlmAdapter, LlmError } from '@deepseek-ai/dsh-llm'
+import { LlmAdapter, LlmError, ReasoningEffortId } from '@deepseek-ai/dsh-llm'
 import type {
   GenerateOptions, LlmModelInfo, LlmProviderInfo, LlmResolvedModelInfo, StreamChunk,
 } from '@deepseek-ai/dsh-llm'
@@ -52,6 +52,71 @@ export interface LoomyRemoteModel {
   contextWindow: number
   supportsImage: boolean
   supportsThinking: boolean
+  /**
+   * 可选思考档位（远端 `reasoning_efforts`，如 `['none','low','medium','high','xhigh']`）。
+   *
+   * ⚠️ **取自远端而非硬编码** —— 服务端 `GET /models` 直接下发了这两个字段，
+   * 且带 `reasoning_catalog_version`（catalog 版本哈希），故档位随服务端更新，
+   * 无需改代码。
+   *
+   * 缺失（`undefined`）表示**该模型不提供档位选择**，此时不声明 `reasoning`，
+   * UI 显示「当前模型未提供推理等级」—— 而不是给一个发了也没用的档位。
+   */
+  efforts?: string[]
+  /** 远端声明的默认档位（`default_reasoning_effort`）。 */
+  defaultEffort?: string
+}
+
+/**
+ * 档位 id → 中文展示名。
+ *
+ * ⚠️ **必须与官方 IDE 一致**。Loomy 是基于 **opencode** 构建的，其
+ * `opencode.json` 的 `variants` 用的就是 `low` / `medium` / `high` 这套 id
+ * （用户截图里的「低 / 中 / 高」正是它）。中文名沿用 Qoder 那套官方 i18n 表
+ * （`src/qoder-adapter.ts` 的 `QODER_EFFORT_NAMES`，同源产品命名一致）。
+ *
+ * ⚠️ DSH 的档位选择器**直接渲染 `efforts[].name`**（不本地化），
+ * 故这里给中文即中文界面。
+ */
+const LOOMY_EFFORT_NAMES: Readonly<Record<string, string>> = {
+  none: '关闭思考',
+  minimal: '最小',
+  low: '低',
+  medium: '中',
+  high: '高',
+  xhigh: '极高',
+  max: '最大',
+}
+
+/**
+ * 本插件选用的**默认思考档位**（用户要求：`high`）。
+ *
+ * ⚠️ **不采信远端的 `default_reasoning_effort`**（它声明的是 `low`）。
+ * 依据是 DSH 的取值逻辑 —— `dsh-client-ui-model-selection` 的
+ * `effectiveEffort = state.current?.reasoningEffort ?? reasoning?.defaultEffort`，
+ * 即「用户没选时发哪个档」**完全由适配器声明的 `defaultEffort` 决定**，
+ * 沿用远端的 `low` 会让默认思考偏浅。
+ *
+ * ⚠️ **必须落在该模型的 `efforts` 内**：DSH 会拿它**直接发请求**，给一个不存在的
+ * 档位会抛 `UNSUPPORTED_REASONING_EFFORT`。故 `reasoningFor` 里做了 `includes`
+ * 校验 —— 某模型若不提供 `high`（远端目录变化时可能发生），则**不下发默认档**，
+ * 退回 DSH 的「服务商默认」语义，而不是发一个非法值。
+ */
+const LOOMY_PREFERRED_DEFAULT_EFFORT = 'high'
+
+/** 把 `reasoning_efforts` 读成去重后的字符串数组（非法项丢弃）。 */
+function readReasoningEfforts(entry: Record<string, unknown>): string[] {
+  const raw = entry.reasoning_efforts
+  if (!Array.isArray(raw)) return []
+  const seen = new Set<string>()
+  const out: string[] = []
+  for (const item of raw) {
+    if (typeof item !== 'string' || item.length === 0) continue
+    if (seen.has(item)) continue
+    seen.add(item)
+    out.push(item)
+  }
+  return out
 }
 
 /** 把 `capabilities.input_modalities` 读成小写字符串数组。 */
@@ -87,12 +152,20 @@ export function parseLoomyRemoteModels(payload: unknown): LoomyRemoteModel[] {
     const capabilities = typeof entry.capabilities === 'object' && entry.capabilities !== null
       ? entry.capabilities as Record<string, unknown>
       : {}
+    const efforts = readReasoningEfforts(entry)
+    const rawDefault = entry.default_reasoning_effort
     models.push({
       id,
       name: loomyDisplayName(rawName),
       contextWindow: Number.isFinite(contextWindow) && contextWindow > 0 ? contextWindow : 0,
       supportsImage: readInputModalities(entry).includes('image'),
       supportsThinking: capabilities.reasoning === true,
+      // ⚠️ 档位缺失时**不写这两个键**（而不是写空数组）：下游据此区分
+      // 「该模型不提供档位」与「提供了但为空」。
+      ...efforts.length > 0 ? { efforts } : {},
+      ...typeof rawDefault === 'string' && rawDefault.length > 0
+        ? { defaultEffort: rawDefault }
+        : {},
     })
   }
   return models
@@ -108,6 +181,10 @@ function fallbackToRemote(model: LoomyFallbackModel): LoomyRemoteModel {
     // 也不要报一个服务端可能不认的模态。
     supportsImage: false,
     supportsThinking: true,
+    ...model.efforts !== undefined && model.efforts.length > 0
+      ? { efforts: [...model.efforts] }
+      : {},
+    ...model.defaultEffort !== undefined ? { defaultEffort: model.defaultEffort } : {},
   }
 }
 
@@ -239,7 +316,47 @@ export class LoomyAdapter extends LlmAdapter {
     if (contextWindow !== undefined && contextWindow > 0) {
       resolved.context = { contextWindow }
     }
+    // 思考档位：**远端 `reasoning_efforts` 直接生成**（用户要求）。
+    const reasoning = this.reasoningFor(entry, fallback)
+    if (reasoning !== undefined) resolved.reasoning = reasoning
     return resolved
+  }
+
+  /**
+   * 该模型的思考档位（`resolveModel` 的 `reasoning` 字段）。
+   *
+   * ⚠️ **此前根本不声明** —— DSH 的思考强度选择器**只会**从
+   * `resolveModel().reasoning` 渲染，故两个站点从来没出现过档位选择器，
+   * 尽管远端早就下发了 `reasoning_efforts`。这与 Qoder 那次（AGENTS.md 2.2 节）
+   * 是**完全同型**的缺陷。
+   *
+   * 三条口径：
+   * 1. `efforts` **原样取远端顺序**（服务端下发的就是展示顺序）；
+   * 2. `defaultEffort` **必须落在 `efforts` 内** —— DSH 会拿它直接发请求，
+   *    给一个不存在的档位会抛 `UNSUPPORTED_REASONING_EFFORT`，比不给更糟；
+   * 3. 远端未下发档位时不声明 `reasoning`（UI 显示「当前模型未提供推理等级」）。
+   */
+  private reasoningFor(
+    entry: LoomyRemoteModel | undefined,
+    fallback: LoomyFallbackModel | undefined,
+  ): LlmResolvedModelInfo['reasoning'] {
+    // 远端优先；远端整体失败时用兜底表（两者字段同名同形）。
+    const efforts = entry?.efforts ?? fallback?.efforts
+    if (efforts === undefined || efforts.length === 0) return undefined
+    // ⚠️ **默认档用本插件自己的「高」，不采信远端的 `default_reasoning_effort`**（用户要求）。
+    // 依据：远端声明的是 `low`，而 DSH 的 `effectiveEffort` 直接取 `defaultEffort`
+    // （`dsh-client-ui-model-selection`：`state.current?.reasoningEffort ?? reasoning?.defaultEffort`），
+    // 即「用户没选时发哪个档」完全由这里决定 —— 沿用 low 会让默认思考偏浅。
+    const defaultEffort = LOOMY_PREFERRED_DEFAULT_EFFORT
+    const hasDefault = efforts.includes(defaultEffort)
+    return {
+      efforts: efforts.map((id) => ({
+        id: ReasoningEffortId(id),
+        // 未登记的中文名回退到 id 本身（新档位上线时不至于空白）。
+        name: LOOMY_EFFORT_NAMES[id] ?? id,
+      })),
+      ...hasDefault ? { defaultEffort: ReasoningEffortId(defaultEffort) } : {},
+    }
   }
 
   /**
@@ -313,6 +430,30 @@ export class LoomyAdapter extends LlmAdapter {
       ? [{ role: 'system', content: options.system }, ...messages]
       : messages
 
+    /**
+     * 思考档位：仅当**该模型确实声明了它**时才下发。
+     *
+     * ⚠️ 字段名是 `reasoning_effort`（与远端声明的 `reasoning_efforts` /
+     * `default_reasoning_effort` 同源，也与 OpenAI 标准一致）。
+     * 本插件其余适配器同样用它（如 `buddy-adapter.ts`）。
+     *
+     * ⚠️ **必须校验档位在该模型的 `efforts` 内**：DSH 会把用户选的档位直接透传，
+     * 给一个远端不认的值比不给更糟。校验不过时**静默不下发**（退回服务端默认档），
+     * 而不是发一个可能被拒的值。
+     *
+     * ⚠️ **不能靠 HTTP 状态码判断该字段是否生效**：实测传
+     * `reasoning_effort` / `reasoningEffort` / `thinking` 三种名字**都返回 200**
+     * —— 服务端对未知字段静默忽略（与「无效模型名回退默认模型」同一模式）。
+     * 故这里的字段名依据是**远端自己的命名**，而非「试出来能通」。
+     */
+    const effortsForModel = (await this.loadModels()).find((m) => m.id === options.model)?.efforts
+      ?? this.fallbackIndex.get(options.model)?.efforts
+    const effort = options.reasoningEffort !== undefined
+      && effortsForModel !== undefined
+      && effortsForModel.includes(options.reasoningEffort)
+      ? options.reasoningEffort
+      : undefined
+
     /** 构造请求体。 */
     const buildBody = (): string => JSON.stringify({
       model: options.model,
@@ -321,6 +462,7 @@ export class LoomyAdapter extends LlmAdapter {
       ...options.maxTokens !== undefined ? { max_tokens: options.maxTokens } : {},
       ...options.temperature !== undefined ? { temperature: options.temperature } : {},
       ...options.stop !== undefined && options.stop.length > 0 ? { stop: options.stop } : {},
+      ...effort !== undefined ? { reasoning_effort: effort } : {},
       ...options.tools !== undefined && options.tools.length > 0
         ? {
             tools: options.tools.map((tool) => ({

@@ -4112,6 +4112,78 @@ loomy: { balance: true, dailyCheckin: true, onboardingTasks: true }
 ⚠️ 面板级（「重测所有 / 重置所有」）与卡片级（「重测 / 重置」）**都要门控**：
 只改面板级会让卡片上仍留着两个永远无效的按钮。
 
+### ⚠️ 思考档位：`resolveModel` **必须声明 `reasoning`**，否则选择器根本不出现
+
+**用户报障**：「loomy ide 中可以设置思考档位，我们现在没法设置」。
+
+**根因与 Qoder 那次完全同型**（见本文件 Qoder 的 2.2 节）：`LoomyAdapter.resolveModel()`
+**只声明 `context`，从不声明 `reasoning`**。而 DSH 的思考强度选择器**只会**从
+`resolveModel().reasoning` 渲染 —— 故档位选择器**从来没有出现过**，
+尽管远端 `GET /models` 早就下发了 `reasoning_efforts`。
+
+⚠️ **判据是「DSH 从哪读档位」，不是「远端有没有给」**：远端给了不等于界面有，
+中间少一次声明就全丢。**加任何 provider 时都要检查 `resolveModel` 是否声明了
+`reasoning`**（同理还有 `context` / `inputModalities`）。
+
+**用户要求「如果能从远端得到配置中直接生成是最好的」—— 已照此实现**：
+
+| 项 | 来源 | 规则 |
+|---|---|---|
+| `efforts` | 远端 `reasoning_efforts` | **原样取用**（服务端下发的就是展示顺序） |
+| `defaultEffort` | ⚠️ **本插件自己的 `high`** | **不采信远端的 `low`**（见下） |
+| 中文展示名 | 本文件 `LOOMY_EFFORT_NAMES` | `none:关闭思考 low:低 medium:中 high:高 xhigh:极高` |
+
+实测 8 个 chat 模型**完全一致**：`['none','low','medium','high','xhigh']`。
+远端还带 `reasoning_catalog_version`（catalog 哈希），故档位随服务端更新、**无需改代码**。
+兜底表（`loomy-product.ts`）存同一份实测值，只在远端整体失败时顶替 ——
+⚠️ **抽成 `LOOMY_EFFORTS` 常量而不是逐条写 8 遍**，避免上游变更时漏改其中几条。
+
+⚠️⚠️ **默认档用本插件自己的 `high`，有意不采信远端的 `low`**（用户要求，2026-09-28）：
+> 我们档位默认用远端的几档，默认值用自己的高
+
+**依据是 DSH 的取值逻辑**（`dsh-client-ui-model-selection/lib/client.js:512`）：
+```js
+const effectiveEffort = state.current?.reasoningEffort ?? reasoning?.defaultEffort
+```
+即「用户没选时发哪个档」**完全由适配器声明的 `defaultEffort` 决定**，
+沿用远端的 `low` 会让默认思考偏浅。
+常量在 `loomy-adapter.ts` 的 `LOOMY_PREFERRED_DEFAULT_EFFORT`，
+兜底表的 `LOOMY_DEFAULT_EFFORT` **必须与它一致** ——
+否则「远端可用 / 远端失败」两条路径的默认档会不同。
+
+⚠️ **仍必须做 `efforts.includes(high)` 校验**：DSH 会拿 `defaultEffort`
+**直接发请求**，某模型若不提供 `high`（远端目录变化时真会发生），
+必须**不下发默认档**（退回 DSH 的「服务商默认」语义），而不是发一个非法值
+（会抛 `UNSUPPORTED_REASONING_EFFORT`）。
+
+⚠️ **`defaultEffort` 不落在 `efforts` 内时不能下发**：DSH 会拿它**直接发请求**，
+给一个不存在的档位会抛 `UNSUPPORTED_REASONING_EFFORT`，比不给更糟。
+
+⚠️ **请求体字段名是 `reasoning_effort`**（与远端声明的复数形式同源，也与 OpenAI 标准
+及本插件其余适配器一致）。⚠️ **不能靠 HTTP 状态码判断字段是否生效**：实测传
+`reasoning_effort` / `reasoningEffort` / `thinking` **三种都返回 200** —— 服务端对
+未知字段**静默忽略**（与「无效模型名回退默认模型」同一模式）。故字段名的依据是
+**远端自己的命名**，而非「试出来能通」。
+
+⚠️ **下发前必须校验档位在该模型的 `efforts` 内**（DSH 会把用户选的值直接透传）：
+越界时**静默不下发**（退回服务端默认档），而不是发一个可能被拒的值。
+
+⚠️ **实测「关闭思考」并不会真的消除思考内容**（`reasoning_effort:'none'` 仍返回
+`reasoning_content`，`reasoning_tokens` 与基准相当）。**这是服务端行为，不是我们的
+bug** —— 用户已明确接受（「设置关闭思考实际思考了可以接受」）。
+同理 `xhigh` 也**不会**显著增加思考量，但**它是安全的**：实测 HTTP 200、
+无流内错误帧、`finish_reason=stop` 未截断（用户关注点：「设置 xhigh 最大思考
+如果出问题就不好了」）。
+
+⚠️ **验证这类字段必须用流式**：第一版用**非流式 + 难题**，结果**连基准都 504**
+（非流式长思考撞网关超时）—— 那是超时，不是档位问题。DSH 走流式，故探针也须流式。
+且**不能用「思考字数」当唯一判据**：简单题目的思考量本来就小，各档差异淹没在噪声里。
+
+排查脚本与取证命令**见不入库的 `docs/loomy-protocol-notes.md`**
+（本文档不放脚本清单）。回归用例在 `tests/unit/loomy-adapter.spec.ts` 的
+「LoomyAdapter 思考档位」段（9 条）与「请求体里的 reasoning_effort」段（4 条）。
+⚠️ 已做**反向验证**：去掉 `resolveModel` 里那两行声明 → **5 条变红**。
+
 ### ⚠️ AccessKey 明文入库（用户明确同意）
 
 `src/loomy-product.ts` 内含从 Loomy 客户端解密得到的讯飞账号 AccessKey。
