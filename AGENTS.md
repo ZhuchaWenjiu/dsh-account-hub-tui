@@ -816,6 +816,63 @@ pool/accountId 且真调共享回写、RPC 与 `createPoolRefresh` 都传 id）�
 - ⚠️ **移除源元素后目标下标会前移**，必须用 `indexOf` 重算而不能复用原下标，
   否则会插到目标之后。`tests/unit/account-order.spec.ts` 覆盖了这一点
 
+### ⚠️ 安全策略拦截（11140）：三条通道都要换号 / 标冷却，错误码**绝不能**取 `AUTH`
+
+腾讯侧业务码 `11140`（`request illegal`，文案写「内容未通过安全审核」）**服务端嘴上说是
+内容问题，实测是账号级拦截**：同一份请求体发往池里 7 个账号得到「2 通 / 4 拦 / 1 限流」，
+连「你好」都被拦，换新会话照样拦（排除上下文累积）。因此它的正确出路是**换号**，
+不是让用户改内容。该结论由 !15（认证路径）与 !16（限流路径）先后确立，本次补齐剩下两处。
+
+- ⚠️ **错误码不能取 `AUTH`，也不能取 `QUOTA` / `ACCOUNT_QUOTA`**（通用教训，不限本 provider）。
+  DSH 聊天 UI 的判据是（取证：`@deepseek-ai/dsh-client-ui-chat/lib/client.js:1229-1234`）：
+  ```js
+  if (code === "QUOTA" || code === "ACCOUNT_QUOTA") return t("message.failure.quota");
+  return code === "AUTH" ? t("message.failure.auth") : message;
+  ```
+  即 `AUTH` 会**把整条 message 换成「API 密钥无效」**（`displayFailure()` 那里甚至强制
+  `message: ""`）。!15 精心写的「全部账号均被服务端安全策略拦截…」在 UI 上**一个字都看不到**，
+  还把用户引向检查密钥（实测 7 个 token 全有效、2027-09 才过期）。
+  ⇒ **凡是要把自定义文案送到用户眼前，码必须避开这三个**。
+  现取 `PERMISSION_DENIED`：与本仓库 `cline-adapter.ts` 的地域限制分支同码（见下文惯例），
+  且**不在** `DEFAULT_RETRYABLE_CODES`（`EMPTY_RESPONSE / RATE_LIMIT / SERVER / TIMEOUT / TRANSPORT`）
+  里 → 确定性结论不会被 harness 白退避 5 次。
+  ⚠️ 也别顺手改回 `AUTH`「与其余 401/403 口径一致」：口径一致不该以吞掉文案为代价。
+- ⚠️ **被拦账号必须打冷却标记**（`markPolicyBlockedAccount`，`src/buddy-adapter.ts`）。
+  !15 / !16 让「有可用账号就一定能用上」成立，但**每轮都要重撞坏账号**：候选顺序是用户拖拽定的
+  （见上文「账号顺序」），实测那池前 4 个被拦 → 每次请求固定先发 4 次失败。
+  复用账号池的 `modelRateLimits` 载体（它是**唯一**的「账号×模型暂时不可用」映射，没有 reason 字段），
+  代价是账号卡片显示「限额重置 · 模型 · 30 分钟后」而非「安全策略拦截」；
+  收益是 `getAvailableAccount` 的过滤、UI 的「重测 / 重置」两条人工解禁路径**全都现成生效**。
+  ⚠️ **时长是自己定的 30 分钟（`BUDDY_POLICY_BLOCK_COOLDOWN_MS`），不要复用
+  `parseRateLimitError` 解析不到时那个 1 小时兜底** —— 11140 报文里根本没有时间字段，
+  走那条兜底等于把「策略拦截」冒充成「服务端限流」。也别与 cline / lobsterai / trae 的
+  `*_RATE_LIMIT_FALLBACK_MS` 合并成一个常量（语义不同，调一个不该动另一个）。
+  ⚠️ 标记**只随时间到期失效**：`sweepExpiredRateLimits` 在生产代码里**没有任何调用方**，
+  别指望它来清过期项（判据是 `account-pool.ts:578` 的 `Date.now() >= resetAt`）。
+  ⚠️ **只标该模型**（同 qoder 额度那条口径）：跨模型无实测依据，标全部模型会误伤本可用的组合。
+  ⚠️ 写标记失败**只记日志、不上抛**（与 `src/expiry-sync.ts` 惯例一致）：本次的准确错误才是主线。
+- ⚠️ **流内（HTTP 200 + SSE 帧）那条通道原先整帧被静默丢掉**：buddy 的帧类型里**没有**
+  `code` / `msg` 字段，而 11140 恰好是顶层 `{code,msg,displayMsg}`、无 `error` 无 `choices`
+  → 一路走到循环末尾，既没内容也没报错，UI 表现成「干净地停止、无任何失败」
+  （与 qoder 的 10605、TRAE 的流内错误同型）。
+  ⚠️ **判据必须带「这一帧没有 `choices`」这层门禁**：正文里出现「安全审核」
+  /`request illegal`/字面 `11140` 是常态（模型在讨论审核策略就会说），只看 payload 字样
+  会把一个合法回答判成拦截并连带标冷却。
+  ⚠️ 判据与 HTTP 层**共用** `isContentRejection()`，别在流内另写一套 —— trae 那次缺陷的成因
+  就是流内分支当年自己写了一套判据。
+  ⚠️ 本通道按定下的口径是「**标记 + 如实报错**」，本轮不重发（重发需要「尚未产出内容」判据
+  + 外层循环，那是 `3823133 fix(trae)` 那种结构改造，不在本次范围）；下一轮选号会自动绕开。
+  故报错文案取「当前账号…」而非「已逐个换号重试」——**文案必须与是否真换过号一致**。
+- ⚠️ **单账号池 + 续期失败**时，`credential expired and refresh failed` 那条早退分支
+  **也必须先排 11140**：单账号池必然满足「没换到号」，修复前真实原因是拦截时报的却是
+  `AUTH` + 一句与凭据有关的话（写用例时实测到）。
+- ⚠️ 文案里的 HTTP 状态取**最后一次拦截**的，不是首发的：「首发 401 + 途中 403/11140」
+  若沿用首发状态会报出一个对不上的「HTTP 401」，把人引向「token 过期」。
+- 测试：`tests/unit/buddy-adapter.spec.ts` 的
+  「安全策略拦截（11140）：账号冷却 + 流内错误帧」段（7 条）。
+  ⚠️ 已做**反向验证**：错误码退回 `AUTH` → **7 条**变红；禁用冷却标记 → **5 条**变红
+  （含认证 / 限流 / 流内三条通道各自那条）；禁用流内识别 → **2 条**变红。
+
 ## 单次输出上限（`maxOutputTokens`）必须下发，不能只用来过滤
 
 腾讯系两个端点（scoped `/console/enterprises/personal/models` 与 `/v3/config`）

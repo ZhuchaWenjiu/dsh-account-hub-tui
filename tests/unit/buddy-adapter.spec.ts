@@ -1,7 +1,9 @@
 import { LlmError } from '@deepseek-ai/dsh-llm'
 import { credentialRef } from '@deepseek-ai/dsh-credentials'
 import { describe, expect, it } from 'vitest'
-import { CHAT_API_BASE, BuddyAdapter, DEFAULT_MODEL, registerBuddyLlm } from '../../src/buddy-adapter.js'
+import {
+  CHAT_API_BASE, BuddyAdapter, DEFAULT_MODEL, policyBlockResetAtMs, registerBuddyLlm,
+} from '../../src/buddy-adapter.js'
 import type { BuddyCredential, BuddyRemoteModel } from '../../src/buddy.js'
 import { CODEBUDDY, WORKBUDDY, type BuddyProduct } from '../../src/product.js'
 
@@ -583,7 +585,10 @@ describe('BuddyAdapter credential handling', () => {
    * 账号条目，归属不到（返回 `''`）时换号会先拿回刚失败的那个账号。
    */
   function makePool(accounts: Array<{ id: string; credential: BuddyCredential }>) {
+    /** 记录 `updateModelRateLimit` 的调用，供「安全策略拦截冷却标记」用例断言。 */
+    const recorded: Array<{ accountId: string; modelId: string; resetAtMs: number }> = []
     return {
+      recorded,
       findAccountIdByCredential: async (_provider: string, token: string) =>
         accounts.find(a => a.credential.access_token === token)?.id ?? '',
       getAvailableAccount: async (
@@ -594,7 +599,9 @@ describe('BuddyAdapter credential handling', () => {
         const entry = accounts.find(a => exclude === undefined || !exclude.has(a.id))
         return entry === undefined ? null : { entry, credential: entry.credential }
       },
-      updateModelRateLimit: async () => {},
+      updateModelRateLimit: async (accountId: string, modelId: string, resetAtMs: number) => {
+        recorded.push({ accountId, modelId, resetAtMs })
+      },
       disabledModelsFor: () => new Set<string>(),
     }
   }
@@ -691,8 +698,13 @@ describe('BuddyAdapter credential handling', () => {
       fetchImpl: async () => { calls++; return new Response(body, { status: 403 }) },
     })
     const error = await collectChunks(adapter, streamOptions).catch((e: unknown) => e)
-    // 错误码取 AUTH：这些账号在服务端不可用，需要换号/重新登录，而不是「你的内容有问题」。
-    expect((error as LlmError).failure.code).toBe('AUTH')
+    // 错误码取 PERMISSION_DENIED（**不是** AUTH）：DSH 的聊天 UI 是
+    // `code === "AUTH" ? "API 密钥无效" : message`
+    // （取证：`@deepseek-ai/dsh-client-ui-chat/lib/client.js:1229-1234`），
+    // 取 AUTH 会把整条 message 换成「API 密钥无效」——下面那些为「指向账号」
+    // 而写的文案一个字都到不了用户眼前，且把用户引向检查密钥（实测 token 全有效）。
+    // PERMISSION_DENIED 也不在 harness 的 DEFAULT_RETRYABLE_CODES 里 → 不白重试。
+    expect((error as LlmError).failure.code).toBe('PERMISSION_DENIED')
     // 文案必须指向**账号**，不再断言「请调整内容后重试」把用户引向错误方向。
     expect((error as LlmError).message).toContain('安全策略')
     expect((error as LlmError).message).toContain('账号')
@@ -742,9 +754,14 @@ describe('BuddyAdapter credential handling', () => {
           : new Response(safety, { status: 403 }),
     })
     const error = await collectChunks(adapter, streamOptions).catch((e: unknown) => e)
-    expect((error as LlmError).failure.code).toBe('AUTH')
+    expect((error as LlmError).failure.code).toBe('PERMISSION_DENIED')
     // 走的是安全策略专用文案（指向账号），而不是泛化的「所有账号均被拒绝」。
     expect((error as LlmError).message).toContain('安全策略')
+    // ⚠️ 文案里的 HTTP 状态必须是**拦截那一次**的 403，而不是首发的 401 ——
+    // 早先这里传的是首发的 authStatus，「HTTP 401」会把排查引向「token 过期」，
+    // 而实际被拦的是换号后的那个账号（它回的是 403）。
+    expect((error as LlmError).message).toContain('HTTP 403')
+    expect((error as LlmError).message).not.toContain('HTTP 401')
   })
 
   it('错误提示只取服务端 displayMsg.zh，不倾倒整段 JSON 原文', async () => {
@@ -1834,8 +1851,19 @@ describe('BuddyAdapter 账号池限流切换', () => {
     // 关键：三个账号都被试过 —— AT2 的 11140 没有中断换号。
     expect(sentTokens).toEqual(['AT1', 'AT2', 'AT3'])
     expect(chunks.some((c) => c.type === 'text-delta' && c.text === 'ok')).toBe(true)
-    // AT1 的限流被记录（AT2 是安全拦截，不该被记成限流）。
-    expect(pool.recorded.map((r) => r.accountId)).toEqual(['acct-1'])
+    // AT1 的限流被记录；AT2 的安全拦截**另记一条冷却**（ !16 之前这里完全不记，
+    // 于是那个坏账号下一轮仍排第一、每轮重撞 —— 见 `markPolicyBlockedAccount`）。
+    expect(pool.recorded.map((r) => r.accountId)).toEqual(['acct-1', 'acct-2'])
+    // 两条记录必须能区分开：acct-1 是**服务端给的**重置时刻（2099-12-31），
+    // acct-2 是**我们自己定的** 30 分钟冷却。绝不能把 11140 冒充成服务端限流，
+    // 也不能复用 `parseRateLimitError` 解析不到时那个 1 小时兜底。
+    const rl = pool.recorded.find((r) => r.accountId === 'acct-1')
+    const blocked = pool.recorded.find((r) => r.accountId === 'acct-2')
+    expect(rl?.resetAtMs).toBeGreaterThan(Date.parse('2090-01-01'))
+    expect(Math.abs((blocked?.resetAtMs ?? 0) - policyBlockResetAtMs(Date.now()))).toBeLessThanOrEqual(5_000)
+    // 只标该模型（同 qoder 额度那条口径）：11140 是否跨模型无实测依据，
+    // 标全部模型会误伤该账号本可用的组合。
+    expect(pool.recorded.every((r) => r.modelId === DEFAULT_MODEL)).toBe(true)
   })
 
   it('限流换号途中撞上安全策略且全部试完：报「安全策略」而非 QUOTA_EXCEEDED', async () => {
@@ -2441,5 +2469,201 @@ describe('BuddyAdapter 目录门控（无已登录账号时隐藏）', () => {
       accountPool: { disabledModelsFor: () => new Set<string>() } as never,
     })
     expect((await adapter.listModels('buddy')).length).toBeGreaterThan(0)
+  })
+})
+
+/**
+ * 安全策略拦截（11140）的两项补修。
+ *
+ * ## ① 被拦账号的冷却标记
+ *
+ * !15 / !16 让「有可用账号就一定能用上」成立，但**每轮都要重撞坏账号**：
+ * 候选顺序是用户在 Jet Hub 拖拽定的（`getAvailableAccount` 不再按重置时间重排），
+ * 实测那个池是「前 4 个被 11140 拦、后 3 个可用」——每次请求都固定先发 4 次失败，
+ * 白烧额度、白等往返，且下一轮一模一样。
+ *
+ * ## ② HTTP 200 + SSE 流内的 11140
+ *
+ * 这形态**实测存在**（同一报文在 CodeArts 侧就以流内错误帧下发），而 buddy 的
+ * 帧类型原先没有 `code` / `msg` 字段：既没内容也没报错，UI 表现成「干净地停止」。
+ */
+describe('安全策略拦截（11140）：账号冷却 + 流内错误帧', () => {
+  /**
+   * 记录 `updateModelRateLimit` 调用的账号池替身。
+   *
+   * ⚠️ `getAvailableAccount` **必须按 `exclude` 取号**（与 `AccountPool` 同语义）：
+   * 直接返回第一个账号会让它等于「刚失败的那个」，命中适配器的 `tried.has` 而
+   * 判成「没换到号」，于是走到 `credential expired and refresh failed` 那条早退 ——
+   * 测出来的是桩的行为，不是被测代码的。
+   */
+  function recordingPool(accounts: Array<{ id: string; token: string }>) {
+    const recorded: Array<{ accountId: string; modelId: string; resetAtMs: number }> = []
+    return {
+      recorded,
+      async findAccountIdByCredential(_provider: string, identity: string) {
+        return accounts.find((a) => a.token === identity)?.id ?? ''
+      },
+      async updateModelRateLimit(accountId: string, modelId: string, resetAtMs: number) {
+        recorded.push({ accountId, modelId, resetAtMs })
+      },
+      async getAvailableAccount(
+        _provider: string,
+        _modelId: string,
+        exclude?: ReadonlySet<string>,
+      ) {
+        const next = accounts.find((a) => exclude === undefined || !exclude.has(a.id))
+        if (next === undefined) return null
+        return {
+          entry: { id: next.id },
+          credential: makeCredential({ access_token: next.token }),
+        }
+      },
+      disabledModelsFor: () => new Set<string>(),
+    }
+  }
+
+  const safetyBodyText = JSON.stringify({
+    code: 11140,
+    msg: 'request illegal',
+    requestId: '5b2240b4-efdf-40e0-94e4-cfee1aa80585',
+    displayMsg: { zh: '内容未通过安全审核，请调整后重试。' },
+  })
+
+  it('冷却时长是 30 分钟，且**不等于**限流解析兜底的那 1 小时', () => {
+    // 防回归：有人会把两者合并成一个常量（它们数值相近、都写进 modelRateLimits），
+    // 但语义不同 —— 一个是「服务端不给时间」的策略拦截，一个是「解析不到限流时间」的兜底。
+    // 合并之后调其中一个会静默改掉另一个。
+    expect(policyBlockResetAtMs(0)).toBe(30 * 60_000)
+    expect(policyBlockResetAtMs(0)).not.toBe(3_600_000)
+  })
+
+  it('认证路径：每个被拦账号都被标冷却，且只标本次要用的那个模型', async () => {
+    const pool = recordingPool([
+      { id: 'acct-1', token: 'AT1' },
+      { id: 'acct-2', token: 'AT2' },
+    ])
+    const adapter = makeAdapter({
+      credential: makeCredential({ access_token: 'AT1' }),
+      refresh: async () => { throw new Error('refresh failed') },
+      accountPool: pool,
+      fetchImpl: async () => new Response(safetyBodyText, { status: 403 }),
+    })
+    const error = await collectChunks(adapter, streamOptions).catch((e: unknown) => e)
+    expect((error as LlmError).failure.code).toBe('PERMISSION_DENIED')
+
+    // 两个账号都撞到拦截 → 都被标记（修复前一条都不记，下轮照样从 acct-1 开始重撞）。
+    expect(pool.recorded.map((r) => r.accountId)).toEqual(['acct-1', 'acct-2'])
+    expect(pool.recorded.every((r) => r.modelId === DEFAULT_MODEL)).toBe(true)
+    expect(pool.recorded.every(
+      (r) => Math.abs(r.resetAtMs - policyBlockResetAtMs(Date.now())) <= 5_000,
+    )).toBe(true)
+  })
+
+  it('单账号池 + 续期失败：不得把拦截报成 AUTH（早退分支也必须先看 11140）', async () => {
+    // 写这批用例时**实测到**的缺陷（补修）：`refreshedCredential === undefined
+    // && !rotated` 那条早退只看「续期失败 + 没换到号」——而单账号池必然满足它，
+    // 于是真实原因是 11140 时，报出来的却是「credential expired and refresh failed」
+    // + `AUTH` → UI 只显示「API 密钥无效」，把用户引向重新登录（token 实测有效）。
+    const pool = recordingPool([{ id: 'acct-1', token: 'AT1' }])
+    const adapter = makeAdapter({
+      credential: makeCredential({ access_token: 'AT1' }),
+      refresh: async () => { throw new Error('refresh failed') },
+      accountPool: pool,
+      fetchImpl: async () => new Response(safetyBodyText, { status: 403 }),
+    })
+    const error = await collectChunks(adapter, streamOptions).catch((e: unknown) => e)
+    expect((error as LlmError).failure.code).toBe('PERMISSION_DENIED')
+    expect((error as LlmError).message).not.toContain('credential expired')
+    expect((error as LlmError).message).toContain('安全策略')
+    expect(pool.recorded.map((r) => r.accountId)).toEqual(['acct-1'])
+  })
+
+  it('认证路径：换到可用账号后只标坏账号，可用账号不被牵连', async () => {
+    const pool = recordingPool([
+      { id: 'acct-1', token: 'AT1' },
+      { id: 'acct-2', token: 'AT2' },
+    ])
+    const adapter = makeAdapter({
+      credential: makeCredential({ access_token: 'AT1' }),
+      refresh: async () => { throw new Error('refresh failed') },
+      accountPool: pool,
+      fetchImpl: async (_url: unknown, init: { headers: Headers }) =>
+        (init.headers.get('Authorization') ?? '').includes('AT1')
+          ? new Response(safetyBodyText, { status: 403 })
+          : sseResponse('data: {"choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n'),
+    })
+    const chunks = await collectChunks(adapter, streamOptions)
+    expect(chunks.some((c) => c.type === 'text-delta' && c.text === 'ok')).toBe(true)
+    // 只有 acct-1 被标；acct-2 成功产出内容，绝不能被记成不可用。
+    expect(pool.recorded.map((r) => r.accountId)).toEqual(['acct-1'])
+  })
+
+  it('冷却标记写不进索引时不反噬：仍报准确的拦截错误', async () => {
+    // 与 `src/expiry-sync.ts` 的回写惯例同口径：标记是**附带收益**，
+    // 它失败不该把「安全策略拦截」顶替成一个无关的写入错误。
+    const pool = recordingPool([{ id: 'acct-1', token: 'AT1' }])
+    const adapter = makeAdapter({
+      credential: makeCredential({ access_token: 'AT1' }),
+      refresh: async () => { throw new Error('refresh failed') },
+      accountPool: {
+        ...pool,
+        updateModelRateLimit: async () => { throw new Error('settings 写入失败') },
+      },
+      fetchImpl: async () => new Response(safetyBodyText, { status: 403 }),
+    })
+    const error = await collectChunks(adapter, streamOptions).catch((e: unknown) => e)
+    expect((error as LlmError).failure.code).toBe('PERMISSION_DENIED')
+    expect((error as LlmError).message).toContain('安全策略')
+    expect((error as LlmError).message).not.toContain('settings 写入失败')
+  })
+
+  it('流内 11140（HTTP 200 + 错误帧）：不再静默结束，报错并标冷却', async () => {
+    const pool = recordingPool([{ id: 'acct-1', token: 'AT1' }])
+    const adapter = makeAdapter({
+      credential: makeCredential({ access_token: 'AT1' }),
+      accountPool: pool,
+      // HTTP 200，但流里第一帧就是 11140 —— 修复前它没有 error / choices 字段，
+      // 被一路当成「正常结束、无内容」，UI 表现为「干净地停止、无任何报错」。
+      fetchImpl: async () => sseResponse(`data: ${safetyBodyText}\n\n`),
+    })
+    const error = await collectChunks(adapter, streamOptions).catch((e: unknown) => e)
+    expect(error).toBeInstanceOf(LlmError)
+    expect((error as LlmError).failure.code).toBe('PERMISSION_DENIED')
+    expect((error as LlmError).message).toContain('安全策略')
+    // 流内这条通道**不重发**（本轮不产出内容才允许重放是 trae 那套结构改造的
+    // 前提，本次没做），所以文案如实说「当前账号」，不谎称「已逐个换号重试」。
+    expect((error as LlmError).message).toContain('当前账号')
+    expect((error as LlmError).message).not.toContain('已逐个换号重试')
+    expect((error as LlmError).message).toContain('HTTP 200')
+    // 标了冷却 → 下一轮选号就绕开它。
+    expect(pool.recorded.map((r) => r.accountId)).toEqual(['acct-1'])
+  })
+
+  it('流内判据必须窄：正文里出现 11140 / 安全审核字样不算拦截', async () => {
+    // 模型在讨论审核策略时正常就会说这些词。判据若只看 payload 里的字样，
+    // 一个合法回答会被判成「账号被拦」并连带标冷却 —— 那是把功能做没。
+    const pool = recordingPool([{ id: 'acct-1', token: 'AT1' }])
+    const text = '关于 code":11140、「request illegal」与安全审核 的说明'
+    const adapter = makeAdapter({
+      credential: makeCredential({ access_token: 'AT1' }),
+      accountPool: pool,
+      fetchImpl: async () => sseResponse(
+        `data: {"choices":[{"delta":{"content":${JSON.stringify(text)}}}]}\n\n`
+        + 'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\n'
+        + 'data: [DONE]\n\n',
+      ),
+    })
+    const chunks = await collectChunks(adapter, streamOptions)
+    expect(chunks.some((c) => c.type === 'text-delta' && c.text === text)).toBe(true)
+    expect(pool.recorded).toEqual([])
+  })
+
+  it('没有账号池时流内 11140 仍准确报错（标记跳过、不得崩）', async () => {
+    const adapter = makeAdapter({
+      credential: makeCredential({ access_token: 'AT1' }),
+      fetchImpl: async () => sseResponse(`data: ${safetyBodyText}\n\n`),
+    })
+    const error = await collectChunks(adapter, streamOptions).catch((e: unknown) => e)
+    expect((error as LlmError).failure.code).toBe('PERMISSION_DENIED')
   })
 })

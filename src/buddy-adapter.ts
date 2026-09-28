@@ -408,23 +408,135 @@ function isContentRejection(body: string): boolean {
 }
 
 /**
+ * 安全策略拦截的**账号冷却时长**（30 分钟）。
+ *
+ * ## 为什么必须自己定一个时长
+ *
+ * 服务端**不给解除时间**：11140 的报文里只有 `code` / `msg` / `displayMsg`，
+ * 没有任何 reset 字段。因此不能走 `parseRateLimitError` —— 它解析不到时间时
+ * 兜底成 1 小时（与限流的真实语义挂钩），把它当作「11140 的时长」属于偷换概念。
+ * 这里独立命名一个常量，把「策略拦截的冷却」与「限流的等待」在语义上分开。
+ *
+ * ## 为什么取 30 分钟
+ *
+ * - 太短（如 1 分钟）挡不住一个 agent 轮次里的连续重发 —— 那正是用户报障的
+ *   「每次都拿最先选中的坏账号去撞」；
+ * - 太长则把「其实已恢复」的账号白白锁死（服务端策略可能随时间/额度状态解除）；
+ * - 30 分钟也限制了误伤窗口：标记**只随时间到期失效**（`getAvailableAccount`
+ *   的判据是 `Date.now() >= resetAt`，见 `src/account-pool.ts:578`），
+ *   所以时长直接等于「这个账号在该模型上被藏起来多久」。
+ *   ⚠️ 别指望 `sweepExpiredRateLimits` 来清 —— 它在生产代码里**没有任何调用方**
+ *   （只有 `account-pool.spec.ts` 用），到期完全靠上面那个时间比较。
+ *
+ * ⚠️ 与 cline / lobsterai / trae 的 `*_RATE_LIMIT_FALLBACK_MS`（均 1 小时）**不同源**：
+ * 那三个是「解析不到限流重置时间」的兜底，本常量是「服务端压根不给时间」的策略拦截冷却。
+ * 别把它们合并成一个常量 —— 语义不同，将来调其中一个不该动另一个。
+ *
+ * ⚠️ UI 副作用（已知取舍）：复用的是 `modelRateLimits`，账号卡片因此显示
+ * 「限额重置 · <模型> · 30 分钟后」（`plugin-src/client/jet-hub.js:412-418`），
+ * 而不是「安全策略拦截」—— 该结构只有一个 `模型→时刻` 映射，不带原因字段。
+ * 换来的是现成的三条解禁路径都能用它：时间到期、Jet Hub「重置」按钮
+ * （`clearModelRateLimits`）、「重测」（`account-probe.ts` 真发一条最小消息，
+ * 通过才清标记）。
+ */
+const BUDDY_POLICY_BLOCK_COOLDOWN_MS = 30 * 60_000
+
+/**
  * 安全策略拦截的错误。
  *
- * ⚠️ 错误码**不能**取 `INVALID_REQUEST`（早期实现如此）：那会把「所有账号都被
- * 安全策略拦下」说成「你的请求有问题」，提示用户去改内容——而实测这是**账号级**
- * 拦截（见 `isContentRejection` 的注释）。取 `AUTH` 与其余 401/403 口径一致，
- * 语义上也对：这些账号在服务端不可用，需要换号或重新登录。
+ * ## 错误码：`PERMISSION_DENIED`，**绝不能**取 `AUTH`
  *
- * 文案如实说明「已试完全部账号」并保留服务端原文，便于用户判断该换号还是
- * 真的调整内容；不再断言「请调整内容后重试」。
+ * 早期实现先取 `INVALID_REQUEST`（把账号级拦截说成「你的请求有问题」，指错方向），
+ * !15 改成了 `AUTH` —— 而 `AUTH` 同样是错的，且错得更彻底：**它会吞掉整条 message**。
+ *
+ * DSH 聊天 UI 的判据（实测于安装包 `dsh-client-ui-chat/lib/client.js:1229-1234`）：
+ * ```js
+ * if (code === "QUOTA" || code === "ACCOUNT_QUOTA") return t("message.failure.quota");
+ * return code === "AUTH" ? t("message.failure.auth") : message;
+ * ```
+ * 即 `AUTH` 会把 message 整个替换成固定文案「API 密钥无效」（`displayFailure()`
+ * 那里甚至强制 `message: ""`），**本函数精心写的中文说明一个字都到不了用户眼前**。
+ * 这与 !16 描述里抱怨的「UI 把用户引向检查密钥，而 7 个 token 实测全部有效」
+ * 是同一个来源 —— 而除 `AUTH` / `QUOTA` / `ACCOUNT_QUOTA` 外的码**原样透传 message**，
+ * 所以换码之后 !15 的文案才第一次真正生效。
+ *
+ * ⚠️ 也不能取 `QUOTA` / `ACCOUNT_QUOTA`：除文案错位（「额度已用尽」）外，
+ * UI 还会为这两个码额外弹全局额度 Toast。
+ *
+ * 取 `PERMISSION_DENIED` 与本仓库既有惯例一致 —— `cline-adapter.ts` 的地域限制
+ * 分支就用的这个码，并配有专门用例断言「错误码不是 AUTH」（`cline-adapter.spec.ts:479`）。
+ * 它同时**不在** harness 的 `DEFAULT_RETRYABLE_CODES`
+ * （`EMPTY_RESPONSE / RATE_LIMIT / SERVER / TIMEOUT / TRANSPORT`）里：
+ * 「这个账号被策略拦了」是确定性结论，交给 harness 白退避 5 次毫无意义 ——
+ * 出路是换号（由本适配器的换号循环负责），不是重试同一个账号。
  */
-function contentRejectionError(productId: string, status: number, body: string): LlmError {
+function contentRejectionError(
+  productId: string,
+  status: number,
+  body: string,
+  rotated: boolean,
+): LlmError {
+  // 两条通道的如实描述不同：HTTP 路径试完了全部候选，流内路径只撞到当前账号
+  // （那里不重发，避免「已吐了一半再重放」的重复计费与重复执行工具风险）。
+  const scope = rotated
+    ? `全部账号均被服务端安全策略拦截（HTTP ${status}，已逐个换号重试）`
+    : `当前账号被服务端安全策略拦截（HTTP ${status}，流内错误帧下发）`
   return new LlmError(
-    `${productId}: 全部账号均被服务端安全策略拦截（HTTP ${status}，已逐个换号重试）。`
-    + `该拦截按账号生效，请在 Jet Hub 停用或更换被拦账号后重试：${errorDetail(body)}`,
-    'AUTH',
+    `${productId}: ${scope}。该拦截按账号生效（同一请求在其他账号可正常返回），`
+    + `请在 Jet Hub 停用或更换被拦账号：${errorDetail(body)}`,
+    'PERMISSION_DENIED',
     { status },
   )
+}
+
+/**
+ * 纯函数：由「现在」算出策略拦截冷却的到期时刻。
+ *
+ * 单测靠它锁死时长（不必等真实时间流逝），也与 {@link markPolicyBlockedAccount}
+ * 分开，避免为了验证一个数字而去 mock 整个账号池。
+ */
+export function policyBlockResetAtMs(nowMs: number): number {
+  return nowMs + BUDDY_POLICY_BLOCK_COOLDOWN_MS
+}
+
+/**
+ * 把被安全策略拦截的账号在**该模型**上冷却一段时间。
+ *
+ * ## 为什么必须标记（真实缺陷，2026-09-28）
+ *
+ * !15 / !16 之后「有可用账号就一定能用上」已经成立，但**每轮都要重撞坏账号**：
+ * 候选顺序是用户在 Jet Hub 拖拽定的（`getAvailableAccount` 不再按重置时间重排），
+ * 被拦账号若排在前面，每次请求都要先把那几个坏账号各发一遍才轮到可用账号 ——
+ * 白烧额度、白等往返，且每轮都一样。实测那个池是「前 4 个被 11140 拦、后 3 个可用」，
+ * 于是每次请求固定多发 4 次失败。
+ *
+ * ## 为什么复用 `modelRateLimits`
+ *
+ * 它是账号池里**唯一**的「账号 × 模型暂时不可用」载体（`ProviderAccountEntry`
+ * 只有 `模型id → 重置时间戳` 这一个映射，没有 reason / 级别字段），复用它的收益：
+ * ① `getAvailableAccount` 的过滤天然生效（`account-pool.ts:577-578`）；
+ * ② UI 已有徽章与「重测 / 重置」两条人工解禁路径（`account-probe.ts`）。
+ * 代价是徽章文案显示为「限额重置」而非「安全策略拦截」—— 已知取舍，见常量注释。
+ *
+ * **只标该模型**，与 qoder 额度那条（`qoder-adapter.ts` 的 `switchAccountOnQuota`）
+ * 同口径：实测只证明「同一模型下按账号生效」，没有跨模型证据，标全部模型会误伤
+ * 本可用的组合。
+ *
+ * ⚠️ 标记失败**只记日志、不上抛**（与 `src/expiry-sync.ts` 的回写惯例一致）：
+ * 本次请求的准确错误才是主线，写不进索引不该把它顶替成未知故障。
+ */
+async function markPolicyBlockedAccount(
+  pool: AccountPool | undefined,
+  productId: string,
+  accountId: string,
+  modelId: string,
+): Promise<void> {
+  if (pool === undefined || accountId.length === 0 || modelId.length === 0) return
+  try {
+    await pool.updateModelRateLimit(accountId, modelId, policyBlockResetAtMs(Date.now()))
+  } catch (error) {
+    console.warn(`[${productId}] 安全策略拦截的冷却标记写入失败（不影响本次请求）:`, error)
+  }
 }
 
 /** 从错误体提取可读 detail 文本。 */
@@ -1124,10 +1236,14 @@ export class BuddyAdapter extends LlmAdapter {
       const rejectedBody = await response.clone().text().catch(() => '')
       const contentRejected = isContentRejection(rejectedBody)
       if (contentRejected) {
-        // 只记一条诊断日志便于排查，**不中断**换号。
+        // 记诊断日志（便于在插件日志里区分「换号」与「被策略拦下」），**不中断**换号，
+        // 同时把这个账号在该模型上冷却 —— 否则它下次仍排第一，每轮都要重撞一遍。
         console.warn(
           `[${this.product.id}] 账号 ${currentAccountId || '(current)'} 被安全策略拦截`
           + `（HTTP ${response.status}，code 11140），继续换号：${errorDetail(rejectedBody).slice(0, 200)}`,
+        )
+        await markPolicyBlockedAccount(
+          this.options.accountPool, this.product.id, currentAccountId, options.model,
         )
       }
       // ⚠️ 真实缺陷（2026-09-26，用户报障「账号池里明明有 3~4 个账号没被限流，
@@ -1160,13 +1276,22 @@ export class BuddyAdapter extends LlmAdapter {
         credential = refreshedCredential
         response = await this.send(credential, body, options)
         if (response.ok) {
-          yield* this.consumeSse(response, options)
+          yield* this.consumeSse(response, options, currentAccountId)
           return
         }
       }
       let rotated = false
       /** 换号过程中是否撞到过安全策略拦截（用于最后的报错口径）。 */
       let sawContentRejection = contentRejected
+      /**
+       * **最后一次**撞到的拦截与其响应体：报错时的 HTTP 状态与文案都取它。
+       *
+       * 早先这里直接用 `authStatus`（**首发**的状态码）—— 而首发是 401、
+       * 换号后才吃到 11140/403 的组合下，报出来的「HTTP 401」与实际被拦的
+       * 那一次对不上，排查时会把人引向「token 过期」。
+       */
+      let rejectionStatus = contentRejected ? authStatus : 0
+      let rejectionBody = contentRejected ? rejectedBody : ''
       if ((response.status === 401 || response.status === 403) && this.options.accountPool !== undefined) {
         for (;;) {
           // modelId 参与过滤：正在限流期的账号不会被选中（与限流换号同语义）。
@@ -1180,14 +1305,21 @@ export class BuddyAdapter extends LlmAdapter {
           currentAccountId = next.entry.id
           response = await this.send(credential, body, options)
           if (response.ok) {
-            yield* this.consumeSse(response, options)
+            yield* this.consumeSse(response, options, currentAccountId)
             return
           }
           // ⚠️ 安全策略拦截（11140）同样继续换号 —— 它按账号生效，换号是唯一出路。
           // 必须**先于**「仅 401/403 才继续」的判据检查，否则会被当成普通 403
           // 之外的错误而 break，退回到「只试一个账号」的老问题。
-          if (isContentRejection(await response.clone().text().catch(() => ''))) {
+          const rotatedBody = await response.clone().text().catch(() => '')
+          if (isContentRejection(rotatedBody)) {
             sawContentRejection = true
+            rejectionStatus = response.status
+            rejectionBody = rotatedBody
+            // 刚换到就是这个账号被拦：同样要冷却，否则下一轮它还是第一候选。
+            await markPolicyBlockedAccount(
+              this.options.accountPool, this.product.id, currentAccountId, options.model,
+            )
           }
           // 只有认证类失败（含安全策略拦截）才继续换号；
           // 429/5xx/400 交给下面的既有分类逻辑。
@@ -1196,6 +1328,20 @@ export class BuddyAdapter extends LlmAdapter {
       }
       // 刷新既没产出凭据、也没换到别的账号：保留原有的可诊断报错。
       if (refreshedCredential === undefined && !rotated) {
+        // ⚠️ **必须先排除安全策略拦截**（补修，2026-09-28）：这条早退只看
+        // 「续期失败 + 没换到号」，而**单账号池**恰恰必然满足它 —— 于是真实原因是
+        // 11140（该账号被服务端策略拦下）时，报出来的却是
+        // 「credential expired and refresh failed」+ `AUTH`，UI 只显示
+        // 「API 密钥无效」，把用户引向重新登录（而实测 token 全部有效）。
+        // 与 !15 / !16 已统一的口径一致：拦截就是拦截，别冒充认证失败。
+        if (sawContentRejection) {
+          throw contentRejectionError(
+            this.product.id,
+            rejectionStatus === 0 ? authStatus : rejectionStatus,
+            rejectionBody.length === 0 ? rejectedBody : rejectionBody,
+            true,
+          )
+        }
         throw new LlmError(`${this.product.id}: credential expired and refresh failed`, 'AUTH', { status: authStatus })
       }
       if (response.status === 401 || response.status === 403) {
@@ -1209,7 +1355,14 @@ export class BuddyAdapter extends LlmAdapter {
         const detail = await response.text().catch(() => '')
         // 换号途中撞上的安全策略拦截：报专门的提示（指向账号，而非内容）。
         if (sawContentRejection || isContentRejection(detail)) {
-          throw contentRejectionError(this.product.id, authStatus, detail)
+          // 状态与响应体都取**最后一次拦截**（没有就退回首发的那一份 `detail`），
+          // 免得「首发 401 + 途中 403/11140」报出一个对不上的 HTTP 401。
+          throw contentRejectionError(
+            this.product.id,
+            rejectionStatus === 0 ? authStatus : rejectionStatus,
+            rejectionBody.length === 0 ? detail : rejectionBody,
+            true,
+          )
         }
         throw new LlmError(
           `${this.product.id}: 所有账号均被拒绝`
@@ -1274,7 +1427,7 @@ export class BuddyAdapter extends LlmAdapter {
           currentAccountId = next.entry.id
           response = await this.send(credential, body, options)
           if (response.ok) {
-            yield* this.consumeSse(response, options)
+            yield* this.consumeSse(response, options, currentAccountId)
             return
           }
           errorText = await response.text().catch(() => '')
@@ -1287,6 +1440,14 @@ export class BuddyAdapter extends LlmAdapter {
             console.warn(
               `[${this.product.id}] 账号 ${currentAccountId || '(current)'} 被安全策略拦截`
               + `（HTTP ${response.status}，code 11140），继续换号：${errorDetail(errorText).slice(0, 200)}`,
+            )
+            // 与认证路径同一实现：被拦的账号在**该模型**上冷却一段时间。
+            //
+            // ⚠️ 这里**不能**用上面的 `updateModelRateLimit` 记账分支 —— 那个写的是
+            // 服务端给的限流重置时刻；11140 报文里**没有**时间，`parseRateLimitError`
+            // 会返回 `null`，走它的兜底等于把「策略拦截」冒充成「限流」。
+            await markPolicyBlockedAccount(
+              this.options.accountPool, this.product.id, currentAccountId, options.model,
             )
             continue
           }
@@ -1301,7 +1462,9 @@ export class BuddyAdapter extends LlmAdapter {
         }
         // 全部候选试完：若途中撞过安全策略拦截，报专门的提示（指向账号而非内容）。
         if (sawContentRejection) {
-          throw contentRejectionError(this.product.id, contentRejectionStatus || 403, contentRejectionBody)
+          throw contentRejectionError(
+            this.product.id, contentRejectionStatus || 403, contentRejectionBody, true,
+          )
         }
         throw new LlmError(`buddy: 模型 ${options.model} 所有账号均受限，请稍后再试`, 'QUOTA_EXCEEDED')
       }
@@ -1309,7 +1472,7 @@ export class BuddyAdapter extends LlmAdapter {
     }
 
     // 5. 消费 SSE 流
-    yield* this.consumeSse(response, options)
+    yield* this.consumeSse(response, options, currentAccountId)
   }
 
   /** 发起一次 chat 请求；网络失败映射为可重试的 TRANSPORT 错误。 */
@@ -1363,6 +1526,12 @@ export class BuddyAdapter extends LlmAdapter {
   private async *consumeSse(
     response: Response,
     options: GenerateOptions,
+    /**
+     * 本次请求实际使用的账号 id（`''` 表示凭据没匹配到池条目）。
+     *
+     * 只用于流内安全策略拦截的冷却标记 —— 见 {@link isContentRejection}。
+     */
+    policyBlockedAccountId: string,
   ): AsyncIterable<StreamChunk> {
     if (!response.body) throw new LlmError('buddy: empty model response body', 'EMPTY_RESPONSE')
 
@@ -1494,6 +1663,33 @@ export class BuddyAdapter extends LlmAdapter {
             data = JSON.parse(payload)
           } catch {
             continue
+          }
+          // ⚠️ **流内**的安全策略拦截（HTTP 200 + SSE 内嵌 11140 帧）。
+          //
+          // ## 原状：整帧被**静默丢掉**
+          //
+          // 下面的帧类型里**根本没有** `code` / `msg` 字段（只有 `error` /
+          // `choices` / `usage`），而这类报文恰好是**顶层** `{code,msg,displayMsg}`、
+          // 没有 `error`、没有 `choices` —— 于是它一路走到循环末尾，既没内容也没报错，
+          // UI 表现成「干净地停止、无任何失败」（与 qoder 的 10605、TRAE 的流内错误
+          // 同型；`isContentRejection` 的注释也记着「同一报文在 CodeArts 侧就以
+          // HTTP 200 + 内嵌错误帧的形式出现」）。
+          //
+          // ## 判据必须**窄**：只认「没有 choices 的帧」
+          //
+          // 正文里出现「安全审核」「request illegal」甚至字面 `11140` 都是常态
+          // （模型在讨论审核策略时就会说这几个词），而**有效内容帧一定带 choices**；
+          // 加上这一层门禁，才不会因为一句正文把整个回答误判成拦截。
+          // 复用 `isContentRejection(payload)` 而非另写一套：与 HTTP 层**同一判据**，
+          // 两处各写一套正是 trae 那次缺陷的成因。
+          if (data.choices === undefined && isContentRejection(payload)) {
+            // 按定下的口径：**标记 + 如实报错**，本轮不重发（流内重发需要
+            // 「尚未产出内容」的判据 + 外层循环，是 trae 3823133 那种结构改造）。
+            // 账号标了冷却，下一轮选号就会绕开它，不再反复重撞。
+            await markPolicyBlockedAccount(
+              this.options.accountPool, this.product.id, policyBlockedAccountId, options.model,
+            )
+            throw contentRejectionError(this.product.id, 200, payload, false)
           }
           if (data.error !== undefined) {
             throw new LlmError(`buddy: ${data.error.message ?? 'unknown error'}`, 'SERVER')
