@@ -1230,11 +1230,31 @@ export class BuddyAdapter extends LlmAdapter {
         const tried = new Set<string>()
         if (currentAccountId) tried.add(currentAccountId)
 
+        // ⚠️ 限流换号途中同样会撞上安全策略拦截（11140，HTTP 403）—— 它按账号
+        // 生效、与限流无关，但**必须继续换号**而不是中断。
+        //
+        // 真实缺陷（用户报障 2026-09-28「本轮运行失败 · API 密钥无效」）：早期
+        // 实现在这里遇到非限流错误就**直接抛**。而池里 7 个 workbuddy 账号中
+        // 前 4 个恰是被 11140 拦截的坏账号、后 3 个可用，于是换号在第 1 个坏
+        // 账号处就中断，后面 3 个可用账号**永远试不到**（实测复刻：中断于
+        // #1，若不中断则 #4 即成功）。错误码取 `httpErrorCode(403)` = `AUTH`，
+        // UI 把它渲染成「API 密钥无效」，把用户引向检查密钥 —— 而 7 个 token
+        // 实测全部有效（2027-09 才过期），真实原因完全丢失。
+        //
+        // 这与认证路径（上面的 401/403 分支）必须保持同一语义：坏账号可能排在
+        // 任何位置，安全策略拦截和认证失败一样只是「这个账号不可用」。
+        let sawContentRejection = false
+        let contentRejectionStatus = 0
+        let contentRejectionBody = ''
+
         for (;;) {
+          // 记录当前账号在该模型上的限流重置时间（UI 据此展示限流标记）。
+          //
+          // 注意 `errorText` 在换号后可能是 11140（非限流）响应体，此时
+          // `parseRateLimitError` 返回 `null`：只跳过记录即可，**不能**据此
+          // break（那正是上面「换号提前中断」缺陷的另一半成因）。
           const parsed = parseRateLimitError(errorText, options.model)
-          if (!parsed) break
-          // 记录当前账号在该模型上的限流重置时间（UI 据此展示限流标记）
-          if (currentAccountId) {
+          if (parsed !== null && currentAccountId) {
             await this.options.accountPool.updateModelRateLimit(
               currentAccountId, parsed.modelId, parsed.resetTimeMs,
             )
@@ -1258,10 +1278,30 @@ export class BuddyAdapter extends LlmAdapter {
             return
           }
           errorText = await response.text().catch(() => '')
+          // ① 安全策略拦截（11140）：按账号生效，继续换号（与认证路径同语义）。
+          //    判据必须**先于**下面「非限流即抛」，否则会退回「只试一个账号」。
+          if (isContentRejection(errorText)) {
+            sawContentRejection = true
+            contentRejectionStatus = response.status
+            contentRejectionBody = errorText
+            console.warn(
+              `[${this.product.id}] 账号 ${currentAccountId || '(current)'} 被安全策略拦截`
+              + `（HTTP ${response.status}，code 11140），继续换号：${errorDetail(errorText).slice(0, 200)}`,
+            )
+            continue
+          }
+          // ② 认证类失败：该账号凭据不可用，与路径 A 一致继续换号。
+          if (response.status === 401 || response.status === 403) continue
+          // ③ 其余非限流错误：请求本身有问题，换号无益，按原错误分类抛出。
           if (!isRateLimited(errorText)) {
             // 新账号失败但不是限流：按原错误分类抛出，不要再吞成"均受限"
             throw new LlmError(`buddy: ${errorDetail(errorText)}`, httpErrorCode(response.status, errorText), { status: response.status })
           }
+          // ④ 仍是限流 → 继续下一轮（重置时间已在上方记录）。
+        }
+        // 全部候选试完：若途中撞过安全策略拦截，报专门的提示（指向账号而非内容）。
+        if (sawContentRejection) {
+          throw contentRejectionError(this.product.id, contentRejectionStatus || 403, contentRejectionBody)
         }
         throw new LlmError(`buddy: 模型 ${options.model} 所有账号均受限，请稍后再试`, 'QUOTA_EXCEEDED')
       }

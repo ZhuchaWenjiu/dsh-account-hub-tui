@@ -1770,6 +1770,142 @@ describe('BuddyAdapter 账号池限流切换', () => {
     expect(sentTokens).toEqual(['AT1', 'AT2'])
     expect(pool.recorded.map((r) => r.accountId)).toEqual(['acct-1', 'acct-2'])
   })
+
+  /**
+   * 限流换号途中撞上安全策略拦截（11140）。
+   *
+   * ## 真实缺陷（用户报障 2026-09-28「本轮运行失败 · API 密钥无效」）
+   *
+   * 适配器有**两条**换号路径，早期实现只在认证路径（首发 401/403）里识别
+   * 11140；限流路径（首发 429/6004）遇到非限流错误就**直接抛**，于是：
+   *
+   * - 池里前几个账号恰是被 11140 拦截的坏账号 → 换号在第 1 个坏账号处**中断**，
+   *   后面的可用账号永远试不到（实测复刻：中断于 #1，不中断则 #4 即成功）；
+   * - 错误码取 `httpErrorCode(403)` = `AUTH` → UI 渲染成「API 密钥无效」，
+   *   把用户引向检查密钥，而 7 个 token 实测**全部有效**（2027-09 才过期）。
+   *
+   * 修复后两条路径语义一致：11140 与 401/403 一样只是「这个账号不可用」，
+   * 继续换号；全部试完才报专门的「安全策略」提示。
+   */
+  function safetyBody(): string {
+    return JSON.stringify({
+      code: 11140,
+      msg: 'request illegal',
+      requestId: '5b2240b4-efdf-40e0-94e4-cfee1aa80585',
+      displayMsg: { zh: '内容未通过安全审核，请调整后重试。' },
+    })
+  }
+
+  it('限流换号途中撞上安全策略（11140）时继续换号，换到可用账号即成功', async () => {
+    // 复刻真实池顺序：AT1 限流 → AT2 被 11140 拦 → AT3 可用。
+    // 修复前换号在 AT2 处中断并抛 AUTH（UI 显示「API 密钥无效」）。
+    const pool = makePool(
+      { id: 'acct-1', token: 'AT1' },
+      [
+        { id: 'acct-2', token: 'AT2' },
+        { id: 'acct-3', token: 'AT3' },
+      ],
+    )
+    const sentTokens: string[] = []
+    const adapter = new BuddyAdapter({
+      credentialRef: CREDENTIAL_REF,
+      resolveCredential: async () => makeCredential({ access_token: 'AT1' }),
+      refresh: async () => {},
+      accountPool: pool as never,
+      fetchImpl: async (_url, init) => {
+        const auth = (init?.headers as Headers | undefined)?.get('Authorization') ?? ''
+        const token = auth.replace('Bearer ', '')
+        sentTokens.push(token)
+        if (token === 'AT3') {
+          return sseResponse('data: {"choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n')
+        }
+        // AT1 限流（触发限流换号路径）；AT2 安全策略拦截（HTTP 403）。
+        if (token === 'AT1') return new Response(rateLimitBody(), { status: 400 })
+        return new Response(safetyBody(), { status: 403 })
+      },
+    })
+
+    const chunks = await collectChunks(adapter, {
+      model: DEFAULT_MODEL,
+      messages: [{ role: 'user', content: 'hi' }] as never,
+      signal: new AbortController().signal,
+    } as never)
+
+    // 关键：三个账号都被试过 —— AT2 的 11140 没有中断换号。
+    expect(sentTokens).toEqual(['AT1', 'AT2', 'AT3'])
+    expect(chunks.some((c) => c.type === 'text-delta' && c.text === 'ok')).toBe(true)
+    // AT1 的限流被记录（AT2 是安全拦截，不该被记成限流）。
+    expect(pool.recorded.map((r) => r.accountId)).toEqual(['acct-1'])
+  })
+
+  it('限流换号途中撞上安全策略且全部试完：报「安全策略」而非 QUOTA_EXCEEDED', async () => {
+    // AT1 限流 → AT2 被 11140 拦 → 候选耗尽。此时真实原因是安全策略拦截
+    // （账号不可用），不是「所有账号都限流」，文案必须指向账号。
+    const pool = makePool({ id: 'acct-1', token: 'AT1' }, [{ id: 'acct-2', token: 'AT2' }])
+    const adapter = new BuddyAdapter({
+      credentialRef: CREDENTIAL_REF,
+      resolveCredential: async () => makeCredential({ access_token: 'AT1' }),
+      refresh: async () => {},
+      accountPool: pool as never,
+      fetchImpl: async (_url, init) => {
+        const auth = (init?.headers as Headers | undefined)?.get('Authorization') ?? ''
+        return auth.includes('AT1')
+          ? new Response(rateLimitBody(), { status: 400 })
+          : new Response(safetyBody(), { status: 403 })
+      },
+    })
+
+    const error = await collectChunks(adapter, {
+      model: DEFAULT_MODEL,
+      messages: [{ role: 'user', content: 'hi' }] as never,
+      signal: new AbortController().signal,
+    } as never).catch((e: unknown) => e)
+
+    expect(error).toBeInstanceOf(LlmError)
+    // 不得吞成「所有账号均受限」——那会把账号拦截误报成限流。
+    expect((error as LlmError).code).not.toBe('QUOTA_EXCEEDED')
+    expect((error as LlmError).message).toContain('安全策略')
+    expect((error as LlmError).message).toContain('账号')
+    // 不再断言「请调整内容后重试」把用户引向错误方向。
+    expect((error as LlmError).message).not.toContain('请调整内容')
+  })
+
+  it('限流换号途中遇到真正的认证失败（401）同样继续换号', async () => {
+    // 与上一条同源：限流路径此前只认「限流」，401/403 都会中断换号。
+    const pool = makePool(
+      { id: 'acct-1', token: 'AT1' },
+      [
+        { id: 'acct-2', token: 'AT2' },
+        { id: 'acct-3', token: 'AT3' },
+      ],
+    )
+    const sentTokens: string[] = []
+    const adapter = new BuddyAdapter({
+      credentialRef: CREDENTIAL_REF,
+      resolveCredential: async () => makeCredential({ access_token: 'AT1' }),
+      refresh: async () => {},
+      accountPool: pool as never,
+      fetchImpl: async (_url, init) => {
+        const auth = (init?.headers as Headers | undefined)?.get('Authorization') ?? ''
+        const token = auth.replace('Bearer ', '')
+        sentTokens.push(token)
+        if (token === 'AT3') {
+          return sseResponse('data: {"choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n')
+        }
+        if (token === 'AT1') return new Response(rateLimitBody(), { status: 400 })
+        return new Response(JSON.stringify({ error: { message: 'token expired' } }), { status: 401 })
+      },
+    })
+
+    const chunks = await collectChunks(adapter, {
+      model: DEFAULT_MODEL,
+      messages: [{ role: 'user', content: 'hi' }] as never,
+      signal: new AbortController().signal,
+    } as never)
+
+    expect(sentTokens).toEqual(['AT1', 'AT2', 'AT3'])
+    expect(chunks.some((c) => c.type === 'text-delta' && c.text === 'ok')).toBe(true)
+  })
 })
 
 /** 端点常量供测试断言引用（避免硬编码字符串漂移）。 */
