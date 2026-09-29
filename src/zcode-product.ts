@@ -5,24 +5,27 @@
  *
  * `BuddyProduct` / `QoderProduct` / `RaccoonProduct` 的字段全部围绕各自
  * 的远端协议设计（归属头、refresh 载荷、WASM 签名、加密密钥…），
- * 对 ZCode 无一有意义。ZCode 需要的是：一个**本机桥地址**、
- * 一个连接超时、一张兜底模型表。故定义**平行**的接口 ——
- * 共用的是架构**模式**（产品差异收敛到单一真相源），不是那个类型。
+ * 对 ZCode 无一有意义。ZCode 需要的是：一个上游 origin、若干超时、
+ * 一张兜底模型表。故定义**平行**的接口 —— 共用的是架构**模式**
+ * （产品差异收敛到单一真相源），不是那个类型。
  *
  * ## 数据来源（全部实测，非推测）
  *
- * - 模型池：2026-09-28 实测 `GET http://127.0.0.1:<port>/v1/models`
- * - 上游模型清单：服务端有 4 个（GLM-5-Turbo / GLM-5.2 / GLM-5.3 /
- *   GLM-5.3-Flash），但**前两个在当前套餐下返回空响应**（实测 0/3 正确），
- *   故**只暴露后两个** —— 列一个用不了的模型比不列更糟。
- * - 上下文窗口与输出上限：来自插件的既有实测（`LATENCY-FINDINGS.md`）。
+ * - 模型池：`GET /api/v1/client/configs` 的 `offPeak.allowed_models`
+ *   与 `startPlanPreview.entitlements`；另经真实推理验证。
+ * - 上游清单里有 4 个（`GLM-5-Turbo` / `GLM-5.2` / `GLM-5.3` /
+ *   `GLM-5.3-Flash`），但**前两个在 Start Plan 下返回空响应**
+ *   （实测 0/3 正确，而 GLM-5.3 是 3/3），故**只暴露后两个**
+ *   —— 列一个用不了的模型比不列更糟。
+ * - `GLM-5.3-Flash` 实测可用（本机账号 1 亿 token 额度，端到端 200）。
  */
 
 import type { ZcodeCredential } from './zcode.js'
+import { ZCODE_APP_VERSION_FALLBACK } from './zcode.js'
 
 /** 兜底模型目录中的一个条目。 */
 export interface ZcodeFallbackModel {
-  /** 模型 ID（传给桥的 `model` 字段）。 */
+  /** 模型 ID（传给上游 `model` 字段）。 */
   id: string
   /** 展示名。 */
   name: string
@@ -32,6 +35,21 @@ export interface ZcodeFallbackModel {
   maxTokens: number
   /** 是否支持图片输入。 */
   supportsImage: boolean
+  /**
+   * 可选的思考档位（**按展示顺序**）。
+   *
+   * ⚠ 取自上游 `client/configs` 的 `builtinModels[].reasoning.levels` 的**键序**。
+   * 缺省 / 空数组表示「不声明档位」—— DSH 会显示
+   * 「当前模型未提供推理等级」（对应 IDE 的「不支持」）。
+   */
+  reasoningLevels?: readonly string[]
+  /**
+   * 默认档位。
+   *
+   * ⚠ 取自上游 `reasoning.defaultLevel`，且**必须落在 `reasoningLevels` 内** ——
+   * 否则 DSH 的档位选择器会指向一个不存在的选项（qoder 那边就是这么规定的）。
+   */
+  defaultReasoningLevel?: string
 }
 
 /** ZCode 产品配置。 */
@@ -46,6 +64,14 @@ export interface ZcodeProduct {
   requestTimeoutMs: number
   /** 远端模型列表不可用时的兜底目录。 */
   fallbackModels: readonly ZcodeFallbackModel[]
+  /**
+   * 客户端版本的兜底值（用于 `X-ZCode-App-Version` 等头）。
+   *
+   * 实际值优先由 `detectZcodeAppVersion()` 从已安装的官方客户端探测；
+   * 探测不到时用这个 —— **不让版本探测失败连带让 provider 不可用**
+   * （版本只是一个头）。
+   */
+  appVersionFallback: string
 }
 
 /**
@@ -65,42 +91,110 @@ export interface ZcodeProduct {
  *
  * ⇒ GLM-5.3 略快但略不准，且并发配额严得多。默认放 Flash（更稳）。
  * 样本量偏小（n≈15），所以两个都列出来让用户自己选。
+ *
+ * ## ⚠ 图片能力：**支持**（曾经误标为 `false`）
+ *
+ * 早先两个模型都标 `supportsImage: false`，理由是「该通道图片链路未验证」。
+ * **那是个错误结论** —— 用户实测在 ZCode IDE 里用 `GLM-5.3-Flash`
+ * 发图片能**正确理解**（描述出了一张足球截图里的拉拽犯规、箭头标注、
+ * bilibili 水印等细节）。
+ *
+ * 逆向官方 agent 拿到了它序列化图片的确切形态（见
+ * `zcode-anthropic.ts` 的 `toImageBlock`），与我们的实现一致 ——
+ * 所以之前失败的原因是**适配器里那个「显式拒绝图片」的守卫**，
+ * 而不是通道不支持。守卫已删除。
+ *
+ * ⚠ 标 `true` 就必须**真支持**：DSH 按适配器播报的 `inputModalities`
+ * 决定是否把图片原样送进来（否则投影成文本占位符）。两边必须一致。
+ *
+ * ## ⚠⚠ 上下文窗口 / 最大输出 / 思考档位：**全部照上游 `client/configs` 抄**
+ *
+ * **真实缺陷（用户报障）**：模型配置页里上下文窗口显示 **1,000,000**、
+ * 最大输出 **128,000**，而模型选择器里**没有任何思考档位可选** ——
+ * 尽管 ZCode IDE 里可以设置（截图见用户反馈）。
+ *
+ * 上游 `GET /api/v1/client/configs` 的 `builtinModels` 是**权威来源**，
+ * 实测（2026-09-29）逐字如下：
+ *
+ * | 字段 | GLM-5.3 | GLM-5.3-Flash |
+ * |---|---|---|
+ * | `contextWindow` | **1000000** | **1000000** |
+ * | `maxCompletionTokens` | **128000** | **128000** |
+ * | `capabilities.vision` | **（无）** | **true** |
+ * | `reasoning.levels` | `low` / `high` / `max` | 同 |
+ * | `reasoning.defaultLevel` | **max** | **max** |
+ * | `modalities.input` | （无） | `text` / `image` / `video` |
+ *
+ * ⚠ 我此前填的 `200_000` / `32_768` **都是错的**（凭空估的），
+ * 且把两个模型都标了 `supportsImage: true` —— 但**上游说只有 Flash 有 vision**。
+ * 教训：能力字段必须抄上游，不能按「同族应该一样」推断。
+ *
+ * ⚠ **档位协议是 `output_config.effort`**（不是 `reasoning_effort`）——
+ * 每个档位在 `reasoning.levels[level].anthropic.set` 里给出确切写法：
+ *
+ * ```json
+ * { "path": ["output_config", "effort"], "value": "low" | "high" | "max" }
+ * ```
  */
 const ZCODE_FALLBACK_MODELS: readonly ZcodeFallbackModel[] = [
   {
     id: 'GLM-5.3-Flash',
     name: 'GLM-5.3-Flash',
-    contextWindow: 200_000,
-    maxTokens: 32_768,
-    supportsImage: false,
+    // 上游值（client/configs 的 builtinModels）。
+    contextWindow: 1_000_000,
+    maxTokens: 128_000,
+    // 上游 capabilities.vision === true。
+    supportsImage: true,
+    // 上游 reasoning.levels 的顺序即展示顺序（low → high → max）。
+    reasoningLevels: ['low', 'high', 'max'],
+    // 上游 reasoning.defaultLevel。
+    defaultReasoningLevel: 'max',
   },
   {
     id: 'GLM-5.3',
     name: 'GLM-5.3',
-    contextWindow: 200_000,
-    maxTokens: 32_768,
+    contextWindow: 1_000_000,
+    maxTokens: 128_000,
+    /**
+     * ⚠ **上游 `capabilities` 是空对象** ⇒ 这个模型**没有 vision**。
+     * 我此前按「同族应该一样」推断成 `true` —— 那是错的。
+     */
     supportsImage: false,
+    reasoningLevels: ['low', 'high', 'max'],
+    defaultReasoningLevel: 'max',
   },
 ]
 
 /** ZCode provider 配置。 */
 export const ZCODE: ZcodeProduct = {
   id: 'zcode',
-  // ⚠ 用『ZCode (智谱)』而非『ZCode Bridge (GLM free)』—— 后者在 Jet Hub 的
-  // provider Tab 里**触发换行**（与 Raccoon 同样的用户报障）。
+  // ⚠ 用『ZCode (智谱)』而非长名 —— 后者在 Jet Hub 的 provider Tab 里
+  // **触发换行**（与 Raccoon 同样的用户报障）。
   // 与 `plugin-src/client/jet-hub.js` 的 `PROVIDERS` label 保持一致。
   displayName: 'ZCode (智谱)',
-  defaultCredentialRef: 'ZCODE_BRIDGE_TOKEN',
   /**
-   * 桥的请求超时。
+   * 单凭据回退 ref。
    *
-   * ⚠ 取值明显高于其它 provider（它们多为 120s）。理由：
-   * 实测单请求耗时 1.3-33 秒，**中位约 4-6 秒**，但长尾能到 30 秒以上；
-   * 而多步 agent 的每一步都是一次独立请求。给 180s 是为了包住长尾，
-   * 不是为了让正常请求等那么久（正常请求 5 秒内就回来了）。
+   * ⚠ ZCode 正常**不需要**用户填任何东西 —— 凭据从官方
+   * `~/.zcode/v2/credentials.json` 自动解密读取（见 `zcode.ts`）。
+   * 这个 ref 只用于「账号池里没有任何 zcode 账号」时的兜底路径，
+   * 内容为 `ZcodeCredential` 的 JSON。
+   */
+  defaultCredentialRef: 'ZCODE_CREDENTIAL',
+  /**
+   * 单次推理请求的超时。
+   *
+   * ⚠ 取值明显高于其它 provider（它们多为 120s）。理由：实测免费通道
+   * 单请求 **3-30 秒**（本机 GLM-5.3-Flash 实测 2.99 秒），长尾来自
+   * 上游限流重试 + 思考链；而多步 agent 的每一步都是一次独立请求。
+   * 给 180s 是为了包住长尾，不是为了让正常请求等那么久。
+   *
+   * ⚠ 不含 captcha 产出时间（那由 `zcode-captcha.ts` 自己的超时管，
+   * 实测每次约 1.2 秒）。
    */
   requestTimeoutMs: 180_000,
   fallbackModels: ZCODE_FALLBACK_MODELS,
+  appVersionFallback: ZCODE_APP_VERSION_FALLBACK,
 }
 
 /** 全部 ZCode 产品配置（当前只有一个，保留数组以便将来扩展）。 */
@@ -127,10 +221,21 @@ export type { ZcodeCredential }
  * 两者当前字段相同，但**语义不同** —— 将来远端可能多出字段
  * （例如倍率、能力标记），那时不该被迫改兜底表。
  */
+/**
+ * 远端模型条目的**结构子集**（`fetchModels()` 的返回形状）。
+ *
+ * ⚠ 字段与上游 `client/configs` 的 `builtinModels[]` 一一对应 ——
+ * 不要只挑「当前用得上的」几个：`reasoningLevels` / `defaultReasoningLevel`
+ * 是思考档位选择器的唯一来源（漏了它选择器就不出现，qoder 那边踩过同型坑）。
+ */
 export interface ZcodeRemoteModelLike {
   id: string
   name: string
   contextWindow: number
   maxTokens: number
   supportsImage: boolean
+  /** 思考档位（键序即展示顺序）；空/缺省表示不声明。 */
+  reasoningLevels?: readonly string[]
+  /** 默认档位（必须落在 `reasoningLevels` 内）。 */
+  defaultReasoningLevel?: string
 }

@@ -1,218 +1,421 @@
 /**
- * ZCode（智谱 z.ai 免费额度通道）常量与凭据形态。
+ * ZCode 凭据读取（**纯 Node，不需要 ZCode 实例运行**）。
  *
- * ## 为什么单独一套 `ZcodeProduct`
+ * ## 为什么不再用「本机 HTTP 桥」
  *
- * 与既有各族都不同源：ZCode 走的是**本机 ZCode 实例的 HTTP 桥**，
- * 不是「读凭据 → 直发远端」。请求由本机那个 Electron 实例代发
- * （captcha 与风控由它自己处理），所以 `BuddyProduct` /
- * `QoderProduct` / `RaccoonProduct` 的字段对它全无意义。
+ * PR #17 初版的设计是「读 `<dataBaseDir>/.zcode/v2/bridge-port.json` → 打本机桥
+ * → 由 ZCode 实例代发上游」。那条路有一个致命的可用性问题（实测）：
  *
- * 这里只放**与协议有关**的常量；产品配置在 `zcode-product.ts`。
+ * **它依赖一个被补丁注入过的开源版实例。** 官方闭源版
+ * （`%LOCALAPPDATA%\Programs\ZCode\ZCode.exe`）**不写** `bridge-port.json`
+ * —— 故「装了 ZCode」并不等于「桥可用」。而现实中用户装的正是官方版。
  *
- * ## 桥的发现方式
+ * 更关键的是，上游准入**并不真的需要 Electron**：
  *
- * ZCode 实例启动时把端口与 token 写进一个 JSON 文件：
+ * - captcha 是阿里云的**网页 SDK**（`o.alicdn.com/captcha-frontend/...`），
+ *   只需「一个有 DOM 的浏览器」—— 不需要 ZCode 那个壳；
+ * - 3012 的判据是**请求体内容**（system 身份块 + 首轮 user 的
+ *   `<system-reminder>` 日期块），与运行时无关 —— 上游实测 curl 同样 200。
  *
- * ```
- * <dataBaseDir>/.zcode/v2/bridge-port.json
- * { "port": 53297, "token": "<48位hex>", "models": ["GLM-5.3", ...] }
- * ```
+ * 而凭据本身就躺在磁盘上，官方用一套**公开可复现**的算法加密：
+ * `enc:v1:` + AES-256-GCM + `sha256(secret)` 密钥，secret 缺省由
+ * `平台 + 家目录 + 用户名` 派生。故纯 Node 即可解密（实测 7 个键全部成功）。
  *
- * ⚠ **端口每次重启都变**，所以必须**每次读文件**，
- * 不能把端口写进配置或缓存太久。
+ * ## 与 `AGENTS.md` 既有约定一致
  *
- * ## 多候选目录探测
- *
- * `<dataBaseDir>` 的取值随安装方式而异（用户主目录 / 自定义数据目录 /
- * 环境变量指定）。`AGENTS.md` 记过一条真实的坑：
- * **launcher 的环境块可能几天没更新**，子进程继承不到新值。
- * 所以这里按「**文件实际在哪**」这个事实做候选探测，
- * 而不是只信环境变量。
+ * 「靠『文件实际在哪』这个事实探测，比靠『进程记得什么』可靠」——
+ * 这里读的是**磁盘上的凭据文件**，不依赖任何进程是否在跑。
  */
 
-import { readFileSync, existsSync, readdirSync } from 'node:fs'
-import { homedir } from 'node:os'
+import { createDecipheriv, createHash } from 'node:crypto'
+import { existsSync, readFileSync } from 'node:fs'
+import { homedir, platform, userInfo } from 'node:os'
 import { join } from 'node:path'
 
-/** 桥的发现文件相对于数据目录的路径。 */
-export const BRIDGE_DISCOVERY_RELATIVE = '.zcode/v2/bridge-port.json'
+/** 密文前缀；无此前缀的值视为明文（官方实现同样如此）。 */
+export const CREDENTIAL_PREFIX = 'enc:v1:'
 
-/** ZCode 免费额度通道的 provider 前缀（账号级，非内置）。 */
-export const ZCODE_START_PLAN_PROVIDER = 'account:bigmodel-start-plan'
+/** 加密算法（官方 `createCredentialCipherProvider`）。 */
+const CREDENTIAL_ALGO = 'aes-256-gcm'
+
+/** IV 长度（字节）。 */
+const CREDENTIAL_IV_LEN = 12
+
+/** AuthTag 长度（字节）。 */
+const CREDENTIAL_TAG_LEN = 16
+
+/** 覆盖密钥的环境变量（官方同名）。 */
+export const CREDENTIAL_SECRET_ENV = 'ZCODE_CREDENTIAL_SECRET'
 
 /**
- * 候选数据目录（按优先级）。
+ * `credentials.json` 的候选位置（按优先级）。
  *
- * ## ★ 一个真实踩到的坑（决定了本函数的最终形态）
- *
- * 第一版只查「环境变量 + 用户主目录」。**对着真桥跑时找不到它**，
- * 尽管实例明明在运行：
- *
- * ```
- * ZCODE_DATA_BASE_DIR = (空)     ← launcher 的环境块里没有它
- * 桥实际在             D:\zcode-glm5.3f\_oss_data\.zcode\v2\bridge-port.json
- * ```
- *
- * 这正是 `AGENTS.md` 记过的那类问题：
- * **「靠『文件实际在哪』这个事实做候选探测，
- * 比靠『进程记得什么』可靠」** —— 只信环境变量会全盘找不到，
- * 而失败形态是「provider 静默没有模型」，用户完全不知道原因。
- *
- * ⇒ 所以除了环境变量，还必须**按盘符扫一遍**。
+ * ⚠ 与初版 `bridgeDiscoveryCandidates()` 的区别：**不再扫盘**。
+ * 初版为找 `bridge-port.json` 会遍历每个盘符的顶层目录（实测 82 个候选、
+ * 每次请求约 3ms），因为发现文件可能落在自定义路径（`<项目>\_oss_data`）。
+ * 而 `credentials.json` 的位置由**官方固定**：写在
+ * `<dataBaseDir>/.zcode/v2/` 下，默认 `dataBaseDir` 就是家目录。
+ * 故只需少量确定候选 —— 这让「每次请求重读」的成本可忽略。
  */
-export function bridgeDiscoveryCandidates(): readonly string[] {
+export function credentialFileCandidates(): readonly string[] {
   const out: string[] = []
-  const push = (p: string): void => {
-    if (!out.includes(p)) out.push(p)
+  const push = (dir: string | undefined): void => {
+    if (typeof dir !== 'string' || dir.trim().length === 0) return
+    const candidate = join(dir.trim(), '.zcode', 'v2', 'credentials.json')
+    if (!out.includes(candidate)) out.push(candidate)
   }
 
-  /** ① 环境变量（标准安装方式）；支持 `;` 分隔的多数据目录。 */
+  // ① 显式数据根目录（支持 `;` 分隔多目录）—— 官方读同一个变量。
   const fromEnv = process.env.ZCODE_DATA_BASE_DIR
   if (typeof fromEnv === 'string' && fromEnv.trim().length > 0) {
-    for (const dir of fromEnv.split(';')) {
-      const trimmed = dir.trim()
-      if (trimmed.length > 0) push(join(trimmed, BRIDGE_DISCOVERY_RELATIVE))
-    }
+    for (const dir of fromEnv.split(';')) push(dir)
   }
+
+  // ② 家目录（官方默认：dataBaseDir = homedir，其下有 .zcode）。
+  push(homedir())
 
   /**
-   * ② 显式声明的已知数据目录（`;` 分隔）。
+   * ③ `%APPDATA%` / `%LOCALAPPDATA%`。
    *
-   * 给「环境块过期、但你知道装在哪」的场景用 —— 比扫描更快更确定。
+   * 实测本机凭据在 `~/.zcode/v2/`，但官方部分安装形态用
+   * `%APPDATA%\ZCode` 作 userData —— 两个都试，代价只是一次 stat。
    */
-  const known = process.env.ZCODE_BRIDGE_KNOWN_DATA_DIRS
-  if (typeof known === 'string' && known.trim().length > 0) {
-    for (const dir of known.split(';')) {
-      const trimmed = dir.trim()
-      if (trimmed.length > 0) push(join(trimmed, BRIDGE_DISCOVERY_RELATIVE))
-    }
-  }
-
-  /** ③ 用户主目录下的标准位置（默认安装）。 */
-  push(join(homedir(), BRIDGE_DISCOVERY_RELATIVE))
-  push(join(homedir(), '.zcode', 'v2', 'bridge-port.json'))
-
-  /**
-   * ④ **扫描常见根目录下的两级目录**（最后手段）。
-   *
-   * 为什么非要它：本机的部署方式把数据目录放在一个**自定义路径**
-   *（`<项目目录>\_oss_data`），那个路径既不在环境变量、也不在主目录下，
-   * 前三类候选**全部落空**。
-   *
-   * 扫描范围刻意收紧（只下两级、只找这个特定文件名），
-   * 且用 `existsSync` 粗筛 —— 它是兜底，慢一点可以接受，
-   * 但「找不到桥」不可接受。
-   */
-  for (const root of scanRoots()) {
-    push(join(root, '\\_oss_data', '.zcode', 'v2', 'bridge-port.json'))
-    push(join(root, '_oss_data', '.zcode', 'v2', 'bridge-port.json'))
-  }
+  push(process.env.APPDATA)
+  push(process.env.LOCALAPPDATA)
 
   return out
 }
 
-/**
- * 扫描根目录（只返回**已存在**的目录，避免大量无效候选）。
- */
-function scanRoots(): readonly string[] {
-  const roots: string[] = []
-  if (process.platform === 'win32') {
-    for (const drive of ['C', 'D', 'E', 'F', 'G', 'H']) {
-      const base = `${drive}:\\`
-      if (!existsSync(base)) continue
-      try {
-        for (const entry of readdirSync(base, { withFileTypes: true })) {
-          if (!entry.isDirectory()) continue
-          // 跳过系统目录 —— 它们不可能放 ZCode 数据
-          if (/^\$|^Windows$|^Program Files|^ProgramData|^System Volume|^Recovery/i.test(entry.name)) {
-            continue
-          }
-          roots.push(join(base, entry.name))
-        }
-      } catch {
-        /* 无权限的盘符跳过 */
-      }
-    }
-  } else {
-    for (const base of ['/opt', '/srv', join(homedir(), 'projects')]) {
-      if (!existsSync(base)) continue
-      try {
-        for (const entry of readdirSync(base, { withFileTypes: true })) {
-          if (entry.isDirectory()) roots.push(join(base, entry.name))
-        }
-      } catch {
-        /* 忽略 */
-      }
+/** 定位实际存在的凭据文件；都找不到时返回首选路径（供报错信息用）。 */
+export function resolveCredentialFilePath(): string {
+  const candidates = credentialFileCandidates()
+  for (const path of candidates) {
+    try {
+      if (existsSync(path)) return path
+    } catch {
+      // 权限/路径异常视为该候选不可用。
     }
   }
-  return roots
+  return candidates[0] ?? join(homedir(), '.zcode', 'v2', 'credentials.json')
 }
 
-/** 桥的发现信息。 */
-export interface BridgeDiscovery {
-  /** 监听端口。 */
-  port: number
-  /** 访问令牌（`Authorization: Bearer <token>`）。 */
-  token: string
-  /** 桥自报可用的模型 id。 */
-  models: readonly string[]
-  /** 发现文件的实际路径（诊断用）。 */
-  sourcePath: string
+/** 读磁盘上的原始凭据表（`键 → 密文或明文`）。失败返回 undefined。 */
+export function readRawCredentials(
+  filePath: string = resolveCredentialFilePath(),
+): Record<string, string> | undefined {
+  try {
+    if (!existsSync(filePath)) return undefined
+    const parsed = JSON.parse(readFileSync(filePath, 'utf8')) as unknown
+    if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) return undefined
+    const out: Record<string, string> = {}
+    for (const [key, value] of Object.entries(parsed as Record<string, unknown>)) {
+      if (typeof value === 'string') out[key] = value
+    }
+    return out
+  } catch {
+    return undefined
+  }
 }
 
 /**
- * 读取桥的发现信息。
+ * 派生解密密钥（官方 `defaultCredentialSecret` + `deriveCipherKey`）。
  *
- * 返回 `undefined` 表示**没找到**（ZCode 实例没跑，或数据目录不对）。
- * **不抛错** —— 调用方（`listModels`）需要的是「返回空数组」这一语义，
- * 抛错会在 DSH 界面上多一条 provider 失败记录。
+ * ⚠ 逐字复刻官方算法，**不要"规范化"**：
+ * - 平台用 `process.platform` 原值（`win32` / `darwin` / `linux`）
+ * - 用户名取值失败时回落**字面量** `unknown`
+ * - 三段用 `:` 连接，前缀是 `zcode-credential-fallback`
+ *
+ * 任一处不同都会解出垃圾（GCM 认证失败），表现为「凭据读不出来」。
  */
-export function readBridgeDiscovery(): BridgeDiscovery | undefined {
-  for (const candidate of bridgeDiscoveryCandidates()) {
-    if (!existsSync(candidate)) continue
+export function deriveCredentialKey(env: NodeJS.ProcessEnv = process.env): Buffer {
+  const explicit = env[CREDENTIAL_SECRET_ENV]
+  if (typeof explicit === 'string' && explicit.length > 0) {
+    return createHash('sha256').update(explicit).digest()
+  }
+  let username = 'unknown'
+  try {
+    username = userInfo().username
+  } catch {
+    // 官方同样吞掉异常并回落 "unknown"。
+  }
+  const secret = `zcode-credential-fallback:${platform()}:${homedir()}:${username}`
+  return createHash('sha256').update(secret).digest()
+}
+
+/**
+ * 解密一个凭据值。
+ *
+ * 无 `enc:v1:` 前缀时**原样返回**（官方 `decrypt()` 行为）——
+ * 这让该函数对「用户手工填入明文」也成立。
+ *
+ * @throws 密文格式非法 / 密钥不匹配 / GCM 认证失败
+ */
+export function decryptCredentialValue(
+  value: string,
+  env: NodeJS.ProcessEnv = process.env,
+): string {
+  if (!value.startsWith(CREDENTIAL_PREFIX)) return value
+  const parts = value.slice(CREDENTIAL_PREFIX.length).split('.')
+  if (parts.length !== 3) throw new Error('凭据密文格式非法（应为 iv.tag.data 三段）')
+  const [ivPart, tagPart, dataPart] = parts as [string, string, string]
+  if (ivPart.length === 0 || tagPart.length === 0 || dataPart.length === 0) {
+    throw new Error('凭据密文格式非法（存在空段）')
+  }
+  const iv = Buffer.from(ivPart, 'base64url')
+  const tag = Buffer.from(tagPart, 'base64url')
+  const data = Buffer.from(dataPart, 'base64url')
+  if (iv.length !== CREDENTIAL_IV_LEN) {
+    throw new Error(`凭据 IV 长度非法（${iv.length} ≠ ${CREDENTIAL_IV_LEN}）`)
+  }
+  if (tag.length !== CREDENTIAL_TAG_LEN) {
+    throw new Error(`凭据 AuthTag 长度非法（${tag.length} ≠ ${CREDENTIAL_TAG_LEN}）`)
+  }
+  const decipher = createDecipheriv(CREDENTIAL_ALGO, deriveCredentialKey(env), iv)
+  decipher.setAuthTag(tag)
+  try {
+    return Buffer.concat([decipher.update(data), decipher.final()]).toString('utf8')
+  } catch (error) {
+    throw new Error(
+      `凭据解密失败（密钥不匹配或密文损坏）：${error instanceof Error ? error.message : String(error)}`,
+    )
+  }
+}
+
+/**
+ * ZCode 账号凭据（全部来自磁盘解密，**不需要实例在跑**）。
+ *
+ * ⚠ 与初版 `ZcodeCredential`（`{bridge_token, bridge_port}`）**完全不同**：
+ * 那个描述「本机桥的访问信息」，这个描述「上游账号身份」。
+ */
+export interface ZcodeCredential {
+  /** ZCode JWT（`zcodejwttoken`）—— 免费额度通道的 `Authorization: Bearer`。 */
+  zcode_jwt: string
+  /**
+   * 设备标识（`~/.zcode/v2/telemetry-state.json` 的 `deviceMid`）。
+   *
+   * ⚠ **必需**：`billing/balance` 等端点缺它会返回
+   * `400 {"code":3001,"msg":"parameter error"}`（实测）。
+   */
+  device_mid: string
+  /** 大模型 access token（`oauth:bigmodel:access_token`），备用身份。 */
+  bigmodel_access_token?: string
+  /** Coding Plan api-key（zai 侧），仅 ultra 通道需要。 */
+  coding_plan_key_zai?: string
+  /** Coding Plan api-key（bigmodel 侧），仅 ultra 通道需要。 */
+  coding_plan_key_bigmodel?: string
+  /** 展示用标签（脱敏手机号 / 用户名 / 设备码）。 */
+  account_label?: string
+  /** 客户端版本，随请求头下发。 */
+  app_version?: string
+  /**
+   * 凭据来源。
+   *
+   * - `plugin` = 用户在 Jet Hub 里**插件内登录**拿到的（无需官方客户端）
+   * - `ide`    = 解密自官方客户端的 `~/.zcode/v2/credentials.json`
+   *
+   * 仅用于展示与排查，不参与鉴权。
+   */
+  source?: 'plugin' | 'ide'
+  /** 不可续期（静态凭据；失效需用户重新登录 ZCode）。 */
+  refresh_token?: undefined
+}
+
+/** 凭据键的匹配片段（官方键名很长且含 uuid，故用片段匹配）。 */
+const KEY_FRAGMENTS = {
+  jwt: 'zcodejwttoken',
+  bigmodelAccess: 'oauth:bigmodel:access_token',
+  codingPlanZai: 'zai-individual-coding-plan',
+  codingPlanBigmodel: 'bigmodel-individual-coding-plan',
+  userInfo: 'oauth:bigmodel:user_info',
+} as const
+
+/** 在凭据表里按键名**片段**查找并解密。 */
+function pickCredential(
+  table: Record<string, string>,
+  fragment: string,
+  env: NodeJS.ProcessEnv,
+): string | undefined {
+  for (const [key, value] of Object.entries(table)) {
+    if (!key.includes(fragment)) continue
     try {
-      const raw = readFileSync(candidate, 'utf8')
-      const parsed = JSON.parse(raw) as {
-        port?: unknown
-        token?: unknown
-        models?: unknown
-      }
-      const port = typeof parsed.port === 'number' ? parsed.port : Number(parsed.port)
-      if (!Number.isSafeInteger(port) || port <= 0 || port > 65_535) continue
-      if (typeof parsed.token !== 'string' || parsed.token.length === 0) continue
-      const models = Array.isArray(parsed.models)
-        ? parsed.models.filter((m): m is string => typeof m === 'string')
-        : []
-      return { port, token: parsed.token, models, sourcePath: candidate }
+      const plain = decryptCredentialValue(value, env)
+      if (plain.length > 0) return plain
     } catch {
-      // 文件正在被写入 / 格式损坏 —— 试下一个候选，不抛错。
+      // 单个键解不开不影响其它键（例如某键用了不同的 secret）。
     }
   }
   return undefined
 }
 
-/** ZCode 凭据（存的是桥的访问信息，不是远端 token）。 */
-export interface ZcodeCredential {
-  /** 桥的访问令牌。 */
-  bridge_token: string
-  /** 上次观察到的端口（仅记录用；**实际请求必须重读文件**）。 */
-  bridge_port: number
-  /** 账号标识（显示用）。 */
-  account_label?: string
-  /** 不可续期（桥的 token 由实例自己管理）。 */
-  refresh_token?: undefined
+/** 从 userInfo 里提取展示名（手机号末 4 位 / 用户名 / id 末 6 位）。 */
+export function labelFromUserInfo(raw: string | undefined): string | undefined {
+  if (raw === undefined) return undefined
+  try {
+    const info = JSON.parse(raw) as Record<string, unknown>
+    for (const field of ['phone', 'mobile', 'name', 'nickname', 'email']) {
+      const value = info[field]
+      if (typeof value === 'string' && value.trim().length > 0) {
+        const text = value.trim()
+        // 手机号只留末 4 位（与其余 provider 的脱敏惯例一致）。
+        if (/^\d{7,}$/.test(text)) return `尾号${text.slice(-4)}`
+        return text.length > 24 ? text.slice(0, 24) : text
+      }
+    }
+    const id = info['id'] ?? info['userId']
+    if (typeof id === 'string' && id.length >= 6) return `id:${id.slice(-6)}`
+  } catch {
+    // userInfo 不是 JSON —— 忽略。
+  }
+  return undefined
+}
+
+/** `telemetry-state.json` 的候选位置（与凭据同目录，故同形）。 */
+function telemetryFileCandidates(): readonly string[] {
+  const out: string[] = []
+  const push = (dir: string | undefined): void => {
+    if (typeof dir !== 'string' || dir.trim().length === 0) return
+    const candidate = join(dir.trim(), '.zcode', 'v2', 'telemetry-state.json')
+    if (!out.includes(candidate)) out.push(candidate)
+  }
+  const fromEnv = process.env.ZCODE_DATA_BASE_DIR
+  if (typeof fromEnv === 'string') for (const dir of fromEnv.split(';')) push(dir)
+  push(homedir())
+  push(process.env.APPDATA)
+  return out
 }
 
 /**
- * 凭据是否过期。
+ * 读设备标识。
  *
- * ⚠ **恒为 `false`**：ZCode 的凭据是「本机桥是否活着」，
- * 而不是一个有有效期的远端 token。端口与 token 随实例重启变化，
- * 那个变化由**每次重读发现文件**处理，不是「续期」。
+ * ⚠ 缺它时上游对 `billing/*` 与推理端点一律回
+ * `400 code 3001 parameter error`（实测）—— 故它是**准入门槛的一部分**。
+ */
+export function readDeviceMid(): string | undefined {
+  for (const path of telemetryFileCandidates()) {
+    try {
+      if (!existsSync(path)) continue
+      const parsed = JSON.parse(readFileSync(path, 'utf8')) as { deviceMid?: unknown }
+      if (typeof parsed.deviceMid === 'string' && parsed.deviceMid.trim().length > 0) {
+        return parsed.deviceMid.trim()
+      }
+    } catch {
+      // 换个候选。
+    }
+  }
+  return undefined
+}
+
+/** 兜底的客户端版本（探测失败时用）。 */
+export const ZCODE_APP_VERSION_FALLBACK = '3.14.3'
+
+/**
+ * 探测已安装的 ZCode 客户端版本。
  *
- * 保留这个函数是为了让适配器可以无条件调用它（与其它 provider 同形），
- * 而不是让调用方到处写 `provider === 'zcode'` 的特例。
+ * 为什么需要：请求头 `X-ZCode-App-Version` 与实际安装版本一致更自然。
+ * 取不到时用兜底值 —— **不让版本探测失败连带让 provider 不可用**
+ * （版本只是一个头，不该成为硬依赖）。
+ */
+export function detectZcodeAppVersion(): string {
+  const roots = [
+    join(process.env.LOCALAPPDATA ?? '', 'Programs', 'ZCode'),
+    join(process.env.PROGRAMFILES ?? '', 'ZCode'),
+    join(process.env['PROGRAMFILES(X86)'] ?? '', 'ZCode'),
+  ]
+  for (const root of roots) {
+    try {
+      if (!existsSync(join(root, 'ZCode.exe'))) continue
+      const manifest = join(root, '.zcode-install-manifest')
+      if (!existsSync(manifest)) continue
+      const match = readFileSync(manifest, 'utf8').match(/"version"\s*:\s*"(\d+\.\d+\.\d+)"/)
+      if (match?.[1] !== undefined) return match[1]
+    } catch {
+      // 忽略，试下一个候选。
+    }
+  }
+  return ZCODE_APP_VERSION_FALLBACK
+}
+
+/**
+ * 读取**可用**的 ZCode 凭据（来源：官方客户端的凭据文件）。
+ *
+ * 返回 `undefined` 表示**没有可用的 ZCode 登录态**（凭据文件不存在、
+ * 解不开、或缺关键字段）—— 调用方据此让 provider 整体隐藏，
+ * 而不是抛错（抛错会在 DSH 界面上多一条 provider 失败记录）。
+ *
+ * ⚠ 这是**回退路径**。优先路径是 `ctx.credentials` 里的插件自存凭据
+ * （见 `ZcodeAuth.current()`）—— 那条路让用户不必安装官方客户端。
+ */
+export function readZcodeCredential(
+  env: NodeJS.ProcessEnv = process.env,
+  filePath?: string,
+): ZcodeCredential | undefined {
+  const table = readRawCredentials(filePath)
+  if (table === undefined) return undefined
+
+  const jwt = pickCredential(table, KEY_FRAGMENTS.jwt, env)
+  if (jwt === undefined) return undefined
+
+  const deviceMid = readDeviceMid()
+  if (deviceMid === undefined) return undefined
+
+  const userInfo = pickCredential(table, KEY_FRAGMENTS.userInfo, env)
+  return {
+    zcode_jwt: jwt,
+    device_mid: deviceMid,
+    bigmodel_access_token: pickCredential(table, KEY_FRAGMENTS.bigmodelAccess, env),
+    coding_plan_key_zai: pickCredential(table, KEY_FRAGMENTS.codingPlanZai, env),
+    coding_plan_key_bigmodel: pickCredential(table, KEY_FRAGMENTS.codingPlanBigmodel, env),
+    account_label: labelFromUserInfo(userInfo) ?? `设备${deviceMid.slice(0, 8)}`,
+    app_version: detectZcodeAppVersion(),
+    // 标记来源，便于 UI 与排查区分「插件登录」与「读官方客户端」。
+    source: 'ide',
+  }
+}
+
+/**
+ * 从两个来源里挑一个可用凭据。
+ *
+ * 优先级：**插件自存 > 官方客户端凭据文件**。
+ *
+ * ## 为什么插件自存优先
+ *
+ * 「插件内登录」的目标是让用户**不装 ZCode 客户端也能用**。
+ * 若反过来（官方优先），一个用户在插件里登录后，只要机器上碰巧有
+ * 另一份（可能已失效的）官方凭据，就会被后者覆盖 —— 表现为
+ * 「明明刚登录成功，却报凭据失效」。
+ *
+ * @param stored 插件自存的凭据（来自 `ctx.credentials`；已解析成对象）。
+ */
+export function resolveZcodeCredential(
+  stored: ZcodeCredential | undefined,
+  env: NodeJS.ProcessEnv = process.env,
+): ZcodeCredential | undefined {
+  if (stored !== undefined && isUsableZcodeCredential(stored)) return stored
+  return readZcodeCredential(env)
+}
+
+/**
+ * 凭据是否「够用」。
+ *
+ * 判据是**上游真正需要的两个字段**：JWT 与 device_mid。
+ * 其余（coding-plan key 等）都是可选的 —— 缺了只影响 ultra 通道。
+ */
+export function isUsableZcodeCredential(value: unknown): value is ZcodeCredential {
+  if (typeof value !== 'object' || value === null) return false
+  const record = value as Record<string, unknown>
+  return typeof record.zcode_jwt === 'string' && record.zcode_jwt.length > 0
+    && typeof record.device_mid === 'string' && record.device_mid.length > 0
+}
+
+/**
+ * 凭据是否过期 —— **恒为 `false`**。
+ *
+ * ZCode 凭据是静态的：JWT 的 payload 里**没有 `exp`**（实测只有
+ * `{user_id, token_version, sub, iat}`）。真失效时上游回 401/1002，
+ * 由适配器归为 AUTH 并提示用户重新登录 —— 不做本地猜测。
+ *
+ * 保留该函数是为了让适配器无条件调用（与其它 provider 同形），
+ * 而不是到处写 `provider === 'zcode'` 的特例。
  */
 export function isZcodeExpired(_credential: ZcodeCredential): boolean {
   return false

@@ -126,6 +126,22 @@ export const CREDITS_CAPABILITIES = Object.freeze({
   //   `dailyCheckin` —— 后者会让用户以为每天都真的加了额度。
   //   ⚠️ 该端点**需要** `X-Client-Platform` 头（值见 RaccoonProduct.clientPlatform）。
   raccoon: Object.freeze({ balance: true, onboardingTasks: true }),
+  /**
+   * ZCode（智谱）：余额与每日领取**都有**。
+   *
+   * - **余额**：`GET /api/v1/zcode-plan/billing/balance`
+   *   （需 `Authorization: Bearer <zcodejwt>` + `X-Device-Mid`；实测返回
+   *   `{total_units, used_units, remaining_units, period}`）。
+   * - **每日领取**：`event/report`(补活跃信号) → `billing/preview` → `billing/claim`。
+   *   ⚠️ 领取**需要阿里云 captcha**（由本插件的常驻 chromium 产出）。
+   *
+   * ⚠️ 这里如实登记为 `balance: true, dailyCheckin: true`，**尽管 ZCode 的
+   * 额度单位是 token 而不是积分** —— 能力矩阵回答的是「有没有这项能力」，
+   * 不是「量纲是否一致」。量纲差异在面板与 RPC 层如实标注（见
+   * `src/jet-hub-rpc.ts` 里 zcode 的 balances 分支与
+   * `src/zcode-auth.ts` 的 `claimDaily`）。
+   */
+  zcode: Object.freeze({ balance: true, dailyCheckin: true }),
 });
 
 /**
