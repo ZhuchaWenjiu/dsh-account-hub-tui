@@ -245,6 +245,50 @@ const STYLES = `
 .dim-jh-formRows { display: flex; flex-direction: column; gap: 8px; margin: 8px 0 4px; }
 /* 弹窗底部动作区：右对齐（生成/确认按钮） */
 .dim-jh-modalActions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 14px; }
+
+/* ── Cline「订阅额度」弹窗（官方额度窗口 + 请求记录）── */
+/* 账号块：每个账号独立一块 —— 多账号下必须一眼分清读数属于谁。 */
+.dim-jh-quotaAccounts { display: flex; flex-direction: column; gap: 12px; margin: 4px 0 8px; }
+.dim-jh-quotaAccount { border: 1px solid var(--dsw-alias-border-l2, #e5e5e5); border-radius: 8px; padding: 10px 12px; }
+.dim-jh-quotaAccountHead { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; margin-bottom: 8px; }
+.dim-jh-quotaAccountHead strong { min-width: 0; overflow: hidden; font-size: 13px; color: var(--dsw-alias-label-primary, #1f2329); text-overflow: ellipsis; white-space: nowrap; }
+/* 失败原因：必须允许换行 —— 网关文案较长，nowrap 会把它撑出弹窗
+   （与请求记录表格那次「429 文案把表格撑出横向滚动」同因）。 */
+.dim-jh-quotaAccountError { flex: 0 1 auto; min-width: 0; font-size: 12px; line-height: 17px; color: #d93025; word-break: break-word; }
+.dim-jh-quotaNoWindow { margin: 0; font-size: 12px; color: var(--dsw-alias-label-tertiary, #8f959e); }
+.dim-jh-quotaWindows { display: flex; flex-direction: column; gap: 10px; margin: 0; padding: 0; list-style: none; }
+.dim-jh-quotaWindow { display: flex; flex-direction: column; gap: 4px; }
+.dim-jh-quotaWindowHead { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; }
+.dim-jh-quotaWindowName { font-size: 12px; color: var(--dsw-alias-label-secondary, #555); }
+.dim-jh-quotaWindowPercent { font-size: 13px; font-weight: 600; font-variant-numeric: tabular-nums; color: var(--dsw-alias-label-primary, #1f2329); }
+.dim-jh-quotaWindowPercent[data-tone="warn"] { color: #d9822b; }
+.dim-jh-quotaWindowPercent[data-tone="danger"] { color: #d93025; }
+/* 进度条：宽度由内联 style 给（已夹取到 0–100 仅用于绘制）。
+   ⚠️ 数值本身**不夹取** —— 超额时显示 120%，那才是有用信息。 */
+.dim-jh-quotaBar { height: 6px; overflow: hidden; border-radius: 999px; background: var(--dsw-alias-bg-layer-2, #f4f5f7); }
+.dim-jh-quotaBarFill { height: 100%; border-radius: 999px; background: #1677ff; transition: width .2s ease; }
+.dim-jh-quotaBarFill[data-tone="warn"] { background: #d9822b; }
+.dim-jh-quotaBarFill[data-tone="danger"] { background: #d93025; }
+.dim-jh-quotaReset { font-size: 11px; color: var(--dsw-alias-label-tertiary, #8f959e); }
+/* 请求记录区：与额度区用上边框分开 */
+.dim-jh-quotaLog { margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--dsw-alias-border-default, #e5e5e5); }
+.dim-jh-quotaSectionTitle { margin: 0 0 8px; font-size: 13px; font-weight: 600; color: var(--dsw-alias-label-primary, #1f2329); }
+.dim-jh-quotaAccountTabs { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 10px; }
+.dim-jh-quotaTab { max-width: 180px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.dim-jh-quotaLogAccount { margin: 0 0 10px; font-size: 12px; color: var(--dsw-alias-label-secondary, #555); }
+/* 表格容器：窄面板下横向滚动，而不是把列压到不可读。
+   ⚠️ 溢出必须落在**这个容器**上；让表格自己溢出会把弹窗整体撑宽。 */
+.dim-jh-quotaTableWrap { overflow-x: auto; margin-bottom: 10px; }
+.dim-jh-quotaTable { width: 100%; border-collapse: collapse; font-size: 12px; }
+.dim-jh-quotaTable th, .dim-jh-quotaTable td { padding: 6px 8px; text-align: left; vertical-align: top; border-bottom: 1px solid var(--dsw-alias-border-l2, #eee); }
+.dim-jh-quotaTable th { font-weight: 600; color: var(--dsw-alias-label-secondary, #555); white-space: nowrap; }
+.dim-jh-quotaNumCol { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.dim-jh-quotaWhen { white-space: nowrap; color: var(--dsw-alias-label-secondary, #555); }
+.dim-jh-quotaModel { display: block; color: var(--dsw-alias-label-primary, #1f2329); }
+/* 上游/模型族另起一行：它与模型名是两个维度，拼在一起会让
+   「同名不同上游」的行无法区分。 */
+.dim-jh-quotaModelType { display: block; font-size: 11px; color: var(--dsw-alias-label-tertiary, #8f959e); }
+.dim-jh-quotaLogError { margin: 0 0 10px; font-size: 12px; line-height: 17px; color: #d93025; word-break: break-word; }
 `
 
 let injected = false

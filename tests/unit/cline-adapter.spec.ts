@@ -584,8 +584,20 @@ describe('Cline 接线（源码级回归）', () => {
     expect(source).toContain('const CLINE_ICON')
   })
 
-  it('能力矩阵登记 cline 为「有余额、无签到」', () => {
+  /**
+   * ⚠️ 这条原先断言**整段字面量** `{ balance: true, dailyCheckin: false }`，
+   * 于是任何新增能力字段（如 `subscriptionQuota`）都会让它假失败 ——
+   * 与上面那条「不要写死整串前缀」是同一类脆断言。
+   * 改为逐字段断言，容忍新增字段与格式变化；而「订阅额度**只**给 cline」
+   * 这条真正的不变式由 `credits-capabilities.spec.ts` 的行为级用例守住。
+   */
+  it('能力矩阵登记 cline 为「有余额、无签到、有订阅额度」', () => {
     const source = read('plugin-src/client/credits-capabilities.js')
-    expect(source).toMatch(/cline:\s*Object\.freeze\(\{\s*balance:\s*true,\s*dailyCheckin:\s*false\s*\}\)/)
+    const entry = /cline:\s*Object\.freeze\(\{([^}]*)\}\)/.exec(source)
+    expect(entry, '未找到 cline 的能力登记').not.toBeNull()
+    const body = entry![1]!
+    expect(body).toMatch(/balance:\s*true/)
+    expect(body).toMatch(/dailyCheckin:\s*false/)
+    expect(body).toMatch(/subscriptionQuota:\s*true/)
   })
 })

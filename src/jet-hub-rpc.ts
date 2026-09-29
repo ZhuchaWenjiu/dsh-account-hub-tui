@@ -64,6 +64,7 @@ import { claimQoderDailyCheckin, fetchQoderCreditBalance } from './qoder-credits
 import { isTraeRefreshable, traeCredentialExpiresAtMs, traeDisplayNickname } from './trae.js'
 import type { TraeCredential } from './trae.js'
 import { fetchClineCreditBalance } from './cline-credits.js'
+import { fetchClineRequestLog, fetchClineUsageLimits } from './cline-quota.js'
 import {
   clineCredentialExpiresAtMs,
   isClineRefreshable,
@@ -129,6 +130,10 @@ import type {
   RpcCreditsClaimSummary,
   RpcCreditsBalancesRequest,
   RpcCreditsBalancesResponse,
+  RpcClineQuotaRequest,
+  RpcClineQuotaResponse,
+  RpcClineRequestLogRequest,
+  RpcClineRequestLogResponse,
   RpcCreditsClaimAccountResult,
   RpcSendSmsRequest,
   RpcSendSmsResponse,
@@ -2453,6 +2458,110 @@ function registerJetHubEndpoints(
             accounts: values,
             windowDays: buddyExpiringWindowDays(),
           } satisfies RpcCreditsBalancesResponse,
+        }
+      }
+
+      // ── Cline「订阅额度」：官方额度窗口 + 请求记录 ──
+      //
+      // 参考实现：`github.com/codeOct/dsh-cline-pass` 的额度管理与请求记录部分。
+      // 两者都用 Cline 网关自己的端点（不是本地记账），故与「余额」是三份
+      // 互不相同的读数：余额答「还剩多少」，额度答「各时间窗用掉百分之几」，
+      // 请求记录答「每一笔花了多少」。
+      //
+      // ⚠️ **两个端点都只认 Cline**（额度端点路径里的 `users/me` 与请求记录的
+      // `usages` 都是 Cline 网关的形状）。别的 provider 一律 `bad-request` ——
+      // 这正是「不要在 UI 上吞掉错误，而是不发起这个请求」那条既有约定的
+      // 服务端一半（客户端另由 `supportsSubscriptionQuota` 门控）。
+      case 'cline.quota': {
+        const req = payload as RpcClineQuotaRequest
+        if (typeof req.provider !== 'string' || req.provider !== CLINE.id) {
+          return { ok: false, error: { code: 'bad-request', message: `unsupported provider: ${String(req.provider)}` } }
+        }
+        const accounts = await pool.listAccounts(req.provider)
+        const values: RpcClineQuotaResponse['accounts'] = []
+        for (const account of accounts) {
+          const resolved = await ctx.credentials.resolve(credentialRef(account.credentialRef))
+          if (!resolved) {
+            values.push({
+              accountId: account.id, nickname: account.nickname,
+              ok: false, windows: [], error: '凭据未配置',
+            })
+            continue
+          }
+          let credential: ClineCredential
+          try {
+            credential = JSON.parse(resolved.value) as ClineCredential
+          } catch {
+            values.push({
+              accountId: account.id, nickname: account.nickname,
+              ok: false, windows: [], error: '凭据解析失败',
+            })
+            continue
+          }
+          const result = await fetchClineUsageLimits(credential, CLINE)
+          values.push({
+            accountId: account.id,
+            nickname: account.nickname,
+            ok: result.ok,
+            windows: result.windows,
+            // ⚠️ 失败时带上**具体原因**（含 HTTP 状态与网关文案），
+            // 而不是笼统一句「查询失败」—— 面板要显示原因而非 0%。
+            ...result.error === undefined ? {} : { error: result.error },
+          })
+        }
+        return { ok: true, value: { accounts: values } satisfies RpcClineQuotaResponse }
+      }
+
+      case 'cline.requestLog': {
+        const req = payload as RpcClineRequestLogRequest
+        if (typeof req.provider !== 'string' || req.provider !== CLINE.id) {
+          return { ok: false, error: { code: 'bad-request', message: `unsupported provider: ${String(req.provider)}` } }
+        }
+        if (typeof req.accountId !== 'string' || req.accountId.trim().length === 0) {
+          return { ok: false, error: { code: 'bad-request', message: 'accountId 不能为空' } }
+        }
+        // 游标只允许字符串：数字/对象传进来会让 `?cursor=` 拼出无意义的值，
+        // 而网关对无法识别的游标**静默忽略**（回到第一页），表现为
+        // 「点了加载更多却看到同一批记录」—— 静默的错误最难排查，故直接拒。
+        if (req.cursor !== undefined && typeof req.cursor !== 'string') {
+          return { ok: false, error: { code: 'bad-request', message: 'cursor 必须是字符串' } }
+        }
+        const accounts = await pool.listAllAccounts()
+        const entry = accounts.find((a) => a.id === req.accountId)
+        if (entry === undefined) {
+          return { ok: false, error: { code: 'bad-request', message: `账号不存在：${req.accountId}` } }
+        }
+        const resolved = await ctx.credentials.resolve(credentialRef(entry.credentialRef))
+        if (!resolved) {
+          return { ok: false, error: { code: 'bad-request', message: '凭据未配置' } }
+        }
+        let credential: ClineCredential
+        try {
+          credential = JSON.parse(resolved.value) as ClineCredential
+        } catch {
+          return { ok: false, error: { code: 'bad-request', message: '凭据解析失败' } }
+        }
+        const result = await fetchClineRequestLog(credential, CLINE, fetch, {
+          ...req.cursor === undefined ? {} : { cursor: req.cursor },
+        })
+        // ⚠️ 与额度端点不同：这里把失败**作为 `ok:false` 的载荷**回报，
+        // 而不是 RPC 级错误 —— 因为它只影响「加载更多」这一处，
+        // 面板要把原因显示在表格下方并保留已加载的行。
+        return {
+          ok: true,
+          value: {
+            ok: result.ok,
+            rows: result.rows.map((row) => ({
+              createdAt: row.createdAt,
+              model: row.model,
+              modelType: row.modelType,
+              totalTokens: row.totalTokens,
+              creditsUsed: row.creditsUsed,
+              costUsd: row.costUsd,
+            })),
+            ...result.nextToken === undefined ? {} : { nextToken: result.nextToken },
+            ...result.error === undefined ? {} : { error: result.error },
+          } satisfies RpcClineRequestLogResponse,
         }
       }
 

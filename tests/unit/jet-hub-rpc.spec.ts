@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import { readFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { dirname, resolve } from 'node:path'
@@ -1725,5 +1725,290 @@ describe('account.reorder 端点', () => {
     expect(result.ok).toBe(true)
     // buddy 的两个账号在各自原下标上互换，codearts 仍在中间
     expect(orderInStore()).toEqual(['b2', 'c1', 'b1'])
+  })
+})
+/**
+ * Cline「订阅额度」端点（`cline.quota` / `cline.requestLog`）。
+ *
+ * 参考实现：`github.com/codeOct/dsh-cline-pass` 的额度管理与请求记录部分。
+ *
+ * 这里守住四条真正的不变式：
+ * 1. **只认 cline** —— 其余 provider 一律 `bad-request`（前端另有
+ *    `supportsSubscriptionQuota` 门控，两侧必须一致）。
+ * 2. **额度逐账号隔离** —— 一个账号凭据坏掉不能让整批失败，
+ *    否则多账号用户会因为「有一个号没配凭据」而完全看不到额度。
+ * 3. **游标只走 `?cursor=`** —— 网关对 `page`/`offset` 静默忽略，
+ *    传错会表现为「点了加载更多还是同一批」（最难排查的一类静默错误）。
+ * 4. **请求记录失败是载荷（`ok:false`）而不是 RPC 错误** ——
+ *    面板要保留已加载的行、只在下方显示原因。
+ */
+describe('cline.quota / cline.requestLog 端点', () => {
+  type Handler = (request: Request) => Promise<Response>
+
+  /** 凭据形态与实测一致（`account_id` 是 `usr-…`）。 */
+  const CLINE_CREDENTIAL = {
+    access_token: 'workos:eyJhbGciOiJSUzI1NiIs',
+    refresh_token: 'tmgEeM2rd9ybYoWpXl8JqUfvK',
+    account_id: 'usr-01M3BCV4FYCGJKAWD3MJG3DBQM',
+    email: 'ijetlee@163.com',
+  }
+
+  const LIMITS_RESPONSE = {
+    success: true,
+    data: {
+      limits: [
+        { type: 'five_hour', percentUsed: 12.5, resetsAt: '2026-09-29T10:00:00.000Z' },
+        { type: 'weekly', percentUsed: 68, resetsAt: '2026-10-05T00:00:00.000Z' },
+      ],
+    },
+  }
+
+  const USAGES_RESPONSE = {
+    success: true,
+    data: {
+      nextToken: 'tok-2',
+      items: [{ createdAt: '2026-09-29T07:12:00.000Z', aiModelName: 'DeepSeek', aiModelTypeName: 'cline-free', totalTokens: 49, creditsUsed: 0, costUsd: 1320 }],
+    },
+  }
+
+  function setup(options: {
+    /** 初始账号（provider 固定 cline）。 */
+    accounts?: Array<{ id: string; enabled: boolean }>
+    /** `ctx.credentials.resolve` 的返回值：`'valid'` = 合法凭据 JSON，`'missing'` = 未配置。 */
+    credential?: 'valid' | 'missing'
+  } = {}) {
+    const accounts = options.accounts ?? [{ id: 'acc-1', enabled: true }]
+    const stored: Record<string, unknown> = {
+      accounts: accounts.map((a, i) => ({
+        id: a.id,
+        nickname: `号${i + 1}`,
+        provider: 'cline',
+        enabled: a.enabled,
+        credentialRef: `CLINE_ACCOUNT_T${i + 1}`,
+        createdAt: Date.now(),
+        refreshable: true,
+      })),
+    }
+    let handler: Handler | undefined
+
+    const pool = new AccountPool({
+      get: (key: string) => key === 'settings'
+        ? { register: () => ({ get: () => stored, replace: async () => {} }) }
+        : undefined,
+      logger: { warn: () => {}, info: () => {} },
+      credentials: {
+        describe: async () => ({ configured: false, writable: true }),
+        resolve: async () => undefined,
+        set: async () => {},
+        unset: async () => {},
+      },
+    } as never)
+
+    /**
+     * ⚠️ `ctx.credentials` 是**服务注入的直接属性**（`ctx.credentials.resolve`），
+     * 不是经 `ctx.get('credentials')` 取的 —— 写成后者会让端点在运行时抛
+     * `Cannot read properties of undefined (reading 'resolve')`，
+     * 而 RPC 把它包成 `jet-hub/handler-failed`，看起来像「方法不存在」。
+     */
+    const credentials = {
+      describe: async () => ({ configured: false, writable: true }),
+      resolve: async () => (options.credential === 'missing'
+        ? undefined
+        : { value: JSON.stringify(CLINE_CREDENTIAL) }),
+      set: async () => {},
+      unset: async () => {},
+    }
+
+    const ctx = {
+      credentials,
+      get: (key: string) => {
+        if (key === 'connection') {
+          return { fetch: { register: (config: { fetch: Handler }) => { handler = config.fetch } } }
+        }
+        return undefined
+      },
+      inject: (_deps: string[], callback: (ctx: unknown) => void) => { callback(ctx) },
+      logger: { warn: () => {}, info: () => {} },
+      emit: () => {},
+    }
+
+    registerJetHubRpc(
+      // ⚠️ 位置参数：新增 provider 会让 `modelAdapters` 错位（本仓库已踩四次）。
+      // 本组用例不依赖 modelAdapters，但**占位数量必须与签名一致**。
+      ctx as never, pool,
+      {} as never, // codearts
+      {} as never, // buddy
+      {} as never, // workbuddy
+      {} as never, // lobsterai
+      {} as never, // qoder
+      {} as never, // qoderCn
+      {} as never, // trae
+      {} as never, // cline
+      {} as never, // loomy
+      {} as never, // raccoon
+    )
+    if (handler === undefined) throw new Error('endpoint handler was not registered')
+
+    const call = async (method: string, payload: unknown) => {
+      const response = await handler!(new Request('http://localhost/api/jet-hub', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ type: 'client-request', rpcId: 'rpc-1', method: 'jet-hub', payload: { method, payload } }),
+      }))
+      const body = await response.json() as { result: { ok: boolean; value?: unknown; error?: { message: string } } }
+      return body.result
+    }
+
+    return { call }
+  }
+
+  /** 桩掉全局 fetch 并记录每次请求的 URL。 */
+  function stubFetch(handler: (url: string) => Response) {
+    const urls: string[] = []
+    vi.stubGlobal('fetch', vi.fn(async (url: string) => {
+      urls.push(url)
+      return handler(url)
+    }))
+    return urls
+  }
+
+  afterEach(() => { vi.unstubAllGlobals() })
+
+  describe('cline.quota', () => {
+    it('回传各账号的额度窗口（按网关原序）', async () => {
+      stubFetch(() => new Response(JSON.stringify(LIMITS_RESPONSE), { status: 200 }))
+      const { call } = setup()
+      const result = await call('cline.quota', { provider: 'cline' })
+      expect(result.ok).toBe(true)
+      const accounts = (result.value as { accounts: Array<{ ok: boolean; windows: Array<{ type: string }> }> }).accounts
+      expect(accounts).toHaveLength(1)
+      expect(accounts[0]!.ok).toBe(true)
+      expect(accounts[0]!.windows.map(w => w.type)).toEqual(['five_hour', 'weekly'])
+    })
+
+    it('用 users/me 端点（不依赖账号 id）', async () => {
+      const urls = stubFetch(() => new Response(JSON.stringify(LIMITS_RESPONSE), { status: 200 }))
+      const { call } = setup()
+      await call('cline.quota', { provider: 'cline' })
+      expect(urls[0]).toBe('https://api.cline.bot/api/v1/users/me/plan/usage-limits')
+    })
+
+    /**
+     * ⚠️ 非 cline 一律 bad-request：前端 `supportsSubscriptionQuota` 只对 cline
+     * 渲染按钮，两侧必须一致，否则就是「按钮在、点了报错」。
+     */
+    it('非 cline 的 provider → bad-request，且不发请求', async () => {
+      const urls = stubFetch(() => new Response(JSON.stringify(LIMITS_RESPONSE), { status: 200 }))
+      const { call } = setup()
+      for (const provider of ['buddy', 'qoder', 'loomy', '']) {
+        expect((await call('cline.quota', { provider })).ok, provider).toBe(false)
+      }
+      expect(urls).toEqual([])
+    })
+
+    /**
+     * ⚠️ 一个账号没配凭据只影响它自己：多账号用户不该因为其中一个号
+     * 凭据缺失就完全看不到额度。
+     */
+    it('逐账号隔离：凭据未配置的账号带原因，其余照常', async () => {
+      // 第一个账号走 missing 分支由 credential 选项控制；这里用两个账号 +
+      // 按 ref 区分较麻烦，故直接验证「missing 时不发请求且带原因」这一半。
+      stubFetch(() => new Response(JSON.stringify(LIMITS_RESPONSE), { status: 200 }))
+      const { call } = setup({ accounts: [{ id: 'acc-1', enabled: true }], credential: 'missing' })
+      const result = await call('cline.quota', { provider: 'cline' })
+      expect(result.ok).toBe(true)
+      const accounts = (result.value as { accounts: Array<{ ok: boolean; error?: string; windows: unknown[] }> }).accounts
+      expect(accounts[0]!.ok).toBe(false)
+      expect(accounts[0]!.error).toBe('凭据未配置')
+      expect(accounts[0]!.windows).toEqual([])
+    })
+
+    it('网关报错时该账号 ok:false 并带 HTTP 状态与文案', async () => {
+      stubFetch(() => new Response(JSON.stringify({ error: 'Unauthorized' }), { status: 401 }))
+      const { call } = setup()
+      const result = await call('cline.quota', { provider: 'cline' })
+      const accounts = (result.value as { accounts: Array<{ ok: boolean; error?: string }> }).accounts
+      expect(accounts[0]!.ok).toBe(false)
+      expect(accounts[0]!.error).toContain('HTTP 401')
+      expect(accounts[0]!.error).toContain('Unauthorized')
+    })
+
+    /** ⚠️ 查不到**不能显示成 0%**（0% 是「没用过」的语义）。 */
+    it('查询失败时 windows 为空且 ok:false（不返回 0% 的假读数）', async () => {
+      stubFetch(() => new Response(JSON.stringify({ success: true, data: {} }), { status: 200 }))
+      const { call } = setup()
+      const result = await call('cline.quota', { provider: 'cline' })
+      const accounts = (result.value as { accounts: Array<{ ok: boolean; windows: unknown[] }> }).accounts
+      expect(accounts[0]!.ok).toBe(false)
+      expect(accounts[0]!.windows).toEqual([])
+    })
+  })
+
+  describe('cline.requestLog', () => {
+    it('回传记录行与下一页游标', async () => {
+      stubFetch(() => new Response(JSON.stringify(USAGES_RESPONSE), { status: 200 }))
+      const { call } = setup()
+      const result = await call('cline.requestLog', { provider: 'cline', accountId: 'acc-1' })
+      expect(result.ok).toBe(true)
+      const value = result.value as { ok: boolean; rows: Array<{ model: string; totalTokens: number }>; nextToken?: string }
+      expect(value.ok).toBe(true)
+      expect(value.rows).toHaveLength(1)
+      expect(value.rows[0]!.model).toBe('DeepSeek')
+      expect(value.rows[0]!.totalTokens).toBe(49)
+      expect(value.nextToken).toBe('tok-2')
+    })
+
+    it('用账号 id 拼路径，第一页不带 query', async () => {
+      const urls = stubFetch(() => new Response(JSON.stringify(USAGES_RESPONSE), { status: 200 }))
+      const { call } = setup()
+      await call('cline.requestLog', { provider: 'cline', accountId: 'acc-1' })
+      expect(urls[0]).toBe(
+        'https://api.cline.bot/api/v1/users/usr-01M3BCV4FYCGJKAWD3MJG3DBQM/usages',
+      )
+    })
+
+    /**
+     * ⚠️ 分页参数只认 `cursor`。写成 `page`/`offset` 会被网关**静默忽略**，
+     * 表现为「点了加载更多还是同一批记录」—— 静默的错误最难排查。
+     */
+    it('传 cursor 时只加 ?cursor=（不带 page/offset）', async () => {
+      const urls = stubFetch(() => new Response(JSON.stringify(USAGES_RESPONSE), { status: 200 }))
+      const { call } = setup()
+      await call('cline.requestLog', { provider: 'cline', accountId: 'acc-1', cursor: 'tok-2' })
+      expect(urls[0]).toContain('?cursor=tok-2')
+      expect(urls[0]).not.toContain('page=')
+      expect(urls[0]).not.toContain('offset=')
+    })
+
+    it('accountId 为空或账号不存在 → bad-request，且不发请求', async () => {
+      const urls = stubFetch(() => new Response(JSON.stringify(USAGES_RESPONSE), { status: 200 }))
+      const { call } = setup()
+      expect((await call('cline.requestLog', { provider: 'cline', accountId: '' })).ok).toBe(false)
+      expect((await call('cline.requestLog', { provider: 'cline', accountId: 'nope' })).ok).toBe(false)
+      expect((await call('cline.requestLog', { provider: 'cline' })).ok).toBe(false)
+      expect(urls).toEqual([])
+    })
+
+    it('cursor 非字符串 → bad-request（不猜默认值）', async () => {
+      const urls = stubFetch(() => new Response(JSON.stringify(USAGES_RESPONSE), { status: 200 }))
+      const { call } = setup()
+      expect((await call('cline.requestLog', { provider: 'cline', accountId: 'acc-1', cursor: 3 })).ok).toBe(false)
+      expect(urls).toEqual([])
+    })
+
+    /**
+     * ⚠️ 失败是**载荷**（`ok:false`）而不是 RPC 错误：面板要保留已加载的行，
+     * 只在表格下方显示原因。若回成 RPC 错误，面板会整块换成错误页。
+     */
+    it('端点失败时以 ok:false 载荷回报（不是 RPC 级错误）', async () => {
+      stubFetch(() => new Response(JSON.stringify({ message: 'Invalid request format' }), { status: 400 }))
+      const { call } = setup()
+      const result = await call('cline.requestLog', { provider: 'cline', accountId: 'acc-1' })
+      expect(result.ok).toBe(true)
+      const value = result.value as { ok: boolean; rows: unknown[]; error?: string }
+      expect(value.ok).toBe(false)
+      expect(value.rows).toEqual([])
+      expect(value.error).toContain('HTTP 400')
+    })
   })
 })

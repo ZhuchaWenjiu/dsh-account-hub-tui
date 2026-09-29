@@ -7,6 +7,7 @@ import {
   supportsOnboardingTasks,
   supportsRateLimit,
   supportsPermanentLock,
+  supportsSubscriptionQuota,
   permanentLockCopy,
   checkinProviders,
 } from './credits-capabilities.js';
@@ -1011,6 +1012,346 @@ function ModelListPanel({ provider, rpcCall, onClose }) {
   return dialog;
 }
 
+/**
+ * 额度窗口类型 → 中文标签。
+ *
+ * ⚠️ **未识别的类型原样显示**，而不是丢弃或归入「其它」：网关新增窗口
+ * （例如将来的 `daily`）时，面板立刻就能显示出新窗口，不必等插件发版 ——
+ * 这与后端「窗口按网关原序透传、不映射到固定形状」是同一个设计。
+ */
+const QUOTA_WINDOW_LABELS = Object.freeze({
+  five_hour: '5 小时',
+  weekly: '本周',
+  monthly: '本月',
+});
+
+/** 额度窗口类型的中文标签（未识别时回落到原值）。 */
+function quotaWindowLabel(type) {
+  return QUOTA_WINDOW_LABELS[type] || type;
+}
+
+/**
+ * 格式化额度窗口的重置时刻。
+ *
+ * ⚠️ **入参是 ISO 字符串**（网关口径，见 `src/cline-quota.ts`），
+ * **不能**喂给 `formatTime` —— 那个函数按毫秒数运算，传字符串会得到
+ * `NaN` 比较、从而一律显示「已过期」，把一个 6 小时后重置的窗口
+ * 说成已重置。两者刻意分开成两个函数。
+ */
+function formatWindowReset(iso) {
+  if (!iso) return '';
+  const ms = Date.parse(iso);
+  // 解析不出来就原样显示：宁可让用户看到奇怪字符串，也不要显示一个
+  // 由错误换算得出的「合理」时间（那会把排查引向错误方向）。
+  if (!Number.isFinite(ms)) return iso;
+  const now = Date.now();
+  if (ms <= now) return '已重置';
+  const diff = ms - now;
+  if (diff < 3_600_000) return `${Math.round(diff / 60_000)} 分钟后重置`;
+  if (diff < 86_400_000) return `${Math.round(diff / 3_600_000)} 小时后重置`;
+  return `${new Date(ms).toLocaleString('zh-CN', {
+    month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit',
+  })} 重置`;
+}
+
+/**
+ * 格式化请求记录的时间戳（ISO 字符串 → 本地「月/日 时:分」）。
+ *
+ * ⚠️ 同样不能复用 `formatTime`（毫秒口径）。解析不出来时**原样显示**，
+ * 理由与 {@link formatWindowReset} 相同。
+ */
+function formatLogTime(iso) {
+  if (!iso) return '—';
+  const ms = Date.parse(iso);
+  if (!Number.isFinite(ms)) return iso;
+  return new Date(ms).toLocaleString('zh-CN', {
+    month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit',
+  });
+}
+
+/**
+ * 百分比显示：整数不带小数位，非整数保留一位。
+ *
+ * ⚠️ **不夹取到 100%**：网关若给 120（超额），显示 120% 才是用户最该看到的信息。
+ * 进度条的**宽度**另行夹取（那只是绘制），两者不能混为一谈。
+ */
+function formatQuotaPercent(value) {
+  if (!Number.isFinite(value)) return '—';
+  const rounded = Math.round(value * 10) / 10;
+  return `${Number.isInteger(rounded) ? rounded : rounded.toFixed(1)}%`;
+}
+
+/** 百分比的着色档位（只影响颜色，不影响显示的数值）。 */
+function quotaTone(percent) {
+  if (!Number.isFinite(percent)) return undefined;
+  if (percent >= 100) return 'danger';
+  if (percent >= 80) return 'warn';
+  return undefined;
+}
+
+/** token 数按千分位显示。 */
+function formatTokenCount(value) {
+  if (!Number.isFinite(value)) return '—';
+  return Math.round(value).toLocaleString('zh-CN');
+}
+
+/**
+ * 「订阅额度」面板：官方额度窗口 + 请求记录。
+ *
+ * ## 与「积分」的区别（面板文案要讲清，否则用户以为是同一个数）
+ *
+ * | | 积分（现有） | 订阅额度（本面板） |
+ * |---|---|---|
+ * | 答什么 | 还剩多少钱 | 各时间窗用掉百分之几 |
+ * | 端点 | `/users/{id}/balance` | `/users/me/plan/usage-limits` |
+ * | 请求记录 | 无 | `/users/{id}/usages`（逐笔流水） |
+ *
+ * ## 两个接口的失败语义**不同**，渲染也必须不同
+ *
+ * - **额度**（`cline.quota`）：逐账号返回 `ok`。某个账号失败只让**那一个**
+ *   卡片显示原因，**其余账号照常显示** —— 多账号下这是最实用的降级。
+ * - **请求记录**（`cline.requestLog`）：失败以 `ok:false` 的**载荷**回报
+ *   （不是 RPC 级错误），所以这里判 `res.ok` 而不是只 catch 异常；
+ *   失败时**保留已加载的行**，只把原因显示在下方 —— 翻页途中失败不该
+ *   把用户已经看到的记录清空。
+ */
+function ClineQuotaPanel({ rpcCall, onClose }) {
+  const mounted = React.useRef(true);
+  React.useEffect(() => () => { mounted.current = false; }, []);
+
+  // 额度：每个账号一条读数。
+  const [quota, setQuota] = React.useState([]);
+  const [quotaPhase, setQuotaPhase] = React.useState('loading');
+  const [quotaError, setQuotaError] = React.useState('');
+
+  // 请求记录：一次只看一个账号（与参考实现的「一次一个账号」一致）。
+  const [logAccountId, setLogAccountId] = React.useState('');
+  const [rows, setRows] = React.useState([]);
+  const [nextToken, setNextToken] = React.useState(undefined);
+  const [logPhase, setLogPhase] = React.useState('idle');
+  const [logError, setLogError] = React.useState('');
+
+  const loadQuota = React.useCallback(async () => {
+    setQuotaPhase('loading');
+    setQuotaError('');
+    try {
+      const res = await rpcCall('cline.quota', { provider: 'cline' });
+      if (!mounted.current) return;
+      const list = Array.isArray(res?.accounts) ? res.accounts : [];
+      setQuota(list);
+      setQuotaPhase('ready');
+      // 默认选中第一个账号；**只在尚未选择时**设置 —— 刷新额度不该把
+      // 用户正在翻看的那个账号的请求记录切走。
+      if (list.length > 0) setLogAccountId(prev => prev || list[0].accountId);
+    } catch (caught) {
+      if (!mounted.current) return;
+      console.error('[jet-hub] load cline quota failed:', caught);
+      setQuotaError(caught?.message || '订阅额度查询失败');
+      setQuotaPhase('error');
+    }
+  }, [rpcCall]);
+
+  React.useEffect(() => { void loadQuota(); }, [loadQuota]);
+
+  const loadLog = React.useCallback(async (accountId, cursor) => {
+    setLogPhase(cursor === undefined ? 'loading' : 'more');
+    setLogError('');
+    try {
+      const res = await rpcCall('cline.requestLog', {
+        provider: 'cline',
+        accountId,
+        ...cursor === undefined ? {} : { cursor },
+      });
+      if (!mounted.current) return;
+      const batch = Array.isArray(res?.rows) ? res.rows : [];
+      setRows(prev => (cursor === undefined ? batch : [...prev, ...batch]));
+      // 空串游标等同于「没有下一页」——否则会渲染出一个点了没反应的按钮。
+      setNextToken(typeof res?.nextToken === 'string' && res.nextToken.length > 0 ? res.nextToken : undefined);
+      // ⚠️ 端点把失败作为载荷回报，故这里必须判 `ok`。
+      if (res?.ok === false) setLogError(res.error || '请求记录查询失败');
+    } catch (caught) {
+      if (!mounted.current) return;
+      console.error('[jet-hub] load cline request log failed:', caught);
+      setLogError(caught?.message || '请求记录查询失败');
+    } finally {
+      if (mounted.current) setLogPhase('ready');
+    }
+  }, [rpcCall]);
+
+  // 切换账号 → 丢掉旧账号的行，重新读第一页。
+  React.useEffect(() => {
+    if (logAccountId === '') return;
+    setRows([]);
+    setNextToken(undefined);
+    void loadLog(logAccountId, undefined);
+  }, [logAccountId, loadLog]);
+
+  const accountLabelOf = (id) => {
+    const entry = quota.find(q => q.accountId === id);
+    return entry?.nickname || id;
+  };
+
+  const renderQuota = () => {
+    if (quotaPhase === 'loading' && quota.length === 0) {
+      return React.createElement('div', { className: 'dim-jh-empty' }, '正在读取订阅额度…');
+    }
+    if (quotaPhase === 'error') {
+      return React.createElement('div', { className: 'dim-jh-empty', role: 'alert' },
+        React.createElement('p', null, quotaError),
+        React.createElement('button', { className: 'dim-jh-btn', onClick: () => void loadQuota() }, '重试'));
+    }
+    if (quota.length === 0) {
+      return React.createElement('div', { className: 'dim-jh-empty' }, '尚未配置账号');
+    }
+    return React.createElement('div', { className: 'dim-jh-quotaAccounts' },
+      quota.map(entry => React.createElement('div', {
+        key: entry.accountId,
+        className: 'dim-jh-quotaAccount',
+      },
+        React.createElement('div', { className: 'dim-jh-quotaAccountHead' },
+          React.createElement('strong', null, entry.nickname || entry.accountId),
+          entry.ok
+            ? null
+            : React.createElement('span', { className: 'dim-jh-quotaAccountError' },
+                entry.error || '额度查询失败')),
+        // ⚠️ 「查询失败」与「没有额度窗口」必须区分渲染：前者是错误（显示原因），
+        // 后者是事实（该账号没有这一层计量）。合并成一句会让用户以为额度没了。
+        entry.ok
+          ? (entry.windows.length === 0
+              ? React.createElement('p', { className: 'dim-jh-quotaNoWindow' }, '该账号没有额度窗口')
+              : React.createElement('ul', { className: 'dim-jh-quotaWindows' },
+                  entry.windows.map((win, index) => {
+                    const tone = quotaTone(win.percentUsed);
+                    const clamped = Number.isFinite(win.percentUsed)
+                      ? Math.min(100, Math.max(0, win.percentUsed))
+                      : 0;
+                    return React.createElement('li', {
+                      // key 用「类型 + 下标」：网关万一重复下发同一类型，
+                      // 只用 type 会触发 React 的重复 key 警告（参考实现在
+                      // 这里踩过一次，见其 `399bbe1` 提交的措辞）。
+                      key: `${win.type}-${index}`,
+                      className: 'dim-jh-quotaWindow',
+                    },
+                      React.createElement('div', { className: 'dim-jh-quotaWindowHead' },
+                        React.createElement('span', { className: 'dim-jh-quotaWindowName' },
+                          quotaWindowLabel(win.type)),
+                        React.createElement('span', {
+                          className: 'dim-jh-quotaWindowPercent',
+                          'data-tone': tone,
+                        }, formatQuotaPercent(win.percentUsed))),
+                      React.createElement('div', {
+                        className: 'dim-jh-quotaBar',
+                        role: 'progressbar',
+                        'aria-label': `${quotaWindowLabel(win.type)} 已用`,
+                        'aria-valuenow': Number.isFinite(win.percentUsed) ? win.percentUsed : 0,
+                        'aria-valuemin': 0,
+                        'aria-valuemax': 100,
+                      },
+                        React.createElement('div', {
+                          className: 'dim-jh-quotaBarFill',
+                          'data-tone': tone,
+                          style: { width: `${clamped}%` },
+                        })),
+                      win.resetsAt
+                        ? React.createElement('span', { className: 'dim-jh-quotaReset' },
+                            formatWindowReset(win.resetsAt))
+                        : null);
+                  })))
+          : null)));
+  };
+
+  const renderLog = () => {
+    if (quota.length === 0) return null;
+    return React.createElement('div', { className: 'dim-jh-quotaLog' },
+      React.createElement('h3', { className: 'dim-jh-quotaSectionTitle' }, '请求记录'),
+      // 多账号才渲染切换器：单账号时它没有可去的地方（与额度卡片的约定一致）。
+      quota.length > 1
+        ? React.createElement('div', { className: 'dim-jh-quotaAccountTabs' },
+            quota.map(entry => React.createElement('button', {
+              key: entry.accountId,
+              className: 'dim-jh-btn dim-jh-quotaTab',
+              'data-kind': entry.accountId === logAccountId ? 'primary' : undefined,
+              onClick: () => setLogAccountId(entry.accountId),
+            }, entry.nickname || entry.accountId)))
+        : React.createElement('p', { className: 'dim-jh-quotaLogAccount' },
+            `账号：${accountLabelOf(logAccountId)}`),
+      logPhase === 'loading'
+        ? React.createElement('div', { className: 'dim-jh-empty' }, '正在读取请求记录…')
+        : rows.length === 0
+          ? React.createElement('div', { className: 'dim-jh-empty' },
+              logError === '' ? '暂无请求记录' : logError)
+          : React.createElement('div', { className: 'dim-jh-quotaTableWrap' },
+              React.createElement('table', { className: 'dim-jh-quotaTable' },
+                React.createElement('thead', null,
+                  React.createElement('tr', null,
+                    React.createElement('th', null, '时间'),
+                    React.createElement('th', null, '模型'),
+                    React.createElement('th', { className: 'dim-jh-quotaNumCol' }, 'TOKEN'),
+                    React.createElement('th', { className: 'dim-jh-quotaNumCol' }, '积分'))),
+                React.createElement('tbody', null,
+                  rows.map((row, index) => React.createElement('tr', {
+                    key: `${row.createdAt}-${index}`,
+                  },
+                    React.createElement('td', { className: 'dim-jh-quotaWhen' },
+                      formatLogTime(row.createdAt)),
+                    React.createElement('td', null,
+                      React.createElement('span', { className: 'dim-jh-quotaModel' }, row.model || '—'),
+                      // 上游/模型族作为次要信息：它与模型名是两个维度，
+                      // 合成一列会让「同名不同上游」的行无法区分。
+                      row.modelType && row.modelType !== row.model
+                        ? React.createElement('span', { className: 'dim-jh-quotaModelType' }, row.modelType)
+                        : null),
+                    React.createElement('td', { className: 'dim-jh-quotaNumCol' },
+                      formatTokenCount(row.totalTokens)),
+                    React.createElement('td', { className: 'dim-jh-quotaNumCol' },
+                      String(row.creditsUsed)))))),
+              // 翻页失败时**保留已加载的行**，只把原因显示在下方。
+              logError !== ''
+                ? React.createElement('p', { className: 'dim-jh-quotaLogError', role: 'alert' }, logError)
+                : null,
+              nextToken !== undefined
+                ? React.createElement('button', {
+                    className: 'dim-jh-btn',
+                    disabled: logPhase === 'more',
+                    onClick: () => void loadLog(logAccountId, nextToken),
+                  }, logPhase === 'more' ? '加载中…' : '加载更多')
+                : null));
+  };
+
+  // 与登录弹窗、模型列表同款：直接渲染在组件树内，靠 position: fixed 覆盖全屏。
+  // **刻意不用 createPortal**（理由见 ModelListPanel 的说明）。
+  return React.createElement('div', {
+    className: 'dim-jh-modalOverlay dim-jh-modalOverlay--top',
+    onClick: (event) => { if (event.target === event.currentTarget) onClose(); },
+  },
+    React.createElement('div', {
+      className: 'dim-jh-modal',
+      role: 'dialog',
+      'aria-modal': 'true',
+      'aria-label': 'Cline 订阅额度',
+    },
+      React.createElement('div', { className: 'dim-jh-modalHead' },
+        React.createElement('div', { className: 'dim-jh-modalTitle' },
+          React.createElement('strong', null, '订阅额度'),
+          React.createElement('span', { className: 'dim-jh-modalSubtitle' }, 'Cline')),
+        React.createElement('div', { className: 'dim-jh-modelPanelActions' },
+          React.createElement('button', {
+            className: 'dim-jh-btn',
+            disabled: quotaPhase === 'loading',
+            onClick: () => void loadQuota(),
+          }, quotaPhase === 'loading' ? '读取中…' : '刷新'),
+          React.createElement('button', {
+            className: 'dim-jh-btn',
+            'data-kind': 'primary',
+            onClick: onClose,
+          }, '完成'))),
+      React.createElement('p', { className: 'dim-jh-modalHint' },
+        '额度窗口与请求记录都来自 Cline 官方网关（不是本地记账），与账号卡片上的「积分」是两份不同的读数：'
+        + '积分答「还剩多少」，额度答「各时间窗用掉百分之几」。'),
+      renderQuota(),
+      renderLog()));
+}
+
 function ProviderPanel({ provider, rpcCall }) {
   const [accounts, setAccounts] = React.useState([]);
   const [phase, setPhase] = React.useState('loading');
@@ -1096,6 +1437,14 @@ function ProviderPanel({ provider, rpcCall }) {
   const canLoadCredits = supportsCreditBalance(provider);
   // 支持每日签到积分的 provider 才渲染领取按钮。
   const supportsCredits = supportsDailyCheckin(provider);
+  /**
+   * 「订阅额度」按钮的渲染条件（当前只有 Cline）。
+   *
+   * ⚠️ 与 `canLoadCredits` 是**两件不同的事**：`credits.balances` 答「还剩多少」，
+   * 订阅额度答「各时间窗用掉百分之几」+ 逐笔请求记录。Cline 两者都有，
+   * 但按钮与请求各自独立门控 —— 将来某渠道只加其中之一时不会互相牵连。
+   */
+  const canShowSubscriptionQuota = supportsSubscriptionQuota(provider);
 
   /**
    * 拉取本页全部账号的积分余额。
@@ -1266,6 +1615,10 @@ function ProviderPanel({ provider, rpcCall }) {
   // 「显示列表」：控制模型列表面板的展开状态。关闭时不挂载面板，避免
   // 每次进入面板都白白发一次 model.list 请求。
   const [showModels, setShowModels] = React.useState(false);
+  // 「订阅额度」：控制额度/请求记录弹窗的展开状态。同样关闭即不挂载，
+  // 避免每次进入面板都发 cline.quota / cline.requestLog（那两发在非 Cline
+  // 渠道会直接 bad-request）。
+  const [showQuota, setShowQuota] = React.useState(false);
 
   /**
    * 一键领取当前 provider 下全部已启用账号的每日签到积分。
@@ -1637,6 +1990,18 @@ function ProviderPanel({ provider, rpcCall }) {
           title: MODEL_LIST_HELP,
           onClick: () => setShowModels(true),
         }, '显示列表'),
+        // 「订阅额度」放在**面板级**（而不是账号卡片的按钮行）：
+        // 那一行已有 5 个按钮且 `flex-wrap: nowrap`，再塞一个必然溢出
+        // （该行的注释里记着「领取新手任务」当时就是这么被挤出去的）。
+        // 且额度是**跨账号**的读数，放在面板级与它的语义一致。
+        canShowSubscriptionQuota
+          ? React.createElement('button', {
+              className: 'dim-jh-btn',
+              title: '查看 Cline 官方订阅额度窗口（5 小时 / 周 / 月各用掉百分之几）'
+                + '与逐笔请求记录（模型、token、积分）。数据来自官方网关，非本地记账。',
+              onClick: () => setShowQuota(true),
+            }, '订阅额度')
+          : null,
         canLoadCredits
           ? React.createElement('button', {
               className: 'dim-jh-btn',
@@ -1822,6 +2187,15 @@ function ProviderPanel({ provider, rpcCall }) {
           provider,
           rpcCall,
           onClose: () => setShowModels(false),
+        })
+      : null,
+    // 「订阅额度」弹窗同样以覆盖层渲染（不挤占账号池版面）。
+    // 不复用 ModelListPanel 的 provider 形参：额度端点当前只认 Cline，
+    // 由 `canShowSubscriptionQuota` 门控按钮，面板内部固定传 'cline'。
+    showQuota
+      ? React.createElement(ClineQuotaPanel, {
+          rpcCall,
+          onClose: () => setShowQuota(false),
         })
       : null);
 }

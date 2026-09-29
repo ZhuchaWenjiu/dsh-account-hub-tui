@@ -1,0 +1,339 @@
+import { describe, expect, it, vi } from 'vitest'
+import {
+  CLINE_USAGE_LIMITS_PATH,
+  fetchClineRequestLog,
+  fetchClineUsageLimits,
+  parseClineRequestLog,
+  parseClineUsageLimits,
+} from '../../src/cline-quota.js'
+import { CLINE } from '../../src/cline-product.js'
+import type { ClineCredential } from '../../src/cline.js'
+
+/**
+ * ⚠️ 这两个 fixture 的**形状**取自参考实现
+ * `github.com/codeOct/dsh-cline-pass`（额度管理与请求记录部分），不是本机实测：
+ * 本机没有可用的 Cline 凭据，无法实发核对。故字段名以参考实现为准，
+ * 解析层对别名做了防御性读取（见 `parseClineRequestLog` 的 `created_at`）。
+ * 若将来实测发现字段不同，**改解析层 + 本 fixture 一起改**，不要只改一边。
+ */
+const LIMITS_FIXTURE = {
+  success: true,
+  data: {
+    limits: [
+      { type: 'five_hour', percentUsed: 12.5, resetsAt: '2026-09-29T10:00:00.000Z' },
+      { type: 'weekly', percentUsed: 68, resetsAt: '2026-10-05T00:00:00.000Z' },
+      { type: 'monthly', percentUsed: 120, resetsAt: '2026-10-31T00:00:00.000Z' },
+    ],
+  },
+}
+
+const USAGES_FIXTURE = {
+  success: true,
+  data: {
+    nextToken: 'tok-next',
+    items: [
+      {
+        createdAt: '2026-09-29T07:12:00.000Z',
+        aiModelName: 'Deepseek-v4.1-Flash',
+        aiModelTypeName: 'cline-free',
+        totalTokens: 49,
+        creditsUsed: 0,
+        costUsd: 1320,
+      },
+      {
+        createdAt: '2026-09-29T06:30:00.000Z',
+        aiModelName: 'GLM-5.2',
+        aiModelTypeName: 'cline-pass',
+        promptTokens: 100,
+        completionTokens: 25,
+        creditsUsed: 3,
+        costUsd: 900,
+      },
+    ],
+  },
+}
+
+const CRED: ClineCredential = {
+  access_token: 'workos:eyJhbGciOiJSUzI1NiIs',
+  refresh_token: 'tmgEeM2rd9ybYoWpXl8JqUfvK',
+  account_id: 'usr-01M3BCV4FYCGJKAWD3MJG3DBQM',
+  email: 'ijetlee@163.com',
+}
+
+describe('parseClineUsageLimits', () => {
+  it('解析实测形状的三个窗口', () => {
+    const result = parseClineUsageLimits(LIMITS_FIXTURE)
+    expect(result.error).toBeUndefined()
+    expect(result.windows).toHaveLength(3)
+    expect(result.windows[0]).toEqual({
+      type: 'five_hour',
+      percentUsed: 12.5,
+      resetsAt: '2026-09-29T10:00:00.000Z',
+    })
+  })
+
+  /**
+   * ⚠️ 窗口按网关原序透传、未知类型保留：这样网关新增窗口（如 `daily`）时
+   * 面板立刻多一行，**不需要**为它发一个插件版本。
+   */
+  it('未知窗口类型原样保留，且顺序不变', () => {
+    const result = parseClineUsageLimits({
+      success: true,
+      data: { limits: [{ type: 'daily', percentUsed: 1, resetsAt: '' }, { type: 'five_hour', percentUsed: 2, resetsAt: '' }] },
+    })
+    expect(result.windows.map(w => w.type)).toEqual(['daily', 'five_hour'])
+  })
+
+  /**
+   * ⚠️ 百分比**不夹取**：120 表示超额，夹到 100 会把「已超限」显示成
+   * 「刚好用完」 —— 那正是最该看见的信息。
+   */
+  it('percentUsed 超额时如实透传 120（不夹取到 100）', () => {
+    const result = parseClineUsageLimits(LIMITS_FIXTURE)
+    expect(result.windows[2]!.percentUsed).toBe(120)
+  })
+
+  it('缺 type 的行被丢弃（无法归属到任何窗口）', () => {
+    const result = parseClineUsageLimits({
+      success: true,
+      data: { limits: [{ percentUsed: 5 }, { type: 'weekly', percentUsed: 6 }] },
+    })
+    expect(result.windows).toHaveLength(1)
+    expect(result.windows[0]!.type).toBe('weekly')
+  })
+
+  it('percentUsed 缺省记 0（合法语义：该窗口没用过）', () => {
+    const result = parseClineUsageLimits({ success: true, data: { limits: [{ type: 'weekly' }] } })
+    expect(result.windows[0]!.percentUsed).toBe(0)
+    expect(result.windows[0]!.resetsAt).toBe('')
+  })
+
+  it('信封缺失时把顶层当载荷（网关不保证有 data 包装）', () => {
+    const result = parseClineUsageLimits({ limits: [{ type: 'weekly', percentUsed: 3 }] })
+    expect(result.windows).toHaveLength(1)
+  })
+
+  it('success:false 时回传服务端文案', () => {
+    const result = parseClineUsageLimits({ success: false, error: 'Unauthorized' })
+    expect(result.windows).toEqual([])
+    expect(result.error).toBe('Unauthorized')
+  })
+
+  /**
+   * ⚠️ 余额端点实测过这种形态：**HTTP 401 的响应体没有 `success` 字段**，
+   * 只在 `error` 里说明原因。订阅额度走同一个网关，必须同样认。
+   */
+  it('网关层失败（无 success 字段、只有 error）也认', () => {
+    const result = parseClineUsageLimits({ error: 'Unauthorized: re-authenticate' })
+    expect(result.windows).toEqual([])
+    expect(result.error).toContain('Unauthorized')
+  })
+
+  it('缺 limits 字段时给出明确原因', () => {
+    expect(parseClineUsageLimits({ success: true, data: {} }).error).toBe('响应缺少 limits 字段')
+  })
+
+  it('垃圾输入返回错误而不抛错', () => {
+    for (const value of [undefined, null, 'str', 42, []]) {
+      expect(parseClineUsageLimits(value).error, String(value)).toBeDefined()
+    }
+  })
+})
+
+describe('parseClineRequestLog', () => {
+  it('解析实测形状的两行', () => {
+    const result = parseClineRequestLog(USAGES_FIXTURE)
+    expect(result.rows).toHaveLength(2)
+    expect(result.rows[0]).toEqual({
+      createdAt: '2026-09-29T07:12:00.000Z',
+      model: 'Deepseek-v4.1-Flash',
+      modelType: 'cline-free',
+      totalTokens: 49,
+      creditsUsed: 0,
+      costUsd: 1320,
+    })
+  })
+
+  /** 分页游标就是响应里的 `nextToken`（请求参数只认 `cursor`）。 */
+  it('取出 nextToken 作为下一页游标', () => {
+    expect(parseClineRequestLog(USAGES_FIXTURE).nextToken).toBe('tok-next')
+  })
+
+  /**
+   * `totalTokens` 缺省时由两个分量现算 —— 直接给 0 会让「有消耗但没记总量」
+   * 的行看起来像没花钱，而它是真实请求。
+   */
+  it('缺 totalTokens 时由 promptTokens + completionTokens 现算', () => {
+    expect(parseClineRequestLog(USAGES_FIXTURE).rows[1]!.totalTokens).toBe(125)
+  })
+
+  it('缺 aiModelName 时回落到 aiModelTypeName', () => {
+    const result = parseClineRequestLog({
+      success: true,
+      data: { items: [{ aiModelTypeName: 'cline-pass', totalTokens: 1 }] },
+    })
+    expect(result.rows[0]!.model).toBe('cline-pass')
+    expect(result.rows[0]!.modelType).toBe('cline-pass')
+  })
+
+  it('容忍 createdAt 的蛇形别名', () => {
+    const result = parseClineRequestLog({
+      success: true,
+      data: { items: [{ created_at: '2026-09-29T00:00:00.000Z', totalTokens: 1 }] },
+    })
+    expect(result.rows[0]!.createdAt).toBe('2026-09-29T00:00:00.000Z')
+  })
+
+  it('没有 nextToken 时不带该字段（而不是空串）', () => {
+    const result = parseClineRequestLog({ success: true, data: { items: [] } })
+    expect(result.nextToken).toBeUndefined()
+    expect(result.rows).toEqual([])
+  })
+
+  it('缺 items 字段时给出明确原因', () => {
+    expect(parseClineRequestLog({ success: true, data: {} }).error).toBe('响应缺少 items 字段')
+  })
+
+  it('垃圾输入返回错误而不抛错', () => {
+    for (const value of [undefined, null, 'str', 42, []]) {
+      expect(parseClineRequestLog(value).error, String(value)).toBeDefined()
+    }
+  })
+})
+
+describe('fetchClineUsageLimits', () => {
+  it('用 users/me 拼 URL，并保留 workos: 前缀', async () => {
+    const calls: { url: string; headers: Record<string, string> }[] = []
+    const fetcher = vi.fn(async (url: string, init: RequestInit) => {
+      calls.push({ url, headers: init.headers as Record<string, string> })
+      return new Response(JSON.stringify(LIMITS_FIXTURE), { status: 200 })
+    }) as unknown as typeof fetch
+
+    const result = await fetchClineUsageLimits(CRED, CLINE, fetcher)
+    expect(calls[0]!.url).toBe(`https://api.cline.bot${CLINE_USAGE_LIMITS_PATH}`)
+    expect(calls[0]!.url).toContain('/users/me/plan/usage-limits')
+    expect(calls[0]!.headers.Authorization).toBe('Bearer workos:eyJhbGciOiJSUzI1NiIs')
+    expect(result.ok).toBe(true)
+    expect(result.windows).toHaveLength(3)
+  })
+
+  /** ⚠️ 额度端点用 `users/me`，故**不要求**凭据里有 account_id。 */
+  it('缺 account_id 也能查额度（路径是 me，不依赖账号 id）', async () => {
+    const fetcher = vi.fn(async () => new Response(JSON.stringify(LIMITS_FIXTURE), { status: 200 })) as unknown as typeof fetch
+    const result = await fetchClineUsageLimits({ access_token: 'workos:a' }, CLINE, fetcher)
+    expect(fetcher).toHaveBeenCalled()
+    expect(result.ok).toBe(true)
+  })
+
+  it('非 2xx 时带上 HTTP 状态码与服务端文案', async () => {
+    const fetcher = vi.fn(async () => new Response(JSON.stringify({ error: 'Unauthorized' }), { status: 401 })) as unknown as typeof fetch
+    const result = await fetchClineUsageLimits(CRED, CLINE, fetcher)
+    expect(result.ok).toBe(false)
+    expect(result.windows).toEqual([])
+    expect(result.error).toContain('HTTP 401')
+    expect(result.error).toContain('Unauthorized')
+  })
+
+  /**
+   * ⚠️ 网关出错时可能回 HTML（`Unexpected token '<'` 那类），必须把前缀带上，
+   * 否则排查者只知道「解析失败」而不知道拿到的是登录页。
+   */
+  it('响应不是 JSON 时给出可读原因（含响应体前缀）', async () => {
+    const fetcher = vi.fn(async () => new Response('<html>sign in</html>', { status: 200 })) as unknown as typeof fetch
+    const result = await fetchClineUsageLimits(CRED, CLINE, fetcher)
+    expect(result.ok).toBe(false)
+    expect(result.error).toContain('不是 JSON')
+    expect(result.error).toContain('<html>')
+  })
+
+  it('网络失败不抛错，返回带原因的空结果', async () => {
+    const fetcher = vi.fn(async () => { throw new Error('ECONNREFUSED') }) as unknown as typeof fetch
+    const result = await fetchClineUsageLimits(CRED, CLINE, fetcher)
+    expect(result.ok).toBe(false)
+    expect(result.windows).toEqual([])
+    expect(result.error).toContain('网络失败')
+    expect(result.error).toContain('ECONNREFUSED')
+  })
+
+  /** ⚠️ 查不到**不能显示成 0%**：0% 是「没用过」的语义。 */
+  it('成功但缺少 limits 时 ok 为 false 而非给一个空窗口列表', async () => {
+    const fetcher = vi.fn(async () => new Response(JSON.stringify({ success: true, data: {} }), { status: 200 })) as unknown as typeof fetch
+    const result = await fetchClineUsageLimits(CRED, CLINE, fetcher)
+    expect(result.ok).toBe(false)
+    expect(result.error).toContain('limits')
+  })
+})
+
+describe('fetchClineRequestLog', () => {
+  it('用 account_id 拼 URL（与余额端点同口径，不是 JWT 的 sub）', async () => {
+    const calls: string[] = []
+    const fetcher = vi.fn(async (url: string) => {
+      calls.push(url)
+      return new Response(JSON.stringify(USAGES_FIXTURE), { status: 200 })
+    }) as unknown as typeof fetch
+
+    const result = await fetchClineRequestLog(CRED, CLINE, fetcher)
+    expect(calls[0]).toBe('https://api.cline.bot/api/v1/users/usr-01M3BCV4FYCGJKAWD3MJG3DBQM/usages')
+    expect(result.ok).toBe(true)
+    expect(result.rows).toHaveLength(2)
+    expect(result.nextToken).toBe('tok-next')
+  })
+
+  /**
+   * ⚠️ 分页参数**只认 `cursor`**（`page` / `offset` / `nextToken` 会被静默忽略，
+   * 表现为「点了加载更多却看到同一批记录」）。故这里锁死 query 的形状。
+   */
+  it('传 cursor 时只加 ?cursor=（不是 page/offset）', async () => {
+    const calls: string[] = []
+    const fetcher = vi.fn(async (url: string) => {
+      calls.push(url)
+      return new Response(JSON.stringify(USAGES_FIXTURE), { status: 200 })
+    }) as unknown as typeof fetch
+
+    await fetchClineRequestLog(CRED, CLINE, fetcher, { cursor: 'tok-next' })
+    expect(calls[0]).toBe(
+      'https://api.cline.bot/api/v1/users/usr-01M3BCV4FYCGJKAWD3MJG3DBQM/usages?cursor=tok-next',
+    )
+    expect(calls[0]).not.toContain('page=')
+    expect(calls[0]).not.toContain('offset=')
+  })
+
+  it('空串游标视为第一页（不加 query）', async () => {
+    const calls: string[] = []
+    const fetcher = vi.fn(async (url: string) => {
+      calls.push(url)
+      return new Response(JSON.stringify(USAGES_FIXTURE), { status: 200 })
+    }) as unknown as typeof fetch
+
+    await fetchClineRequestLog(CRED, CLINE, fetcher, { cursor: '' })
+    expect(calls[0]).not.toContain('?')
+  })
+
+  /**
+   * ⚠️ 缺 account_id 时**不发请求**：路径里要有它，发出去必然 400。
+   * 这正是「对不支持的输入无条件发请求」那类缺陷的形态。
+   */
+  it('缺 account_id 时给出可操作原因且不发请求', async () => {
+    const fetcher = vi.fn(async () => new Response('{}', { status: 200 })) as unknown as typeof fetch
+    const result = await fetchClineRequestLog({ access_token: 'workos:a' }, CLINE, fetcher)
+    expect(result.ok).toBe(false)
+    expect(result.error).toContain('凭据缺少账号 id')
+    expect(fetcher).not.toHaveBeenCalled()
+  })
+
+  it('非 2xx 时带上 HTTP 状态码与服务端文案', async () => {
+    const fetcher = vi.fn(async () => new Response(JSON.stringify({ message: 'Invalid request format' }), { status: 400 })) as unknown as typeof fetch
+    const result = await fetchClineRequestLog(CRED, CLINE, fetcher)
+    expect(result.ok).toBe(false)
+    expect(result.error).toContain('HTTP 400')
+    expect(result.error).toContain('Invalid request format')
+  })
+
+  it('网络失败不抛错', async () => {
+    const fetcher = vi.fn(async () => { throw new Error('ETIMEDOUT') }) as unknown as typeof fetch
+    const result = await fetchClineRequestLog(CRED, CLINE, fetcher)
+    expect(result.ok).toBe(false)
+    expect(result.rows).toEqual([])
+    expect(result.error).toContain('ETIMEDOUT')
+  })
+})

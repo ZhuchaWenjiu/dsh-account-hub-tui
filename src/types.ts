@@ -397,6 +397,80 @@ export interface RpcCreditsBalancesResponse {
 
 /**
  * ========================================
+ * Cline 订阅额度与请求记录
+ * ========================================
+ *
+ * 与 `credits.balances`（余额）**语义不同，两个端点不能互相替代**：
+ *
+ * | | 余额 | 订阅额度 | 请求记录 |
+ * |---|---|---|---|
+ * | 回答的问题 | 还剩多少钱 | 各时间窗用掉百分之几 | 每一笔请求花了多少 |
+ * | 端点 | `/users/{id}/balance` | `/users/me/plan/usage-limits` | `/users/{id}/usages` |
+ *
+ * 参考实现：`github.com/codeOct/dsh-cline-pass` 的额度管理与请求记录部分
+ * （见 `src/cline-quota.ts` 的模块头注释）。
+ */
+
+/** RPC: 查询某 provider 的**订阅额度窗口**（当前只有 Cline 支持）。 */
+export interface RpcClineQuotaRequest {
+  provider: string
+}
+
+/**
+ * 单个账号的订阅额度读数。
+ *
+ * ⚠️ **`ok:false` 与「窗口为 0 个」是两件不同的事**：前者是查询失败
+ * （凭据失效、网关报错），后者是「账号确实没有任何额度窗口」。
+ * 面板对两者的文案必须不同 —— 把失败显示成「无额度」会让用户
+ * 以为额度没了（与本仓库「查不到不显示成 0」的一贯约定同源）。
+ */
+export interface RpcClineQuotaAccount {
+  accountId: string
+  nickname: string
+  ok: boolean
+  /** 窗口按网关原序透传（网关新增窗口类型时无需改插件）。 */
+  windows: Array<{ type: string; percentUsed: number; resetsAt: string }>
+  error?: string
+}
+
+/** RPC: 订阅额度响应。 */
+export interface RpcClineQuotaResponse {
+  accounts: RpcClineQuotaAccount[]
+}
+
+/**
+ * RPC: 查询**请求记录**（网关自己的流水，按时间倒序）。
+ *
+ * `cursor` 省略表示第一页；其值来自上一页响应的 `nextToken`。
+ */
+export interface RpcClineRequestLogRequest {
+  provider: string
+  accountId: string
+  /** 上一页的 `nextToken`；省略表示第一页。 */
+  cursor?: string
+}
+
+/** 请求记录的一行。 */
+export interface RpcClineRequestLogRow {
+  createdAt: string
+  model: string
+  modelType: string
+  totalTokens: number
+  creditsUsed: number
+  costUsd: number
+}
+
+/** RPC: 请求记录响应。 */
+export interface RpcClineRequestLogResponse {
+  ok: boolean
+  rows: RpcClineRequestLogRow[]
+  /** 下一页游标；没有更多时为 undefined。 */
+  nextToken?: string
+  error?: string
+}
+
+/**
+ * ========================================
  * 短信验证码登录（仅 Loomy）
  * ========================================
  *

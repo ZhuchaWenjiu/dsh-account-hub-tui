@@ -2816,8 +2816,79 @@ DSH_CLINE_CHAT_E2E_ALL_FREE=1            才遍历其余 4 个免费模型
   `X-Title: Cline`、`X-IS-MULTIROOT: false`、`X-CLIENT-TYPE: cline-sdk`。
 - `max_tokens` 上界收敛到 **943718**（内嵌目录最大 `maxTokens`，取自
   `muse-spark-1.3-contributor`），不自行编造更大值。
-- 单元测试 6 个文件：`cline.spec.ts` / `cline-models.spec.ts` / `cline-oauth.spec.ts` /
-  `cline-credits.spec.ts` / `cline-auth.spec.ts` / `cline-adapter.spec.ts`。
+- 单元测试 7 个文件：`cline.spec.ts` / `cline-models.spec.ts` / `cline-oauth.spec.ts` /
+  `cline-credits.spec.ts` / `cline-quota.spec.ts` / `cline-auth.spec.ts` / `cline-adapter.spec.ts`。
+
+### ⚠️ Cline「订阅额度」：官方额度窗口 + 请求记录（2026-09-29 新增）
+
+Cline 面板的账号管理区有一个**订阅额度**按钮（只在 Cline 出现），点开是弹窗：
+上半部是**官方额度窗口**（5 小时 / 周 / 月各用掉百分之几 + 重置时刻），
+下半部是**请求记录**（逐笔：时间、模型、token、积分）。
+
+与账号卡片上的「积分」是**两份不同的读数，不能互相替代**：
+
+| | 积分（既有） | 订阅额度（本次） | 请求记录（本次） |
+|---|---|---|---|
+| 回答的问题 | 还剩多少钱 | 各时间窗用掉百分之几 | 每一笔花了多少 |
+| 端点 | `/api/v1/users/{id}/balance` | `/api/v1/users/me/plan/usage-limits` | `/api/v1/users/{id}/usages` |
+
+参考实现：`github.com/codeOct/dsh-cline-pass` 的额度管理与请求记录部分。
+
+#### ⚠️ 五个实测坑（沿用参考实现已核实的结论，**不要重新踩**）
+
+1. **分页参数只认 `cursor`**，值取自响应 `data.nextToken`。
+   `nextToken` / `next_token` / `page` / `offset` / `skip` 作为**请求参数**会被网关
+   **静默忽略** —— 永远返回同一页。早期据此连翻会**重复计数**，得出
+   「已用 28 亿 token、超限 120%」这种荒谬结果。
+2. **`data.total` 恒为 0**，不能用来算页数或总量。
+3. **`/usages` 忽略 `startDate` / `endDate`**：只按时间**倒序**返回，
+   要按窗口截断只能读每行的 `createdAt`。
+4. **`resetsAt` 是 ISO 字符串**，不是数字时间戳 —— ⚠️ 故**不能**复用客户端的
+   `formatTime()`（它按毫秒运算，传字符串会一律显示「已过期」，
+   把 6 小时后重置的窗口说成已重置）。已另写 `formatWindowReset`。
+5. **`userId` 用凭据里的 `account_id`（`usr-…`）**，不是 JWT 的 `sub`（`user_…`）：
+   后者实测 `400 Invalid request format`。而**额度端点用字面量 `users/me`**，
+   不依赖 `account_id`（两者口径不同，别顺手统一）。
+
+#### 设计要点（改这个功能前先读）
+
+- **能力表两侧必须同时改**：客户端 `CREDITS_CAPABILITIES.cline.subscriptionQuota`
+  决定按钮是否渲染；服务端 `cline.quota` / `cline.requestLog` 对非 Cline 一律
+  `bad-request`。只改一边就是「按钮在、点了报错」或「功能存在却点不出来」。
+  `credits-capabilities.spec.ts` 用**全表推导**守住「只有 cline 登记」。
+- **`subscriptionQuota` 与 `balance` / `dailyCheckin` 语义独立，不能互相推断**：
+  Cline 是「有余额、有订阅额度、无签到」，Loomy 是「有余额、有签到、无订阅额度」。
+  合并成一个标志会让某个面板冒出不该有的按钮。
+- **额度逐账号隔离**：一个账号凭据坏掉只让**那一张卡片**显示原因，其余照常。
+  多账号用户不该因为一个号没配凭据就完全看不到额度。
+- **「查询失败」与「没有额度窗口」必须分开渲染**：前者是错误（显示原因），
+  后者是事实。合并成一句会让用户以为额度没了。
+- **失败不得显示成 0%**：0% 是「这个窗口没用过」的合法语义；
+  查询失败一律 `ok:false` + 原因（与其余 provider「查不到不显示成 0」同约定）。
+- **请求记录的失败是载荷（`ok:false`）而不是 RPC 级错误**：
+  面板要**保留已加载的行**、只把原因显示在表格下方；回成 RPC 错误会让整块换成错误页，
+  翻页途中失败就把用户已看到的记录清空了。
+- **百分比数值不夹取**（超额时如实显示 120%），只有进度条的**宽度**夹取到 0–100
+  —— 夹取数值会把「已超限」显示成「刚好用完」，那正是最该看见的信息。
+- **窗口按网关原序透传、不映射到固定形状**：网关新增窗口（如 `daily`）时面板
+  立刻多一行，**不需要**为它发一个插件版本。未知类型的中文标签回落到原值。
+- 按钮放在**面板级**而不是账号卡片的按钮行：那一行已有 5 个按钮且
+  `flex-wrap: nowrap`，再塞一个必然溢出（「领取新手任务」当时就是这么被挤出去的）。
+  且额度是**跨账号**读数，放面板级与语义一致。
+
+#### ⚠️ 验证边界（如实声明，别当成已实证）
+
+- **端点形状取自参考实现，本机没有可用 Cline 凭据，未做实发核对**。
+  `tests/unit/cline-quota.spec.ts` 的 fixture 同样据此写就。
+  **首次用真实账号验证时若发现字段不同**：改解析层（`src/cline-quota.ts`）与
+  fixture **一起改**，不要只改一边 —— 否则单测会在错误的形状上保持绿色。
+- 已做：`pnpm typecheck`、`pnpm test`（新增 42 条：`cline-quota` 30 条、
+  能力表 3 条、RPC 端点 9 条）、`pnpm build:all`。
+- 未做：GUI 点击级实测（`/api/jet-hub` 需浏览器登录态，直接调用返回 401，
+  与既有记录一致）。
+- **改了宿主侧（`src/`）需重启 DSH** 才生效；只改 `lib/client/jet-hub.js`
+  会被客户端 HMR 热加载（刷新页面即可，无需重启）。
+
 ## 常见开发任务
 
 ### 新增功能
