@@ -99,4 +99,53 @@ describe('rate limit parser', () => {
     const result = parseRateLimitError(body, 'm')!
     expect(result.resetTimeMs).toBe(Date.parse('2026-09-17 09:09:36 UTC+0'))
   })
+
+  // ── HTTP 429 状态码兜底 ──
+  //
+  // 真实缺陷（用户报障）：「账号池里明明还有可用账号，插件却直接报错、也不换号」。
+  //
+  // 根因：`isRateLimited` 原先**只接收响应体**，判据是「结构化业务码 6004」或
+  // 「中英文限流文案」。而服务端（网关 / CDN / 限流中间件）完全可能返回**空体**的
+  // 429 —— 两个判据双双不命中 → 返回 false → 适配器里
+  //
+  //     if (accountPool && isRateLimited(errorText)) { ...记录重置时间 + 换号... }
+  //
+  // 这整块逻辑被跳过：既不切换账号、也不写 modelRateLimits 标记，而是把原始 429
+  // 直接抛给用户。本可自愈的限流于是变成硬失败。
+  //
+  // 429 是 HTTP 语义上**唯一**的限流信号，无需也不应再去猜文案；文案 / 业务码兜底
+  // 保留，服务于「状态码不是 429、但正文表达限流」的场景（6004、SSE 流内错误、
+  // 网关包装过的 200/400）。
+
+  it('空体 429 必须判为限流（只看正文时会漏判）', () => {
+    // 先固定「只看正文」的旧行为确实是漏判，防止本用例退化成同义反复。
+    expect(isRateLimited('')).toBe(false)
+    expect(isRateLimited('', 429)).toBe(true)
+  })
+
+  it('任何无法识别正文的 429 都靠状态码兜底', () => {
+    const bodies = [
+      '',                                // 完全空体（真实缺陷的形态）
+      '   ',                             // 仅空白
+      '<html><body>429</body></html>',   // CDN 错误页：无「too many requests」字样
+      '{"requestId":"abc"}',             // 有 JSON 但无 code/msg
+    ]
+    for (const body of bodies) {
+      expect(isRateLimited(body, 429), `429 应判为限流: ${JSON.stringify(body)}`).toBe(true)
+    }
+  })
+
+  it('状态码兜底不得把非 429 的普通错误误判为限流（防误伤）', () => {
+    // 这是该修复的主要风险：多传一个 status 参数后，绝不能变成「有状态码就算限流」，
+    // 否则 404「模型不存在」这类**换号无益**的错误会被吞成「所有账号均受限」。
+    const body = '{"error":{"message":"model not found"}}'
+    for (const status of [400, 401, 403, 404, 500, 502]) {
+      expect(isRateLimited(body, status), `status=${status} 不应判为限流`).toBe(false)
+    }
+  })
+
+  it('429 之外仍保留既有文案 / 业务码兜底（状态码不是唯一判据）', () => {
+    expect(isRateLimited('usage exceeds frequency limit', 200)).toBe(true)
+    expect(isRateLimited('{"code":6004}', 400)).toBe(true)
+  })
 })

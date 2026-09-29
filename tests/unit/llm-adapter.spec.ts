@@ -1,7 +1,12 @@
 import { LlmError } from '@deepseek-ai/dsh-llm'
 import { describe, expect, it, vi } from 'vitest'
 import { credentialRef } from '@deepseek-ai/dsh-credentials'
-import { CHAT_API_BASE, CodeArtsAdapter, QUEUE_STATUS_BASE } from '../../src/llm-adapter.js'
+import {
+  CHAT_API_BASE,
+  CodeArtsAdapter,
+  QUEUE_STATUS_BASE,
+  RATE_LIMIT_FALLBACK_MS,
+} from '../../src/llm-adapter.js'
 import { setBenefitMemoryCache } from '../../src/models.js'
 import type { CodeArtsCredential } from '../../src/types.js'
 
@@ -616,6 +621,98 @@ describe('CodeArtsAdapter', () => {
     await expect(async () => {
       for await (const _ of adapter.stream(streamOptions)) { /* drain */ }
     }).rejects.toMatchObject({ code: 'INVALID_REQUEST' })
+  })
+
+  /**
+   * 回归（行为级）：**空体 429** 在 CodeArts 的换号入口必须换号并写入限流标记。
+   *
+   * ## 真实缺陷
+   *
+   * 「账号池里明明还有可用账号，插件却直接报错、也不换号」—— 本可自愈的限流
+   * 变成硬失败。
+   *
+   * 该入口原本有两道各自独立的判据，**必须同时带上 `response.status`**：
+   *
+   * ```ts
+   * if (accountPool && isRateLimited(errorText, response.status)) {   // 外层
+   *   const parsed = parseRateLimitError(errorText, options.model)     // 内层
+   *   if (parsed) { ...写标记 + 换号 + continue... }
+   * }
+   * ```
+   *
+   * 只补外层、漏掉内层时，空体 429 的后果是：外层判真放行 → 内层因体为空
+   * （`JSON.parse('')` 抛错，且没有状态码可兜底）返回 `null` → `if (parsed)`
+   * 把**整块**（写标记 + 换号 + `continue`）一起跳过 → 最终按原错误抛出。
+   * 与 buddy 侧最初那个缺陷同源，只是第三条调用点漏了。
+   *
+   * ## 本用例的响应体刻意是**空串**
+   *
+   * 换任何含限流措辞的正文（如 `TM.00001042` /「请稍后重试」），外层与内层
+   * 都会命中，缺陷根本不会暴露 —— 那正是既有的 429 队列用例（:548）覆盖不到
+   * 它的原因：那个用例的正文本身就能被判为排队/限流。
+   *
+   * ⚠️ 断言刻意落在**chat 请求逐个帐号的凭据**（`chatKeys`）而不是「fetch 总
+   * 调用次数」：修复前的路径会去探测排队状态端点（`queryQueueStatus`），
+   * 那也是一次 `fetch`，`mock.calls.length > 1` 在缺陷下同样成立 —— 写成
+   * 「次数 > 1」就是一条永远为真的假断言。
+   */
+  it('空体 429 在 CodeArts 换号入口同样换号并写入限流标记（状态码必须传进 parseRateLimitError）', async () => {
+    // 账号池替身：只实现 `CodeArtsAdapter.stream` 真正走到的三个方法。
+    // - findAccountIdByCredential：把首个凭据 AK 归属到 acct-1（决定写标记的账号）；
+    // - getAvailableAccount：返回**另一个**账号 acct-2 及其凭据 AK2；
+    // - updateModelRateLimit：记录标记，供断言兜底时长。
+    const marked: Array<{ accountId: string; modelId: string; resetAtMs: number }> = []
+    const pool = {
+      findAccountIdByCredential: async (provider: string, identity: string) =>
+        (provider === 'codearts' && identity === 'AK' ? 'acct-1' : ''),
+      getAvailableAccount: async () => ({
+        entry: { id: 'acct-2' },
+        credential: {
+          access_key_id: 'AK2', secret_access_key: 'SK2', security_token: 'ST2',
+          expires_at: '2099-01-01T00:00:00Z',
+        },
+      }),
+      updateModelRateLimit: async (accountId: string, modelId: string, resetAtMs: number) => {
+        marked.push({ accountId, modelId, resetAtMs })
+      },
+    }
+
+    // 只统计 **chat/completions** 请求（按 Authorization 里的 Access=<AK> 区分账号）；
+    // 排队状态端点的探测请求不参与，避免假断言（见用例注释）。
+    const chatKeys: string[] = []
+    const fetchImpl = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const headers = new Headers(init?.headers)
+      const key = /Access=([^,\s]+)/.exec(headers.get('Authorization') ?? '')?.[1] ?? ''
+      if (String(input).startsWith(CHAT_API_BASE)) chatKeys.push(key)
+      if (key === 'AK2') {
+        // 换号后成功：SSE 形状照抄既有用例（'streams text deltas…'）。
+        return new Response(
+          'data: {"choices":[{"delta":{"content":"ok"}}]}\n\ndata: [DONE]\n\n',
+          { status: 200, headers: { 'content-type': 'text/event-stream' } },
+        )
+      }
+      // 首个账号返回**空体 429**：没有任何可识别文案，只剩状态码可判。
+      return new Response('', { status: 429 })
+    })
+
+    const adapter = makeAdapter({ fetchImpl, accountPool: pool })
+    const texts: string[] = []
+    for await (const chunk of adapter.stream(streamOptions)) {
+      if (chunk.type === 'text-delta') texts.push(chunk.text)
+    }
+
+    // ① 换号后确实重试了（请求数多于一次）。
+    expect(fetchImpl.mock.calls.length).toBeGreaterThan(1)
+    // ② 第二/后续请求用的是**另一个账号**的凭据：['AK'] 表示只试了当前账号就放弃。
+    expect(chatKeys).toEqual(['AK', 'AK2'])
+    // ③ 失败账号被写入限流标记；空体无时刻可解析 → 必须是兜底时长（≈ 1 小时）。
+    expect(marked.map(entry => entry.accountId)).toEqual(['acct-1'])
+    expect(marked[0]!.modelId).toBe((streamOptions as { model: string }).model)
+    const fallbackDelta = marked[0]!.resetAtMs - Date.now()
+    expect(fallbackDelta).toBeGreaterThan(RATE_LIMIT_FALLBACK_MS - 60_000)
+    expect(fallbackDelta).toBeLessThanOrEqual(RATE_LIMIT_FALLBACK_MS)
+    // ④ 最终拿到内容，而不是把 429 抛给用户。
+    expect(texts).toEqual(['ok'])
   })
 
   it('translates tool_calls deltas into tool-call blocks so the harness can run them', async () => {
