@@ -665,6 +665,71 @@ describe('CodeArtsAdapter', () => {
     expect(JSON.parse(toolCallBlock!.arguments)).toEqual({ command: 'ls -la' })
   })
 
+  // 回归（严重，2026-09-29）：后端**完全不返回** tool_call id（或返回空串）时，
+  // 早期实现把它落成 `id:''`。后果不是「这一轮失败」而是**整条会话报废**：
+  //   1. `tool/call` 带 `callId:''` 落库；
+  //   2. 写 `tool/result` 时 DSH 的格式 v4 校验（`assertV4ToolResultMessage`）
+  //      要求 `message.toolCallId === source.callId` 且**都非空**（判 `length === 0`），
+  //      于是抛
+  //      `format v4 tool/result at seq N requires toolCallId matching its tool source`；
+  //   3. 日志停在 `tool/call`，崩溃恢复 `interruptedTurnClosers` 按空 callId
+  //      合成修补结果时**再次**命中同一校验 —— 既写不进也修不好。
+  // 线上实证：唯一命中的 provider 就是 codearts（31 个会话里 codearts 的
+  // 3 个 tool-call 块 100% 是空 id，其余 provider 共 1.4 万个全为 0）。
+  // 兄弟适配器（openai-compat / buddy / lobsterai / trae）都有 `toolIds` 兜底，
+  // 只有本文件漏了 —— 这就是该缺陷只在 codearts 复现的原因。
+  it('synthesizes a stable non-empty call id when the backend omits tool_call id', async () => {
+    // ⚠️ 三个分片**都没有** `id` 字段（真实形态），且是跨分片续传的同一调用。
+    const fetchImpl = vi.fn(async () => new Response(
+      'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"name":"pwsh","arguments":"{\\"command\\":"}}]}}]}\n\n'
+      + 'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"name":"","arguments":"\\"ls\\"}"}}]}}]}\n\n'
+      + 'data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}\n\n'
+      + 'data: [DONE]\n\n',
+      { status: 200, headers: { 'content-type': 'text/event-stream' } },
+    ))
+    const adapter = makeAdapter({ fetchImpl })
+    const deltaIds: unknown[] = []
+    let toolCallBlock: { type: 'tool-call'; id: string; name: string; arguments: string } | undefined
+    for await (const chunk of adapter.stream(streamOptions)) {
+      if (chunk.type === 'tool-call-delta') deltaIds.push(chunk.id)
+      if (chunk.type === 'block-end' && chunk.block.type === 'tool-call') toolCallBlock = chunk.block
+    }
+    // 核心判据：id 必须非空。空串会被格式 v4 校验直接拒绝。
+    expect(toolCallBlock?.id).toBeTruthy()
+    expect(typeof toolCallBlock?.id).toBe('string')
+    expect(toolCallBlock!.id.length).toBeGreaterThan(0)
+    // 同一次响应内必须**稳定**：所有分片同一个 id，且与 block-end 一致
+    // （否则 tool/result 无法与 tool/call 配对）。
+    expect(new Set(deltaIds).size).toBe(1)
+    expect(deltaIds[0]).toBe(toolCallBlock!.id)
+    // 工具名与参数不受影响。
+    expect(toolCallBlock).toMatchObject({ type: 'tool-call', name: 'pwsh' })
+    expect(JSON.parse(toolCallBlock!.arguments)).toEqual({ command: 'ls' })
+  })
+
+  // 反向用例：id 只出现在**首个**分片、且后续分片带空串 id 时，
+  // 不能被空串覆盖（与 `function.name` 同因）。空串会通过 `!== undefined`
+  // 判断，故 `if (call.id !== undefined)` 那种写法会在这里失败。
+  it('keeps the real call id when a later fragment carries an empty id', async () => {
+    const fetchImpl = vi.fn(async () => new Response(
+      'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call-real","function":{"name":"pwsh","arguments":"{}"}}]}}]}\n\n'
+      + 'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"","function":{"name":"","arguments":""}}]}}]}\n\n'
+      + 'data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}\n\n'
+      + 'data: [DONE]\n\n',
+      { status: 200, headers: { 'content-type': 'text/event-stream' } },
+    ))
+    const adapter = makeAdapter({ fetchImpl })
+    const deltaIds: unknown[] = []
+    let toolCallBlock: { id: string } | undefined
+    for await (const chunk of adapter.stream(streamOptions)) {
+      if (chunk.type === 'tool-call-delta') deltaIds.push(chunk.id)
+      if (chunk.type === 'block-end' && chunk.block.type === 'tool-call') toolCallBlock = chunk.block
+    }
+    // 真实 id 必须被保留，不能被后续空串抹掉。
+    expect(toolCallBlock?.id).toBe('call-real')
+    expect(deltaIds.every(id => id === 'call-real')).toBe(true)
+  })
+
   it('serializes harness tool schemas into the request tools field', async () => {
     const fetchImpl = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       const sent = JSON.parse(String(init?.body ?? '{}')) as {

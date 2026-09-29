@@ -1109,6 +1109,34 @@ export class CodeArtsAdapter extends LlmAdapter {
       announced: boolean
     }>()
     const toolOrder: number[] = []
+    /**
+     * `tool_call` 分片 index → 后端签发的真实 id。
+     *
+     * ⚠️ **本兜底不可省略**（真实缺陷，2026-09-29 定位）：OpenAI 兼容协议里
+     * `id` 只在**首个**分片出现，但实测华为侧偶发**完全不返回 `id`**（或返回空串）。
+     * 早期实现直接把 `call.id` 写进 `block.callId`，缺失时落成**空串** id，
+     * 于是 assistant 消息里留下 `{type:'tool-call', id:''}`：
+     *
+     * 1. `tool/call` 带着 `callId:''` 被持久化；
+     * 2. 该调用完成后写 `tool/result` 时，DSH 的格式 v4 校验
+     *    （`assertV4ToolResultMessage`）要求 `message.toolCallId === source.callId`
+     *    且**都非空**，于是抛
+     *    `format v4 tool/result at seq N requires toolCallId matching its tool source`；
+     * 3. 该轮直接失败，且**会话永久报废** —— 日志停在 `tool/call`，崩溃恢复
+     *    (`interruptedTurnClosers`) 按空 callId 合成修补结果时**再次**命中同一校验，
+     *    既写不进也修不好。
+     *
+     * 空 id 同样过不了 `SessionFormatError`（它判 `length === 0`），故判据必须是
+     * 「非空字符串」而不是「!== undefined」。
+     *
+     * 兄弟适配器（`openai-compat.ts` / `buddy-adapter.ts` / `lobsterai-adapter.ts` /
+     * `trae-adapter.ts`）**都**有这层 `toolIds` 兜底，只有本文件漏了 —— 这正是
+     * 该缺陷只在 `codearts` provider 复现的原因。
+     *
+     * ⚠️ 兜底 id 用 `call_${wireIndex}` 而非随机值：同一次响应内 index 唯一，
+     * 且它必须是**稳定**的 —— 后续分片每片都要得到同一个 id。
+     */
+    const toolIds = new Map<number, string>()
     let buffer = ''
     let streamEnded = false
     let finishReason: 'stop' | 'tool_calls' | 'length' | undefined
@@ -1419,12 +1447,16 @@ export class CodeArtsAdapter extends LlmAdapter {
           }
           for (const call of delta?.tool_calls ?? []) {
             const wireIndex = call.index ?? 0
+            // ⚠️ 只接受**非空** id 并记住它：后续分片可能新一轮又给空串/缺失，
+            // 无条件覆盖会把首片拿到的真实 id 抹成空（与 `function.name` 同因）。
+            if (typeof call.id === 'string' && call.id.length > 0) toolIds.set(wireIndex, call.id)
+            const callId = toolIds.get(wireIndex) ?? `call_${wireIndex}`
             let block = toolCalls.get(wireIndex)
             if (block === undefined) {
               block = { index: nextIndex++, text: '', announced: false }
               toolCalls.set(wireIndex, block)
             }
-            if (call.id !== undefined) block.callId = call.id
+            block.callId = callId
             // 后续参数分片会带上空的 function.name（""），它不是 undefined，
             // 直接覆盖会把首个分片解析出的真实工具名清空，导致
             // `unknown tool ""`。只有非空名字才允许更新。
@@ -1445,7 +1477,7 @@ export class CodeArtsAdapter extends LlmAdapter {
               yield {
                 type: 'tool-call-delta',
                 index: block.index,
-                id: ToolCallId(block.callId ?? ''),
+                id: ToolCallId(callId),
                 name: block.name!,
                 argumentsDelta: block.text,
               }
@@ -1454,7 +1486,7 @@ export class CodeArtsAdapter extends LlmAdapter {
             yield {
               type: 'tool-call-delta',
               index: block.index,
-              id: ToolCallId(block.callId ?? ''),
+              id: ToolCallId(callId),
               ...block.name !== undefined ? { name: block.name } : {},
               argumentsDelta: fragment,
             }
@@ -1603,7 +1635,11 @@ export class CodeArtsAdapter extends LlmAdapter {
         index,
         block: {
           type: 'tool-call',
-          id: ToolCallId(block.callId ?? ''),
+          // ⚠️ 判据用 `||`（同时兜 undefined 与空串），**不可**退回成
+          // `block.callId ?? ''`：空串 id 会被格式 v4 校验拒绝（它判
+          // `length === 0`），落库即等于报废整条会话（见上方 `toolIds` 注释）。
+          // 正常路径下 `block.callId` 已在建块时填好，此处仅为最后一道防线。
+          id: ToolCallId(block.callId || `call_${index}`),
           name: block.name!,
           // 同上：空分片补 {}，残缺参数保持原样交由截断判定处理。
           arguments: isTruncatedArguments(block.text)
