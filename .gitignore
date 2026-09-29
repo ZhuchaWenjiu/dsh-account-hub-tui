@@ -14,6 +14,18 @@ lib/
 stderr.log']
 commit-msg.tmp
 
+# 本地临时工作区（协议取证脚本 / 探针 / 发现记录）。
+#
+# ⚠️ 与 `scripts` 行同理：这些是**只读排查与研究工具**，仅本地保留。
+# `scripts` 那行只匹配文件与目录名 `scripts`，**不覆盖**这个目录，
+# 故必须单独列出（否则 `.tmp-zcode/` 会被 `git add .` 一起提交）。
+.tmp-zcode/
+.tmp-*/
+
+# 其它任务的本地取证目录（非本插件运行时依赖）。
+.minimax-forensics/
+.research/
+
 ide-models.json
 scripts
 
