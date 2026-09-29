@@ -20,11 +20,18 @@ import { RaccoonAuth } from './raccoon-auth.js'
 import { LOOMY } from './loomy-product.js'
 import { LoomyBalanceSelector } from './loomy-balance-selector.js'
 import { RACCOON } from './raccoon-product.js'
+import { ZcodeAuth } from './zcode-auth.js'
+import { registerZcodeLlm } from './zcode-adapter.js'
+import { ZCODE } from './zcode-product.js'
+import { ZCODE_CAPTCHA_FALLBACK } from './zcode-captcha.js'
+import type { ZcodeCredential } from './zcode.js'
 import { AccountPool } from './account-pool.js'
 import { hasLegacyNamespaceRegistration, settingsOf, suppressAutoSettingsPage } from './settings-compat.js'
 import type { ImageRequestTarget } from './image-budget.js'
 import { buildRaccoonNickname, registerJetHubRpc } from './jet-hub-rpc.js'
-import { CODEBUDDY, WORKBUDDY } from './product.js'
+import { CODEBUDDY, WORKBUDDY, type BuddyProduct } from './product.js'
+import { buddyExpiringWindowDays } from './buddy-balance-rank.js'
+import { BuddyBalanceSelector, pickBuddyAccount } from './buddy-balance-selector.js'
 import { LOBSTERAI } from './lobsterai-product.js'
 import { QODER, QODER_CN } from './qoder-product.js'
 import { TRAE } from './trae-product.js'
@@ -205,7 +212,7 @@ export function apply(ctx: Context): void {
   registerProviderSettings(
     ctx, 'llm-buddy', 'llm-workbuddy', 'llm-codearts', 'llm-lobsterai',
     'llm-qoder', 'llm-qodercn', 'llm-trae', 'llm-cline', 'llm-loomy', 'llm-raccoon',
-    'llm-minimax',
+    'llm-minimax', 'llm-zcode',
   )
   const service = new CodeArtsAuth(ctx)
   const pool = new AccountPool(ctx)
@@ -256,18 +263,127 @@ export function apply(ctx: Context): void {
   // ===== Buddy (腾讯 CodeBuddy) 服务 =====
   // 不注册斜杠命令：登录/状态/续期都在 Jet Hub 设置页完成（多账号 + 账号池），
   // 命令式的单凭据入口已无必要。
+
+  /**
+   * 按凭据 ref 解析 buddy 系凭据（CodeBuddy 与 WorkBuddy **共用这一个函数**）。
+   *
+   * 两站凭据同构（同一 CLI 内核、同一认证协议），差别只在 endpoint；
+   * 解析这件事与 endpoint 无关，故不写两份。
+   */
+  const resolveBuddyCredentialByRef = async (refName: string): Promise<BuddyCredential | undefined> => {
+    const resolved = await ctx.credentials.resolve(credentialRef(refName))
+    if (!resolved) return undefined
+    try {
+      return JSON.parse(resolved.value) as BuddyCredential
+    } catch {
+      return undefined
+    }
+  }
+
+  /**
+   * 两个 buddy 各自的**按到期分档选号器**（各自一份余额缓存，绝不串味）。
+   *
+   * ⚠️ **为什么需要它**：一个 buddy 账号常同时持有多种资源包（实测 WorkBuddy
+   * 每个号都有「Bonus Pack（14 天到期）」+「Free Plan Subscription（扣费截止
+   * 8 年后）」），而**服务端扣哪个包不由插件决定**。插件能决定的只有「用哪个号」：
+   * 优先用还有「15 天内到期积分」的号（那部分再不用就作废），只剩长期积分的号
+   * 排最后 —— 与「锁定永久积分」配套（锁定时后者直接判不可用）。
+   *
+   * 判据出处见 `buddy-balance-rank.ts`（为什么是 15 天、为什么用 DeductionEndTime
+   * 而不是 CycleEndTime / ExpiredTime，都有实测对照）。
+   */
+  const buddyBalanceSelector = new BuddyBalanceSelector({
+    product: CODEBUDDY,
+    resolveCredential: resolveBuddyCredentialByRef,
+  })
+  const workbuddyBalanceSelector = new BuddyBalanceSelector({
+    product: WORKBUDDY,
+    resolveCredential: resolveBuddyCredentialByRef,
+  })
+
+  /**
+   * buddy 系的选号编排：按「enabled + 模型未受限」筛候选 → 按余额分档选号 → 取凭据。
+   *
+   * ⚠️ 余额分档**只在这批候选内部进行** —— 即与 Loomy 同一约定：策略建立在
+   * 「模型没有受限且账号没有被停用」的基础上，不能因为某个号积分多就绕开限流标记。
+   *
+   * @returns 选中账号的凭据；`credential` 为空时 `tried` 是「档位最优但凭据坏了」
+   * 的账号集合，调用方要把它作为排除集合传给 `getAvailableAccount` 继续兜底。
+   *   锁定且无可用账号时**抛错**（绝不回落，否则锁定形同虚设）。
+   */
+  const pickBuddyCredential = async (options: {
+    product: BuddyProduct
+    selector: BuddyBalanceSelector
+    /** 报错文案里的产品名（用户要知道去哪个面板解锁）。 */
+    displayName: string
+    modelId?: string
+  }): Promise<{ credential?: BuddyCredential; tried: Set<string> }> => {
+    const tried = new Set<string>()
+    const candidates = pool
+      .listAccountsByProvider(options.product.id)
+      .filter(a => a.enabled)
+      .filter((a) => {
+        // 与 `getAvailableAccount` 的限流判据保持一致（空 modelId = 不过滤）。
+        const key = options.modelId ?? ''
+        if (key.length === 0) return true
+        if (!a.modelRateLimits) return true
+        const resetAt = a.modelRateLimits[key]
+        return resetAt === undefined || resetAt === 0 || Date.now() >= resetAt
+      })
+      .map(a => ({ id: a.id, credentialRef: a.credentialRef }))
+
+    const allowPermanent = !pool.permanentLocked(options.product.id)
+
+    const picked = await pickBuddyAccount(options.selector, candidates, {
+      allowPermanent,
+      resolveCredential: resolveBuddyCredentialByRef,
+    })
+    if (picked.kind === 'account') {
+      return { credential: picked.credential, tried: new Set(picked.tried) }
+    }
+    for (const id of picked.tried) tried.add(id)
+    if (picked.kind === 'locked') {
+      // ⚠️ **锁定时绝不可落到调用方的 `getAvailableAccount` 兜底** —— 那会绕过
+      // 锁定、照样消耗永久积分，锁定形同虚设（与 Loomy 那条同因）。
+      const days = buddyExpiringWindowDays()
+      // ⚠️ 同样要区分「真的用尽」与「查不到」（与 Loomy 那条同型缺陷）：
+      // 把一次网络抖动报成"额度已用尽"，用户会去解锁或白等，而号其实有钱。
+      if (picked.reason?.kind === 'unknown') {
+        throw new Error(
+          `${options.displayName}：无法确认是否有可用账号。已锁定永久积分，而部分账号的余额查询失败`
+          + `（${picked.reason.errors.slice(0, 2).join('；')}）。这些账号**可能仍有**「${days} 天内到期」`
+          + '的积分 —— 请重试，或在 Jet Hub 对应面板检查凭据是否失效。',
+        )
+      }
+      throw new Error(
+        `${options.displayName}：没有可用账号。已锁定永久积分，而所有账号的「${days} 天内到期」`
+        + '积分都已用尽。请在 Jet Hub 的 '
+        + `${options.displayName} 面板解锁永久积分，或等待资源包到期后重新发放额度。`,
+      )
+    }
+    return { tried }
+  }
+
   const buddy = new BuddyAuth(ctx)
   const buddyAdapter = registerBuddyLlm(ctx, {
     credentialRef: credentialRef(BUDDY_CREDENTIAL_REF),
     resolveCredential: async (modelId?: string) => {
-      // 优先使用账号池获取可用账号，回退到单凭据解析
-      if (pool) {
-        // ⚠️ `modelId` 必须透传：限流按**模型**记（`modelRateLimits[model]`），
-        // 传空串会让 `getAvailableAccount` 的限流过滤整体短路
-        //（`if (modelId.length === 0) return true`）→ 被标记限流的账号仍被选中。
-        const available = await pool.getAvailableAccount('buddy', modelId ?? '')
-        if (available) return available.credential as BuddyCredential
-      }
+      // 优先按「快到期积分」分档选号（锁定永久积分时也走这条，见上）。
+      const picked = await pickBuddyCredential({
+        product: CODEBUDDY,
+        selector: buddyBalanceSelector,
+        displayName: 'CodeBuddy',
+        modelId,
+      })
+      if (picked.credential) return picked.credential
+      // 回退到账号池的既有选择（凭据损坏的账号已被 tried 排除），最后才退单凭据 ref。
+      // provider 实参用 CODEBUDDY.id 而非字面量 'buddy'：写死字面量在改名/多产品
+      // 场景下会静默查不到账号（本插件在 workbuddy 上踩过同类坑）。
+      // ⚠️ `modelId` 必须透传：限流按**模型**记（`modelRateLimits[model]`），
+      // 传空串会让 `getAvailableAccount` 的限流过滤整体短路
+      //（`if (modelId.length === 0) return true`）→ 被标记限流的账号仍被选中。
+      const available = await pool.getAvailableAccount(CODEBUDDY.id, modelId ?? '', picked.tried)
+      if (available) return available.credential as BuddyCredential
       const resolved = await ctx.credentials.resolve(credentialRef(BUDDY_CREDENTIAL_REF))
       if (!resolved) return undefined
       try {
@@ -299,8 +415,18 @@ export function apply(ctx: Context): void {
     resolveCredential: async (modelId?: string) => {
       // 只从 workbuddy 的账号池取账号，回退到 WorkBuddy 自己的单凭据 ref，
       // 保证不会串用 CodeBuddy 的凭据。
+      // 选号策略与 CodeBuddy 同款，但用的是**WorkBuddy 自己的锁状态与余额缓存**
+      // （两站积分构成不同：实测国际版是「Bonus Pack 14 天 + Free Plan 长期」）。
+      const picked = await pickBuddyCredential({
+        product: WORKBUDDY,
+        selector: workbuddyBalanceSelector,
+        displayName: 'WorkBuddy',
+        modelId,
+      })
+      if (picked.credential) return picked.credential
       // ⚠️ `modelId` 透传：否则模型级限流标记被忽略（详见 buddy 处说明）。
-      const available = await pool.getAvailableAccount('workbuddy', modelId ?? '')
+      // provider 实参用 WORKBUDDY.id 而非字面量 'workbuddy'（同类坑见上）。
+      const available = await pool.getAvailableAccount(WORKBUDDY.id, modelId ?? '', picked.tried)
       if (available) return available.credential as BuddyCredential
       const resolved = await ctx.credentials.resolve(credentialRef(WORKBUDDY.defaultCredentialRef))
       if (!resolved) return undefined
@@ -653,19 +779,33 @@ export function apply(ctx: Context): void {
         .map(a => ({ id: a.id, credentialRef: a.credentialRef }))
 
       // 「锁定永久积分」：只允许消耗今日赠送额度（用户要求，且持久化）。
-      const allowPermanent = !pool.loomyPermanentLocked()
+      // 开关按 provider 存（CodeBuddy / WorkBuddy 各有一份，互不影响）。
+      const allowPermanent = !pool.permanentLocked(LOOMY.id)
 
       if (candidates.length > 0) {
         const picked = await loomyBalanceSelector.select(candidates, { allowPermanent })
-        if (picked !== undefined) {
+        if (picked.ok) {
           const credential = await resolveLoomyCredentialByRef(picked.account.credentialRef)
           if (credential !== undefined) return credential
         } else if (!allowPermanent) {
           // ⚠️ **锁定时绝不可落到下面的单凭据兜底** —— 那会绕过锁定、
           // 照样消耗永久积分，锁定形同虚设。这里直接抛明确错误（用户要求）。
+          //
+          // ⚠️ **必须区分「真的用尽」与「查不到」**（真实缺陷，用户报障
+          // 2026-09-29）：曾把两者混成一句「今日额度都已用尽」，于是
+          // **一次网络抖动**就让用户被告知"钱花完了"（实测当时 4 个号里
+          // 3 个还有 4965/5000/5000）—— 用户会去解锁或白等一天，而号其实有钱。
+          const reason = picked.reason
+          if (reason.kind === 'unknown') {
+            throw new Error(
+              'Loomy：无法确认是否有可用账号。已锁定永久积分，而部分账号的余额查询失败'
+              + `（${reason.errors.slice(0, 2).join('；')}）。这些账号**可能仍有**今日额度 —— `
+              + '请重试，或在 Jet Hub 的 Loomy 面板检查凭据是否失效。',
+            )
+          }
           throw new Error(
-            'Loomy：没有可用账号。已锁定永久积分，而所有账号的今日赠送额度都已用尽'
-            + '（或余额查询失败）。请在 Jet Hub 的 Loomy 面板解锁永久积分，或等待明日额度刷新。',
+            'Loomy：没有可用账号。已锁定永久积分，而所有账号的今日赠送额度都已用尽。'
+            + '请在 Jet Hub 的 Loomy 面板解锁永久积分，或等待明日额度刷新。',
           )
         }
       }
@@ -876,6 +1016,169 @@ export function apply(ctx: Context): void {
     ctx.logger.warn(`[jet-hub] 修正 Raccoon 账号显示名失败：${String(error)}`)
   })
 
+// ===== ZCode（智谱 z.ai 免费额度通道）=====
+//
+// 形态与前面所有 provider **相同**：读凭据 → 直发远端。
+// 用户只需在官方 ZCode 客户端登录一次 —— 凭据就落在
+// `~/.zcode/v2/credentials.json`（AES-256-GCM 加密，公开算法），
+// 本插件纯 Node 解密即可，**不需要任何实例常驻**。
+//
+// 与其余 provider 的三处差异（全部实测）：
+//   1. 协议是 **Anthropic Messages**（不是 OpenAI 兼容）——
+//      见 `zcode-anthropic.ts` 的转换层。
+//   2. 每请求要产出一个**一次性**的阿里云 captcha（约 1.2 秒）——
+//      见 `zcode-captcha.ts`。
+//   3. 请求体必须带官方身份块与首轮日期块，否则上游回 `3012` ——
+//      见 `zcode-identity.ts`。
+//
+// ⚠ **可脱离官方客户端使用**：登录走官方 CLI 设备授权流
+// （`/oauth/cli/init` → 浏览器授权 → `/oauth/cli/poll/{flow_id}`，
+// 纯 HTTP，见 `zcode-login.ts`），且 `device_mid` **由插件自己生成**。
+// 若机器上已装并登录过官方客户端，也会自动读取它的凭据作为回退。
+//
+// ⚠ **不可续期**：凭据是静态的（JWT 的 payload 里没有 `exp`）。
+// 失效时上游回 401/1002，适配器归为 AUTH 并提示用户重新登录。
+//
+// 服务名注册为 ctx.zcodeAuth（由 `Service` 基类完成）。
+// 不注册斜杠命令：入口在 Jet Hub 的 ZCode 面板。
+//
+// ⚠ **必须把账号池传进去**：`ZcodeAuth.current()` 要从账号池里找用户在
+// Jet Hub 登录时创建的那个 ref（`ZCODE_ACCOUNT_XXXX`），而不是只认固定的
+// `ZCODE_CREDENTIAL`。不传的话「登录成功但面板显示未配置」——
+// 且该缺口会被「回退读官方凭据文件」掩盖，只有没装官方客户端的用户才看得到。
+const zcode = new ZcodeAuth(ctx, { accountPool: pool })
+/**
+ * captcha 配置：优先向服务端索取，失败回退内置兜底值。
+ *
+ * ## ⚠ 这里**不再**做缓存（2026-10-01 修正）
+ *
+ * 旧实现是 `??=` 的**永久缓存**，两个缺陷（都已实测确认）：
+ *
+ * 1. **服务端换 `sceneId`／灰度切换后永不生效**（必须重启宿主才能跟上）；
+ * 2. **首次拉取失败会被永久固化** —— `??=` 连「回退到兜底值」这个结果
+ *    一起记住，此后即使服务端恢复也不会重试。
+ *
+ * 正确做法是官方 `f3()` 的语义：**60 秒 TTL + 在飞去重、失败不缓存**。
+ * 那个能力已下沉到 `ZcodeAuth.fetchCaptchaConfig()`
+ *（见其 `captchaConfigCacheInstance`），故这里只做「拿 → 回退」的编排。
+ */
+const resolveZcodeCaptchaConfig = async (): Promise<{ region: string; prefix: string; sceneId: string }> => {
+  const remote = await zcode.fetchCaptchaConfig().catch(() => undefined)
+  if (remote !== undefined) {
+    zcodeAdapter.setCaptchaConfig(remote)
+    return remote
+  }
+  return ZCODE_CAPTCHA_FALLBACK
+}
+/**
+ * 「本次 ZCode 请求**实际使用**的账号 id」。
+ *
+ * ## 为什么需要（与 `activeQoderAccountId` 同因）
+ *
+ * 额度受限时适配器要**标记失败的账号**，而它能拿到的只有这个回调。
+ * 池的选号是即时决策，且**切号后回调不会跟着变** —— 若适配器改用
+ * 「池当前的默认账号」，切到 B 之后失败时会**再标记一次 A**，
+ * B 从未被标记，下次取号又把 B 选中，于是在 A/B 之间反复空转
+ * （`qoder-adapter.ts` 的 `switchAccountOnQuota` 注释里记了这条实测）。
+ *
+ * ⇒ 在 `resolveCredential` 里记录**实际返回的那个账号**，供适配器查询。
+ */
+const activeZcodeAccountId = new Map<string, string | undefined>()
+const zcodeAdapter = registerZcodeLlm(ctx, {
+  credentialRef: credentialRef(ZCODE.defaultCredentialRef),
+  resolveCredential: async (modelId?: string) => {
+    // 只从 zcode 自己的账号池取账号，回退到自己的单凭据 ref，
+    // 保证不会串用其它 provider 的凭据。
+    // provider 实参用 ZCODE.id 而非字面量：写死字面量在改名/多产品场景下
+    // 会静默查不到账号（本插件在 workbuddy 上踩过同类坑）。
+    // ⚠ `modelId` 透传：否则模型级限流标记被忽略（详见 buddy 处说明）。
+    const available = await pool.getAvailableAccount(ZCODE.id, modelId ?? '')
+    /**
+     * `getAvailableAccount` 的凭据类型是历史遗留的联合类型，
+     * 与 `ZcodeCredential` 无充分重叠，故经 `unknown` 转换。
+     * 运行时安全性由 provider 过滤保证：查询用 `ZCODE.id`，取到的必是 zcode 凭据。
+     */
+    if (available) {
+      // 记下**实际返回的**账号：额度受限时适配器要标记的是它。
+      activeZcodeAccountId.set(ZCODE.id, available.entry.id)
+      return available.credential as unknown as ZcodeCredential
+    }
+    /**
+     * 账号池里没有条目时，落到 `ZcodeAuth.current()` ——
+     * 它已经实现了「插件自存优先 → 官方客户端凭据回退」。
+     * ⚠ 不要在这里重复实现那条优先级（重复必然漂移）。
+     *
+     * ⚠ 同时**清空**记录：没有账号条目可标记，留着旧 id 会误伤一个无辜账号。
+     */
+    activeZcodeAccountId.set(ZCODE.id, undefined)
+    return await zcode.current()
+  },
+  refresh: async () => {
+    // ⚠ ZCode **没有** refresh 端点（与 Loomy 恒 false 同类，但原因不同）：
+    // 凭据是**静态**的（在官方客户端登录一次就固定下来）。
+    // 这里做的是「重读磁盘凭据并回写账号条目」——
+    // 使用户在官方客户端重新登录后，本插件无需重启即可用上新凭据。
+    const credential = await zcode.current()
+    if (credential === undefined) return
+    const available = await pool.getAvailableAccount(ZCODE.id, '')
+    // ⚠ `getAvailableAccount` 返回的可能是 `null`（本仓库该 API 的约定），
+    // 只判 `undefined` 会漏掉它 —— 用显式判空覆盖两者。
+    if (available === null || available === undefined) return
+    try {
+      await ctx.credentials.set(
+        credentialRef(available.entry.credentialRef),
+        JSON.stringify(credential),
+      )
+    } catch {
+      // 回写失败不影响请求（请求走磁盘凭据）。静默即可。
+    }
+  },
+  // ⚠ captcha 是**一次性**的 —— 每次调用都必须现产一个新 param。
+  // 走 `zcode.mintCaptcha`：整个插件**共用一台**常驻浏览器
+  //（适配器自建会变成两台，白占 200MB）。
+  //
+  // ⚠ `options.signal` 必须继续往下传：captcha 侧的取页等待与建连历史上有
+  // 无超时的路径，不传就等于「用户点停止也停不下来」（真实缺陷，2026-09-29）。
+  mintCaptcha: async (options?: { signal?: AbortSignal }) => {
+    const config = await resolveZcodeCaptchaConfig()
+    return await zcode.mintCaptcha(config, options)
+  },
+  captchaRegion: ZCODE_CAPTCHA_FALLBACK.region,
+  /**
+   * ⚠ **图片字节桥接** —— 这是图片能真正发出去的关键。
+   *
+   * DSH 的图片块只带 `attachment:{attachmentId}`，真正拿字节要经附件服务。
+   * 缺了这两项，`serializeMessages` 拿到**空映射**，图片会退化成
+   * `[image unavailable]` 占位符 —— 实测症状是模型回
+   * 「我在当前对话中没有收到任何图片」。
+   *
+   * ⚠ 与其余 provider 同款约定（十余处一致）：
+   *   - `readImage`：拿原始字节（内联为 data URL）
+   *   - `readImageRequest`：拿**按预算缩放后**的字节；**不可用时返回
+   *     `undefined`**（不抛错），适配器据此回退原图
+   */
+  readImage: makeReadImage(ctx),
+  // 图片请求版本（缩放）桥接：ZCode 免费通道的请求体没有实测硬上限，
+  // 但 base64 后的截图很大（2560×1600 各约 3.9 MB），两张就接近常见网关
+  // 的 10MB 门槛 —— 与 raccoon 的同因（issue !IKITT9 那一族）。
+  readImageRequest: makeReadImageRequest(ctx),
+  // 模型目录用静态白名单（实测可用的两个）—— 上游模型池含
+  // 实测返回空响应的两条（GLM-5-Turbo / GLM-5.2），故不枚举远端。
+  fetchRemoteModels: () => zcode.fetchModels(),
+  accountPool: pool,
+  product: ZCODE,
+  // 就绪判据 = 有可用凭据（插件自存或官方客户端凭据）。
+  isReady: async () => (await zcode.current()) !== undefined,
+  /**
+   * 额度用尽 / 无权益时，适配器据此**标记失败的账号并切换**。
+   *
+   * 回调的是「本次实际使用的账号」（理由见 `activeZcodeAccountId` 的注释）——
+   * 不要改成 `pool.getAvailableAccount(...)` 之类「再问一次池」的实现。
+   */
+  currentAccountId: () => activeZcodeAccountId.get(ZCODE.id),
+})
+
+
   // 一次性修复**老 TRAE 账号**的展示名（与上面 Raccoon 同类，同因）：
   // 服务端 ScreenName 是**按 uid 自动生成的默认名**（`用户26815487395`），
   // 多账号无法区分；`GetUserInfo` 的 `NonPlainTextMobile`（脱敏手机号）可区分。
@@ -935,6 +1238,11 @@ export function apply(ctx: Context): void {
     // MiniMax **可续期**（refresh_token 授权，会轮换 refresh_token）。
     // 与 raccoon 同款：只按 refreshable 过滤，不看 enabled。
     ['minimax', (p) => minimax.refreshAll(p)],
+    // zcode **不可续期**（凭据是静态的）—— 但这个方法仍做实事：
+    // 把磁盘上最新的凭据回写到全部 zcode 账号，
+    // 使用户在官方客户端重新登录后无需重启 DSH。
+    // ⚠ 只按 `refreshable` 过滤、**不看 `enabled`**（AGENTS.md 既有约定）。
+    ['zcode', (p) => zcode.refreshAll(p)],
   ]
 
   async function refreshAllCredentials(): Promise<void> {
@@ -982,6 +1290,10 @@ export function apply(ctx: Context): void {
       trae.stop()
       cline.stop()
       loomy.stop()
+      zcode.stop()
+      // ⚠ 必须 dispose captcha 浏览器 —— 否则会留下孤儿 chromium
+      //（约 200-400MB，且用户没有界面能关掉它）。
+      zcodeAdapter.stop()
     }, 'jet-hub: multi-account refresh scheduler')
   }).catch((error: unknown) => {
     // ⚠️ 原来这个 `.then()` **没有** `.catch()`：`listAllAccounts()` 一旦 reject
@@ -1004,6 +1316,9 @@ export function apply(ctx: Context): void {
     trae.stop()
     cline.stop()
     loomy.stop()
+    zcode.stop()
+    // 同上：captcha 浏览器必须随插件一起回收。
+    zcodeAdapter.stop()
   }, 'codearts-auth.scheduler (legacy)')
 
   // ===== Jet Hub RPC 注册 =====
@@ -1024,8 +1339,9 @@ export function apply(ctx: Context): void {
     loomy: loomyAdapter,
     raccoon: raccoonAdapter,
     minimax: minimaxAdapter,
+    zcode: zcodeAdapter,
   }
 
-  registerJetHubRpc(ctx, pool, service, buddy, workbuddy, lobsterai, qoder, qoderCn, trae, cline, loomy, raccoon, minimax, modelAdapters)
+  registerJetHubRpc(ctx, pool, service, buddy, workbuddy, lobsterai, qoder, qoderCn, trae, cline, loomy, raccoon, minimax, zcode, modelAdapters)
   ctx.provide('accountPool', pool)
 }

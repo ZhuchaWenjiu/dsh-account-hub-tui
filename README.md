@@ -10,8 +10,9 @@ deepseek-harness 插件：执行 CodeArts（华为云）登录流程，默认走
 其中带积分能力的几个：
 
 - **buddy（腾讯 CodeBuddy）** — 见 [buddy provider](#buddy-provider)；
-  另支持「一键领取积分」（每日签到）。
-- **workbuddy（腾讯 WorkBuddy 国际版）** — 见 [WorkBuddy provider](#workbuddy-provider)。
+  另支持「一键领取积分」（每日签到）与「**锁定永久积分**」。
+- **workbuddy（腾讯 WorkBuddy 国际版）** — 见 [WorkBuddy provider](#workbuddy-provider)；
+  支持「**锁定永久积分**」。
 - **lobsterai（有道 LobsterAI / 龙虾）** — 见 [LobsterAI provider](#lobsterai-provider)；
   另支持「一键领取积分」（每日签到）。
 - **qoder（阿里系 Qoder）** — 见 [Qoder provider](#qoder-provider)；
@@ -19,7 +20,8 @@ deepseek-harness 插件：执行 CodeArts（华为云）登录流程，默认走
   走**加密推理端点**，模型池与客户端一致（含 Qwen3.8 系列）。
 - **loomy（讯飞 Loomy 办公助手）** — 见 [Loomy provider](#loomy-provider讯飞办公助手)；
   **唯一用短信验证码登录**、**唯一不能自动续期**的 provider；
-  支持积分余额（两个池）、每日额度签到，以及**新手任务一键领取 10000 积分**。
+  支持积分余额（两个池）、每日额度签到、**新手任务一键领取 10000 积分**，
+  以及「**锁定永久积分**」（CodeBuddy / WorkBuddy 也有同名按钮，但判据不同）。
 - **minimax（MiniMax Code 中国版）** — 见
   [MiniMax Code provider](#minimax-code-provider中国版)；
   **首个 Anthropic Messages 协议族**的 provider；
@@ -127,8 +129,9 @@ Tokens 福利）。
 [TRAE provider](#trae-provider字节跳动-trae)）、`cline`（见
 [Cline provider](#cline-provider)）、`loomy`（见
 [Loomy provider](#loomy-provider讯飞办公助手)）、`raccoon`（见
-[Raccoon Work provider](#raccoon-work-provider商汤小浣熊)）与 `minimax`（见
-[MiniMax Code provider](#minimax-code-provider中国版)）。十一者互不覆盖，可同时使用。
+[Raccoon Work provider](#raccoon-work-provider商汤小浣熊)）、`minimax`（见
+[MiniMax Code provider](#minimax-code-provider中国版)）与 `zcode`（见
+[ZCode provider](#zcode-provider智谱-zai-免费额度)）。十二者互不覆盖，可同时使用。
 
 ## 凭证
 
@@ -589,12 +592,86 @@ Jet Hub 各 provider 面板的账号卡片可**拖动调整顺序**，卡片左�
 账号卡片上的「积分」一行显示该账号的**可用积分**，与 IDE 顶部显示的
 `Credits Balance` 是同一个数值。鼠标悬停可看到各资源包的明细与到期时间。
 
+两个 buddy 的卡片还会**额外显示「临时 X · 永久 Y」分桶**（与下方
+[锁定永久积分](#锁定永久积分codebuddy--workbuddy)同一判据），tooltip 里每个包
+标出「距到期 N 天」。这条也直接解释了"锁上为什么没号可用"——临时桶是 0。
+
+⚠️ **分类在渲染的那一刻现算，不缓存**：它是「距扣费截止是否满 15 天」的判断，
+而宿主长期开着、时间只向前流——一笔距到期 15 天 30 秒的余额，用户什么都不做，
+半分钟后就越过了线。所以选号侧缓存的也只是 `get-user-resource` 的**原始包列表**
+（TTL 60 秒只用于抑制网络请求），命中缓存同样重新分桶；面板侧每次渲染传当下的
+`Date.now()`，不存分类、不设常驻定时器。
+
 **两个产品通用**——CodeBuddy 中国版与 WorkBuddy 国际版都实现同一接口
 （只是 baseURL 随 `product.endpoint` 切换）：
 
 ```
 POST /v2/billing/meter/get-user-resource    body {}
 ```
+
+### 锁定永久积分（CodeBuddy / WorkBuddy）
+
+面板上的「锁定永久积分 / 解锁永久积分」按钮用来**保住不会马上作废的积分**，
+语义与 [Loomy 的同名功能](#锁定永久积分)一致，但**判据必须自己算**——腾讯系
+的响应里没有「永久 / 临时」这个字段。
+
+**判定规则（用户定）：距扣费截止不足 15 天的积分算临时（优先烧掉），其余算永久。**
+
+⚠️ 「到期」只能看 `DeductionEndTime`（毫秒时间戳）。实测 2026-09-29 两站真实账号：
+
+| 包 | `ExpiredTime` | `CycleEndTime` | **`DeductionEndTime`** | 归入 |
+|---|---|---|---|---|
+| WorkBuddy「Bonus Pack」 | `''` | 9 天后 | **9 天后** | 临时 |
+| WorkBuddy「Free Plan Subscription」 | `''` | **2 天后** | **3008 天后** | 永久 |
+| CodeBuddy「个人体验版」 | `''` | 已过期 | 3008 天后 | 永久（本周期已无余额） |
+| CodeBuddy「拉新权益包 / 国内运营裂变包」 | `''` | 同下 | **17～208 天后** | ≥15 天者永久 |
+
+- `ExpiredTime` **没有区分力**：有效包一律是空串，它只在包**真正失效之后**才回填
+  （此时 `Status` 已变 3、余额已归零）。
+- `CycleEndTime` **会把套餐误判**：订阅包的计量周期是月度的（月底清零），但扣费
+  截止在 8 年后。取前者会把每月刷新的套餐当成「马上作废」，锁定就形同虚设。
+- 余额口径取 **`CycleCapacityRemain`（本计费周期剩余）**，与 IDE 顶部的
+  `Credits Balance` 一致：实测体验版**终身**还剩 500 而**本周期**剩 0，
+  那 500 实际扣不到，算进可用额度会出现「看起来有钱却用不了」。
+- 到期时间**未知**（服务端没给 `DeductionEndTime`）的包归入永久桶——保守方向，
+  最坏是少用一个号，而不是误把长期积分当快到期烧掉。
+
+**选号策略**（与 Loomy 同构）：有 15 天内到期积分的号优先 → 只剩永久积分的号
+→ 无余额 / 查询失败排最后；**档内保持你在 Jet Hub 拖拽的手动顺序**。余额查询带
+60 秒缓存（该端点响应实测可达数百 KB，一个账号可能有 105 个资源包）。
+
+| 状态 | 行为 |
+|---|---|
+| 解锁（默认） | 先烧快到期的积分，这类用完**继续用永久积分** |
+| **锁定** | **只消耗 15 天内到期的积分**；只剩永久积分的账号视为不可用 |
+
+锁定后若所有账号都没有 15 天内到期的积分，请求报**明确错误**提示你解锁，
+而不是偷偷消耗永久积分。
+
+⚠️ **中国版的一个直接推论**（实测，不是缺陷）：CodeBuddy 的赠送包按 30 天发放，
+「距到期」天然落在 17～30 天区间 ⇒ 默认 15 天窗口下**整池都算永久**，锁上就立刻
+「无可用账号」。想在这种池上用锁定，把窗口放宽即可（重启插件生效）：
+
+```
+DSH_BUDDY_EXPIRING_WINDOW_DAYS=31
+```
+
+实测（窗口 31 天）：该账号 10064 积分里 6264.61 改判临时、3799.99 仍是永久，
+锁定后仍可正常选号。面板与报错文案会**跟随后端回传的实际天数**渲染，
+不会出现「提示说 15 天、实际按 31 天筛号」。
+
+开关是 **provider 级**（CodeBuddy 与 WorkBuddy 各一份，互不影响），持久化在独立文档
+`$DSH_HOME/jet-hub/permanent-locks.json` 的 `locks` 表（形如 `{ buddy: true }`，
+缺键即未锁定）；RPC 端点 `credits.permanentLock`（`loomy.permanentLock` 是同一
+实现的历史别名）。
+
+⚠️ **为什么不与账号池同放 `state.json`**：那份文档是 **dsh home 级、同机多 profile
+共享**的，而本插件的存储是整体替换语义。若你像我一样把 desktop 与 web 分成两个
+工作区（两份代码版本不同），另一侧的旧版本代码任何一次整体写入（加删账号、改模型
+开关、命中限流）都会把它不认识的字段抹掉 —— 于是这侧的锁定**静默失效**，而失效的
+后果是真把永久积分烧掉，不可撤回。拆成独立文档后旧代码从不碰它，两个工作区才真正
+互不影响。Loomy 那一项仍会同步一份镜像到 `state.json` 的 `loomyPermanentLocked`
+（旧版本只读它），所以另一侧的 Loomy 面板也不会显示错值。
 
 ### 模型列表开关（黑名单）
 
@@ -1617,6 +1694,13 @@ loomy: { balance: true, dailyCheckin: true, onboardingTasks: true }
 锁定后若所有账号的今日额度都用尽，请求会报**明确错误**提示你解锁或等明日
 刷新 —— 而不是偷偷用掉永久积分。
 
+⚠️ 同一功能在 **CodeBuddy / WorkBuddy** 上也有（见
+[锁定永久积分（CodeBuddy / WorkBuddy）](#锁定永久积分codebuddy--workbuddy)），
+但「临时积分」的判据**完全不同**：Loomy 直接读服务端给的 `dailyBalance`
+（**当日**到期、次日重发），两个 buddy 没有现成字段，要按资源包的 `DeductionEndTime`
+距今是否满 15 天现算。因此面板文案**按 provider 取**（`permanentLockCopy`），
+不能把「只消耗每日赠送额度」这句话套到 buddy 上——它们根本没有每天刷新的额度池。
+
 ### ⚠️ 为什么 Loomy 没有「重测 / 重置」按钮
 
 那组按钮用于清除**模型限流标记**，而 Loomy **不返回限流错误**（积分耗尽时
@@ -1974,3 +2058,226 @@ pnpm test:e2e:minimax-chat   # ⚠️ 发推理（真实适配器；默认测 M2
 就会被弄坏（代价远大于「探针跑不起来」）。实测过期 token 打只读端点返回
 **HTTP 401 `invalid access token`**。
 
+
+---
+
+## ZCode provider（智谱 z.ai 免费额度）
+
+第十个 provider，id `zcode`，面板显示为 **ZCode (智谱)**。
+
+它把 **ZCode 官方客户端的免费额度通道**（智谱 z.ai Start Plan，
+`GLM-5.3-Flash`）接进 DSH。实测本机账号额度 **1 亿 token / 日**。
+
+### ⚠️ 与其余 provider 完全不同的四点
+
+| 维度 | ZCode | 对照 |
+|---|---|---|
+| **凭据来源** | **解密磁盘** `~/.zcode/v2/credentials.json` | 浏览器登录拿 token |
+| **协议** | **Anthropic Messages**（非 OpenAI 兼容） | 其余多为 OpenAI 格式 |
+| **每请求前置** | 产出一个**一次性**阿里云 captcha（约 1.2 秒） | 无 |
+| **请求体准入** | 必须带**官方身份块**（否则 `3012`） | 无 |
+
+### 凭据：**可以完全脱离官方客户端**
+
+两条路**并存**，插件自存优先：
+
+1. **插件内登录**（推荐，无需装任何东西）—— 走官方 CLI 设备授权流：
+
+   ```
+   ① POST /api/v1/oauth/cli/init        Bearer <自己生成的 32 字节 hex>
+        body: { provider: "bigmodel" }
+      → { flow_id, poll_token, authorize_url, expires_at, poll_interval_sec }
+   ② 用户在浏览器打开 authorize_url 完成授权
+   ③ GET /api/v1/oauth/cli/poll/{flow_id}
+      → { status: "pending" } 继续等
+      → { status: "ready", token, user, bigmodel: { access_token } }
+   ```
+
+   ⚠️ 这是**纯 HTTP**，不经 `zcode://` 自定义协议回调 —— 普通 Node 进程就能
+   走完（实测 ① 返回 200、③ 正常 `pending` 轮询）。它还**绕开了故障的**
+   `POST /api/v1/oauth/token`（该端点自 2026-09-28 起稳定 500 / code 2007）。
+
+2. **回退：读官方客户端凭据** —— 解密 `~/.zcode/v2/credentials.json`
+   （`enc:v1:` + AES-256-GCM，密钥由官方公开算法派生：
+   `sha256(ZCODE_CREDENTIAL_SECRET ?? \`zcode-credential-fallback:${platform}:${homedir}:${username}\`)`）。
+   「已经装了官方客户端并登录过」的用户**零操作**即可用。
+
+⚠️ **`device_mid` 由插件自己生成**（UUID v4），不再读官方
+`telemetry-state.json` —— 这是「脱离 IDE」的关键。实测依据：同一 JWT 换
+任意随机 UUID，`billing/balance` 都返回 200；而缺它才回
+`400 {"code":3001,"msg":"parameter error"}`。故它的**值**不被绑定校验，
+只需**稳定**（生成后持久化在凭据里，登录一次即固定）。
+
+⚠️ 凭据形状校验必须做：凭据存储里可能有任何字符串（用户手填、旧版本残留），
+`isUsableZcodeCredential()` 保证后续代码拿到的是完整对象。
+
+### captcha：唯一还需要浏览器的地方
+
+免费通道强制阿里云 captcha（缺失时上游回
+`400 {"code":3007,"msg":"captcha verify failed"}`）。它是**网页 SDK**，
+不是 Electron 专有 API：
+
+```
+script:  https://o.alicdn.com/captcha-frontend/aliyunCaptcha/AliyunCaptcha.js
+配置:    GET /api/v1/client/configs?platform=unknown  →  {region, prefix, sceneId}
+调用:    window.AliyunCaptchaConfig = { region, prefix }
+         initAliyunCaptcha({ SceneId, element, button, getInstance, success, … })
+取参:    getInstance 里调 instance.startTracelessVerification()（无感验证）
+```
+
+**三条实测得到的硬约束**：
+
+1. **`--headless=new` 过不了**，必须 **headful**（窗口移到屏幕外
+   `--window-position=-32000,-32000`，不进任务栏、不抢焦点，用户无感）。
+   实测矩阵（同一份代码，只换一个变量）：
+
+   | | `about:blank` | 真实 origin |
+   |---|---|---|
+   | **headless** | **0/3** | **0/3** |
+   | **headful** | 3/3 | **3/3（811ms）** |
+
+2. **页面必须是真实 https origin**（`https://zcode.z.ai/`），不能用 `about:blank`
+   —— 后者的 origin 是字符串 `"null"`，阿里云风控据此拒绝：
+
+   | origin | 同一页面连续 mint |
+   |---|---|
+   | `about:blank` | **1/3**（#2 起 `F001`） |
+   | **`https://zcode.z.ai/`** | **5/5，中位 426ms** |
+
+3. **可以复用同一个页面**（因为 origin 对了）+ 每次重置 DOM。
+   比「每次新建 page」快 **2.9 倍**（1246ms → 426ms）。
+
+⚠️ SDK 在**降级路径**下会产出**约 76 字符的垃圾 param**，发上游**必然 3007**。
+故 `validateCaptchaParam()` 会校验（长度 ≥200 且 `securityToken` ≥50），
+不合格**不发请求**（省一次注定失败的往返）。
+
+浏览器自动探测（`ZCODE_CHROME_PATH` 可显式指定）：
+scoop `chromium` → Chrome → Chromium → Edge。**常驻一台 + 复用页面**；
+并发 mint 会串行化（captcha param 一次性，共用页面会互相踩状态）；
+插件卸载时 `dispose()`（否则留孤儿进程约 200-400MB）。
+
+### ⚠️ 关于「更轻量的浏览器」：实测结论是**都不行**
+
+试过三个 obscura 构建（obscura-node 自带 0.1.8 / scoop 0.2.3 /
+官方 release `-stealth` 0.2.3）与 Lightpanda，**均无法跑通阿里云 captcha**：
+
+| 方案 | 结果 |
+|---|---|
+| obscura 0.2.3（官方 stealth，最完整构建） | ✗ `getInstance` 从不触发，**零阿里云网络请求** |
+| obscura 0.1.8（obscura-node 自带） | ✗ 与 0.2.3 **同样的**错误 |
+| Lightpanda | ✗ 特性清单**明确无 canvas/WebGL** |
+
+obscura 的根因是**引擎级缺口**（不是补几个 API 能解决）：
+
+```
+[error] Dynamic script fetch error: HTTP 0        ← 动态模块加载器失败
+[error] Couldn't find a style target              ← CSSOM 注入不工作
+[error] Dynamic script error: moveTo is not defined
+[error] Timer error: TypeError: Cannot read properties of undefined (reading 'prototype')
+```
+
+我试过**拦截 `HTMLCanvasElement.prototype.getContext`**（给 SDK 自建的 canvas
+注入带真实 VENDOR/RENDERER 的假 WebGL）+ 补 `Permissions` / `TouchEvent`：
+补丁确实生效、错误也变了，但暴露出 `Dynamic script fetch error: HTTP 0`
+这个**死结** —— FeiLin 无感引擎靠动态加载若干 JS 模块工作。
+
+⇒ **继续用 chromium**（scoop 已装，零新增安装；或用系统 Chrome / Edge）。
+
+`Playwright` 也能跑通（复用页面同样约 546ms），但它会引入依赖；
+当前手写 CDP 版本**零第三方依赖**且已优化到同等水平，故不引入。
+
+### 3012：判据是**请求体内容**，不是 HTTP 头
+
+上游对 `zcode-plan` 通道做内容检查。实测矩阵：
+
+| `system` 内容 | 字符数 | 结果 |
+|---|---|---|
+| 无 | 0 | ✗ 3012 |
+| 仅 `cliPrefix` | 42 | ✗ 3012 |
+| **`cliPrefix` + `stable`** | **2900** | **✓ 200** |
+
+⇒ 身份块必须**逐字**为官方文本且**处在开头**，调用方的 prompt 追加在最后。
+另外首轮 user 消息要带 `<system-reminder>` 日期块（官方称之为
+「3012 的最后一个开关」）。
+
+⚠️⚠️ **3012 有账号冷却惩罚**（30 分钟；24h 内第 3 次起 24h；**5 次停用**）。
+故 `httpErrorCodeForZcode()` 把它映射为 `PERMISSION`（**不可重试**），
+而 `3007` 映射为 `RATE_LIMIT`（可重试，换个新 param 就能过）。
+
+### 积分与签到
+
+- **余额**：`GET /api/v1/zcode-plan/billing/balance`
+  （⚠️ **需要** `Authorization: Bearer <zcodejwt>`，与 `preview` 不同）。
+- **每日领取**：`event/report`（补 `app_launch` + `app_daily_active`）
+  → `billing/preview` → `billing/claim`。
+
+⚠️ **补激活上报不能省**：不补这两条事件，`preview` 恒为空 `plans: []`
+（实测：补前空、补后立刻出现 plan）。「每日随机派发」不是随机推送，
+而是**服务端按活跃信号决定要不要给**。
+
+⚠️ **captcha 一次性** ⇒ 每个 plan 都要**重新 mint**（复用会得 `3007`）。
+
+⚠️ **`1003`（已领取）是幂等成功，不是错误** —— 当失败会让定时任务反复误报。
+
+⚠️ 能力矩阵登记为 `{ balance: true, dailyCheckin: true }`，
+但**额度单位是 token 而不是积分** —— 面板与 RPC 层如实标注量纲，不伪装。
+
+### 模型表是**静态白名单**
+
+上游模型池有 4 个，但 `GLM-5-Turbo` / `GLM-5.2` 实测**返回空响应**
+（0/3 正确，而 `GLM-5.3` 是 3/3），故只暴露实测可用的两个：
+
+| 模型 | 中位延迟 | 正确率 | 并发限流 |
+|---|---|---|---|
+| `GLM-5.3` | 4452ms | 8/14 | 撞过 21 次 3009 |
+| `GLM-5.3-Flash` | 4915ms | 10/15 | **0 次** |
+
+⚠️ `listModels` **不发网络请求**（枚举远端会列出用不了的模型）。
+
+### 显式不支持图片
+
+该通道的图片链路**未验证**，故适配器**显式拒绝**图片输入
+（`UNSUPPORTED_CONTENT`）—— 比静默丢图好（丢图会让模型看到空内容）。
+
+### 实测（本机，2026-09-29）
+
+```
+readZcodeCredential()   ✓  device_mid=72c145cd…  app_version=3.14.3
+fetchZcodeBalance()     ✓  GLM-5.3-Flash  remaining=99,999,344 / 100,000,000
+fetchZcodeCaptchaConfig ✓  {"region":"cn","prefix":"no8xfe","sceneId":"11xygtvd"}
+captcha mint            ✓  2339ms  len=280  securityToken=128
+真实推理（GLM-5.3-Flash）✓  3685ms  可见文本="正常"
+                            chunk 类型 = block-start, reasoning-delta, text-delta, block-end
+额度扣减                 ✓  used: 656 → 1475
+```
+
+### ⚠️ 与「本机 HTTP 桥」方案的关系
+
+PR 初版的实现是「读 `<dataBaseDir>/.zcode/v2/bridge-port.json` → 打本机桥
+→ 由 ZCode 实例代发上游」。那条路依赖一个**被补丁注入过的开源版实例**，
+而**官方闭源版不写那个发现文件** —— 故「装了 ZCode」并不等于「桥可用」。
+本实现改为**直连上游**（凭据解密 + captcha 由普通浏览器产出 +
+身份块满足准入），**不再需要任何实例常驻**。
+
+### 协议层：`zcode-anthropic.ts`
+
+ZCode 免费通道**只认 Anthropic Messages**（实测 `zcode-plan` 下的
+`openai` / 裸 `v1/chat/completions` 路径一律 `404 page not found`）。
+而 `openai-compat.ts` 的 `serializeMessages()` 产出 OpenAI 形态，
+故需要一层转换：
+
+| 维度 | OpenAI | Anthropic |
+|---|---|---|
+| system | `messages[0].role='system'` | **顶层 `system` 字段**（块数组） |
+| 工具声明 | `tools[].function.{name,parameters}` | **`tools[].{name,input_schema}`**（扁平） |
+| 工具调用 | `tool_calls[].function.arguments`（**字符串**） | `content[].{type:'tool_use',input}`（**对象**） |
+| 工具结果 | `{role:'tool', tool_call_id}` | `{role:'user', content:[{type:'tool_result'}]}` |
+| SSE 结束 | `data: [DONE]` | `message_stop` 事件（**无** `[DONE]`） |
+| 思考 | `delta.reasoning_content` | `thinking_delta` |
+
+⚠️ 两个最容易踩的：`tool_use.input` 是**对象**（不是 JSON 字符串）；
+工具结果必须包成 `role:'user'` 里的 `tool_result` 块。
+
+⚠️ **空响应必须显式抛 `EMPTY_RESPONSE`** —— Anthropic SSE 没有 `[DONE]`
+可做锚点，若不检查就会「干净地停止、无任何报错」
+（与 Qoder 那次静默失败的形态完全一致）。

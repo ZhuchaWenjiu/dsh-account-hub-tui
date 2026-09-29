@@ -554,6 +554,7 @@ export class ClineAdapter extends LlmAdapter {
       label: 'cline',
       firstTokenTimeoutMs: resolveFirstTokenTimeoutMs(),
       chunkTimeoutMs: resolveChunkTimeoutMs(),
+      ...options.maxTokens === undefined ? {} : { maxTokens: options.maxTokens },
     })
   }
 

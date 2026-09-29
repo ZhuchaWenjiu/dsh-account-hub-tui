@@ -330,6 +330,67 @@ describe('fetchLobsteraiCreditBalance', () => {
     expect(balance?.packages[1]).toMatchObject({ name: 'campaign', remaining: 50, active: true })
   })
 
+  /**
+   * 用户报障：账号 hover 列表显示「100 / 0」，期望「100 / 100」。
+   *
+   * 实测真实响应（2026-09-29 抓包）里**没有**面值字段，只有
+   * `creditsRemaining` + `expiresAt`；「每日登录奖励」的面值恒为 100，
+   * 没用过的包剩余量 = 面值。⇒ 取「同组有效包剩余量最大值」推断面值。
+   */
+  it('包名优先用 label（人读的名字）而非 type（机器分类码）', async () => {
+    const { fetcher } = stubFetch(() => new Response(JSON.stringify({
+      code: 0,
+      data: {
+        totalCreditsRemaining: 692.73,
+        creditItems: [
+          { type: 'campaign', label: '每日登录奖励', creditsRemaining: 92.73, expiresAt: '2026-10-23T01:21:23' },
+        ],
+      },
+    }), { status: 200 }))
+    const balance = await fetchLobsteraiCreditBalance(makeCredential(), LOBSTERAI, fetcher)
+    expect(balance?.packages[0]!.name).toBe('每日登录奖励')
+  })
+
+  it('面值推断：同组有效包的最大剩余量充当 total（100/0 → 100/100）', async () => {
+    const { fetcher } = stubFetch(() => new Response(JSON.stringify({
+      code: 0,
+      data: {
+        totalCreditsRemaining: 692.73,
+        creditItems: [
+          { type: 'campaign', label: '每日登录奖励', creditsRemaining: 92.73, expiresAt: '2026-10-23T01:21:23' },
+          ...Array.from({ length: 6 }, (_, i) => ({
+            type: 'campaign', label: '每日登录奖励',
+            creditsRemaining: 100, expiresAt: `2026-10-2${i + 4}T00:00:00`,
+          })),
+        ],
+      },
+    }), { status: 200 }))
+    const balance = await fetchLobsteraiCreditBalance(makeCredential(), LOBSTERAI, fetcher)
+    // 6 个没用过的包：100 / 100
+    for (const pkg of balance!.packages.slice(1)) {
+      expect(pkg.total).toBe(100)
+      expect(pkg.used).toBe(0)
+    }
+    // 用过的包按同组面值显示：92.73 / 100（used = 7.27）
+    expect(balance!.packages[0]).toMatchObject({ remaining: 92.73, total: 100, used: 7.27 })
+  })
+
+  it('面值推断不越界：只有被用过的包（无没用过的参照）时如实显示 ?', async () => {
+    const { fetcher } = stubFetch(() => new Response(JSON.stringify({
+      code: 0,
+      data: {
+        totalCreditsRemaining: 50,
+        creditItems: [
+          { type: 'campaign', label: '每日登录奖励', creditsRemaining: 50, expiresAt: '2026-10-23T01:21:23' },
+        ],
+      },
+    }), { status: 200 }))
+    const balance = await fetchLobsteraiCreditBalance(makeCredential(), LOBSTERAI, fetcher)
+    // 只有一个包且它就是最大值 → total=50 是「这个包自己的剩余量」，
+    // 显示 50/50 虽然可能低估面值，但比 50/0 好 —— 用户不再看到分母 0。
+    expect(balance!.packages[0]).toMatchObject({ remaining: 50, total: 50 })
+  })
+
   it('已过期的包标 active: false 并计入 expiredTotal（不并入 total）', async () => {
     const { fetcher } = stubFetch(() => new Response(JSON.stringify({
       code: 0,

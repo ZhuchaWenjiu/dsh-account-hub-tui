@@ -318,6 +318,46 @@ export interface RpcLoomyPermanentLockResponse {
 }
 
 /**
+ * RPC: 通用「锁定永久积分」开关的读写请求（**provider 维度**）。
+ *
+ * ## 为什么不是 Loomy 那个单字段开关的扩展
+ *
+ * 「锁定永久积分」这件事**三个 provider 都有**，但「什么算永久积分」各不相同：
+ *
+ * | provider | 临时积分 | 永久积分 |
+ * |---|---|---|
+ * | Loomy | `dailyBalance`（**当日**到期，次日重新发放） | `balance`（注册奖励 + 新手任务） |
+ * | CodeBuddy / WorkBuddy | 资源包中**扣费截止距今 < 15 天**者（实测 14/30/365 天） | 其余包（实测套餐的扣费截止在 8 年后） |
+ *
+ * ⚠️ 判据不同但**开关语义相同**（「只消耗会近期作废的积分」），故共用一个端点
+ * 与一张持久化表，而不是每个 provider 加一条 case —— 平行分支越多，漏接概率越高
+ * （WorkBuddy 的「刷新」按钮就是这么一直坏着的）。
+ *
+ * `locked` 省略表示**只读查询**；给出布尔值表示写入。
+ */
+export interface RpcPermanentLockRequest {
+  /** provider id（`loomy` / `buddy` / `workbuddy`）。 */
+  provider: string
+  locked?: boolean
+}
+
+/** RPC: 通用「锁定永久积分」开关响应。 */
+export interface RpcPermanentLockResponse {
+  /** 回显请求的 provider（前端并发切换时据此对号）。 */
+  provider: string
+  /** 当前是否已锁定。 */
+  locked: boolean
+  /**
+   * 当前生效的「临时积分」窗口（天）—— **仅两个 buddy 返回**。
+   *
+   * ⚠️ 必须回传而不是让前端写死：窗口可被 `DSH_BUDDY_EXPIRING_WINDOW_DAYS`
+   * 覆盖，前端写死 15 就会出现「提示说只烧 15 天内的，实际按 31 天筛号」。
+   * Loomy 没有窗口概念（它看服务端的当日池），故不带该字段。
+   */
+  windowDays?: number
+}
+
+/**
  * 单个账号的积分余额。
  *
  * 与签到状态的设计取舍不同：余额**带回每个包的明细**而不只是总数 ——
@@ -337,6 +377,22 @@ export interface RpcCreditsBalanceAccount {
 /** RPC: 查询积分余额响应 */
 export interface RpcCreditsBalancesResponse {
   accounts: RpcCreditsBalanceAccount[]
+  /**
+   * 当前生效的「临时积分」窗口（天）—— **CodeBuddy / WorkBuddy / TRAE /
+   * LobsterAI 返回**。
+   *
+   * 面板据此把每个资源包分成临时 / 长期两桶显示（`credit-expiry.js`），
+   * 且必须在**渲染时**用当前时刻现算 —— 分类是时间的函数，把结果存下来就会
+   * 让越线的包继续被当成长期（宿主长期开着，时间只向前流）。
+   *
+   * ⚠️ 为什么由后端回传而不是前端写死：窗口可被
+   * `DSH_BUDDY_EXPIRING_WINDOW_DAYS` 覆盖，前端写死就会出现
+   * 「提示说只烧 15 天内的、实际按 31 天筛号」。
+   * Loomy / Raccoon **不带**该字段：它们的积分由服务端按语义分成多个池下发
+   * （其中有「每日刷新」池），走的是**池名分桶**（`formatPoolSplitLine`），
+   * 不是到期时间分桶。Qoder 虽有包到期字段但未接入分桶展示（仅 hover 明细）。
+   */
+  windowDays?: number
 }
 
 /**
@@ -573,10 +629,21 @@ export interface BackupPayload {
   /** 模型黑名单：provider id → 被关闭的模型 id → true。 */
   disabledModels: Record<string, Record<string, boolean>>
   /**
-   * Loomy「锁定永久积分」开关。
+   * 各 provider 的「锁定永久积分」开关：provider id → 已锁定。
+   *
+   * ⚠️ **可选**：老备份文件里没有该字段，导入时保持当前值（不重置）。
+   * 导出时总写完整表（含空表），故新备份一律自包含。
+   */
+  permanentLocks?: Record<string, boolean>
+  /**
+   * Loomy「锁定永久积分」开关（**兼容字段**，权威值在 {@link permanentLocks}）。
    *
    * ⚠️ **可选**：老备份文件里没有该字段，导入时保持当前值（不重置），
    * 因此不需要提升 {@link BACKUP_VERSION}。
+   *
+   * ⚠️ 导出时**继续双写**：老版本只读这一个字段，缺了它回退版本会看到
+   * 「锁定悄悄失效」——而锁定失效的后果是**真的把永久积分烧掉**，
+   * 属于不可逆损失，所以宁可留一个冗余字段。
    */
   loomyPermanentLocked?: boolean
 }

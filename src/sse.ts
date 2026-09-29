@@ -332,6 +332,54 @@ export function isTruncatedArguments(raw: string): boolean {
   }
 }
 
+/**
+ * 思考死循环中止的**错误码**。
+ *
+ * ## 为什么不复用 `max-tokens`（真实缺陷，Gitee !IKIZNK）
+ *
+ * 用户报障：循环守卫中断后，UI 显示
+ * 「**已达到输出 token 上限** / 回答被截断，已有输出保留在对话中。发送"继续"可让模型接着输出。」
+ *
+ * ⚠️ **这句话是错的，且误导方向**：DSH 客户端对 `max-tokens` 只有这一句**固定
+ * i18n 文案**（`dsh-client-ui-chat` 的 `message.maxTokens` / `.hint`），
+ * **不读适配器的任何 message**。于是「检测到死循环并主动止损」被显示成
+ * 「token 用满了」，用户既不知道真实原因，也被告知「继续就能接着输出」——
+ * 而实测继续之后往往**立刻再次进入同一循环**。
+ *
+ * 全库取证（219 会话，`scripts/probe-max-tokens-provenance.mjs`）：
+ * `finish=max-tokens` 的 35 步里 **25 步（71%）是循环守卫截断**，只有 5 步是
+ * 真的烧满额度。且这 25 步**全部**在截断后被迫由用户手动补「继续」
+ * （11× 「继续」、9× 「继续上面未完成的任务」，其中 2 次用户自己诊断出
+ * 「你陷入思考循环了」）。
+ *
+ * ## 为什么必须是**独立且不可重试**的码
+ *
+ * - **独立**：UI 的 `failureMessage()` 只对 `AUTH` / `QUOTA` / `ACCOUNT_QUOTA` /
+ *   `ACCOUNT_SIGNED_OUT` / `ACCOUNT_SIGN_IN_REQUIRED` 做文案替换，
+ *   **其余码一律原样显示我们给的 message**（`dsh-client-ui-chat/lib/client.js`
+ *   的 `failureMessage`）——故自定义码是「把真实原因送到用户眼前」的**唯一**通道。
+ * - **不可重试**：`REASONING_LOOP` **刻意不在** harness 的
+ *   `DEFAULT_RETRYABLE_CODES`（`EMPTY_RESPONSE` / `RATE_LIMIT` / `SERVER` /
+ *   `TIMEOUT` / `TRANSPORT`）里。死循环是**确定性**病理，白退避 5 次
+ *   （500/1000/2000/4000/8000 ≈ 15.5 秒）只会再烧一轮额度。
+ *   这与 `QUOTA_EXCEEDED` / `PERMISSION_DENIED` 的既有口径一致。
+ */
+export const REASONING_LOOP_CODE = 'REASONING_LOOP'
+
+/** {@link createReasoningLoopDetector} 命中时的诊断快照。 */
+export interface ReasoningLoopDiagnostics {
+  /** 该通道累计观察到的字符数。 */
+  readonly observedChars: number
+  /** 命中时**连续循环段**的持续体量（字符）。 */
+  readonly runChars: number
+  /** 命中时尾部窗口内的非空行数。 */
+  readonly lines: number
+  /** 命中时尾部窗口内的去重行数。 */
+  readonly distinctLines: number
+  /** 命中时尾部窗口去重率（`distinctLines / lines`），判据为 `< 0.35`。 */
+  readonly distinctLineRatio: number
+}
+
 /** {@link createReasoningLoopDetector} 的可调参数。 */
 export interface ReasoningLoopDetectorOptions {
   /** 判定窗口大小（字符）。默认 3000。 */
@@ -367,6 +415,15 @@ export interface ReasoningLoopDetector {
    * 未检测到时为 undefined。
    */
   readonly cutAt: number | undefined
+  /**
+   * 命中时的诊断快照（供错误文案使用）。
+   *
+   * ⚠️ **必须由检测器自己给出，不能由调用方估算**：判据的输入是**内部固定切片**
+   * 的状态机（`text` / `runChars` / 尾部窗口行集），调用方只有原始 delta，
+   * 自行复算会与真实判据漂移（`cutAt` 的数值精度也已证明依赖切片而非调用方粒度）。
+   * 未检测到时为 undefined。
+   */
+  readonly diagnostics: ReasoningLoopDiagnostics | undefined
 }
 
 /**
@@ -450,6 +507,14 @@ export function createReasoningLoopDetector(
   /** 当前连续循环段的起点（字符偏移）与已持续长度。 */
   let runStart = 0
   let runChars = 0
+  /**
+   * 命中瞬间的尾部窗口统计（供 {@link ReasoningLoopDiagnostics}）。
+   *
+   * ⚠️ **必须在 `feedPiece` 里就地记录**，不能等 `observe` 返回后再由调用方
+   * 复算 —— 那时 `text` 已继续增长，窗口统计会与真实判据不一致。
+   */
+  let hitLines = 0
+  let hitDistinct = 0
 
   /**
    * 喂入一个**固定小片**并推进状态机。
@@ -498,12 +563,25 @@ export function createReasoningLoopDetector(
     if (runChars < minLoopChars) return false
     detected = true
     cutAt = runStart
+    // 就地记录命中瞬间的窗口统计（见 hitLines / hitDistinct 的注释）。
+    hitLines = lines.length
+    hitDistinct = new Set(lines).size
     return true
   }
 
   return {
     get detected(): boolean { return detected },
     get cutAt(): number | undefined { return cutAt },
+    get diagnostics(): ReasoningLoopDiagnostics | undefined {
+      if (!detected) return undefined
+      return {
+        observedChars: text.length,
+        runChars,
+        lines: hitLines,
+        distinctLines: hitDistinct,
+        distinctLineRatio: hitLines === 0 ? 1 : hitDistinct / hitLines,
+      }
+    },
     observe(delta: string): boolean {
       if (detected) return false
       if (delta.length === 0) return false
@@ -514,6 +592,74 @@ export function createReasoningLoopDetector(
       return false
     },
   }
+}
+
+/**
+ * 构造思考死循环中止的**失败原因**（`finish` 报 `error`）。
+ *
+ * ## 文案要回答用户三个问题
+ *
+ * 用户要求（Gitee !IKIZNK）：
+ * > 如果只是陷入思考循环的出错，就要给出**有分辨力**的错误提示，
+ * > 现在用「达到输出 token 上限」是不对的
+ * > 提示中要加上**当前窗口还有多少可用**，没有真的占满可以尝试继续任务
+ *
+ * 故文案必须含：
+ * 1. **真实原因**：模型思考陷入病态重复，**不是** token 上限；
+ * 2. **额度实况**：本次只烧掉多少、还剩多少（证明"没有真的占满"）；
+ * 3. **可执行建议**：直接继续即可（因为额度还在），并提示若再次循环可降思考档位。
+ *
+ * ⚠️ **额度是估算**，必须如实标注：`observedChars` 是**字符数**、不是 token 数，
+ * 只有 `usage` 才给权威 token 数；而守卫命中时 `reader.cancel()` 已中止上游，
+ * `usage` 帧**往往根本没到达**（实测 25 例中 0 例带 usage）。
+ * 故用「按经验约 1 token ≈ 3.5 字符」估算，并明确写成「约」。
+ * 这个系数的选取依据：中文为主的思考文本实测 token/字符比约 1:1.5~1:2，
+ * 英文短句（`OK.` / `Hmm.` / `Let me write.` 这类循环体）约 1:4~1:5，
+ * 取 **3.5** 作为两者之间的保守中值 —— 宁可低估剩余额度，也不要让用户
+ * 以为还有很多而反复撞墙。
+ *
+ * @param diagnostics - 检测器给出的命中快照；**允许 undefined**（见下）。
+ * @param maxTokens - 本次请求的输出额度；undefined 表示上游未声明。
+ * @param channel - 命中通道（思考 / 正文），用于文案区分。
+ *
+ * ⚠️ `diagnostics` 允许 undefined 是**刻意的防御**：调用点写的是
+ * `loopGuard!.diagnostics!`，虽然当前实现下「`loopDetected === true` ⇒
+ * `diagnostics !== undefined`」恒成立（`loopDetected` 只在 `observe()` 返回 true
+ * 时置位），但**这里抛错会发生在 `finish` 路径上** —— 那是收尾的最后一步，
+ * 抛错会把「有分辨力的错误」变成「连 finish 都没有」的更糟故障。
+ * 故缺诊断信息时**降级成不带数值的文案**，而不是崩。
+ */
+export function reasoningLoopFailure(
+  diagnostics: ReasoningLoopDiagnostics | undefined,
+  maxTokens: number | undefined,
+  channel: 'reasoning' | 'text',
+): { message: string; code: string } {
+  const label = channel === 'reasoning' ? '思考' : '正文'
+  const parts = [
+    `模型${label}陷入病态重复，已中止本轮（**不是**输出 token 上限）。`,
+  ]
+  if (diagnostics !== undefined) {
+    parts.push(
+      `判据：尾部 ${diagnostics.lines} 行里只有 ${diagnostics.distinctLines} 行不重复`
+      + `（去重率 ${diagnostics.distinctLineRatio.toFixed(3)}，阈值 <0.35），`
+      + `连续循环体量 ${diagnostics.runChars} 字符。`,
+    )
+  }
+  // ⚠️ 只有拿到 maxTokens 才能给「还剩多少」；拿不到就**不要编造**数字
+  // （与 `maxOutputTokens` 那条口径一致：三者皆无则不发该字段，不编造数值）。
+  if (diagnostics !== undefined && maxTokens !== undefined && maxTokens > 0) {
+    const usedTokens = Math.ceil(diagnostics.observedChars / 3.5)
+    const remaining = Math.max(0, maxTokens - usedTokens)
+    parts.push(
+      `本次${label}仅产出约 ${diagnostics.observedChars} 字符（约 ${usedTokens} token），`
+      + `额度 ${maxTokens} token 中**还剩约 ${remaining}**（估算值）——`
+      + `额度没有占满，可以直接继续任务。`,
+    )
+  } else {
+    parts.push(`额度没有占满，可以直接继续任务。`)
+  }
+  parts.push('若继续后再次陷入同一循环，建议降低思考档位或更换模型。')
+  return { message: parts.join(''), code: REASONING_LOOP_CODE }
 }
 
 /**

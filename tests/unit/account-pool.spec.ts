@@ -1,5 +1,5 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest'
-import { mkdtempSync, rmSync } from 'node:fs'
+import { describe, it, expect, beforeEach, afterEach, beforeAll, afterAll } from 'vitest'
+import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { credentialRef } from '@deepseek-ai/dsh-credentials'
@@ -18,7 +18,13 @@ function createMockContext(
   options: {
     staleReads?: boolean
     initialDisabledModels?: Record<string, Record<string, boolean>>
-    /** 初始的 Loomy 永久积分锁定状态（模拟「已落盘的老状态」）。 */
+    /**
+     * 初始的 Loomy 永久积分锁定状态 —— 模拟**升级前**落盘的老状态文档
+     * （只有镜像字段、没有独立文档），用于验证一次性迁移。
+     *
+     * ⚠️ 锁定表本体不在这里：它住在 `$DSH_HOME/jet-hub/permanent-locks.json`
+     * （由 `DSH_JET_HUB_STATE_DIR` 指到临时目录），测试用 `readLockDoc()` 读。
+     */
     initialLoomyPermanentLocked?: boolean
   } = {},
 ) {
@@ -62,6 +68,14 @@ function createMockContext(
   return {
     replaceCalls,
     replacePayloads,
+    /**
+     * 直接改写「后端里的文档」，用于模拟**同机另一条工作区里的旧版本代码**
+     * 全量重写账号池文档（只带它认识的那几个键）。
+     */
+    overwriteStored(value: Record<string, unknown>): void {
+      stored = value as typeof stored
+      if (options.staleReads) visible = stored
+    },
     logger: { warn: () => {}, info: () => {} },
     get: (key: string) => key === 'settings' ? mockSettings : undefined,
     credentials: {
@@ -84,6 +98,61 @@ function createMockContext(
       },
     },
   }
+}
+
+/**
+ * ⚠️ **本文件所有用例都必须把 dsh home 隔离到临时目录**，且必须注册在**模块顶层**。
+ *
+ * 原因：AccountPool 现在会把「锁定永久积分」写到
+ * `$DSH_HOME/jet-hub/permanent-locks.json`（与账号池文档分开，见
+ * `src/permanent-lock-store.ts`），而后端定位 home 的顺序是
+ * `DSH_JET_HUB_STATE_DIR` → profileContext → `DSH_HOME` → `~/.dsh`。
+ * 本文件里多个**平级**的顶层 describe 各自 new AccountPool，钩子挂在某一个
+ * describe 内部时其余 describe 拿不到它 —— 那些用例会直接读写**用户真实的
+ * `~/.dsh/jet-hub/`**（污染真实锁定状态，且让"默认未锁定"的用例读到用户的
+ * 实际值而莫名失败）。
+ */
+let isolatedHome: string | undefined
+let previousHome: string | undefined
+
+beforeAll(() => {
+  previousHome = process.env.DSH_JET_HUB_STATE_DIR
+  isolatedHome = mkdtempSync(join(tmpdir(), 'dsh-account-pool-'))
+  process.env.DSH_JET_HUB_STATE_DIR = isolatedHome
+})
+
+afterAll(() => {
+  if (previousHome === undefined) delete process.env.DSH_JET_HUB_STATE_DIR
+  else process.env.DSH_JET_HUB_STATE_DIR = previousHome
+  if (isolatedHome !== undefined) rmSync(isolatedHome, { recursive: true, force: true })
+})
+
+const LOCK_DOC = (): string => join(isolatedHome!, 'jet-hub', 'permanent-locks.json')
+
+beforeEach(() => {
+  // 每个用例从干净的锁定文档开始：残留会让「首次迁移」路径被跳过，
+  // 于是本应验证迁移的用例其实测的是「读已有文档」。
+  rmSync(LOCK_DOC(), { force: true })
+})
+
+/** 读临时 home 里的锁定表文档（不存在返回 undefined）。 */
+function readLockDoc(): { schema?: string; locks?: Record<string, boolean> } | undefined {
+  const file = LOCK_DOC()
+  if (!existsSync(file)) return undefined
+  return JSON.parse(readFileSync(file, 'utf8')) as { schema?: string; locks?: Record<string, boolean> }
+}
+
+/**
+ * 模拟**另一条工作区里的旧版本代码**全量重写账号池文档：只带它认识的那三个键
+ * （旧代码读 `loomyPermanentLocked` 并原样写回，但不认识任何新字段）。
+ *
+ * 这正是本次改造要防的场景 —— 断言锁定态在重写后依然成立。
+ */
+function simulateLegacyRewrite(
+  ctx: { overwriteStored(value: Record<string, unknown>): void },
+  legacyLoomyLocked: boolean,
+): void {
+  ctx.overwriteStored({ accounts: [], disabledModels: {}, loomyPermanentLocked: legacyLoomyLocked })
 }
 
 describe('AccountPool', () => {
@@ -936,32 +1005,36 @@ describe('AccountPool 模型黑名单', () => {
   })
 
   /**
-   * ⚠️ **Loomy 永久积分锁定**（用户要求「需要支持持久化」）。
+   * ⚠️ **永久积分锁定 —— Loomy 那一项**（用户最初要求「需要支持持久化」）。
    *
-   * 这是**第三个**整体写入的字段，与 `disabledModels` 当年踩过的坑同型：
+   * 现在它是 `permanentLocks` 表里的一个键（CodeBuddy / WorkBuddy 各占另一个键，
+   * 见下一段）。这里保留 loomy 视角是因为**它是第一个被实现的**，且
+   * `loomyPermanentLocked` 那个兼容字段因它而存在。
+   *
+   * ⚠️ 这是**第三个**整体写入的数据，与 `disabledModels` 当年踩过的坑同型：
    * 任何一处写入漏带它，就会被静默抹掉（用户看到「锁自己解开了」）。
    */
-  describe('Loomy 永久积分锁定', () => {
+  describe('永久积分锁定（Loomy 那一项）', () => {
     it('默认解锁（未设置时为 false）', () => {
       const pool = new AccountPool(createMockContext() as never)
-      expect(pool.loomyPermanentLocked()).toBe(false)
+      expect(pool.permanentLocked('loomy')).toBe(false)
     })
 
     it('设置后可读回，并落盘到 replace 载荷', async () => {
       const ctx = createMockContext()
       const pool = new AccountPool(ctx as never)
-      await pool.setLoomyPermanentLocked(true)
+      await pool.setPermanentLocked('loomy', true)
 
-      expect(pool.loomyPermanentLocked()).toBe(true)
+      expect(pool.permanentLocked('loomy')).toBe(true)
       expect(ctx.replacePayloads.at(-1)!.loomyPermanentLocked).toBe(true)
     })
 
     it('可再解锁', async () => {
       const ctx = createMockContext()
       const pool = new AccountPool(ctx as never)
-      await pool.setLoomyPermanentLocked(true)
-      await pool.setLoomyPermanentLocked(false)
-      expect(pool.loomyPermanentLocked()).toBe(false)
+      await pool.setPermanentLocked('loomy', true)
+      await pool.setPermanentLocked('loomy', false)
+      expect(pool.permanentLocked('loomy')).toBe(false)
       expect(ctx.replacePayloads.at(-1)!.loomyPermanentLocked).toBe(false)
     })
 
@@ -969,25 +1042,25 @@ describe('AccountPool 模型黑名单', () => {
     it('新增账号不会抹掉锁定', async () => {
       const ctx = createMockContext()
       const pool = new AccountPool(ctx as never)
-      await pool.setLoomyPermanentLocked(true)
+      await pool.setPermanentLocked('loomy', true)
       await pool.addAccount({
         id: 'loomy-x', provider: 'loomy', nickname: 'X', enabled: true,
         credentialRef: 'LOOMY_ACCOUNT_X', createdAt: Date.now(), refreshable: false,
       })
 
       expect(ctx.replacePayloads.at(-1)!.loomyPermanentLocked).toBe(true)
-      expect(pool.loomyPermanentLocked()).toBe(true)
+      expect(pool.permanentLocked('loomy')).toBe(true)
     })
 
     /** ⚠️ 改模型黑名单不得抹掉锁定。 */
     it('写黑名单不会抹掉锁定', async () => {
       const ctx = createMockContext()
       const pool = new AccountPool(ctx as never)
-      await pool.setLoomyPermanentLocked(true)
+      await pool.setPermanentLocked('loomy', true)
       await pool.setModelDisabled('loomy', 'spark-x', true)
 
       expect(ctx.replacePayloads.at(-1)!.loomyPermanentLocked).toBe(true)
-      expect(pool.loomyPermanentLocked()).toBe(true)
+      expect(pool.permanentLocked('loomy')).toBe(true)
     })
 
     /** ⚠️ 反向：写锁定不得抹掉账号与黑名单。 */
@@ -999,7 +1072,7 @@ describe('AccountPool 模型黑名单', () => {
         credentialRef: 'BUDDY_ACCOUNT_Z', createdAt: Date.now(), refreshable: true,
       })
       await pool.setModelDisabled('buddy', 'glm-5.2', true)
-      await pool.setLoomyPermanentLocked(true)
+      await pool.setPermanentLocked('loomy', true)
 
       const last = ctx.replacePayloads.at(-1)!
       expect(last.accounts).toHaveLength(1)
@@ -1008,21 +1081,262 @@ describe('AccountPool 模型黑名单', () => {
 
     it('跨实例读回（模拟重启）', async () => {
       const ctx1 = createMockContext()
-      await new AccountPool(ctx1 as never).setLoomyPermanentLocked(true)
+      await new AccountPool(ctx1 as never).setPermanentLocked('loomy', true)
       // 用第一实例落盘的载荷作为「新进程」的初始状态
       const persisted = ctx1.replacePayloads.at(-1) as { loomyPermanentLocked?: boolean }
 
       const ctx2 = createMockContext([], {
         initialLoomyPermanentLocked: persisted.loomyPermanentLocked,
       })
-      expect(new AccountPool(ctx2 as never).loomyPermanentLocked()).toBe(true)
+      expect(new AccountPool(ctx2 as never).permanentLocked('loomy')).toBe(true)
     })
 
     it('初始状态为已锁定时可读回（模拟重启后首次载入）', () => {
       const pool = new AccountPool(createMockContext([], {
         initialLoomyPermanentLocked: true,
       }) as never)
-      expect(pool.loomyPermanentLocked()).toBe(true)
+      expect(pool.permanentLocked('loomy')).toBe(true)
+    })
+  })
+
+  /**
+   * ⚠️ **按 provider 的永久积分锁定**（用户需求：为 CodeBuddy 与 WorkBuddy
+   * 各加一个开关，粒度与 Loomy 一致）。
+   *
+   * 关键约定：
+   * - 三个 provider **各自独立**（两站账号池本就分开，一个的锁定不得影响另一个）；
+   * - 表里**只记录已锁定的**（缺键 = 未锁定），故解锁是删键而不是写 false；
+   * - `loomyPermanentLocked` 是同一值的兼容副本，必须与表**同源**。
+   */
+  describe('按 provider 的永久积分锁定', () => {
+    it('默认全部解锁（未设置时都是 false）', () => {
+      const pool = new AccountPool(createMockContext() as never)
+      expect(pool.permanentLocked('loomy')).toBe(false)
+      expect(pool.permanentLocked('buddy')).toBe(false)
+      expect(pool.permanentLocked('workbuddy')).toBe(false)
+      expect(pool.listPermanentLocked()).toEqual([])
+    })
+
+    it('锁定一个 provider 不影响其余两个', async () => {
+      const pool = new AccountPool(createMockContext() as never)
+      await pool.setPermanentLocked('buddy', true)
+      expect(pool.permanentLocked('buddy')).toBe(true)
+      expect(pool.permanentLocked('workbuddy')).toBe(false)
+      expect(pool.permanentLocked('loomy')).toBe(false)
+      expect(pool.listPermanentLocked()).toEqual(['buddy'])
+    })
+
+    /**
+     * ⚠️ **本方案的核心**：锁定表落**独立文档**，账号池文档只带 Loomy 镜像字段。
+     *
+     * 因为账号池文档是同机多 profile 共享的，旧版本代码全量重写它时不会携带
+     * 自己不认识的键 —— 表若住在那儿就会被抹掉，解锁的后果是真烧永久积分。
+     */
+    it('锁定表落独立文档，账号池文档只带镜像字段', async () => {
+      const ctx = createMockContext()
+      const pool = new AccountPool(ctx as never)
+      await pool.setPermanentLocked('workbuddy', true)
+
+      expect(readLockDoc()?.locks).toEqual({ workbuddy: true })
+      // 账号池文档里绝不该出现表本体（出现了就等于把它放在会被抹掉的位置）
+      const last = ctx.replacePayloads.at(-1)!
+      expect('permanentLocks' in last).toBe(false)
+      // 表里没有 loomy → 镜像必须是 false，不能跟着一起锁上
+      expect(last.loomyPermanentLocked).toBe(false)
+
+      await pool.setPermanentLocked('loomy', true)
+      expect(readLockDoc()?.locks).toEqual({ workbuddy: true, loomy: true })
+      expect(ctx.replacePayloads.at(-1)!.loomyPermanentLocked).toBe(true)
+    })
+
+    /**
+     * ⚠️ 回归用户真实风险的用例：另一条工作区的**旧代码**把账号池文档整体
+     * 重写一遍（只带它认识的三个键）之后，本侧的锁定必须**一个都不丢**。
+     *
+     * 这正是把表拆到独立文档要解决的问题 —— 拆之前，这一步会让
+     * buddy / workbuddy 静默解锁（而 Loomy 因镜像字段仍在而侥幸存活）。
+     */
+    it('旧版本代码全量重写账号池文档后，锁定不丢', async () => {
+      const ctx = createMockContext()
+      const pool = new AccountPool(ctx as never)
+      await pool.setPermanentLocked('buddy', true)
+      await pool.setPermanentLocked('loomy', true)
+
+      // 旧代码接手：它只认 loomyPermanentLocked，其余按自己的形状写回
+      simulateLegacyRewrite(ctx, true)
+
+      const reopened = new AccountPool(ctx as never)
+      expect(reopened.permanentLocked('buddy')).toBe(true)
+      // Loomy 走镜像也仍然为真
+      expect(reopened.permanentLocked('loomy')).toBe(true)
+
+      // 反向：本侧解锁 Loomy 后，旧文档里那个陈旧的 true 不得把它拉回锁定
+      await reopened.setPermanentLocked('loomy', false)
+      expect(new AccountPool(ctx as never).permanentLocked('loomy')).toBe(false)
+    })
+
+    it('解锁是删键（文档里不留 false）', async () => {
+      const ctx = createMockContext()
+      const pool = new AccountPool(ctx as never)
+      await pool.setPermanentLocked('buddy', true)
+      await pool.setPermanentLocked('buddy', false)
+
+      expect(pool.permanentLocked('buddy')).toBe(false)
+      expect(readLockDoc()?.locks).toEqual({})
+    })
+
+    it('空 provider 名被忽略（不写入无意义的键）', async () => {
+      const ctx = createMockContext()
+      const pool = new AccountPool(ctx as never)
+      await pool.setPermanentLocked('', true)
+      expect(ctx.replacePayloads).toHaveLength(0)
+      expect(readLockDoc()).toBeUndefined()
+      expect(pool.permanentLocked('')).toBe(false)
+    })
+
+    /** ⚠️ 新增账号不得抹掉锁定（与当年 `disabledModels` 同型缺陷）。 */
+    it('新增账号不会抹掉 buddy 的锁定', async () => {
+      const ctx = createMockContext()
+      const pool = new AccountPool(ctx as never)
+      await pool.setPermanentLocked('buddy', true)
+      await pool.addAccount({
+        id: 'buddy-x', provider: 'buddy', nickname: 'X', enabled: true,
+        credentialRef: 'BUDDY_ACCOUNT_X', createdAt: Date.now(), refreshable: true,
+      })
+
+      expect(readLockDoc()?.locks).toEqual({ buddy: true })
+      expect(pool.permanentLocked('buddy')).toBe(true)
+    })
+
+    /** ⚠️ 改模型黑名单不得抹掉锁定。 */
+    it('写黑名单不会抹掉锁定', async () => {
+      const ctx = createMockContext()
+      const pool = new AccountPool(ctx as never)
+      await pool.setPermanentLocked('workbuddy', true)
+      await pool.setModelDisabled('workbuddy', 'glm-5.2', true)
+
+      expect(readLockDoc()?.locks).toEqual({ workbuddy: true })
+      expect(pool.permanentLocked('workbuddy')).toBe(true)
+    })
+
+    /** ⚠️ 反向：写锁定不得抹掉账号与黑名单（镜像同步走的是全量写入）。 */
+    it('写锁定不会抹掉账号列表与黑名单', async () => {
+      const ctx = createMockContext()
+      const pool = new AccountPool(ctx as never)
+      await pool.addAccount({
+        id: 'buddy-z', provider: 'buddy', nickname: 'Z', enabled: true,
+        credentialRef: 'BUDDY_ACCOUNT_Z', createdAt: Date.now(), refreshable: true,
+      })
+      await pool.setModelDisabled('buddy', 'glm-5.2', true)
+      await pool.setPermanentLocked('buddy', true)
+
+      const last = ctx.replacePayloads.at(-1)!
+      expect(last.accounts).toHaveLength(1)
+      expect(last.disabledModels).toEqual({ buddy: { 'glm-5.2': true } })
+      expect(last.loomyPermanentLocked).toBe(false)
+    })
+
+    /**
+     * ⚠️ **只有老字段**的状态文档（升级前落盘的）必须仍能读到锁定。
+     * 判错的后果不是显示问题而是**行为**问题：锁定静默失效 → 继续消耗
+     * 永久积分 → 用户的损失不可撤回。
+     *
+     * 迁移同时要**固化到独立文档**：否则每次冷启动都重新读镜像，
+     * 而镜像随时可能被另一条工作区改回旧值。
+     */
+    it('老状态文档只有 loomyPermanentLocked 时迁移并固化', async () => {
+      const ctx = createMockContext([], { initialLoomyPermanentLocked: true })
+      const pool = new AccountPool(ctx as never)
+      expect(pool.permanentLocked('loomy')).toBe(true)
+      expect(pool.permanentLocked('buddy')).toBe(false)
+      expect(pool.listPermanentLocked()).toEqual(['loomy'])
+      // 让迁移的落盘微任务完成（ensureLoaded 里是尽力而为的 void 调用）
+      await new Promise(resolve => setTimeout(resolve, 0))
+      expect(readLockDoc()?.locks).toEqual({ loomy: true })
+    })
+
+    /**
+     * ⚠️ 迁移**只在新文档不存在时**生效。
+     * 一旦新文档写了（哪怕内容是空表 = 用户明确解锁），镜像字段里残留的
+     * `true` 就不能再把锁定打开 —— 否则会出现"解不掉的开关"。
+     */
+    it('新文档存在后不再回看镜像字段', async () => {
+      const ctx = createMockContext([], { initialLoomyPermanentLocked: true })
+      const pool = new AccountPool(ctx as never)
+      await pool.setPermanentLocked('buddy', true)
+      await pool.setPermanentLocked('loomy', false)
+
+      // 镜像此刻是 false；把它强行改回 true（模拟另一条工作区写的旧值）
+      simulateLegacyRewrite(ctx, true)
+      const reopened = new AccountPool(ctx as never)
+      expect(reopened.permanentLocked('loomy')).toBe(false)
+      expect(reopened.permanentLocked('buddy')).toBe(true)
+    })
+
+    it('跨实例读回（模拟重启，含两个 provider）', async () => {
+      const pool1 = new AccountPool(createMockContext() as never)
+      await pool1.setPermanentLocked('buddy', true)
+      await pool1.setPermanentLocked('workbuddy', true)
+      expect(readLockDoc()?.locks).toEqual({ buddy: true, workbuddy: true })
+
+      const pool2 = new AccountPool(createMockContext() as never)
+      expect(pool2.permanentLocked('buddy')).toBe(true)
+      expect(pool2.permanentLocked('workbuddy')).toBe(true)
+      expect(pool2.permanentLocked('loomy')).toBe(false)
+    })
+
+    /**
+     * ⚠️ Loomy 那一项必须**同时写进镜像字段**：老版本宿主只读这一个字段，
+     * 缺了它另一条工作区的面板就会显示错的锁定态（而它读它、也原样写回它）。
+     */
+    it('表里的 Loomy 项同步落到镜像字段，且不被别的 provider 带起来', async () => {
+      const ctx = createMockContext()
+      const pool = new AccountPool(ctx as never)
+      await pool.setPermanentLocked('loomy', true)
+      expect(ctx.replacePayloads.at(-1)!.loomyPermanentLocked).toBe(true)
+      await pool.setPermanentLocked('loomy', false)
+      expect(ctx.replacePayloads.at(-1)!.loomyPermanentLocked).toBe(false)
+      await pool.setPermanentLocked('buddy', true)
+      expect(ctx.replacePayloads.at(-1)!.loomyPermanentLocked).toBe(false)
+      expect(readLockDoc()?.locks).toEqual({ buddy: true })
+    })
+
+    /**
+     * ⚠️ 状态快照**不带**表（它在独立文档里）—— 备份导出必须改用
+     * `permanentLocksSnapshot()`，漏改会让备份里的锁定永远是空表。
+     */
+    it('状态快照不带表，锁定另有快照方法', async () => {
+      const pool = new AccountPool(createMockContext() as never)
+      await pool.setPermanentLocked('buddy', true)
+      const snapshot = pool.getStateSnapshot()
+      expect('permanentLocks' in snapshot).toBe(false)
+      expect(snapshot.loomyPermanentLocked).toBe(false)
+      expect(pool.permanentLocksSnapshot()).toEqual({ buddy: true })
+    })
+
+
+    /**
+     * ⚠️ 备份导入的三态（与 `backup.ts` 的 `locksFromPayload` 对接）：
+     * 给表 = 整体替换；不给（undefined）= **保持当前值**，否则导入一份
+     * 老备份会静默解锁用户的永久积分。
+     */
+    it('replaceAll 给表时整体替换，不给时保持当前值', async () => {
+      const pool = new AccountPool(createMockContext() as never)
+      await pool.setPermanentLocked('buddy', true)
+
+      await pool.replaceAll([], {}, { workbuddy: true })
+      expect(pool.permanentLocked('buddy')).toBe(false)
+      expect(pool.permanentLocked('workbuddy')).toBe(true)
+
+      await pool.replaceAll([], {})
+      expect(pool.permanentLocked('workbuddy')).toBe(true)
+    })
+
+    it('replaceAll 过滤表里的脏值', async () => {
+      const pool = new AccountPool(createMockContext() as never)
+      await pool.replaceAll([], {}, { buddy: 'yes', workbuddy: true } as never)
+      expect(pool.permanentLocked('buddy')).toBe(false)
+      expect(pool.permanentLocked('workbuddy')).toBe(true)
     })
   })
 

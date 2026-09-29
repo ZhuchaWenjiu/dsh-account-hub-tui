@@ -52,8 +52,8 @@ describe('接线点完整性（源码断言）', () => {
     expect(indexSource).toContain("['minimax', (p) => minimax.refreshAll(p)]")
     // 5. modelAdapters 登记
     expect(indexSource).toContain('minimax: minimaxAdapter')
-    // 6. registerJetHubRpc 实参
-    expect(indexSource).toMatch(/loomy, raccoon, minimax, modelAdapters/)
+    // 6. registerJetHubRpc 实参（⚠️ 2026-09-30 合并后 zcode 排在 minimax 之后）
+    expect(indexSource).toMatch(/loomy, raccoon, minimax, zcode, modelAdapters/)
   })
 
   it('⚠️ index.ts 的 refresh 回调必须用两层结构（available.entry.*）', () => {

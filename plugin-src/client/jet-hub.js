@@ -2,13 +2,23 @@ import * as React from 'react';
 
 import {
   supportsCreditBalance,
+  supportsCreditPackageList,
   supportsDailyCheckin,
   supportsOnboardingTasks,
   supportsRateLimit,
   supportsPermanentLock,
+  permanentLockCopy,
   checkinProviders,
 } from './credits-capabilities.js';
 import { orderAfterDrop, dropPositionFromPointer } from './account-order.js';
+import {
+  formatExpirySplitLine,
+  formatPoolSplitLine,
+  formatPackageTooltip,
+  splitCreditsByExpiry,
+  expiryBucketLabel,
+  daysUntilExpiry,
+} from './credit-expiry.js';
 import {
   allModelsDisabled,
   disablingLeavesNoEnabledAccount,
@@ -179,6 +189,16 @@ const RACCOON_ICON = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAADAAAAAwCAYA
  * 也能正确显示（见 jet-hub-styles.js 的 `.dim-jh-providerIcon.minimax`）。
  */
 const MINIMAX_ICON = 'data:image/svg+xml;base64,PHN2ZyB3aWR0aD0iODAiIGhlaWdodD0iODAiIHZpZXdCb3g9IjAgMCA4MCA4MCIgZmlsbD0ibm9uZSIgeG1sbnM9Imh0dHA6Ly93d3cudzMub3JnLzIwMDAvc3ZnIj4KPGcgY2xpcC1wYXRoPSJ1cmwoI2NsaXAwXzQ3XzY0MDUpIj4KPHJlY3Qgd2lkdGg9IjgwIiBoZWlnaHQ9IjgwIiBmaWxsPSIjN0RDNkZGIiBzdHlsZT0iZmlsbDojN0RDNkZGO2ZpbGw6Y29sb3IoZGlzcGxheS1wMyAwLjQ5MDIgMC43NzY1IDEuMDAwMCk7ZmlsbC1vcGFjaXR5OjE7Ii8+CjxwYXRoIGQ9Ik02Ni45NTc1IDUwLjY1NTZDNjYuOTU3NSA1MS43MDYgNjYuNDg1NSA1Mi43MDA4IDY1LjY3MTkgNTMuMzY1MUw1Ni4wMDgzIDYxLjI1NTZDNTUuMzgzOCA2MS43NjU1IDU0LjYwMjMgNjIuMDQ0IDUzLjc5NiA2Mi4wNDRIMTcuMTExOEMxNS4zMDA3IDYyLjA0NCAxMy44MzI1IDYwLjU3NTggMTMuODMyNSA1OC43NjQ3VjMxLjEwNzZDMTMuODMyNSAzMC4wNTQ3IDE0LjMwNjggMjkuMDU3OSAxNS4xMjM3IDI4LjM5MzZMMjUuODc2MyAxOS42NTAzQzI2LjUgMTkuMTQzMiAyNy4yNzkzIDE4Ljg2NjMgMjguMDgzMiAxOC44NjYzSDYzLjY3ODJDNjUuNDg5MyAxOC44NjYzIDY2Ljk1NzUgMjAuMzM0NSA2Ni45NTc1IDIyLjE0NTZWNTAuNjU1NloiIGZpbGw9ImJsYWNrIiBzdHlsZT0iZmlsbDpibGFjaztmaWxsLW9wYWNpdHk6MTsiLz4KPHBhdGggZD0iTTYwLjM5ODQgNDguMzY4NEM2MC4zOTg0IDQ4Ljg5NDYgNjAuMTYxNCA0OS4zOTI4IDU5Ljc1MzMgNDkuNzI1TDUzLjE3NDIgNTUuMDc4NUM1Mi44NjIzIDU1LjMzMjMgNTIuNDcyNCA1NS40NzA5IDUyLjA3MDMgNTUuNDcwOUgyMS41MzVDMjAuOTMxMyA1NS40NzA5IDIwLjQ0MTkgNTQuOTgxNSAyMC40NDE5IDU0LjM3NzhWMzMuMjYwMUMyMC40NDE5IDMyLjczMiAyMC42ODA1IDMyLjIzMjIgMjEuMDkxMSAzMS45MDAxTDI4LjYzNDcgMjUuNzk5OEMyOC45NDYyIDI1LjU0NzkgMjkuMzM0NyAyNS40MTA2IDI5LjczNTMgMjUuNDEwN0w1OS4zMDU4IDI1LjQyNDVDNTkuOTA5MyAyNS40MjQ3IDYwLjM5ODQgMjUuOTE0MSA2MC4zOTg0IDI2LjUxNzZWNDguMzY4NFoiIGZpbGw9IndoaXRlIiBzdHlsZT0iZmlsbDp3aGl0ZTtmaWxsLW9wYWNpdHk6MTsiLz4KPHBhdGggZD0iTTI2LjU1NDcgNDMuNjYxOUMyNi41NTQ3IDQyLjY5NTkgMjcuMzM3NyA0MS45MTI5IDI4LjMwMzcgNDEuOTEyOUgzMi40NTc1QzMzLjQyMzQgNDEuOTEyOSAzNC4yMDY0IDQyLjY5NTkgMzQuMjA2NCA0My42NjE5VjU2LjIzMjZIMjYuNTU0N1Y0My42NjE5WiIgZmlsbD0iYmxhY2siIHN0eWxlPSJmaWxsOmJsYWNrO2ZpbGwtb3BhY2l0eToxOyIvPgo8cGF0aCBkPSJNMzguMTQxOCA0My42NjE5QzM4LjE0MTggNDIuNjk1OSAzOC45MjQ5IDQxLjkxMjkgMzkuODkwOCA0MS45MTI5SDQ0LjA0NDZDNDUuMDEwNiA0MS45MTI5IDQ1Ljc5MzYgNDIuNjk1OSA0NS43OTM2IDQzLjY2MTlWNTYuMjMyNkgzOC4xNDE4VjQzLjY2MTlaIiBmaWxsPSJibGFjayIgc3R5bGU9ImZpbGw6YmxhY2s7ZmlsbC1vcGFjaXR5OjE7Ii8+CjwvZz4KPGRlZnM+CjxjbGlwUGF0aCBpZD0iY2xpcDBfNDdfNjQwNSI+CjxwYXRoIGQ9Ik0wIDIwQzAgOC45NTQzMSA4Ljk1NDMxIDAgMjAgMEg2MEM3MS4wNDU3IDAgODAgOC45NTQzMSA4MCAyMFY2MEM4MCA3MS4wNDU3IDcxLjA0NTcgODAgNjAgODBIMjBDOC45NTQzMSA4MCAwIDcxLjA0NTcgMCA2MFYyMFoiIGZpbGw9IndoaXRlIiBzdHlsZT0iZmlsbDp3aGl0ZTtmaWxsLW9wYWNpdHk6MTsiLz4KPC9jbGlwUGF0aD4KPC9kZWZzPgo8L3N2Zz4K'
+/**
+ * ZCode（智谱）面板图标。
+ *
+ * 32×32 PNG（深色圆角底 + 青色 "Z"），内联 data URI —— 与其余 provider
+ * 的图标方式一致（bundle 里不放二进制资源文件）。
+ *
+ * ⚠️ 生成方式：纯 Node 手写 PNG（zlib deflate + CRC32），零第三方依赖。
+ * 重新生成见 `.tmp-zcode/icon-gen.mjs`（不入库的本地工具）。
+ */
+const ZCODE_ICON = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAAgklEQVR42u3XsRGAIAyF4UxgYe0g7j+FpZtgRwN36stLAhruqP+v4ICIdNaybsViy92yCj+CeMW7CO94gwgFRMUrIgFTAPbzgPe/Aa5nAInTAGicAtDE1QBtXAVgxGEAeuIpAFYYArDj81xEoQDLd+A1ID8k3wTkXDDEaDbEcBo1nl/XXoK4yMqvMgAAAABJRU5ErkJggg==';
 
 const PROVIDERS = Object.freeze([
   { id: 'codearts', label: 'CodeArts (华为云)', icon: CODEARTS_ICON, logoClass: 'codearts' },
@@ -196,6 +216,19 @@ const PROVIDERS = Object.freeze([
   // **触发换行**（用户报障）。与 `RaccoonProduct.displayName` 保持一致。
   { id: 'raccoon', label: 'Raccoon (商汤)', icon: RACCOON_ICON, logoClass: 'raccoon' },
   { id: 'minimax', label: 'MiniMax Code', icon: MINIMAX_ICON, logoClass: 'minimax' },
+  /**
+   * ZCode（智谱）—— 第十个 provider。
+   *
+   * ⚠️ 用『ZCode (智谱)』，与 `ZCODE.displayName` 保持一致；长度也刻意
+   * 控制在不会触发换行的范围内（Raccoon 那条用户报障过）。
+   *
+   * ⚠️ 它走**标准两步式登录**（与 codearts / qoder / trae 同型）：
+   * 后端立刻返回官方授权 URL（`https://bigmodel.cn/login?appId=zcode…`），
+   * 前端弹窗、用户在浏览器授权，后端轮询到 `status: "ready"` 后拿到 token。
+   * 故它**不需要任何特殊分支** —— 与其余 provider 共用同一条
+   * 「弹窗 + 登录轮询」路径。
+   */
+  { id: 'zcode', label: 'ZCode (智谱)', icon: ZCODE_ICON, logoClass: 'zcode' },
 ]);
 
 /**
@@ -285,73 +318,194 @@ function formatCredits(value) {
   return Number.isInteger(value) ? String(value) : value.toFixed(2);
 }
 
-/** 把一个包的明细格式化成 tooltip 的一行。 */
-function formatPackageLine(pkg) {
-  const remaining = formatCredits(pkg.remaining) ?? '?';
-  const total = formatCredits(pkg.total) ?? '?';
+/**
+ * 把 **token 计数**格式化成人类可读的 `xx.yyM` / `x.yyK`。
+ *
+ * ## ⚠ 为什么需要它（真实缺陷）
+ *
+ * 用户报障：「智谱 plan 给的不是积分是 tokens，应该显示 `Token: xx.yyM` 这种格式」。
+ *
+ * 上游 `billing/balance` 的桶里有明确单位声明（实测）：
+ * ```json
+ * { "meter": "model_usage", "unit_type": "token",
+ *   "total_units": 100000000, "remaining_units": 94539275 }
+ * ```
+ * Host 侧已如实标注 `unit: 'token'`，但客户端此前**完全不消费 `unit`** ——
+ * 于是界面显示 `94539275`（无单位、看起来像 1 亿积分，量级也读不出来）。
+ *
+ * 规则（与常见 token 展示一致）：
+ *   - `>= 1e6` → `94.54M`
+ *   - `>= 1e3` → `945.39K`
+ *   - 其余     → 原样整数
+ *
+ * ⚠ 小数位**固定两位**（`94.54M` 而不是 `94.5M`）：token 余额的百位变化
+ * 对用户有意义（差 0.04M = 4 万 token），一位小数会把它们抹平。
+ */
+function formatTokens(value) {
+  if (typeof value !== 'number' || !Number.isFinite(value)) return null;
+  const abs = Math.abs(value);
+  if (abs >= 1e6) return `${(value / 1e6).toFixed(2)}M`;
+  if (abs >= 1e3) return `${(value / 1e3).toFixed(2)}K`;
+  return String(Math.round(value));
+}
+
+/**
+ * 按**单位**选择格式化函数。
+ *
+ * ⚠ 这是 `unit` 字段的唯一消费点 —— 加新单位（如 `credit`）时改这里，
+ * 不要在渲染处写 `if (provider === 'zcode')` 那种分支（会漏掉别的 provider）。
+ */
+function formatUnits(value, unit) {
+  if (unit === 'token') return formatTokens(value);
+  return formatCredits(value);
+}
+
+/** 单位的展示名（账号卡片上的标签）。 */
+function unitLabel(unit) {
+  return unit === 'token' ? 'Token' : '积分';
+}
+
+/**
+ * 把一个包的明细格式化成 tooltip 的一行。
+ *
+ * ⚠️ 到期提示取 `deductionEndTime`（扣费截止），**不是** `cycleEndTime`：
+ * 订阅套餐的计量周期是月度的（月底清零），但积分本身可以留到 8 年后 ——
+ * 拿周期时间显示会让用户以为"永久积分只剩 2 天"。两者都没有时才不显示。
+ *
+ * ⚠ 按**包自身**的 `unit` 格式化：同一 provider 的不同包可能单位不同
+ * （且 ZCode 的包是 token，`94539275` 直接显示读不出量级）。
+ *
+ * @param pkg - 资源包。
+ * @param windowDays - 后端回传的窗口天数（决定这一行标成「N 天内到期」还是「还有 N 天」）。
+ * @param now - **渲染时**的当前时刻（分类是时间的函数，不能传缓存值）。
+ */
+function formatPackageLine(pkg, windowDays, now) {
+  const remaining = formatUnits(pkg.remaining, pkg.unit) ?? '?';
+  const total = formatUnits(pkg.total, pkg.unit) ?? '?';
   const parts = [`${pkg.active ? '' : '[已失效] '}${pkg.name || '未命名'}: ${remaining} / ${total}`];
-  // 失效包显示它自己的失效时间，有效包显示本周期结束时间
+  const daysLeft = daysUntilExpiry(pkg, now);
   if (!pkg.active && pkg.expiredTime) parts.push(`失效于 ${pkg.expiredTime}`);
-  else if (pkg.cycleEndTime) parts.push(`本周期至 ${pkg.cycleEndTime}`);
+  else if (daysLeft !== null) {
+    const label = expiryBucketLabel(pkg, windowDays, now);
+    parts.push(`距到期 ${Math.ceil(daysLeft)} 天${label ? `（${label}）` : ''}`);
+  } else if (pkg.cycleEndTime) parts.push(`本周期至 ${pkg.cycleEndTime}`);
   return parts.join(' · ');
 }
 
 /**
- * 账号卡片上的积分余额行。
+ * 账号卡片上的余额行（积分 / Token 两种单位）。
  *
  * 三种状态严格区分，不能混为一谈：
- * - 查不到（balance 为 null）→ 显示原因，不要显示成 0 积分
+ * - 查不到（balance 为 null）→ 显示原因，不要显示成 0
  * - 查到了但余额为 0 → 显示 0
  * - 还没有结果 → 显示"读取中"
+ *
+ * ## ⚠ 单位（真实缺陷）
+ *
+ * 用户报障：「智谱 plan 给的不是积分是 tokens，应该显示 `Token: xx.yyM` 这种格式」。
+ * ZCode 的 `billing/balance` 里 `unit_type: "token"`（实测），Host 已把它
+ * 透传成 `balance.unit` / `package.unit` —— 故**标签与数字都要按单位走**：
+ * 标签用 `Token`（不是「积分」），数字用 `94.54M`（不是 `94539275`）。
+ *
+ * ⚠ 判定取**首个有效包**的单位（Host 侧同一 provider 的包单位一致；
+ * 混合单位时以第一个为准，避免标签闪烁）。
+ *
+ * @param windowDays - 后端 `credits.balances` 回传的「临时积分」窗口（天）。
+ *   有它才显示**临时 / 长期**两桶（CodeBuddy / WorkBuddy / TRAE / LobsterAI 带）。
  */
-function CreditBalanceRow({ balance, error, loading }) {
+function CreditBalanceRow({ balance, error, loading, windowDays, provider }) {
+  const all = balance?.packages || [];
+  // ⚠ 单位从**包**上取（ZCode 是 token，其余是积分），标签与格式化都按它走。
+  const unit = all.find(p => p && p.unit)?.unit;
+  const label = unitLabel(unit);
   if (loading) {
     return React.createElement('div', { className: 'dim-jh-metaRow' },
-      React.createElement('dt', null, '积分'),
+      React.createElement('dt', null, label),
       React.createElement('dd', { 'data-tone': 'muted' }, '读取中…'));
   }
   if (error || !balance) {
     return React.createElement('div', { className: 'dim-jh-metaRow' },
-      React.createElement('dt', null, '积分'),
+      React.createElement('dt', null, label),
       React.createElement('dd', { 'data-tone': 'warn', title: error || '查询失败' },
         error || '查询失败'));
   }
-  const total = formatCredits(balance.total) ?? '0';
-  // 明细放进 title，不占版面；账号卡片本身已经信息密集了
-  const detail = (balance.packages || []).map(formatPackageLine).join('\n');
-  const all = balance.packages || [];
+  const total = formatUnits(balance.total, unit) ?? '0';
   const activeCount = all.filter(p => p.active).length;
   /**
-   * Loomy 的两个积分池必须**分开显示**（用户明确要求）。
-   *
-   * 判据是「恰好两个包且名字为已知池名」—— 其余 provider 的 packages 是
-   * 多个同类资源包（如 5 个 Bonus Pack），不适用这种展示。
+   * ⚠️ 分类在**渲染的这一刻**用当前时间现算，绝不存进 state、也不缓存到别处：
+   * 「临时 / 永久」等于「距扣费截止是否满 N 天」，而宿主长期开着、时间只向前流 ——
+   * 一笔距到期 15 天 30 秒的余额，用户什么都不做，半分钟后就越过线。
+   * 存下来的分类会同时骗到用户（面板说没临时积分，其实有了）和排查者
+   * （明明越线却按永久选号）。渲染节拍由「挂载 / 切 provider / 点刷新积分」提供，
+   * 数字本身也正是这些时刻才重拉，无需额外的常驻定时器。
    */
-  const isLoomyTwoPools = all.length === 2
-    && all[0].name === '永久积分' && all[1].name === '每日赠送';
+  const now = Date.now();
+  const split = splitCreditsByExpiry(all, windowDays, now);
+  // ⚠ 数字按**单位**格式化（remote 引入的单位支持）：ZCode 的包是 token，
+  // 用 `formatCredits` 会把 94539275 显示成「9453.93万」而非「94.54M」。
+  const formatForUnit = (value) => formatUnits(value, unit);
+  const expiryText = formatExpirySplitLine(split, formatForUnit);
+  // 明细放进 title，不占版面；账号卡片本身已经信息密集了
+  const detail = [
+    all.length > 1 ? `共 ${all.length} 个资源包，${activeCount} 个有效` : null,
+    ...all.map(pkg => formatPackageLine(pkg, windowDays, now)),
+  ].filter(Boolean).join('\n');
+  /**
+   * Loomy / Raccoon 的「当日刷新池」必须**单独显示**（用户明确要求）。
+   *
+   * 两家的积分都由语义不同的池构成，其中有一个当日刷新（今天不用就没了）：
+   * - Loomy：`每日赠送`（每天 5000，消耗后不回补）+ `永久积分`
+   * - Raccoon：`每日积分`（`daily_points`）+ 奖励 / 会员 / 充值
+   *
+   * 判据是**池名**（见 `findDailyPool`），不是下标 —— Raccoon 的池是按
+   * 「服务端给了哪个字段」动态 push 的，下标会错位。
+   */
+  const poolSplitText = formatPoolSplitLine(
+    all,
+    formatForUnit,
+    // Loomy 的另一个池就叫「永久积分」；Raccoon 的奖励/会员/充值三种池
+    // 到期规则各不相同，不能统称永久。
+    provider === 'loomy' ? '永久' : '长期',
+  );
   return React.createElement('div', { className: 'dim-jh-metaRow' },
-    React.createElement('dt', null, '积分'),
+    // ⚠ 标签按单位走：ZCode 是 token，显示「Token」而不是「积分」。
+    React.createElement('dt', null, label),
     React.createElement('dd', {
       className: 'dim-jh-creditValue',
       title: detail || undefined,
     },
     React.createElement('strong', { className: 'dim-jh-creditTotal' }, total),
-    isLoomyTwoPools
-      ? React.createElement('span', { className: 'dim-jh-creditPools' },
-          `永久 ${formatCredits(all[0].remaining) ?? '0'} · 每日 ${formatCredits(all[1].remaining) ?? '0'}`)
+    // 当日池分桶（loomy / raccoon）：`formatPoolSplitLine` 已覆盖原先硬编码的
+    // loomy 两池判据，且对 Raccoon 的「每日积分」同样成立（用户 2026-09-29 要求）。
+    // ⚠ 数字按**包自身的单位**格式化（remote 的单位支持）：池可能来自
+    // 不同 provider，不能假定都是积分。
+    poolSplitText
+      ? React.createElement('span', { className: 'dim-jh-creditPools' }, poolSplitText)
       : null,
-    !isLoomyTwoPools && all.length > 1
+    // 两个 buddy + TRAE + LobsterAI：按「会不会近期作废」分桶，与选号判据同一套规则。
+    // 这条也解释了「锁定永久积分后为什么没有可用账号」——临时桶是 0。
+    // ⚠️ 用词「长期」不是「永久」：这些积分都有到期日，只是较远（用户定）。
+    // ⚠️ 与上面的池分桶互斥：有当日池的（loomy / raccoon）走池名分桶，
+    // 没有的走到期时间分桶。
+    !poolSplitText && expiryText
+      ? React.createElement('span', {
+          className: 'dim-jh-creditPools',
+          title: `临时 = 距扣费截止不足 ${windowDays} 天（再不用就作废，优先消耗）；`
+            + '长期 = 其余积分（锁定永久积分后不参与消耗）。',
+        }, expiryText)
+      : null,
+    !poolSplitText && !expiryText && all.length > 1
       ? React.createElement('span', { className: 'dim-jh-creditPackages' },
           `${activeCount}/${all.length} 个资源包有效`)
       : null,
     // 失效额度单独提示：它们仍在服务端响应里，但不计入上面的数字
     balance.expiredTotal > 0
       ? React.createElement('span', { className: 'dim-jh-creditExpired' },
-          `另有 ${formatCredits(balance.expiredTotal)} 已失效`)
+          `另有 ${formatUnits(balance.expiredTotal, unit)} 已失效`)
       : null));
 }
 
-function AccountCard({ account, index, order, onToggle, onDelete, onRetest, onReset, onClaimOnboarding, onboardingBusy, busy, credits, creditsLoading, showCredits, showRateLimitActions, drag }) {
+function AccountCard({ account, index, order, provider, onToggle, onDelete, onRetest, onReset, onClaimOnboarding, onboardingBusy, busy, credits, creditsLoading, showCredits, showPackageList, windowDays, showRateLimitActions, drag }) {
   const rateLimits = account.modelRateLimits
     ? Object.entries(account.modelRateLimits).filter(([, v]) => v > Date.now())
     : [];
@@ -361,6 +515,39 @@ function AccountCard({ account, index, order, onToggle, onDelete, onRetest, onRe
   const hasAnyLimit = Boolean(account.modelRateLimits && Object.keys(account.modelRateLimits).length > 0);
   // 拖拽相关的状态与回调由 ProviderPanel 统一管理（它掌握整个列表顺序）。
   const dragProps = drag || {};
+
+  /**
+   * 账号名 / 状态标签 hover 时的资源包列表。
+   *
+   * ⚠️ 只在 `showPackageList` 为真时挂 —— 那是「余额真的由多个资源包构成」的
+   * 能力位（buddy 系 / lobsterai / qoder / qodercn / trae）。loomy 的 packages
+   * 是我们合成的两个池名，且没有到期字段，列出来会把「每日赠送」标成**长期**
+   * （恰好说反）。
+   *
+   * ⚠️ `now` 在渲染时取：过滤与排序都是时间的函数，宿主长期开着，缓存会让
+   * 已过期的包继续显示、或"8 天后"一直不变。
+   *
+   * ⚠️ 列表**只含还能用的包**（已消耗为 0 / 已过期 / 已失效的都被过滤掉），
+   * 且按**到期时间升序**排（最快到期在最上）。两者都在
+   * `formatPackageTooltip` 内部完成 —— 那是所有 provider 共用的，
+   * 故此处无需按 provider 分支。
+   *
+   * ⚠️ 数字按**包自身单位**格式化：ZCode 的包是 token，用 `formatCredits`
+   * 会把 94539275 显示成「9453.93万」而非「94.54M」。
+   */
+  const hoverPackages = credits?.balance?.packages;
+  const packageTooltip = showPackageList && hoverPackages?.length
+    ? formatPackageTooltip(hoverPackages, {
+        format: (value) => formatUnits(value, hoverPackages.find(p => p && p.unit)?.unit),
+        now: Date.now(),
+      })
+    : null;
+  // 有可用包才挂列表；余额还没拉到时挂提示而不是空 title —— 否则用户 hover
+  // 一个看起来该有内容的名字却毫无反应，会以为是坏了。
+  // ⚠️ 包全不可用时 `packageTooltip` 为 null，此时**不挂** title（而不是挂空串）：
+  // 那种情况说明"这个号确实没有可用资源包了"，浮层里没什么可说的。
+  const accountTitle = packageTooltip
+    ?? (showPackageList && creditsLoading ? '资源包加载中…' : undefined);
 
   return React.createElement('div', {
     className: 'dim-jh-accountCard',
@@ -397,11 +584,17 @@ function AccountCard({ account, index, order, onToggle, onDelete, onRetest, onRe
         title: account.enabled ? '已启用' : '已停用',
         'aria-hidden': 'true',
       }),
-      React.createElement('span', { className: 'dim-jh-accountName' },
+      React.createElement('span', {
+        className: 'dim-jh-accountName',
+        // 资源包列表（剩余/总量 + 到期时间）。仅 buddy 系挂，见 packageTooltip。
+        title: accountTitle,
+      },
         account.nickname || account.id),
       React.createElement('span', {
         className: 'dim-jh-accountTag',
         'data-tone': account.enabled ? 'on' : 'off',
+        // 同账号名：hover 出资源包列表（两处都挂，用户 hover 哪个都能看见）。
+        title: accountTitle,
       }, account.enabled ? '已启用' : '已停用')),
     React.createElement('dl', { className: 'dim-jh-accountMeta' },
       React.createElement('div', { className: 'dim-jh-metaRow' },
@@ -421,6 +614,10 @@ function AccountCard({ account, index, order, onToggle, onDelete, onRetest, onRe
             balance: credits?.balance ?? null,
             error: credits?.error,
             loading: creditsLoading,
+            // 「临时 / 长期」分桶的窗口天数（buddy 系 + TRAE + LobsterAI 有值）。
+            windowDays,
+            // 池名分桶（loomy / raccoon）要按 provider 决定另一个池的标签。
+            provider,
           })
         : null),
     rateLimits.length > 0
@@ -828,6 +1025,17 @@ function ProviderPanel({ provider, rpcCall }) {
   const [credits, setCredits] = React.useState({});
   const [creditsLoading, setCreditsLoading] = React.useState(false);
   /**
+   * 后端回传的「临时积分」窗口（天）—— 仅 CodeBuddy / WorkBuddy 有值。
+   *
+   * 两个来源写同一个值（同一后端函数解析 `DSH_BUDDY_EXPIRING_WINDOW_DAYS`）：
+   * `credits.balances`（积分行的分桶显示）与 `credits.permanentLock`
+   * （按钮文案）。互为备份：不支持余额查询时按钮 tooltip 仍有正确天数。
+   *
+   * ⚠️ 这里存的是**窗口配置**，不是分类结果 —— 分类每次渲染现算（见
+   * `CreditBalanceRow`），因为它是时间的函数。
+   */
+  const [expiryWindowDays, setExpiryWindowDays] = React.useState(null);
+  /**
    * 弹窗被拦截时展示给用户手动打开的登录链接。
    *
    * 保留它而不是直接失败：弹窗拦截取决于浏览器设置，用户手动点一下就能继续，
@@ -911,6 +1119,8 @@ function ProviderPanel({ provider, rpcCall }) {
         next[item.accountId] = { balance: item.balance, error: item.error };
       }
       setCredits(next);
+      // 窗口天数随余额一起回来（buddy 系 + TRAE 带）——积分行据此分「临时 / 长期」。
+      setExpiryWindowDays(res?.windowDays ?? null);
     } catch (caught) {
       console.error('[jet-hub] load credits failed:', caught);
       if (!mounted.current) return;
@@ -955,13 +1165,17 @@ function ProviderPanel({ provider, rpcCall }) {
   const canClaimOnboarding = supportsOnboardingTasks(provider);
 
   /**
-   * Loomy「锁定永久积分」（全局开关，持久化在宿主侧）。
+   * 「锁定永久积分」（**provider 级**开关，持久化在宿主侧）。
    *
-   * 锁定后选号**只允许消耗今日赠送额度**；永久积分不参与，故只剩永久积分的
-   * 账号在锁定期间等同于不可用（用户语义：「锁定后没有临时积分后找可用账号
-   * 就是没有可用账号」）。
+   * CodeBuddy / WorkBuddy / Loomy **共用这一个开关位**（各自一份状态），
+   * 但「临时积分」的含义不同 —— 文案由 `permanentLockCopy(provider)` 给出，
+   * 不在这里写死（把 Loomy 的「每日赠送额度」套到 buddy 上会误导用户）。
    */
   const canLockPermanent = supportsPermanentLock(provider);
+  // 窗口天数用上面与余额共用的 `expiryWindowDays`（两个来源同值，互为备份）。
+  // ⚠️ 文案必须用它渲染：窗口可被 `DSH_BUDDY_EXPIRING_WINDOW_DAYS` 覆盖，
+  // 前端写死 15 就会出现「提示说只烧 15 天内的、实际按 31 天筛号」。
+  const lockCopy = permanentLockCopy(provider, expiryWindowDays);
   const [permanentLocked, setPermanentLocked] = React.useState(false);
   const [lockBusy, setLockBusy] = React.useState(false);
   const [lockNotice, setLockNotice] = React.useState(null);
@@ -977,8 +1191,10 @@ function ProviderPanel({ provider, rpcCall }) {
     let alive = true;
     void (async () => {
       try {
-        const res = await rpcCall('loomy.permanentLock', {});
-        if (alive) setPermanentLocked(res?.locked === true);
+        const res = await rpcCall('credits.permanentLock', { provider });
+        if (!alive) return;
+        setPermanentLocked(res?.locked === true);
+        setExpiryWindowDays(res?.windowDays ?? null);
       } catch (caught) {
         // 读失败不阻塞面板：保持「解锁」这一保守默认值（与后端缺省一致）。
         console.error('[jet-hub] load permanent lock failed:', caught);
@@ -994,14 +1210,13 @@ function ProviderPanel({ provider, rpcCall }) {
     setLockBusy(true);
     setLockNotice(null);
     try {
-      const res = await rpcCall('loomy.permanentLock', { locked: next });
+      const res = await rpcCall('credits.permanentLock', { provider, locked: next });
       if (!mounted.current) return;
       setPermanentLocked(res?.locked === true);
+      setExpiryWindowDays(res?.windowDays ?? null);
       setLockNotice({
         tone: 'ok',
-        text: next
-          ? '已锁定永久积分：只消耗每日赠送额度。今日额度用尽后将无可用账号。'
-          : '已解锁永久积分：今日额度用尽后会继续使用永久积分。',
+        text: next ? lockCopy.lockedNotice : lockCopy.unlockedNotice,
       });
     } catch (caught) {
       console.error('[jet-hub] toggle permanent lock failed:', caught);
@@ -1459,14 +1674,14 @@ function ProviderPanel({ provider, rpcCall }) {
               onClick: () => void runLimitAction('resetAll'),
             }, '重置所有')
           : null,
-        // 锁定永久积分（仅 Loomy）：只消耗每日赠送额度，保住永久积分。
+        // 锁定永久积分：只消耗会近期作废的积分，保住长期积分。
+        // 文案按 provider 给（Loomy 是「每日赠送额度」，两个 buddy 是
+        // 「15 天内到期的积分包」）—— 见 permanentLockCopy 的说明。
         canLockPermanent
           ? React.createElement('button', {
               className: 'dim-jh-btn',
               'data-kind': permanentLocked ? 'primary' : undefined,
-              title: permanentLocked
-                ? '当前已锁定永久积分：只消耗每日赠送额度。今日额度用尽后将没有可用账号。点此解锁。'
-                : '锁定永久积分后只消耗每日赠送额度（今日额度用尽即无可用账号），可保住永久积分。点此锁定。',
+              title: permanentLocked ? lockCopy.lockedTitle : lockCopy.lockTitle,
               disabled: lockBusy,
               onClick: () => void togglePermanentLock(),
             }, lockBusy
@@ -1570,10 +1785,21 @@ function ProviderPanel({ provider, rpcCall }) {
                 key: account.id,
                 account,
                 index,
+                // ⚠️ `provider` 必须传进来：积分行的**池名分桶**要按 provider
+                // 决定另一个池的标签（Loomy 是「永久」、Raccoon 是「长期」）。
+                // 漏传会在渲染时抛 `ReferenceError: provider is not defined`
+                // 并让整个 Jet Hub 设置页崩成白屏（真实事故，2026-09-29）。
+                provider,
                 busy: probeBusy !== null,
                 credits: credits[account.id],
                 creditsLoading: creditsLoading && credits[account.id] === undefined,
                 showCredits: canLoadCredits,
+                // 账号名 hover 列资源包：只有余额真由多个包构成的 provider 才挂
+                // （loomy 的池是我们合成的、无到期字段，列出来会把「每日赠送」
+                // 标成长期 —— 恰好说反）。
+                showPackageList: supportsCreditPackageList(provider),
+                // 「临时 / 长期」分桶的窗口天数（buddy 系 + TRAE + LobsterAI 才有值）。
+                windowDays: expiryWindowDays,
                 // 卡片级「重测 / 重置」：只对会返回限流错误的 provider 渲染。
                 showRateLimitActions: supportsRateLimit(provider),
                 onToggle: toggleAccount,

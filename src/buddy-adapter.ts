@@ -33,7 +33,7 @@ import type { BuddyCredential, BuddyRemoteModel } from './buddy.js'
 import { CODEBUDDY, resolveUserAgent, type BuddyFallbackModel, type BuddyProduct } from './product.js'
 import { normalizeHarnessMessages } from './message-shape.js'
 import { projectRequestImage, type ImageRequestTarget } from './image-budget.js'
-import { createBlankReasoningSuppressor, createReasoningLoopDetector, hasUsableToolName, isProseTruncatedByStopString, isReasoningLoopGuardEnabled, isTruncatedArguments, normalizeToolArguments, readWithIdleTimeout, resolveEmptyResponseReason, resolveToolPairing, splitThinkTaggedContent, stripBareThinkCloseTagIfEnabled, stripCourseLeakFromHistoryContent, stripCourseLeakIfEnabled } from './sse.js'
+import { createBlankReasoningSuppressor, createReasoningLoopDetector, hasUsableToolName, isProseTruncatedByStopString, isReasoningLoopGuardEnabled, isTruncatedArguments, normalizeToolArguments, readWithIdleTimeout, reasoningLoopFailure, resolveEmptyResponseReason, resolveToolPairing, splitThinkTaggedContent, stripBareThinkCloseTagIfEnabled, stripCourseLeakFromHistoryContent, stripCourseLeakIfEnabled } from './sse.js'
 
 /**
  * CodeBuddy（中国版）的 chat completions 基址。
@@ -2074,10 +2074,30 @@ export class BuddyAdapter extends LlmAdapter {
     const proseCutByStopString = finishReason === 'stop'
       && toolOrder.length === 0
       && isProseTruncatedByStopString(emittedProse)
-    const reason = loopDetected
-      // 思考死循环：截断并报可重试。**优先级最高** —— 循环中生成的工具调用
-      // 参数不可信；且若无可用调用，落到 `stop` 会让任务静默中断。
-      ? { kind: 'max-tokens' as const }
+    /**
+     * 思考死循环是否**是唯一的产出**（无正文、无工具调用）。
+     *
+     * ⚠️ 这层门禁**不可省** —— 用户要求（Gitee !IKIZNK）：「**如果只是**陷入
+     * 思考循环的出错，就要给出有分辨力的错误提示」。只有该步没有任何可见产出时
+     * 才报 `error`：`error` 路径**不落 `assistant/message`**（实测 219 会话里
+     * 222 例），有正文/工具调用时报它会把用户可见内容整块丢掉。
+     * 实测守卫命中的 25 例**全部**只有思考，故正常路径都走 error。
+     */
+    const reasoningLoopIsSoleOutput = loopDetected
+      && emittedProse === ''
+      && toolOrder.length === 0
+    const reason = reasoningLoopIsSoleOutput
+      // 思考死循环且无可见产出：报**有分辨力的 error**（见 REASONING_LOOP_CODE）。
+      // ⚠️ 不能报 max-tokens —— UI 对它的固定文案是「已达到输出 token 上限」，
+      // 把「检测到死循环」误导成「额度用满」（真实缺陷，Gitee !IKIZNK）。
+      ? { kind: 'error' as const, failure: reasoningLoopFailure(
+          loopGuard?.diagnostics,
+          options.maxTokens,
+          'reasoning',
+        ) }
+      // 循环命中但另有可见产出：只能报 max-tokens（保住内容），不能报 error。
+      : loopDetected
+        ? { kind: 'max-tokens' as const }
       : finishReason === 'length'
         || finishReason === undefined && toolOrder.length > 0
         || argsTruncated

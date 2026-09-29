@@ -177,4 +177,56 @@ describe('fetchTraeCheckinStatus / fetchTraeCreditBalance', () => {
     const { fetcher } = stubFetcher([{ user_entitlement_pack_list: [] }])
     expect(await fetchTraeCreditBalance(makeCredential(), TRAE, fetcher)).toBeNull()
   })
+
+  /**
+   * 用户报障：hover 显示 500 和 3 个 150 都是「永久」，但 500 明明 9/30 到期
+   * （15 天窗口内）。
+   *
+   * 2026-09-29 抓包取证：服务端在**条目级**直接下发 `expire_time`
+   * （**秒级** Unix 时间戳，1790783999 = 2026-09-30 23:59:59），包名在
+   * `display_desc`（"每月登录赠送"/"签到奖励"）而非 `base.name`（实测 undefined）。
+   * 早前"起始日期+31天"的推断方案被推翻 —— 不需要推断，直接读真值。
+   */
+  it('到期读条目级 expire_time（秒→毫秒），包名读 display_desc', async () => {
+    const { fetcher } = stubFetcher([{
+      user_entitlement_pack_list: [
+        {
+          entitlement_base_info: {
+            display_desc: '每月登录赠送',
+            quota: { credits_limit: 500 },
+            start_time: 1788192000, end_time: 1790783999,
+          },
+          expire_time: 1790783999,
+          usage: {},
+        },
+        {
+          entitlement_base_info: { display_desc: '签到奖励', quota: { credits_limit: 150 } },
+          expire_time: 1793119698,
+          usage: {},
+        },
+        { // expire_time 缺失/为 0 → 不设置 deductionEndTime（前端显示"永久"）
+          entitlement_base_info: { display_desc: '签到奖励', quota: { credits_limit: 150 } },
+          expire_time: 0,
+          usage: {},
+        },
+      ],
+    }])
+    const balance = await fetchTraeCreditBalance(makeCredential(), TRAE, fetcher)
+    expect(balance?.packages[0]).toMatchObject({
+      name: '每月登录赠送',
+      deductionEndTime: 1790783999_000, // 秒 → 毫秒
+    })
+    expect(balance?.packages[1]).toMatchObject({ name: '签到奖励', deductionEndTime: 1793119698_000 })
+    expect(balance?.packages[2]!.deductionEndTime).toBeUndefined()
+  })
+
+  it('base.name 缺失时（实测为 undefined）回退 entry.display_desc，再回退「资源包」', async () => {
+    const { fetcher } = stubFetcher([{
+      user_entitlement_pack_list: [
+        { entitlement_base_info: { quota: { credits_limit: 100 } } }, // 全都没给
+      ],
+    }])
+    const balance = await fetchTraeCreditBalance(makeCredential(), TRAE, fetcher)
+    expect(balance?.packages[0]!.name).toBe('资源包')
+  })
 })

@@ -1,17 +1,39 @@
 /**
  * 适配器侧的思考死循环中断回归（以 qoder 的 `consumeOpenAiSse` 为代表）。
  *
- * 验收三条：
+ * 验收四条：
  * 1. 命中后 reasoning 块只剩循环前的干净前缀（截断生效）；
- * 2. `finish` 报 `max-tokens`（可重试），**不是** `stop` —— 否则 harness
- *    会认为「模型正常答完」而让任务静默中断；
- * 3. 未命中时行为与现状完全一致。
+ * 2. `finish` 报 **`error` + `REASONING_LOOP`**（**不是** `max-tokens`）——
+ *    见下方「为什么改判」；
+ * 3. 命中后**中止上游**（`reader.cancel()`），不把流读到底；
+ * 4. 未命中时行为与现状完全一致。
+ *
+ * ## ⚠️ 为什么从 `max-tokens` 改判 `error`（真实缺陷，Gitee !IKIZNK）
+ *
+ * 用户报障：循环守卫中断后 UI 显示「**已达到输出 token 上限** / 回答被截断，
+ * 已有输出保留在对话中。发送"继续"可让模型接着输出」。
+ *
+ * ⚠️ DSH 客户端对 `max-tokens` 只有这一句**固定 i18n 文案**
+ * （`dsh-client-ui-chat` 的 `message.maxTokens`），**不读适配器的 message** ——
+ * 于是「检测到死循环并主动止损」被误导成「token 用满了」，且建议的「继续」
+ * 往往立刻再次进入同一循环。
+ *
+ * 全库取证（219 会话）：`finish=max-tokens` 的 35 步里 **25 步（71%）是守卫截断**，
+ * 只有 5 步真烧满额度；且那 25 步**全部**由用户手动补「继续」才得以继续
+ * （11× 「继续」、9×「继续上面未完成的任务」，2 次用户自己诊断出「陷入思考循环」）。
+ *
+ * ⚠️ **改判 error 的内容代价已实测为零**（`scripts/probe-guard-hit-block-mix.mjs`）：
+ * 25/25 例守卫命中时该步**只有思考、零正文、零工具调用**，而 error 路径不落
+ * `assistant/message` —— 丢的只是默认折叠的循环垃圾。
+ * ⚠️ **故该判据带「无可见产出」门禁**：若某步真有正文/工具调用，仍报 `max-tokens`
+ * 保住内容（见各适配器的 `reasoningLoopIsSoleOutput`）。
  */
 import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { credentialRef } from '@deepseek-ai/dsh-credentials'
 import { consumeOpenAiSse } from '../../src/openai-compat.js'
+import { reasoningLoopFailure } from '../../src/sse.js'
 import { BuddyAdapter } from '../../src/buddy-adapter.js'
 import { CodeArtsAdapter } from '../../src/llm-adapter.js'
 import { LobsteraiAdapter } from '../../src/lobsterai-adapter.js'
@@ -112,9 +134,25 @@ function soloLoopFrames(totalFrames: number, finishEvents: string[]): string[] {
 }
 
 /**
+ * 死循环命中后的期望 finish reason（**有分辨力的 error**，不是 max-tokens）。
+ *
+ * 只断言 `kind` 与 `code`，不断言 message 全文 —— 文案会随额度信息变化，
+ * 逐字锁死会让每次调整措辞都要改一堆用例（且文案里含估算出的 token 数）。
+ */
+function expectReasoningLoopFinish(chunks: Array<Record<string, unknown>>): void {
+  const last = chunks.at(-1) as { type?: string; reason?: { kind?: string; failure?: { code?: string; message?: string } } }
+  expect(last.type).toBe('finish')
+  expect(last.reason?.kind).toBe('error')
+  expect(last.reason?.failure?.code).toBe('REASONING_LOOP')
+  // ⚠️ 文案必须**明确否定**「token 上限」这一误导说法（用户的核心诉求）。
+  expect(String(last.reason?.failure?.message ?? '')).toContain('不是')
+  expect(String(last.reason?.failure?.message ?? '')).toContain('token 上限')
+}
+
+/**
  * 终审 C1 的共用判据：命中后 ① 上游读取必须**提前停止**（远小于总帧数），
- * ② 截断仍保留干净前缀，③ `finish` 仍是可重试的 `max-tokens`（不得因止损
- * 变成传输错误或用户取消）。
+ * ② 截断仍保留干净前缀，③ `finish` 报**有分辨力的 error**（不得因止损
+ * 变成传输错误或用户取消，也不得退回会误导的 `max-tokens`）。
  */
 function expectUpstreamStopped(
   chunks: Array<Record<string, unknown>>,
@@ -129,8 +167,8 @@ function expectUpstreamStopped(
   )
   expect(reasoningEnd).toBeDefined()
   expect(String((reasoningEnd!.block as { text?: string }).text ?? '').length).toBeGreaterThan(0)
-  // ③ 行为不变：仍报 max-tokens，未被误判成传输错误 / 用户取消。
-  expect(chunks.at(-1)).toEqual({ type: 'finish', reason: { kind: 'max-tokens' } })
+  // ③ 报有分辨力的 REASONING_LOOP 错误（未被误判成传输错误 / 用户取消）。
+  expectReasoningLoopFinish(chunks)
 }
 
 // ⚠️ 顶层 `beforeEach`（不是只在文件末尾放 `afterEach`）：若开发者 shell 里设了
@@ -145,7 +183,7 @@ afterEach(() => {
 })
 
 describe('思考死循环中断（真实缺陷回归）', () => {
-  it('命中后截断思考并报 max-tokens', async () => {
+  it('命中后截断思考并报有分辨力的 REASONING_LOOP 错误', async () => {
     const loop = readFileSync(join(FIXTURES, 'reasoning-loop.txt'), 'utf8')
     const chunks = await collect(reasoningFrames(loop))
 
@@ -158,7 +196,112 @@ describe('思考死循环中断（真实缺陷回归）', () => {
     expect(kept.length).toBeGreaterThan(0)
     expect(kept.length).toBeLessThan(loop.length)
 
-    // 2) 必须报 max-tokens（可重试），不能是 stop。
+    // 2) 必须报有分辨力的 REASONING_LOOP 错误，不能是 stop，也不能退回 max-tokens。
+    expectReasoningLoopFinish(chunks)
+  })
+
+  /**
+   * 用户的核心诉求（Gitee !IKIZNK）：**文案必须有分辨力**，不能复用
+   * 「已达到输出 token 上限」。
+   */
+  it('错误文案有分辨力：说明真实原因是死循环、否定 token 上限、并给出剩余额度', async () => {
+    const loop = readFileSync(join(FIXTURES, 'reasoning-loop.txt'), 'utf8')
+    const response = new Response(reasoningFrames(loop), {
+      status: 200, headers: { 'Content-Type': 'text/event-stream' },
+    })
+    const chunks: Array<Record<string, unknown>> = []
+    for await (const chunk of consumeOpenAiSse(response, {}, {
+      label: 'qoder', firstTokenTimeoutMs: 5000, chunkTimeoutMs: 5000,
+      // 显式给额度，才能断言「还剩多少」那一段。
+      maxTokens: 128_000,
+    })) {
+      chunks.push(chunk as unknown as Record<string, unknown>)
+    }
+    const failure = (chunks.at(-1) as {
+      reason?: { kind?: string; failure?: { code?: string; message?: string } }
+    }).reason?.failure
+    expect(failure?.code).toBe('REASONING_LOOP')
+    const message = String(failure?.message ?? '')
+    // ① 说清真实原因（思考死循环），② 明确否定「token 上限」，
+    // ③ 给出判据数值，④ 告知额度没占满、可以继续。
+    expect(message).toContain('思考')
+    expect(message).toContain('不是')
+    expect(message).toContain('token 上限')
+    expect(message).toContain('去重率')
+    expect(message).toContain('额度')
+    expect(message).toContain('继续')
+    // ⑤ 额度充足时不得谎称「已达上限」。
+    expect(message).not.toContain('已达到输出 token 上限')
+  })
+
+  it('拿不到 maxTokens 时不编造额度数字（只说明未占满）', async () => {
+    const loop = readFileSync(join(FIXTURES, 'reasoning-loop.txt'), 'utf8')
+    // 默认 collect() 不传 maxTokens。
+    const chunks = await collect(reasoningFrames(loop))
+    const message = String((chunks.at(-1) as {
+      reason?: { failure?: { message?: string } }
+    }).reason?.failure?.message ?? '')
+    expect(message).toContain('额度没有占满')
+    // 不得出现具体额度数字（无依据）。
+    expect(message).not.toMatch(/额度 \d+ token/)
+  })
+
+  /**
+   * ⚠️ **降级路径**：`reasoningLoopFailure` 必须容忍 `diagnostics === undefined`。
+   *
+   * 理由：调用点写的是 `loopGuard?.diagnostics`，而该函数在 **`finish` 路径**上执行
+   * —— 那里抛错会把「有分辨力的错误」变成「连 finish 都没有」的更糟故障。
+   * 当前实现下 `loopDetected === true` 蕴含 `diagnostics !== undefined`，
+   * 故这条纯函数用例是**防御性**的（锁住「不得因此崩」的契约）。
+   */
+  it('纯函数：diagnostics 缺失时降级成不带数值的文案，而不是抛错', () => {
+    const failure = reasoningLoopFailure(undefined, 128_000, 'reasoning')
+    expect(failure.code).toBe('REASONING_LOOP')
+    expect(failure.message).toContain('不是')
+    expect(failure.message).toContain('token 上限')
+    expect(failure.message).toContain('额度没有占满')
+    // 无诊断信息时不得编造判据数值。
+    expect(failure.message).not.toContain('去重率')
+  })
+
+  /**
+   * ⚠️ **门禁判据**：只有「**只是**思考循环」（无正文、无工具调用）时才报 error。
+   *
+   * 依据（用户要求原文）：「**如果只是**陷入思考循环的出错，就要给出有分辨力的
+   * 错误提示」。反向约束同样重要：本步若还有可见产出，报 error 会让
+   * `dsh-agent-loop` 的 error 分支不落 `assistant/message`（实测 219 会话里
+   * 222 例），把用户可见内容整块丢掉。
+   */
+  it('循环命中但**另有工具调用**时仍报 max-tokens（不丢内容）', async () => {
+    const loop = readFileSync(join(FIXTURES, 'reasoning-loop.txt'), 'utf8')
+    const frames: string[] = []
+    for (let i = 0; i < loop.length; i += 256) {
+      frames.push(`data: ${JSON.stringify({ choices: [{ delta: { reasoning_content: loop.slice(i, i + 256) } }] })}\n\n`)
+    }
+    // 循环之后到达一个**有效**工具调用（实测正文/思考循环的 wire 顺序正是如此）。
+    frames.push(`data: ${JSON.stringify({
+      choices: [{
+        delta: {
+          reasoning_content: '还在循环还在循环',
+          tool_calls: [{ index: 0, id: 'c1', function: { name: 'read', arguments: '{"file_path":"a"}' } }],
+        },
+      }],
+    })}\n\n`)
+    frames.push('data: [DONE]\n\n')
+    const chunks = await collect(frames.join(''))
+    // 有可用调用 ⇒ 不能报 error（会丢内容），也不能报 tool-calls（循环中的调用不可信）。
+    expect(chunks.at(-1)).toEqual({ type: 'finish', reason: { kind: 'max-tokens' } })
+  })
+
+  it('循环命中但**另有正文**时仍报 max-tokens（不丢内容）', async () => {
+    const loop = readFileSync(join(FIXTURES, 'reasoning-loop.txt'), 'utf8')
+    const frames: string[] = []
+    for (let i = 0; i < loop.length; i += 256) {
+      frames.push(`data: ${JSON.stringify({ choices: [{ delta: { reasoning_content: loop.slice(i, i + 256) } }] })}\n\n`)
+    }
+    frames.push(`data: ${JSON.stringify({ choices: [{ delta: { content: '这里是用户可见的正文。' } }] })}\n\n`)
+    frames.push('data: [DONE]\n\n')
+    const chunks = await collect(frames.join(''))
     expect(chunks.at(-1)).toEqual({ type: 'finish', reason: { kind: 'max-tokens' } })
   })
 
@@ -202,8 +345,8 @@ describe('思考死循环中断（真实缺陷回归）', () => {
     const chunks = await collect(frames.join(''))
     // usage 必须被产出（用 continue 时会丢失）。
     expect(chunks.filter((c) => c.type === 'usage')).toHaveLength(1)
-    // 且死循环仍被正确判定为 max-tokens。
-    expect(chunks.at(-1)).toEqual({ type: 'finish', reason: { kind: 'max-tokens' } })
+    // 且死循环仍被正确判定为有分辨力的 REASONING_LOOP 错误。
+    expectReasoningLoopFinish(chunks)
   })
 })
 
@@ -228,7 +371,7 @@ async function collectBuddy(sse: string | Response): Promise<Array<Record<string
 }
 
 describe('思考死循环中断（workbuddy，用户实际报障路径）', () => {
-  it('命中后截断思考并报 max-tokens', async () => {
+  it('命中后截断思考并报有分辨力的 REASONING_LOOP 错误', async () => {
     const loop = readFileSync(join(FIXTURES, 'reasoning-loop.txt'), 'utf8')
     const chunks = await collectBuddy(reasoningFrames(loop))
     const reasoningEnd = chunks.find(
@@ -237,7 +380,7 @@ describe('思考死循环中断（workbuddy，用户实际报障路径）', () =
     const kept = String((reasoningEnd!.block as { text?: string }).text ?? '')
     expect(kept.length).toBeGreaterThan(0)
     expect(kept.length).toBeLessThan(loop.length)
-    expect(chunks.at(-1)).toEqual({ type: 'finish', reason: { kind: 'max-tokens' } })
+    expectReasoningLoopFinish(chunks)
   })
 
   it('正常思考不受影响', async () => {
@@ -265,7 +408,7 @@ describe('思考死循环中断（workbuddy，用户实际报障路径）', () =
     frames.push('data: [DONE]\n\n')
     const chunks = await collectBuddy(frames.join(''))
     expect(chunks.filter((c) => c.type === 'usage')).toHaveLength(1)
-    expect(chunks.at(-1)).toEqual({ type: 'finish', reason: { kind: 'max-tokens' } })
+    expectReasoningLoopFinish(chunks)
   })
 })
 
@@ -300,7 +443,7 @@ async function collectCodeArts(sse: string | Response): Promise<Array<Record<str
 }
 
 describe('思考死循环中断（codearts）', () => {
-  it('命中后截断思考并报 max-tokens', async () => {
+  it('命中后截断思考并报有分辨力的 REASONING_LOOP 错误', async () => {
     const loop = readFileSync(join(FIXTURES, 'reasoning-loop.txt'), 'utf8')
     const chunks = await collectCodeArts(reasoningFrames(loop))
     const reasoningEnd = chunks.find(
@@ -309,7 +452,7 @@ describe('思考死循环中断（codearts）', () => {
     const kept = String((reasoningEnd!.block as { text?: string }).text ?? '')
     expect(kept.length).toBeGreaterThan(0)
     expect(kept.length).toBeLessThan(loop.length)
-    expect(chunks.at(-1)).toEqual({ type: 'finish', reason: { kind: 'max-tokens' } })
+    expectReasoningLoopFinish(chunks)
   })
 
   it('正常思考不受影响', async () => {
@@ -337,7 +480,7 @@ describe('思考死循环中断（codearts）', () => {
     frames.push('data: [DONE]\n\n')
     const chunks = await collectCodeArts(frames.join(''))
     expect(chunks.filter((c) => c.type === 'usage')).toHaveLength(1)
-    expect(chunks.at(-1)).toEqual({ type: 'finish', reason: { kind: 'max-tokens' } })
+    expectReasoningLoopFinish(chunks)
   })
 
   // 第一处 reasoning 出口：`delta.content` 里的 `<thought>` 经
@@ -358,27 +501,35 @@ describe('思考死循环中断（codearts）', () => {
     const kept = String((reasoningEnd!.block as { text?: string }).text ?? '')
     expect(kept.length).toBeGreaterThan(0)
     expect(kept.length).toBeLessThan(loop.length)
-    expect(chunks.at(-1)).toEqual({ type: 'finish', reason: { kind: 'max-tokens' } })
+    expectReasoningLoopFinish(chunks)
   })
 
   // self-review 发现：本适配器独有 `visible` 回退（正文为空且无工具调用时用
   // 推理文本填充正文，GLM 端点偶尔把整段回答作为 reasoning_content 发出）。
-  // 死循环命中时正文恰好为空、也无工具调用 → 回退会把**未截断**的循环文本
-  // 复制进正文块并持久化，下次重放又要把病态文本吃一遍（正是本守卫要根除的
-  // 问题）。故回退必须用截断后的文本。
-  it('命中后 visible 回退不得把未截断的循环文本复制进正文', async () => {
+  //
+  // ⚠️ **命中死循环时必须关闭该回退**（`!loopDetected` 门禁），两个理由：
+  //   1. 回退会把**循环文本**复制进正文块并持久化，下次重放又要把病态文本吃一遍
+  //      （正是本守卫要根除的问题）；
+  //   2. 回退一旦生效，`visible !== ''` 会让「只是思考循环」的判据恒为假 →
+  //      永远落回误导性的 `max-tokens`，「有分辨力的错误提示」在 codearts 这条
+  //      路径上**静默失效**。
+  // 故本用例锁死：命中后**不产出正文块**，且报 REASONING_LOOP。
+  it('命中后 visible 回退被关闭（不把循环文本复制进正文）且报 REASONING_LOOP', async () => {
     const loop = readFileSync(join(FIXTURES, 'reasoning-loop.txt'), 'utf8')
     const chunks = await collectCodeArts(reasoningFrames(loop))
     const reasoningEnd = chunks.find(
       (c) => c.type === 'block-end' && (c.block as { type?: string }).type === 'reasoning',
     )
     const kept = String((reasoningEnd!.block as { text?: string }).text ?? '')
+    // 思考块仍保留干净前缀（截断生效，未被截空）。
+    expect(kept.length).toBeGreaterThan(0)
+    expect(kept.length).toBeLessThan(loop.length)
+    // 正文块**不得**被回填（否则循环文本会落盘，且判据失效）。
     const textEnd = chunks.find(
       (c) => c.type === 'block-end' && (c.block as { type?: string }).type === 'text',
     )
-    const body = String((textEnd?.block as { text?: string } | undefined)?.text ?? '')
-    // 回退内容必须与截断后的推理一致（不能是循环全文）。
-    expect(body).toBe(kept)
+    expect(textEnd).toBeUndefined()
+    expectReasoningLoopFinish(chunks)
   })
 })
 
@@ -418,7 +569,7 @@ async function collectLobsterai(sse: string | Response): Promise<Array<Record<st
 }
 
 describe('思考死循环中断（lobsterai）', () => {
-  it('命中后截断思考并报 max-tokens', async () => {
+  it('命中后截断思考并报有分辨力的 REASONING_LOOP 错误', async () => {
     const loop = readFileSync(join(FIXTURES, 'reasoning-loop.txt'), 'utf8')
     const chunks = await collectLobsterai(reasoningFrames(loop))
     const reasoningEnd = chunks.find(
@@ -429,7 +580,7 @@ describe('思考死循环中断（lobsterai）', () => {
     // 既不能截空（`cutAt=0` 是已知的截空风险），也不能保留循环全文。
     expect(kept.length).toBeGreaterThan(0)
     expect(kept.length).toBeLessThan(loop.length)
-    expect(chunks.at(-1)).toEqual({ type: 'finish', reason: { kind: 'max-tokens' } })
+    expectReasoningLoopFinish(chunks)
   })
 
   it('正常思考不受影响', async () => {
@@ -457,7 +608,7 @@ describe('思考死循环中断（lobsterai）', () => {
     frames.push('data: [DONE]\n\n')
     const chunks = await collectLobsterai(frames.join(''))
     expect(chunks.filter((c) => c.type === 'usage')).toHaveLength(1)
-    expect(chunks.at(-1)).toEqual({ type: 'finish', reason: { kind: 'max-tokens' } })
+    expectReasoningLoopFinish(chunks)
   })
 
   it('开关关闭时不干预（行为与现状一致）', async () => {
@@ -524,7 +675,7 @@ describe('思考死循环中断（trae）', () => {
     return events.join('')
   }
 
-  it('命中后截断思考并报 max-tokens', async () => {
+  it('命中后截断思考并报有分辨力的 REASONING_LOOP 错误', async () => {
     const loop = readFileSync(join(FIXTURES, 'reasoning-loop.txt'), 'utf8')
     const chunks = await collectTrae(soloReasoningFrames(loop))
     const reasoningEnd = chunks.find(
@@ -535,7 +686,7 @@ describe('思考死循环中断（trae）', () => {
     // 既不能截空（`cutAt=0` 是已知的截空风险），也不能保留循环全文。
     expect(kept.length).toBeGreaterThan(0)
     expect(kept.length).toBeLessThan(loop.length)
-    expect(chunks.at(-1)).toEqual({ type: 'finish', reason: { kind: 'max-tokens' } })
+    expectReasoningLoopFinish(chunks)
   })
 
   it('正常思考不受影响', async () => {
@@ -577,7 +728,12 @@ describe('思考死循环中断（trae）', () => {
     expect(toolEnd).toBeDefined()
     // 收尾的 token_usage 也必须被读到（证明流被消费完，没有提前 break）。
     expect(chunks.filter((c) => c.type === 'usage')).toHaveLength(1)
-    // 死循环优先级最高：即便有工具调用也报 max-tokens（循环中生成的调用不可信）。
+    // ⚠️ 本步**另有工具调用**，故不满足「只是思考循环」的判据 —— 必须仍报
+    // max-tokens（保住该步的 text/reasoning 落盘）。
+    // 若改报 error，`dsh-agent-loop` 的 error 分支不落 `assistant/message`，
+    // 这一步的内容会被整块丢弃（实测 219 会话里 222 例）。
+    // 死循环优先级仍最高：即便有工具调用也不报 tool-calls
+    //（循环中生成的调用参数不可信）。
     expect(chunks.at(-1)).toEqual({ type: 'finish', reason: { kind: 'max-tokens' } })
   })
 
@@ -685,6 +841,6 @@ describe('命中后 cancel 上游：真正止损（终审 C1 回归）', () => {
     // 仍提前止损（没有把剩余帧读完）。
     expect(consumed()).toBeLessThan(frames.length / 2)
     // 行为不变：截断 + max-tokens。
-    expect(chunks.at(-1)).toEqual({ type: 'finish', reason: { kind: 'max-tokens' } })
+    expectReasoningLoopFinish(chunks)
   })
 })

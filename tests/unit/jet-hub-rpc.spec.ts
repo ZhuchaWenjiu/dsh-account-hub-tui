@@ -647,6 +647,9 @@ describe('account.create 必须立即返回 loginUrl（两步式登录回归）'
       {} as never, // qoderCn（本组用例不触发）
       makeAuth('trae') as never,
       makeAuth('cline') as never,
+      {} as never, // loomy（本组用例不触发）
+      {} as never, // raccoon（本组用例不触发）
+      {} as never, // zcode（本组用例不触发）
     )
     if (handler === undefined) throw new Error('endpoint handler was not registered')
 
@@ -959,8 +962,8 @@ describe('model.list / model.setDisabled 端点', () => {
       // ⚠️ 位置参数：每新增一个 provider 都要在这里补一个 `{}` 占位，
       // 否则 `modelAdapters` 会错位落到最后一个 auth 形参上
       // （加 Loomy 时踩过一次，加 Raccoon 又踩一次，加 QoderCN 第三次，
-      //  加 MiniMax 第四次 —— 见计划末尾「把 registerJetHubRpc 改成具名
-      //  参数对象」的后续项建议）。
+      //  加 MiniMax 第四次、加 ZCode 第五次 —— 见计划末尾「把
+      //  registerJetHubRpc 改成具名参数对象」的后续项建议）。
       ctx as never, pool,
       {} as never, // codearts
       {} as never, // buddy
@@ -973,6 +976,7 @@ describe('model.list / model.setDisabled 端点', () => {
       {} as never, // loomy
       {} as never, // raccoon
       {} as never, // minimax
+      {} as never, // zcode（2026-09-29 新增，紧随 raccoon）
       options.modelAdapters as never,
     )
     if (handler === undefined) throw new Error('endpoint handler was not registered')

@@ -11,7 +11,7 @@ import { settingsNamespaceFor } from './settings-compat.js'
 import { isCodeArtsBenefitModel } from './models.js'
 import { normalizeHarnessMessages } from './message-shape.js'
 import { signRequestHuawei } from './sign.js'
-import { createBlankReasoningSuppressor, createReasoningLoopDetector, hasUsableToolName, isReasoningLoopGuardEnabled, isTruncatedArguments, normalizeToolArguments, readWithIdleTimeout, resolveEmptyResponseReason, resolveToolPairing, stripCourseLeakFromHistoryContent, stripCourseLeakIfEnabled } from './sse.js'
+import { createBlankReasoningSuppressor, createReasoningLoopDetector, hasUsableToolName, isReasoningLoopGuardEnabled, isTruncatedArguments, normalizeToolArguments, readWithIdleTimeout, reasoningLoopFailure, resolveEmptyResponseReason, resolveToolPairing, stripCourseLeakFromHistoryContent, stripCourseLeakIfEnabled } from './sse.js'
 import type { CodeArtsCredential } from './types.js'
 
 export const CHAT_API_BASE = 'https://snap-access.cn-north-4.myhuaweicloud.com/api/v2'
@@ -1109,6 +1109,34 @@ export class CodeArtsAdapter extends LlmAdapter {
       announced: boolean
     }>()
     const toolOrder: number[] = []
+    /**
+     * `tool_call` 分片 index → 后端签发的真实 id。
+     *
+     * ⚠️ **本兜底不可省略**（真实缺陷，2026-09-29 定位）：OpenAI 兼容协议里
+     * `id` 只在**首个**分片出现，但实测华为侧偶发**完全不返回 `id`**（或返回空串）。
+     * 早期实现直接把 `call.id` 写进 `block.callId`，缺失时落成**空串** id，
+     * 于是 assistant 消息里留下 `{type:'tool-call', id:''}`：
+     *
+     * 1. `tool/call` 带着 `callId:''` 被持久化；
+     * 2. 该调用完成后写 `tool/result` 时，DSH 的格式 v4 校验
+     *    （`assertV4ToolResultMessage`）要求 `message.toolCallId === source.callId`
+     *    且**都非空**，于是抛
+     *    `format v4 tool/result at seq N requires toolCallId matching its tool source`；
+     * 3. 该轮直接失败，且**会话永久报废** —— 日志停在 `tool/call`，崩溃恢复
+     *    (`interruptedTurnClosers`) 按空 callId 合成修补结果时**再次**命中同一校验，
+     *    既写不进也修不好。
+     *
+     * 空 id 同样过不了 `SessionFormatError`（它判 `length === 0`），故判据必须是
+     * 「非空字符串」而不是「!== undefined」。
+     *
+     * 兄弟适配器（`openai-compat.ts` / `buddy-adapter.ts` / `lobsterai-adapter.ts` /
+     * `trae-adapter.ts`）**都**有这层 `toolIds` 兜底，只有本文件漏了 —— 这正是
+     * 该缺陷只在 `codearts` provider 复现的原因。
+     *
+     * ⚠️ 兜底 id 用 `call_${wireIndex}` 而非随机值：同一次响应内 index 唯一，
+     * 且它必须是**稳定**的 —— 后续分片每片都要得到同一个 id。
+     */
+    const toolIds = new Map<number, string>()
     let buffer = ''
     let streamEnded = false
     let finishReason: 'stop' | 'tool_calls' | 'length' | undefined
@@ -1419,12 +1447,16 @@ export class CodeArtsAdapter extends LlmAdapter {
           }
           for (const call of delta?.tool_calls ?? []) {
             const wireIndex = call.index ?? 0
+            // ⚠️ 只接受**非空** id 并记住它：后续分片可能新一轮又给空串/缺失，
+            // 无条件覆盖会把首片拿到的真实 id 抹成空（与 `function.name` 同因）。
+            if (typeof call.id === 'string' && call.id.length > 0) toolIds.set(wireIndex, call.id)
+            const callId = toolIds.get(wireIndex) ?? `call_${wireIndex}`
             let block = toolCalls.get(wireIndex)
             if (block === undefined) {
               block = { index: nextIndex++, text: '', announced: false }
               toolCalls.set(wireIndex, block)
             }
-            if (call.id !== undefined) block.callId = call.id
+            block.callId = callId
             // 后续参数分片会带上空的 function.name（""），它不是 undefined，
             // 直接覆盖会把首个分片解析出的真实工具名清空，导致
             // `unknown tool ""`。只有非空名字才允许更新。
@@ -1445,7 +1477,7 @@ export class CodeArtsAdapter extends LlmAdapter {
               yield {
                 type: 'tool-call-delta',
                 index: block.index,
-                id: ToolCallId(block.callId ?? ''),
+                id: ToolCallId(callId),
                 name: block.name!,
                 argumentsDelta: block.text,
               }
@@ -1454,7 +1486,7 @@ export class CodeArtsAdapter extends LlmAdapter {
             yield {
               type: 'tool-call-delta',
               index: block.index,
-              id: ToolCallId(block.callId ?? ''),
+              id: ToolCallId(callId),
               ...block.name !== undefined ? { name: block.name } : {},
               argumentsDelta: fragment,
             }
@@ -1570,7 +1602,14 @@ export class CodeArtsAdapter extends LlmAdapter {
       ? stripCourseLeakIfEnabled(truncatedText)
       : textBlock !== undefined && textBlock.text !== ''
         ? stripCourseLeakIfEnabled(textBlock.text)
-        : reasoningBlock !== undefined && toolOrder.length === 0 && !reasoningHasDsml ? reasoningText : ''
+        // ⚠️ `!loopDetected` 门禁**不可省**：命中思考死循环时若仍做该回退，
+        // `visible` 会变成那段**被截断的循环垃圾**，于是下面的
+        // `reasoningLoopIsSoleOutput` 判据恒为假 → 永远落回 max-tokens，
+        // 「有分辨力的错误提示」在 codearts 这条路径上**静默失效**。
+        // 且把循环垃圾回填进正文正是本守卫要根除的问题（见上方注释）。
+        : reasoningBlock !== undefined && toolOrder.length === 0 && !reasoningHasDsml && !loopDetected
+          ? reasoningText
+          : ''
     /**
      * 本次响应**实际会发出的 `block-end` 数量**（＝真正落进 assistant 消息的块数）。
      *
@@ -1603,7 +1642,11 @@ export class CodeArtsAdapter extends LlmAdapter {
         index,
         block: {
           type: 'tool-call',
-          id: ToolCallId(block.callId ?? ''),
+          // ⚠️ 判据用 `||`（同时兜 undefined 与空串），**不可**退回成
+          // `block.callId ?? ''`：空串 id 会被格式 v4 校验拒绝（它判
+          // `length === 0`），落库即等于报废整条会话（见上方 `toolIds` 注释）。
+          // 正常路径下 `block.callId` 已在建块时填好，此处仅为最后一道防线。
+          id: ToolCallId(block.callId || `call_${index}`),
           name: block.name!,
           // 同上：空分片补 {}，残缺参数保持原样交由截断判定处理。
           arguments: isTruncatedArguments(block.text)
@@ -1644,11 +1687,35 @@ export class CodeArtsAdapter extends LlmAdapter {
     // 非 stop —— 否则模型本意调工具、harness 却认为「正常答完了」，
     // 又是一次无报错中断（与 `openai-compat.ts` 同因同修）。
     const droppedUnnamedCalls = [...toolCalls.values()].some(block => !block.announced)
-    const reason = loopDetected
-      // 思考死循环：截断并报可重试。**优先级最高**（高于 tool_calls）——
-      // 循环中生成的工具调用参数不可信；且若无可用调用，落到 `stop` 会让
-      // 任务静默中断。
-      ? { kind: 'max-tokens' as const }
+    /**
+     * 思考死循环是否**是唯一的产出**（无可见正文、无工具调用）。
+     *
+     * ⚠️ 与 `buddy-adapter.ts` / `openai-compat.ts` 同因同修（Gitee !IKIZNK）：
+     * 只有该步没有可见产出时才报 `error` —— `error` 路径**不落
+     * `assistant/message`**（实测 219 会话里 222 例），有可见内容时报它会把内容
+     * 整块丢掉。
+     *
+     * ⚠️ 判据用 `visible`（＝真正会发出去的正文块文本）而**不是** `textBlock`：
+     * 本适配器有「正文为空且无工具调用时用推理文本回填正文」的回退（见下方
+     * `visible` 的定义），该回退会让正文块非空 —— 只看 `textBlock` 会误判成
+     * 「没有可见产出」，于是报 error 把那块回填文本静默丢掉。
+     * 为配合本判据，回退分支也已加上 `!loopDetected` 门禁（见下方注释）。
+     */
+    const reasoningLoopIsSoleOutput = loopDetected
+      && visible === ''
+      && toolOrder.length === 0
+    const reason = reasoningLoopIsSoleOutput
+      // 思考死循环且无可见产出：报**有分辨力的 error**（见 REASONING_LOOP_CODE）。
+      // ⚠️ 不能报 max-tokens —— UI 对它的固定文案是「已达到输出 token 上限」，
+      // 把「检测到死循环」误导成「额度用满」（真实缺陷，Gitee !IKIZNK）。
+      ? { kind: 'error' as const, failure: reasoningLoopFailure(
+          loopGuard?.diagnostics,
+          options.maxTokens,
+          'reasoning',
+        ) }
+      // 循环命中但另有可见产出：只能报 max-tokens（保住内容），不能报 error。
+      : loopDetected
+        ? { kind: 'max-tokens' as const }
       : finishReason === 'length'
         || (droppedUnnamedCalls && toolOrder.length === 0)
         ? { kind: 'max-tokens' as const }

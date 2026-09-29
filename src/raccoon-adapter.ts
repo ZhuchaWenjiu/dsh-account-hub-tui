@@ -467,6 +467,7 @@ export class RaccoonAdapter extends LlmAdapter {
       label: 'raccoon',
       firstTokenTimeoutMs: resolveFirstTokenTimeoutMs(),
       chunkTimeoutMs: resolveChunkTimeoutMs(),
+      ...options.maxTokens === undefined ? {} : { maxTokens: options.maxTokens },
     })
   }
 }

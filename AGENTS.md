@@ -1439,7 +1439,7 @@ UI 表现为 `TraeAdapter.reasoningFor` 返回 `undefined` → 不声明 `reason
 
 | 字段 | 值 | 可区分性 |
 |---|---|---|
-| `ScreenName` | `用户26815487395` 等 | ❌ 自动生成、形态雷同 |
+| `ScreenName` | `用户<uid片段>` 等 | ❌ 自动生成、形态雷同 |
 | **`NonPlainTextMobile`** | `130******00` | ✅ **末两位互异** |
 | `NonPlainTextEmail` | 四个**全为空**（`LastLoginType` 均为 `sms`） | ⚠️ 仅邮箱登录有值 |
 | `Description` | 全为空 | ❌ |
@@ -1499,7 +1499,7 @@ UI 表现为 `TraeAdapter.reasoningFor` 返回 `undefined` → 不声明 `reason
   `130******00`。幂等意味着老账号无需重新登录、重复运行不产生新写入
 - ⚠️ **判据只认「像手机号」的形态**：`/^1\d{10}$/`（完整）或
   `/^\d{3}\*+\d+$/`（已脱敏）。**绝不能泛化到任意字符串** —— 那会把真实昵称
-  （`用户26815487395` / `RaccoonAva` / `a@b.c`）一起打掉。单测有专门一条守这个
+  （`用户<uid片段>` / `<自定义昵称>` / 邮箱形态）一起打掉。单测有专门一条守这个
 - ⚠️ **星号个数按原串总长推算**（`总长 - 3 - 2`），长度保持不变；
   故对非 11 位的号码也自洽
 - ⚠️ **末 2 位必须仍可区分**：四个真实账号掩码后为
@@ -1524,7 +1524,7 @@ UI 表现为 `TraeAdapter.reasoningFor` 返回 `undefined` → 不声明 `reason
 ### ⚠️ 改昵称类修复必须**重启宿主**才生效，且旧进程会覆盖你的写入
 
 **这是本轮实操踩到的坑**（2026-09-27）：用脚本把 `state.json` 的昵称改对之后，
-**几分钟内又变回了旧值**（TRAE 的 `用户26815487395` 复活）。
+**几分钟内又变回了旧值**（TRAE 的 `用户<uid片段>` 复活）。
 
 根因：**当时有一个 1 小时前启动的 DSH 宿主进程仍在运行**（PID 9616，监听 3080）。
 它加载的是**旧代码**（没有 `repairAccountNicknames`），内存里的账号池是旧昵称；
@@ -1937,6 +1937,221 @@ ctx.remote.$on('credentials/reference-updated', () => this.catalog.refresh())
 ⚠️ **同名消歧必须基于未过滤的全量集合**（`displayNameFor(model, source)` 而非
 `listed`）：用过滤后的集合会让「关掉其中一个同名模型」改变另一个的变体标记，
 名字随开关跳变。
+
+## ⚠️ 「锁定永久积分」三家**共用一张表与一个端点**，但判据必须各算
+
+**用户需求**：为 codebuddy 与 workbuddy 加入永久积分锁定，类似 loomy 的锁定/解锁
+永久积分；差别是 loomy 的到期积分是**当日**到期，两个 buddy 的到期是**一个月或更久**，
+且「区分永久积分的方法可能稍有差异」。
+
+**用户 2026-09-29 定下的四条口径**（不要擅自改）：
+
+| 项 | 规则 |
+|---|---|
+| 判据 | 距**扣费截止**不足 **15 天** ⇒ 临时（优先烧）；≥ 15 天 ⇒ 永久 |
+| 余额口径 | `CycleCapacityRemain`（本计费周期剩余，= IDE 顶部 `Credits Balance` 口径） |
+| 开关粒度 | **provider 级**（CodeBuddy 与 WorkBuddy 各一份，互不影响） |
+| 选号策略 | 与 loomy 同构：有临时积分的号优先 → 只剩永久 → 无/查不到；**档内保持手动顺序** |
+
+### 区分永久积分**只能看 `DeductionEndTime`**（实测 2026-09-29，两站真实账号）
+
+| 包 | `ExpiredTime` | `CycleEndTime` | **`DeductionEndTime`** | 归入 |
+|---|---|---|---|---|
+| WorkBuddy「Bonus Pack」 | `''` | 9 天后 | **9 天后** | 临时 |
+| WorkBuddy「Free Plan Subscription」 | `''` | **2 天后** | **3008 天后** | 永久 |
+| CodeBuddy「个人体验版」 | `''` | 已过期 | 3008 天后 | 永久（本周期已无余额） |
+| CodeBuddy「拉新权益包 / 国内运营裂变包」 | `''` | 同下 | **17～208 天后** | ≥15 天者永久 |
+
+⚠️ **三个看着像判据、其实都不能用的字段**（每一条都足以让功能静默失效）：
+
+- **`ExpiredTime` 没有区分力**：有效包**一律是空串** —— 它是包**真正失效之后**
+  由服务端回填的动作时间（此时 `Status` 已变 3、余额已归零），不是「预定失效时间」。
+  既有的 `parseCreditPackage` 本来就把它用于失效判定，但**不能**反过来用它分池。
+- **`CycleEndTime` 会把套餐误判成「马上作废」**：订阅包的计量周期是月度的
+  （WorkBuddy Free Plan：周期 9-01→9-30，只剩 2 天），而扣费截止在 8 年后。
+  用它 ⇒ 套餐被划进临时桶 ⇒ 锁定**形同虚设**（该保的照烧）。
+- **终身口径 `CapacityRemain` 会虚增可用额度**：实测体验版**终身**剩 500 而
+  **本周期**剩 0，那 500 实际扣不到（`TotalCycles=1 / RemainCycles=0`，周期不刷新）。
+  用它 ⇒ 账号「看起来有钱却用不了」，锁定期间的可用判定也会错。
+
+⇒ 实现：`CreditPackage` 新增**可选** `deductionEndTime?: number`（由
+`parseCreditPackage` 从 `DeductionEndTime` 带出；`> 0` 才写，缺失 = 未知），
+`splitBuddyCreditsByExpiry()` 据此现算两桶。顺带把「扣费截止已过」并入 `active`
+失效判定（实测有效包的该字段都在未来，故这条只会捞出真正作废的包）。
+
+⚠️ **到期时间未知（缺失 / 0 / NaN）归入永久桶**：保守方向 —— 最坏是少用一个号，
+而不是把长期积分当快到期烧掉（不可逆损失）。
+
+### 为什么不复用 loomy 那份（`loomy-balance-rank.ts`）
+
+loomy 的两个池是**服务端直接给的字段**（`dailyBalance` / `balance`），buddy 要
+**从包列表按到期时间现算**。压成一份代码得把「什么叫临时」参数化成回调，
+那会让本文件最有价值的东西（**15 天这条线怎么来的**）从注释里消失。
+⇒ 新增 `src/buddy-balance-rank.ts` + `src/buddy-balance-selector.ts`，
+**同构但独立**；两站各持一个 selector 实例（余额缓存不串味）。
+
+### ⚠️ 锁定表必须住**独立文档**，不能住 `state.json`（同机多 profile 会抹掉它）
+
+**用户 2026-09-29 定案**（我先放错位置，被这条真实约束纠正）。
+
+关键事实：`$DSH_HOME/jet-hub/state.json` 是 **dsh home 级、同机多 profile 共享**的
+（`resolveJetHubHome` 只看 home，不看 profile），而本机现状是两个工作区并存 ——
+`desktop` profile link 到 `dsh-codearts`（本仓库，带锁定功能），
+`web` / `tui` / `headless` profile link 到 `deepseek-harness-codearts`
+（另一条 minimax 工作区，**不认识锁定表**）。用户刻意让它们互不影响。
+
+于是把 `permanentLocks` 放进 state.json 会这样失效：
+
+| 步骤 | 发生什么 |
+|---|---|
+| 1 | desktop 写入 `permanentLocks: { buddy: true }` |
+| 2 | 用户在 web 侧触发**任意一次**整体写入（加删账号 / 改模型开关 / 命中限流标记） |
+| 3 | 旧代码 `store.save(全量 state)` 只带它认识的三个键 ⇒ `permanentLocks` **被抹掉** |
+| 4 | desktop 读回 ⇒ CodeBuddy / WorkBuddy **静默解锁** ⇒ 继续消耗永久积分（**不可撤回**） |
+
+⇒ 表落在 **`$DSH_HOME/jet-hub/permanent-locks.json`**（`src/permanent-lock-store.ts`），
+旧代码从不读写它。**新增任何"跨版本共存"的字段时都要过一遍这个判断**：
+共享文档 + 整体替换语义 ⇒ 只有对方也认识的字段才安全。
+
+- ⚠️ `state.json` 里仍写 `loomyPermanentLocked`，但它是**镜像**不是权威：
+  旧代码读它、也原样写回它，保持一致才能让另一侧的 Loomy 面板不显示错值，
+  且回退版本时不会"锁定悄悄失效"。由 `AccountPool.lockFields()` 同源写出。
+- ⚠️ **迁移判据必须是「独立文档不存在」**（`load()` 返回 `exists: false`），
+  不能是「表里缺该键」。缺键的语义是**用户明确解锁了**；此时若回看镜像里那个
+  陈旧的 `true`，就会出现**解不掉的开关**（比丢状态更难排查）。
+  迁移出的内容要**立即固化**，否则每次冷启动都重新读那个会被改动的镜像。
+- ⚠️ 文档损坏时按「存在但空表」处理，**不**回落到镜像 —— 同上理由。
+- ⚠️ 写入顺序：**先权威、再镜像**；镜像失败只 warn 不上抛（否则一次 settings
+  后端抖动会让面板按钮报错，而开关其实已生效）。
+- ⚠️ 解锁是**删键**而不是写 `false`（与黑名单同款约定：只认显式 `true`）。
+- ⚠️ **备份**：表不在 `getStateSnapshot()` 里了，导出必须走
+  `permanentLocksSnapshot()`（漏改 = 备份里的锁定永远是空表）。导入侧
+  `locksFromPayload()` 三态仍需分清：有表 = 整体替换；只有老字段 = 恢复/解锁
+  Loomy 那一项（`false` 是**明确的**不锁，传 `{}`）；两者都没有 = 传
+  `undefined` 让池**保持当前值**（否则导入老备份会静默解锁）。
+- ⚠️ **测试必须隔离 home**：`vitest.config.ts` 已全局设
+  `DSH_JET_HUB_STATE_DIR` 到临时目录，但**用例间的清理钩子要注册在模块顶层** ——
+  本文件有多个**平级**的顶层 `describe`，钩子挂在某个 describe 内部时其余
+  describe 拿不到，于是 `permanent-locks.json` 在用例间残留，"默认未锁定"
+  会被前一条用例写入的值污染（实测踩过：9 条莫名失败）。
+
+**怎么复核这条风险是真的**（不是推演）：`scripts/probe-cross-profile-overwrite.mjs`
+（本地、零网络）用**另一条工作区的真实编译产物**当"旧代码"跑一次 `addAccount`，
+实测：塞在 `state.json` 里的表**被抹掉**，而 `permanent-locks.json` 里的
+`buddy` / `workbuddy` / `loomy` 三把锁全部健在。自动触发条件也不是"用户主动加账号"：
+旧代码有 **每 30 分钟的续期定时器**（`REFRESH_INTERVAL_MS`）与 8 处
+`updateModelRateLimit` 调用（一次对话命中限流即写）；且覆盖是**整份文档级、不分
+provider** —— web 侧 qoder / trae / loomy 等账号被写一次，同样会抹掉 desktop 侧
+给 CodeBuddy 上的锁。
+
+### ⚠️ 分类是时间的函数：**缓存原料，绝不缓存分类结果**
+
+**用户 2026-09-29 提出**：dsh 宿主长期开着，时间向前流动 —— 现在不是临时积分的包，
+过一阵（距扣费截止跌破 15 天）就变成临时积分。所以分类**不能算一次就固定**。
+
+⇒ 两处都按「只缓存原料」实现：
+
+| 位置 | 缓存什么 | 每次做什么 |
+|---|---|---|
+| `BuddyBalanceSelector`（选号） | `get-user-resource` 的**原始 `CreditBalance`**，TTL 60 秒 | 命中缓存也调 `classify()` 重新分桶 + 定档，并**重读窗口 env** |
+| `CreditBalanceRow`（面板） | 不缓存分类 | 每次渲染传 `Date.now()` 现算（`splitCreditsByExpiry` 是纯函数） |
+
+⚠️ **TTL 的唯一职责是抑制网络请求**，绝不能顺手把 `split` / `tier` 一起缓存住。
+一笔距到期 15 天 + 30 秒的余额，在 60 秒 TTL 内就越过了线 —— 冻结分类会让选号
+继续按「永久」处理一笔其实马上作废的积分（锁定时更糟：本该可用的号被判成不可用）。
+⇒ `balanceOf` 拆成 `fetchSource()`（网络，缓存）+ `classify()`（纯计算，每次做）。
+
+⚠️ **Loomy 那份（`loomy-balance-selector.ts`）缓存的是服务端给的两个数字**
+（`dailyBalance` / `balance`），里面不含「按 now 现算」的成分，所以它没有这个问题
+—— **不是漏改，不要"顺手统一"**。
+
+⚠️ 前端**不需要常驻定时器**：渲染节拍由「挂载 / 切 provider / 点刷新积分」提供，
+而数字本身也正是这些时刻才重拉。分类只是渲染时现算的派生值，页面活着就自动跟上。
+
+### ⚠️ 展示与选号的判据必须**逐条一致**（用对账用例锁，不是靠"看起来一样"）
+
+前端 `plugin-src/client/credit-expiry.js` 是后端 `src/buddy-balance-rank.ts`
+`splitBuddyCreditsByExpiry()` 的**展示侧复刻**。两者一旦漂移，用户就会看到
+「面板说还有 250 临时积分，选号却说没号可用」——**任何单侧用例都发现不了**。
+
+⇒ `tests/unit/credit-expiry.spec.ts` 用同一组 fixture（含恰好 15 天的边界、
+失效包、到期未知、脏值、浮点尾数、时间前进 40 秒越线）喂两侧并断言结果相同。
+⚠️ 已做**反向验证**：把前端边界从 `<` 改成 `<=` → 2 条变红（其中 1 条正是对账）。
+
+⚠️ 窗口天数只能**由后端回传**（`credits.balances` 与 `credits.permanentLock` 都带
+`windowDays`，前端存进同一个 state），不能在前端写死 15 —— 否则用户设了
+`DSH_BUDDY_EXPIRING_WINDOW_DAYS=31` 后，面板说「只烧 15 天内的」而实际按 31 天筛号。
+
+⚠️ 前端归一化窗口要显式挡 `null`/`undefined`：`Number(null) === 0`，而**非 buddy
+provider 后端不带该字段**，不挡住就会在它们的卡片上凭空渲染一行假的
+「临时 0 · 永久 N」。窗口实际恒为 15（或经 env 放宽），不存在"设成 0"的用法。
+
+⚠️ tooltip 的到期天数取 `deductionEndTime`，**不是 `cycleEndTime`**：套餐的计量
+周期是月度的（月底清零），拿它显示会让用户以为"永久积分只剩 2 天"。
+
+### RPC：一条实现 + 一个历史别名
+
+`credits.permanentLock { provider, locked? }`（`locked` 省略 = 只读）。
+`loomy.permanentLock` 保留为**别名**（老客户端 bundle 仍调它，删了会让 Loomy
+面板按钮静默失效），且该别名**忽略载荷里的 provider**（固定 loomy，否则老前端
+能借它越权改别的 provider）。白名单 `PERMANENT_LOCK_PROVIDERS`
+= `{loomy, buddy, workbuddy}`，与前端 `supportsPermanentLock` **必须一致** ——
+单测 `credits-capabilities.spec.ts` 逐个 provider 对账两边。
+
+⚠️ **不要**为每个 provider 各加一条 case：本仓库已经因此坏过
+（「WorkBuddy 的刷新按钮一直坏着」就是漏接平行分支）。
+
+### ⚠️ 文案必须按 provider 取，且**天数由后端回传**
+
+- `permanentLockCopy(provider, windowDays)`：loomy 说「每日赠送额度」，
+  两个 buddy 说「N 天内到期的积分包」。把 loomy 那句套到 buddy 上是**实质性误导**
+  —— buddy 没有每天刷新的额度池（签到得来的也是 14/30 天后到期的包）。
+- ⚠️ 窗口可被 `DSH_BUDDY_EXPIRING_WINDOW_DAYS` 覆盖，故响应带 `windowDays`
+  回传、前端据此渲染。写死 15 会出现「提示说只烧 15 天、实际按 31 天筛号」。
+- ⚠️ 前端归一化要区分 `null/undefined`（回落默认，**不能**当 0 ——
+  `Number(null) === 0`）与数字 `0`（合法，语义是「没有临时积分」）。
+  写 `|| 默认值` 会吞掉 0，与 Qoder 排队超时那条同一个坑。
+
+### ⚠️ 中国版在默认窗口下的必然结果（**不是缺陷**，但要说清）
+
+实测 CodeBuddy 中国版账号的赠送包**按 30 天发放**，「距到期」天然落在 17～30 天
+⇒ 默认 15 天下**整池 10064 积分全算永久** ⇒ 锁上立刻「无可用账号」。
+这是用户定的判据的直接推论。逃生门：`DSH_BUDDY_EXPIRING_WINDOW_DAYS=31`
+（实测改后 6264.61 划为临时、3799.99 仍永久，锁定可正常选号）。
+报错文案用 `buddyExpiringWindowDays()` **运行时解析**，不写死常量。
+
+### ⚠️ 锁定时绝不可落到 `getAvailableAccount` 兜底
+
+`pickBuddyAccount()` 返回 `kind:'locked'` 时 `index.ts` 必须**抛明确错误**
+（告诉用户去哪个面板解锁）。落到既有的池兜底会绕过锁定、照样消耗永久积分，
+使锁定形同虚设 —— loomy 当初就是这条，单测里也专门钉住「编排函数体内不出现
+`getAvailableAccount`」。未锁定时的 `exhausted`（凭据都坏了）才允许兜底，
+且必须把 `tried` 传给 `getAvailableAccount` 的排除集合，否则会原地打转。
+
+### 回归用例
+
+- `tests/unit/buddy-balance-rank.spec.ts`（37 条）：窗口边界（14d / 恰好 15d /
+  差 1ms）、失效包跳过、到期未知归永久、本周期口径、锁定降档、稳定排序、
+  环境变量解析（含 **0 合法**）、脏值。
+- `tests/unit/buddy-balance-selector.spec.ts`（25 条）：TTL 缓存与 invalidate、
+  凭据失败/异常/null 三种失败形态、锁定不被选中、解锁保持既有行为、
+  编排换号循环、`locked` vs `exhausted`、env 窗口生效。
+- `tests/unit/credits.spec.ts` 的「DeductionEndTime 解析」段（5 条）：带出毫秒、
+  缺失不编造、过期判 `active:false`、脏值。
+- `tests/unit/jet-hub-store.spec.ts` / `account-pool.spec.ts`：表与老字段同源、
+  三处整体写入不互相抹掉、跨实例读回、脏表按空、replaceAll 三态。
+- `tests/unit/buddy-permanent-lock.spec.ts`（12 条）：`index.ts` **接线**源码断言
+  （两个 selector 各绑自己的 product、候选先过滤再分档、锁定分支不兜底、
+  兜底传 `tried`）+ 行为级「两站不串味」。
+- `tests/unit/loomy-client.spec.ts` / `loomy-rpc-dispatch.spec.ts` /
+  `credits-capabilities.spec.ts`：通用端点 + 别名、provider 白名单两边对账、
+  文案带 windowDays。
+- ⚠️ 已做**反向验证**：阈值改 7 天 ⇒ 9 条变红；去掉锁定降档那一行 ⇒ 6 条变红；
+  把 `locked` 的 throw 改成兜底 ⇒ 接线用例变红。
+- 排查脚本（只读、零额度、**不入库**）：`scripts/probe-buddy-resource-raw.mts`
+  （打印两站资源包原始形状与到期分布，判据的取证来源）、
+  `scripts/probe-buddy-permanent-lock.mts`（用真实凭据跑一遍拆分与选号，
+  可加 `DSH_BUDDY_EXPIRING_WINDOW_DAYS` 看放宽窗口的效果）。
 
 ## 目录门控：没有已登录账号就隐藏整个 provider
 
@@ -2705,12 +2920,11 @@ Let me write. / Writing. / Go. / OK. / Producing. / Let me output. / Final.
 
 **中断动作**：丢弃后续思考增量 → **`reader.cancel()` 中止上游**（真正止损，见下）
 → 收尾发**截断后的 reasoning block**（保留 `cutAt` 前的干净前缀）
-→ `finish` 报 **`max-tokens`**（标记为不完整，由用户/上层决定是否继续）。
+→ `finish` 报 **`error` + `REASONING_LOOP`**（**有分辨力**，见下节；2026-09-29 改判）。
 
 ⚠️ **「止损」这一步不可省**（终审 C1，已实测）：只跳过**下行**累积/发射、却把流读到底，
 则上游继续生成、**128000 token 照烧**（实测上游 200 帧被读 **200 帧**；守卫在 ~2304
-字符即命中，即 99.5% 额度仍被消耗）。且报障会话的 `turn/end` **本来就是 `max-tokens`**
-（分支前 `finishReason === 'length'` 已报同样 reason）—— 不止损就等于没修。
+字符即命中，即 99.5% 额度仍被消耗）。
 
 四个必须保留的实现要点：
 
@@ -2722,10 +2936,7 @@ Let me write. / Writing. / Go. / OK. / Producing. / Let me output. / Final.
    剩余行（**实测踩过**：五处首次插入全部误落内层，typecheck 与多数用例都不报错，
    只有「同帧 usage」用例抓到）。
    ⚠️ **绝不能 abort `options.signal`** —— 那是**调用方**信号，abort 会被上层报成
-   「用户取消」而非**标记为不完整**的 `max-tokens`（DSH 在 `max-tokens` 时
-   **不自动重试** —— `dsh-agent-loop` 直接 `return {kind:'max-tokens'}`，
-   UI 提示「发送"继续"可让模型接着输出」，即由**用户**决定是否继续）。
-   只 cancel reader。
+   「用户取消」（`aborted`）而非我们想要的 `error`。只 cancel reader。
    ⚠️ `reader.cancel()` 必须 `.catch(() => {})`：连接已断时会抛错，不吞掉会把
    「正常止损」变成一次失败。
    ⚠️ **不得用 `continue`**（Task 2 审查发现、已实测复现）：`continue` 跳过本帧
@@ -2746,6 +2957,158 @@ Let me write. / Writing. / Go. / OK. / Producing. / Let me output. / Final.
 回归用例：`tests/unit/reasoning-loop.spec.ts`（判据）、
 `tests/unit/reasoning-loop-adapter.spec.ts`（各适配器中断行为）；
 fixture 为**真实会话文本**（`tests/fixtures/reasoning-*.txt`）。
+
+#### ⚠️⚠️ 死循环中断**不得复用 `max-tokens`**：必须给有分辨力的错误（Gitee !IKIZNK）
+
+**真实缺陷**（用户报障，2026-09-29）：
+
+> 会话异常问题：**已达到输出 token 上限**回答被截断，已有输出保留在对话中。
+> 发送"继续"可让模型接着输出。
+
+用户的原话点明了性质：
+
+> 如果只是陷入思考循环的出错，就要给出**有分辨力**的错误提示，
+> 现在用「达到输出 token 上限」是**不对**的。
+
+**根因：DSH 客户端对 `max-tokens` 只有一句固定 i18n 文案，且不读适配器的 message。**
+`dsh-client-ui-chat/lib/client.js` 的 `message.maxTokens` / `.hint`：
+
+```
+已达到输出 token 上限 / 回答被截断，已有输出保留在对话中。发送"继续"可让模型接着输出。
+```
+
+⇒ 于是「**检测到死循环并主动止损**」被显示成「**token 用满了**」，
+而那句「发送继续可让模型接着输出」对死循环**恰好是错的建议**。
+
+**全库取证**（219 会话；脚本 `scripts/probe-max-tokens-provenance.mjs`）——
+`finish=max-tokens` 的 35 步里：
+
+| 归因 | 步数 | 占比 |
+|---|---|---|
+| **循环守卫截断**（**不是** token 上限）| **25** | **71%** |
+| 真·烧满额度（`output=32000/64000/128000`）| 5 | 14% |
+| 上游 `length` / 其他折叠 | 5 | 14% |
+
+⚠️ **判据（决定性，不依赖 usage）**：守卫命中时 `block-end` 只发**截断后的前缀**，
+而已流出的 delta 无法撤回 ⇒ **「流出思考总量 − 落块思考量」＝ 被截掉的量**。
+这 25 例的截掉量**恒为 1994~1999 字符**（= `minLoopChars` 默认 2000），
+被截段行去重率 **0.0114~0.0831**（阈值 `<0.35`），内容形如
+`OK. / Hmm. / Hmm. / …`（233× `Hmm.`）、`好。/ 执行。/（写。）/（结束。）`。
+
+⚠️ **这 25 例全部是真循环、零误报** —— 问题**不在判据，在上报方式**
+（脚本 `scripts/probe-loop-truncation-content.mjs` 逐例打印被截原文可复核）。
+
+**更严重的副作用：文案里的建议对死循环无效**（脚本
+`scripts/probe-continue-after-loop.mjs`）：25/25 例守卫命中之后，用户**都**被迫手动介入：
+
+```
+11×  "继续"
+ 9×  "继续上面未完成的任务"
+ 1×  "你陷入思考循环了，醒醒。继续上面未完成的任务"   ← 用户自己诊断出来了
+ 1×  "你的思考陷入死循环了，继续调查上面的问题"       ← 同上
+```
+
+且有会话**反复命中同一守卫**（`session-fa` 4 次、`session-8c` 4 次、`session-27` 3 次）。
+
+##### 修法：改报 `error` + `REASONING_LOOP`，**并带「无可见产出」门禁**
+
+为什么 `error` 能把文案送到用户眼前（两条都是实测/源码依据）：
+
+1. UI 的 `failureMessage()` 只对 `AUTH` / `QUOTA` / `ACCOUNT_QUOTA` /
+   `ACCOUNT_SIGNED_OUT` / `ACCOUNT_SIGN_IN_REQUIRED` 做**文案替换**，
+   **其余码一律原样显示我们的 message**（`dsh-client-ui-chat/lib/client.js`
+   的 `failureMessage`）。这正是用户说的「出错5次重试那里会显示失败原因」那条通道。
+2. UI 读的是 `reason.error`（`client.js` 的 `failureFrom`），而
+   `dsh-llm` 的 `LlmFailure` 形状是 `{message, code, …}` ⇒ **适配器给什么就显示什么**。
+
+⚠️ **但 `error` 路径会丢内容，故必须加门禁**（`dsh-agent-loop/lib/index.js`）：
+
+```js
+if (finish.kind === "error" || finish.kind === "aborted") {
+  live.settle("assistant/attempt", …)   // ← 只落 attempt（UI 不可见）
+  if (action?.kind !== "retry") throw new LlmError(finish.failure.message, …)
+}
+live.settle("assistant/message", …)     // ← error 走不到这里
+```
+
+即 **error 不落 `assistant/message`**，该步已产出内容不进会话历史。
+实测（`scripts/probe-error-finish-content-loss.mjs`）：**351 次 `finish=error` 里
+222 次该步没有 `assistant/message`** ⇒ 内容确实会丢。
+
+⇒ 故判据必须是「**只是**思考循环」（用户原话里的「只是」正是这层门禁）：
+
+| 命中时的产出 | 报什么 | 理由 |
+|---|---|---|
+| **只有思考**（实测 25/25 例都是）| `error` + `REASONING_LOOP` | 可见内容为零，报 error 不丢东西，文案有分辨力 |
+| 还有正文或工具调用 | `max-tokens`（保持原行为）| 报 error 会把可见内容整块丢掉，更糟 |
+
+实现：各适配器算 `reasoningLoopIsSoleOutput = loopDetected && emittedProse === '' && toolOrder.length === 0`。
+⚠️ **codearts（`llm-adapter.ts`）还有一层额外陷阱**：它有「正文为空且无工具调用时
+用**推理文本回填正文**」的 `visible` 回退 —— 回退一生效 `visible !== ''`，
+判据**恒为假**、永远落回误导性的 `max-tokens`（**静默失效**）。
+故该回退必须加 `!loopDetected` 门禁（顺带也修掉了「把循环垃圾回填进正文并持久化」）。
+
+##### 文案三要素（用户明确要求）
+
+用户原话：
+
+> 提示中要加上**当前窗口还有多少可用**，没有真的占满可以尝试继续任务
+
+故 `reasoningLoopFailure()`（`src/sse.ts`）产出：
+
+1. **真实原因**：`模型思考陷入病态重复，已中止本轮（**不是**输出 token 上限）。`
+2. **判据数值**：尾部 N 行里只有 M 行不重复（去重率 x.xxx，阈值 <0.35）、连续循环体量。
+3. **额度实况 + 建议**：`本次思考仅产出约 N 字符（约 K token），额度 L token 中**还剩约 R**（估算值）——额度没有占满，可以直接继续任务。`
+   并附「若继续后再次陷入同一循环，建议降低思考档位或更换模型」。
+
+⚠️ **额度是估算，必须如实标注**：`observedChars` 是**字符数**不是 token 数；
+守卫命中时 `reader.cancel()` 已中止上游，`usage` 帧**往往根本没到达**
+（实测 25 例中 **0 例**带 usage）。故用「约 1 token ≈ 3.5 字符」估算并写明「估算值」。
+系数 3.5 取中文（约 1:1.5~1:2）与英文短句（`OK.`/`Hmm.`，约 1:4~1:5）之间的**保守中值**
+—— 宁可低估剩余额度，也不要让用户以为还有很多而反复撞墙。
+⚠️ **拿不到 `maxTokens` 时不得编造数字**（与 `maxOutputTokens` 那条口径一致）：
+文案退化成「额度没有占满，可以直接继续任务」而不给具体数值。
+故 `ConsumeOpenAiSseOptions` 新增可选的 `maxTokens`，由四个调用方（cline / loomy /
+raccoon / qoder）透传 `options.maxTokens`。
+
+##### `REASONING_LOOP` **刻意不在**可重试集合里
+
+死循环是**确定性**病理（同上下文会稳定复现），若可重试则白退避 5 次
+（500/1000/2000/4000/8000 ≈ 15.5 秒）并**再烧一轮额度**，而每轮可能烧掉几十万 token。
+与 `QUOTA_EXCEEDED` / `PERMISSION_DENIED` 的既有口径一致。
+验证脚本 `scripts/probe-reasoning-loop-retry-codes.mjs`（只读 `dsh-llm` 产物，
+断言 `REASONING_LOOP`/`QUOTA_EXCEEDED`/`PERMISSION_DENIED` **不在**集合里，
+而 `SERVER`/`EMPTY_RESPONSE` **在** —— 后者是对照组，防止「不在」只是解析失败）。
+
+##### 回归与验证
+
+- 回归用例 `tests/unit/reasoning-loop-adapter.spec.ts`（30 条）：其中 4 条新增 ——
+  「文案有分辨力（含否定 token 上限、判据数值、剩余额度）」「拿不到 maxTokens 时不编造数字」
+  「另有工具调用时仍报 max-tokens（不丢内容）」「另有正文时仍报 max-tokens（不丢内容）」。
+- ⚠️ **已做反向验证**（三处变异，各自变红，证明非同义反复）：
+  ① `reasoningLoopIsSoleOutput → false`（退回 max-tokens）→ **6 条**变红；
+  ② 去掉「只是思考循环」门禁（恒为 true）→ **2 条**变红（正是内容保全那两条）；
+  ③ 去掉 codearts `visible` 回退的 `!loopDetected` 门禁 → **5 条**变红。
+- 端到端回放 `scripts/verify-reasoning-loop-error.mjs`：用**真实会话的 wire 分片**
+  （seq=1963，流出思考 57073 / 落块 55084 / 正文块 0 / 工具调用 0）重放，确认产出
+  `error` + `REASONING_LOOP`，文案含「不是 token 上限」「还剩约 111693」。
+- 取证脚本（均只读、离线、零额度）：`probe-max-tokens-provenance.mjs`（归因）、
+  `probe-loop-truncation-content.mjs`（被截原文）、`probe-continue-after-loop.mjs`
+  （用户后续消息）、`probe-guard-hit-block-mix.mjs`（命中时的落块构成）、
+  `probe-error-finish-content-loss.mjs`（error 路径丢内容）。
+
+⚠️ **排查这类问题的两个通用教训**（本缺陷踩过）：
+
+1. **会话日志里的 `data.stream` 是「合并形态」，不是原始 chunk 数组**：
+   形如 `{type:'reasoning-chunks', texts:[…]}` / `{type:'chunk', chunk:{…}}` 混排。
+   按 `item.chunk.type` 统计会**静默得到 0**（合并项没有 `.chunk`）——
+   我第一版探针据此得出「reasoning 帧 = 0」的**假象**。
+   文本量必须从 `texts[]` / `args[]` 累加（见 `probe-stream-shape.mjs`）。
+2. **按 `turn` 聚合会掩盖失败步**：一轮有几十步，前面正常步的 `assistant/message`
+   会让「本轮有内容」恒为真 ⇒ 得到「error 不丢内容」的**假阴性**。
+   必须按 **(turn, step)** 聚合，或直接看 `assistant/attempt` 里那个 `finish` chunk
+   （attempt **只在失败路径落盘**，本身就是「这步曾失败」的指纹）。
+
 
 #### ⚠️ 思考标签泄漏与「引用 `</think>` 导致对话中断」
 
@@ -4862,4 +5225,662 @@ pnpm test:e2e:minimax-chat   # ⚠️ 发推理（真实适配器；默认 M2.7�
 ⚠️ **另一个格式陷阱**：`registerJetHubRpc` 的**调用**必须保持**单行**
 （`... raccoon, minimax, modelAdapters)`）。拆成多行（哪怕只加尾随逗号）
 会让 `qoder-wiring.spec.ts` / `raccoon-wiring.spec.ts` 的正则失配而失败。
+
+## ⚠️ ZCode（智谱）provider：「卡住 + 停止按钮无效」的两个根因（真实缺陷，2026-09-29）
+
+**用户报障原文**：
+
+> zcode 执行任务会卡住……显示「**深度求索中，用时 5分27秒...**」，
+> 还没有继续输出推理或者思考……此时**停止按钮点击都没反应**，
+> 我重启后才能让这个任务停止。
+
+### 一、先记住这条判据：日志里的收尾事件可能是**伪造的**
+
+排查时**不要**看到 `turn/end{kind:'interrupted'}` 就以为「turn 正常结束过」。
+`dsh-session` 的 `openTurnClosers()`（`lib/types/repair.js`）会在加载会话时给
+**打开的 turn** 补一份合成收尾，并且**复用最后一个真实事件的时间戳**
+（原文：*"The last real event supplies the seq base and the timestamp for the
+synthetic closers"*）。
+
+⇒ **判据：`step/end` 与 `step/start` 同一毫秒 + `turn/end{kind:'interrupted'}`**
+= 那不是真收尾，**这个 turn 从未结束**（适配器的 generator 挂在某个 `await` 上）。
+
+本机实测三次（全是 `zcode/GLM-5.3-Flash`）：
+
+| 会话 | `step/start` | 最后一个真实事件 | 无输出时长 |
+|---|---|---|---|
+| `session-a77ed457` | 17:20:57.353 | 17:38:14.442 | **1018.7 秒**（用户看到的「5分27秒」正在其中） |
+| `session-fe7a9979` | 20:00:25.179 | 20:00:25.179（即 start 本身） | 直到重启宿主 |
+| `session-2271311d` | 20:10:59.738 | 20:10:59.738 | 直到切换模型 |
+
+### 二、根因 A（本次直接原因）：流式读取阶段**既无超时、也失了中断通道**
+
+`src/zcode-adapter.ts` 旧实现把清理放在 **`fetch` 的 `finally`** 里 ——
+那个 `finally` 在「响应头一到」就执行：
+
+```ts
+try { response = await this.fetchImpl(..., { signal: controller.signal }) }
+finally {
+  clearTimeout(timer)                                    // ← 流还没读，超时就被清了
+  options.signal?.removeEventListener('abort', onAbort)  // ← 中断通道也被摘了
+}
+yield* consumeAnthropicSse(response.body, ...)           // ← 这一段无超时、无中断
+```
+
+而 `src/zcode-anthropic.ts` 的 `iterateSseFrames` 里是裸的
+`await reader.read()`，且 `finally` 只有 `releaseLock()`。
+
+⇒ 上游（免费通道首字节实测有 20 秒以上长尾，也会整段静默）一旦不吐数据：
+`read()` 永远挂着、**`abort` 唤不醒它**、180 秒的 `requestTimeoutMs` 形同虚设、
+用户点「停止」也到不了 controller —— **只能重启宿主**。
+
+**修法**（三处，缺一不可）：
+
+1. `iterateSseFrames(body, { signal })`：abort 时**主动 `reader.cancel()`**
+   （取消底层流会让挂起的 `read()` 立刻以 `{done:true}` 收尾，这是**唯一**能唤醒
+   它的手段）；循环顶部再判一次 `aborted` 兜底。
+2. `finally` 里**先 `await reader.cancel()` 再 `releaseLock()`** ——
+   `releaseLock()` **不关闭底层流**，上游连接会继续生成并**白扣额度**。
+3. `zcode-adapter.ts`：把超时/中断的作用域提升到**整轮**
+   （`stream()` 负责建 `AbortController` + 计时器，`streamScoped()` 干活），
+   并把 `controller.signal` 一路传进 SSE 消费；超时收尾抛 **`TIMEOUT`**
+   （可重试），**但用户中断必须原样上抛**（否则用户主动取消会被白重试）。
+
+⚠️ 可作对照的实现：`D:\jet\code\js\dsh-free-glm\src\adapter.ts` 早已修过同型三处
+（[L1897-1900](file:///D:/jet/code/js/dsh-free-glm/src/adapter.ts) 清理覆盖全流程、
+[L712-729](file:///D:/jet/code/js/dsh-free-glm/src/adapter.ts) 把超时 signal 传进 SSE、
+[L921-948](file:///D:/jet/code/js/dsh-free-glm/src/adapter.ts) `cancel()` 再 `releaseLock()`），
+注释原文就是「**`abort` 不会唤醒 `reader.read()`**」「超时失去全部作用，请求可无限挂起」。
+
+### 三、根因 B（同型的第二颗雷）：captcha 侧有无超时的等待，且失败后**把闸门焊死**
+
+`src/zcode-captcha.ts`：
+
+| 位置 | 旧行为 | 后果 |
+|---|---|---|
+| `acquirePage` 取页 | `while (this.pageBusy) await sleep(50)` —— **无上限、不看 signal** | 一旦标志没被复位就**永久自旋** |
+| `acquirePage` 建连 | `await new Promise(... ws 'open' ...)` —— **无超时** | Chromium 僵死时 `open`/`error` 都不来 ⇒ 永久挂起 |
+| `acquirePage` 建页 | `await browser.send('Target.createTarget')` 在 try **之外** | CDP 抛错后 `pageBusy` 不复位 |
+| `mint()` 的 `finally` | `if (this.reusablePage === page) this.releasePage(page)` | catch 里已 `discardPage()` 把 `reusablePage` 置空 ⇒ 条件**恒为假** ⇒ `pageBusy` **永不复位** |
+
+最后一条是**致命**的：它让「一次 captcha 失败」升级成「此后每次 mint 都死锁」——
+adapter 的 `await this.mintCaptcha()` 永不返回，请求根本不发出，UI 永远「深度求索中」。
+
+**修法**：取页自旋加 `pageWaitTimeoutMs`（默认 30s）+ 判 signal；建连加
+`connectTimeoutMs`（默认 10s）；`createTarget` 包进 try；`mint()` 的 `finally`
+改成 **`else this.pageBusy = false`**（无条件复位）；`mint(config, { signal })`
+与 `ZcodeAuth.mintCaptcha` / `index.ts` 的注入点**逐层透传 signal**。
+
+⚠️ 超时**不**复位别人的 `pageBusy`（此刻它属于另一个持有者，越权复位会让两个
+mint 共用同一页面 —— captcha 是一次性的，必串状态）。
+
+### 四、回归用例与**反向验证**
+
+`tests/unit/zcode-stream-hang.spec.ts`（8 条，全部毫秒级、零网络、零额度）：
+
+| 用例 | 反向验证（改回旧行为 ⇒ 变红） |
+|---|---|
+| abort 唤醒挂起的 read | 去掉 abort→`cancel` 注册 ⇒ **红**（挂到用例超时） |
+| 中断必须真的 cancel 底层流 | 同上 ⇒ 红 |
+| 消费方 `break` 时必须取消底层流 | 去掉 `finally` 的 `reader.cancel()` ⇒ 红（仅此条红） |
+| 200 + 整段静默 ⇒ `TIMEOUT` | 不把 signal 传进 SSE 消费 ⇒ **红（挂 5s 超时）** |
+| 用户中断**不得**翻译成 `TIMEOUT` | 同上 ⇒ 红 |
+| 取页等待有上限 | 去掉 deadline 判定 ⇒ **红（挂 5s 超时）** |
+| `mintOnPage` 失败后 `pageBusy` 必须复位 | `finally` 改回条件式 ⇒ 红 |
+
+⚠️ 写这类用例时**判据是「在有限时间内结束」**：唤醒/超时/复位任一失效，
+用例呈**挂起直到 vitest 超时**，而不是干脆的断言失败 —— 那正是线上那条路径的形状。
+
+### 五、其它必须记住的点
+
+- **两次 checkout 都要改**：`D:\jet\code\js\dsh-codearts` 与
+  `D:\jet\code\js\deepseek-harness-codearts` 是同一插件的两份链接目录，而
+  `~/.dsh/profiles/web/pnpm-lock.yaml` link 的是**后者**（GUI 加载它）、
+  `desktop` 用前者。改完两份 `src/` 都要 `pnpm build:all`，且**必须重启宿主**才生效。
+- `requestTimeoutMs`（`zcode-product.ts`，180s）现在**覆盖整轮**（含 captcha 与流读取），
+  不再是「只到响应头」。
+- captcha 每请求现 mint（约 1.2 秒）**不是**本次卡住的原因：卡住前后的请求都正常，
+  且 17:20 那次卡死后 19:59 的 zcode 请求又成功了 —— 若是 `pageBusy` 死锁，
+  后续请求会**全部**一起卡。⇒ 别把 `imageUrls`/captcha 配额当成第一嫌疑人。
+
+---
+
+## ⚠️ ZCode 上游节流三件套（吸收自 `dsh-free-glm`，2026-09-30）
+
+**起因**：`dsh-free-glm` 的作者指出我们的瓶颈是「每请求 +1.2s captcha」。
+核对后确认：**这不仅对，而且还有第二处更大的漏算**（见第 4 条）。
+本次把那边已验证的三套机制搬了过来，并顺手补上了 prompt caching 断点。
+
+### 一、captcha **预取池**（`src/captcha-pool.ts`）
+
+**要解决的问题**：`zcode-captcha.ts` 实测「页面空闲 <8s 复用约 0.5 秒，
+更久（实测 15s 必 `F001`）要**新建页面约 3.7 秒**」，而 agent 多步循环的
+两步间隔**通常大于 8 秒** ⇒ 现产路径几乎每步都付建页面的钱。
+
+**关键依据（那边的实测，决定了「能提前产」这件事成立）**：
+
+| 生成后经过 | 使用结果 |
+|---|---|
+| 0 / 10 / 30 / 60 秒 | ✅ 可用 |
+| 120 秒 | ❌ 3007 |
+
+⇒ 「一次性」只指**用一次就作废**，**不指必须立刻用**。
+
+**实现要点（三条都是那边记过的坑）**：
+
+1. **现产之后也要补池**。少了它，首次请求现产后池永远空，优化形同虚设。
+2. **取走即补下一个**（不 await，不阻塞本次请求）。
+3. **预取要 inflight 去重**，否则每轮请求都叠一个预取，白耗 captcha 配额。
+4. ⚠ **`hasFresh()` 必须只读**（本次写单测时实测到的缺陷）：初版实现成
+   「调一次 `takeFresh()` 看结果」，而 `takeFresh()` 会清空池 ——
+   于是**看一眼就把预取好的 param 丢掉了**，池在诊断代码路过时静默失效。
+   修法：拆出 `peekFresh()`（只判不删）+ `takeFresh()`（删）。
+
+**开关**：`DSH_ZCODE_CAPTCHA_POOL=0` 关闭（关闭后与引入池之前逐字一致）；
+`DSH_ZCODE_CAPTCHA_POOL_TTL_MS` 调 TTL（默认 **30 秒** —— 比那边的 45 秒保守，
+因为**我们没有复测过**这个窗口，且两边的产出路径不同：它走壳内 renderer，
+我们走普通 Chromium CDP。若实测无 3007 可放宽）。
+
+**回归**：`tests/unit/captcha-pool.spec.ts`（9 条）。
+反向验证：删掉 `take()` 里现产后的 `prefetch()` ⇒ 第 1 条变红。
+
+### 二、上游**发车闸门**（`src/model-gate.ts`）
+
+**依据（那边分模型实测）**：`429` 里的 `3009 model concurrency limit exceeded`
+是**并发配额**（撞它时 token 还剩 299.4 万），且两个模型窗口明显不同：
+
+```
+GLM-5.3-Flash  605 次 200    0 次限流      ← 从未撞过
+GLM-5.3         74 次 200   21 次重试     6 次最终 429
+```
+
+⇒ **串行**（不重叠）+ **按模型最小间隔**（不挨太近）。加了之后 `3009` 21 → 1 次。
+参数落在 `zcode-product.ts`（`serializeUpstream` / `modelGapMs`：
+`glm-5.3` 350ms、`glm-5.3-flash` 0），**不要在适配器里写死**。
+
+⚠ **闸门只包 fetch，不包 captcha**：那边第一版把 mint 一起放进闸门，
+`mintMs` 从 200-500ms 暴涨到 **2500-3100ms**（变成「排在 N 个人后面再 mint」）。
+
+⚠ 与 `model-queue.ts` 分工不同：那个管**服务端指定的**排队时长（`10605`），
+这个管**客户端自保**的发车节流。
+
+**回归**：`tests/unit/model-gate.spec.ts`（8 条，含「等待期间中断必须生效」——
+否则前面某个请求挂住会把后面全部拖死）。
+
+### 三、额度用尽 / 无权益 → **标记 + 切号**
+
+**两种 429 的处置必须分开**（`isZcodeConcurrencyLimited` / `isZcodeQuotaExhausted`）：
+
+| 形态 | 判据 | 处置 |
+|---|---|---|
+| 并发限流 | `3009` | **退避重试**（`ZCODE.concurrencyRetryMax`=2，1500ms 线性退避），**不换号、不标记** |
+| 额度用尽 | `1005 exceed quota limit` / `1113 余额不足` | **标记该账号+该模型到 UTC+8 当日 24:00**，换下一个账号重发 |
+| 无权益 | **秒回空**（`EMPTY_RESPONSE` 且耗时 < `ZCODE_FAST_EMPTY_MS`=3 秒） | 同上（换号） |
+| 链路卡住 | 慢回空（≈180s） | 重试 / 排查，**不换号**（换号解决不了） |
+
+⚠ **`isZcodeQuotaExhausted` 必须先排除 `3009`** —— 否则会把一个完全可用的账号
+误标成「当日用尽」（与 qoder 那次「把 rate_limit 当 billing」同型）。
+
+⚠ **重试前必须重新 mint captcha**（一次性，沿用旧的必 `3007`）：
+实现上把 `mintCaptcha()` 放在**内层循环第一行**，天然满足。
+
+⚠ **`emitted` 闸**：一旦已向调用方 yield 过内容，就不许再切号/重试
+（否则用户看到两份输出）。HTTP 层错误与空响应都发生在输出之前，不受此限。
+
+⚠ **切号三件事**（与 `qoder-adapter.ts` 同因，缺一即空转）：
+① 标记用的是**局部可变**的 `activeAccountId`（不是回调，回调切号后不跟着变）；
+② 取号必须传 `tried`（池按手动顺序返回，刚失败的账号可能仍排第一）；
+③ `tried` 跨重试保留。回调由 `index.ts` 的 `activeZcodeAccountId` 提供，
+在 `resolveCredential` 里记录**实际返回的那个账号**。
+
+⚠ 无法再切时抛 **`QUOTA_EXCEEDED`**（**不在** harness 的
+`DEFAULT_RETRYABLE_CODES` 里）—— 不能落 `SERVER`，否则「今日额度已用尽」
+这种确定性错误会被白退避重试 5 次（约 15.5 秒）。
+
+**回归**：`tests/unit/zcode-throttle.spec.ts`（13 条：5 条纯函数 + 8 条行为，
+含「3009 不标记账号」「秒回空切号」「已产出内容后不切号」「tried 传下去」）。
+
+### 四、**prompt caching 断点**（本次额外发现的更大瓶颈）
+
+**用户反馈**：`dsh-free-glm` 的作者说我们「每请求 +1.2s」。
+captcha 只解释**一部分**；下面这条解释**每一步**的开销：
+
+`toAnthropicTools()` **从不产出 `cache_control`**，而 `system` 此前**每块都打**
+（3-4 块）—— 正好用满 Anthropic「单请求最多 4 个断点」的预算，
+于是 `tools` 再也打不了点。而 DSH 每步带 24 个工具、约 19KB schema
+（那边 P0-2 的实测原文），**每步全量重算这段 prefill**。
+
+**修法（两处）**：
+
+1. `zcode-identity.ts`：system **只在最后一块**打断点。前缀式缓存语义下，
+   一个位于末块的断点**覆盖面等于（不小于）**每块各打一个；
+   且「调用方 system（DSH 的 AGENTS.md，本仓库数十 KB）必须落在断点内」——
+   只打末块天然满足。
+2. `zcode-adapter.ts` 的 `withToolCacheBreakpoint()`：给**最后一个** tool 打断点
+   （前缀式 ⇒ 覆盖「system + 全部 tools」整段）。总断点数 = 2 ≤ 4。
+
+⚠ **不影响准入**：3012 的判据是身份块的**内容与结构**存在，
+`cache_control` 只是缓存提示。用例断言了「断点总数 ≤ 4」。
+
+**回归**：`tests/unit/zcode.spec.ts` 的「只在最后一块打 cache_control」等 3 条 +
+`zcode-throttle.spec.ts` 的「tools 断点真的进了请求体」。
+
+### 五、额度用尽时**必须说出真实原因**（用户报障，2026-10-01）
+
+**用户看到的原文**：
+
+> 本轮运行失败　`zcode: 模型返回了空响应（无任何 text / thinking / tool 内容）`
+> `EMPTY_RESPONSE`　（并伴随「已重试模型请求 (5/5)」）
+
+**两处都不对**：
+
+| 项 | 问题 |
+|---|---|
+| **文案** | 说的是**现象**（没收到内容），没说**原因**（额度用尽）—— 用户无从判断该等额度、换模型还是加账号 |
+| **错误码** | `EMPTY_RESPONSE` **在** harness 的 `DEFAULT_RETRYABLE_CODES` 里 ⇒ 这种**确定性**错误被白退避重试 5 次（约 15.5 秒，即截图里的 5/5） |
+
+⚠ **这与 qoder「110 额度错误落 `SERVER`」是同型缺陷**：
+**用错误码的默认归类代替了对业务语义的判断**（本文件 qoder 章节记过该教训）。
+
+**上游为什么回「空」而不是报错**：额度耗尽时请求**根本没送达模型**
+（对照那边的实测：`provider runtime headers` 请求从未出现），网关直接回
+**HTTP 200 + 空内容** —— 所以它**看起来**像空响应，实际是权益问题。
+
+**最可惜的地方：判据本来就是现成的**。`isFastEntitlementMiss()` 早就实现了
+「**秒回空**（<3s）= 该账号对该模型无权益」（依据：150-200ms 空响应
+vs 卡住形态的 ≈180000ms），但它此前**只用于决定「要不要切号」**，
+判据本身从未进入文案 —— 于是「无法再切号」那一步抛出的还是通用裸错误。
+
+**修法（`zcode-adapter.ts`）**：「秒回空」且**无法再切号**时 → 抛
+`zcodeEntitlementErrorMessage()` 的文案 + **`QUOTA_EXCEEDED`**
+（不在可重试集合里 ⇒ 立即失败）。
+
+⚠ **文案措辞必须诚实**：不断言是「额度用尽」还是「无权益」—— 两者在 wire 上
+**表现完全相同**（都是秒回空），我们**无法区分**。故写
+「额度已用尽或没有可用权益」并给出两种都能解决的建议。
+
+⚠ **不得在 `zcode-anthropic.ts` 的 SSE 层做这个分类**：那一层**拿不到耗时上下文**
+（它不知道自己跑了多久），若在那里武断报「额度用尽」，**慢回空**那条路径
+（链路故障，该重试）就会被误报成「换账号」。故该层保留通用文案与可重试的
+`EMPTY_RESPONSE`，**分类交给适配器**（它持有 `consumeStartedAt`）。
+
+**回归**：`tests/unit/zcode-throttle.spec.ts` 的
+「额度用尽：文案必须说出真实原因、错误码必须不可重试」段（3 条：
+无账号池时抛 `QUOTA_EXCEEDED` + 文案含真实原因且**不含**那句通用文案 +
+慢回空不得被误判 + 多账号时才提账号数）。
+反向验证：把错误码改回 `EMPTY_RESPONSE` ⇒ 第 1 条变红。
+
+### ⚠ 改完这些要做的两件事（同 zcode 其它改动）
+
+1. **两份 checkout 都要同步**（`D:\jet\code\js\dsh-codearts` 与
+   `D:\jet\code\js\deepseek-harness-codearts`），并各自 `pnpm build:all`。
+2. **必须重启宿主**才生效（插件模块在进程启动时读进内存）。
+
+### 六、会话实证：额度耗尽 + **两个插件抢同一份 captcha 信誉**（2026-10-01）
+
+**用户报障**：zcode 赠送额度用完后，界面报通用的「空响应」；并追问
+「我们哪里设置 zcode 保活频率的？用我们的 zcode 执行任务后用 dsh-free-glm
+执行会碰到错误，似乎我们保活频率太高了」。
+
+#### 6.1 先纠正一个归属：那条 `503 降级冷却` **不是我们抛的**
+
+用户贴的截图里的文案是 **`zcode-bridge:`** 开头 + 「降级冷却 / 连续 5 次失败 /
+约 233 秒后可重试」。两处都对得上 **dsh-free-glm 的桥**：
+
+- 前缀：我们的 provider 报错一律是 `zcode: `；`zcode-bridge:` 是它的 `PROVIDER` 名。
+- 逻辑：`mintBackoffUntilMs` + `noteMintFailure()` + 指数冷却、出口在
+  `dsh-free-glm/patches/zcodeBridgeServer.ts:3151`。
+
+⚠ **顺带回答「滑块要在哪做」**：必须在**开源版实例窗口**里做。
+dsh-free-glm 的桥只认源码检出的 `packages/desktop`（`appDirCandidates()`），
+官方闭源版起不来桥 ⇒ 闭源版窗口**永远不会弹**它那个验证。
+且**冷却期内桥直接返回 503、连 mint 都不发起**（`mintBackoffRemainingMs() > 0`），
+所以要在**冷却结束后**主动发一次对话才会弹滑块。
+
+#### 6.2 但用户的方向**成立**：确实在抢同一份设备信誉
+
+**关键证据（两个 session，同一台机器，时间相差约 1 分钟）**：
+
+| session | provider | 现象 |
+|---|---|---|
+| `session-eced01ed` | **`zcode`（我方）** | 14:26:53 起连续 **12 次**空响应失败（6 请求 × 2 turn），每次重试**都重新 mint 一个 captcha** |
+| `session-b0e4eb3f` | **`zcode-bridge`（dsh-free-glm）** | 开局第 1 步就报 **`502 Failed to mint auth material`** |
+
+⇒ captcha 信誉是**设备级**的（不是按插件算），我们多产的每个 captcha
+都在消耗它的额度。**两个都开着就是在互相抢。**
+
+⚠ **排查可复现**：会话内容在 `~/.dsh/sessions/<工作目录编码>/<session>/session.v4.jsonl.zstd`，
+用 Node 内置 `zlib.zstdDecompressSync` 解压（**无需装 zstd**）。
+字段是 `e.type` / `e.time` / `e.data`，**不是** `kind`/`timestamp` —— 我第一版按
+猜的字段名取时间线，全部取到空值。
+
+#### 6.3 修了什么（三处）
+
+**① 空响应必须说出真实原因**（见上一节）：秒回空 → `QUOTA_EXCEEDED`
++ 「额度已用尽或没有可用权益」。
+
+⚠ **判据用耗时是可行的，但要看对指标**：会话实测**单次请求耗时仅 125ms**
+（`step/start 14:26:53.069` → `attempt .194`），命中 3 秒阈值。
+⚠ 我一度把「重试间隔 6.858s」误当成「单次耗时」而以为修复失效 ——
+**重试间隔 ≠ 单次请求耗时**，两者在日志里长得像（都是相邻 attempt 的时间差）。
+`step/start → assistant/attempt` 的差才是单次耗时。
+
+**② HTTP `body === null` 分支也是同一缺口**（本轮新发现）：
+
+| 形态 | 分支 | 原先 |
+|---|---|---|
+| 200 + 空 SSE 流（0 帧） | `consumeAnthropicSse` 的 `!sawAny` | ① 已覆盖 |
+| 200 + **`body === null`** | `zcode-adapter.ts` 的 `response.body === null` | ❌ 抛裸 `EMPTY_RESPONSE` |
+
+后者**跳过整个 SSE 消费** ⇒ 哪怕 ① 修好，走这条路的用户仍看到通用文案
+且白重试。现已同样改为「先换账号，换不动就 `QUOTA_EXCEEDED` + 真实文案」。
+
+**③ captcha 产出失败退避**（`src/captcha-backoff.ts`，**本轮最重要**）：
+
+此前我们**完全没有**这个机制 —— 额度耗尽时连 mint 12 个 captcha。
+现按那边的做法（阈值 3、首次 1 分钟、指数翻倍、上限 30 分钟）加闸门：
+连续产出失败达阈值后**直接抛错、不再发起 mint**。
+那边的原话：「**继续请求不会让信誉恢复，只会更糟**」。
+
+- ⚠ **`steps` 必须用 `streak - threshold`**：用 `streak` 会让第 3 次失败
+  直接等到 `base × 8`（8 分钟），与「起步 1 分钟」的语义相反（用例守住了）。
+- ⚠ 冷却到点**只清冷却、不清 `streak`**：否则退避重新从 1 分钟起步，
+  达不到「指数」效果。
+- ⚠ **只对「产出失败」计数**（`mintOnPage` 抛错），不对「上游回 `3007`」计数 ——
+  后者归因不清（可能是服务端抖动），记成我们的信誉问题会误伤。
+- ⚠ 闸门放在 `mintCaptcha` 的**取池之前**：这样池的 `prefetch()` 后台路径
+  天然也被挡住，**不需要池自己判断退避**。
+- 关闭：`DSH_ZCODE_CAPTCHA_BACKOFF=0`。
+
+**回归**：`tests/unit/captcha-backoff.spec.ts`（7 条）+
+`zcode-throttle.spec.ts` 新增 2 条（HTTP 空 body 的文案与换账号）。
+反向验证：去掉 `remainingMs()` 的到点清零 ⇒ 「冷却到点后恢复」变红。
+
+#### 6.4 仍未做的两件事（需要用户拍板）
+
+1. **captcha 预取池默认值**：它让 mint 次数**翻倍**（每请求 1 次 + 后台预取 1 次），
+   是**唯一主动加倍**信誉消耗的改动。在信誉紧张的设备上是净负面。
+   建议把 `enabled` 默认值反转为 `false`（保留实现与开关）。
+   ⚠ **已实测存在跨插件干扰，但未实测「预取池是否是压垮信誉的那一下」** ——
+   不要把它当成已证结论。
+2. **持久化 captcha profile**：我们每次 `mkdtempSync` 新建临时 profile
+   （`zcode-captcha.ts:547`），而 dsh-free-glm 用 ZCode 实例的长期 profile
+   ⇒ 它的信誉能跨会话累积，我们不能。**但阿里云的信誉究竟按 IP、
+   按指纹还是两者加权，没有实测过** —— 若是按指纹，独立 profile 反而
+   保护了对方的信誉（各算各的）；若是按 IP，我们就是在直接抢。**结论未定，勿凭推断动手。**
+
+### 七、官方 ZCode 的 captcha 护栏（逆向 `app.asar` 实证，2026-10-01）
+
+**起因**：用户追问「zcode 如果每一步都认证一样也会碰到上限吧，是否它不是
+每步都用一个 captcha」。⇒ 去逆向**官方闭源版**安装目录核实。
+
+#### 7.1 怎么读的（可复现）
+
+官方安装版是 Electron 打包产物，源码在 `app.asar`（312 MB）：
+
+```
+C:\Users\Jet\AppData\Local\Programs\ZCode\resources\app.asar
+```
+
+⚠ **两个读取要点**（都踩过）：
+1. asar 头是 `[u32=4][u32 headerSize][u32 jsonSize][u32 jsonStrSize]`，
+   JSON 表从 **offset 16** 开始、长度 `headerSize - 8`。
+2. ⚠ **JSON 表尾部有填充字节**，直接 `JSON.parse` 会报
+   `Unexpected non-whitespace character after JSON` —— 必须
+   `s.slice(0, s.lastIndexOf('}') + 1)` 再 parse。
+3. 数据区起点 = `16 + jsonLen`；每个文件的 `offset` 是**相对数据区**的。
+
+captcha 代码在 `/out/renderer/assets/styles-*.js`（5.8 MB）——
+与 dsh-free-glm 记录的 `styles-S9_69L9k.js` 同一类产物。
+
+#### 7.2 官方**确实是每请求一个 captcha**——但有三层我们没有的护栏
+
+先回答用户的疑问：**不是复用**。证据：
+- 每个 model request 都走 `Fnn()` → `Mnn()` 重新产出，再经 `lnn()` 注入
+  `X-Aliyun-Captcha-Verify-Param` / `-Region` 两个头。
+- `Snn`（param 表）**只有 `set` / `delete`，没有 `get`** ——
+  它是**诊断记录表**，不是复用缓存。
+
+但官方有三层护栏，**我们此前一条都没有**：
+
+| 机制 | 官方实现（产物里的符号） | 我们此前 |
+|---|---|---|
+| **全局串行队列** | `wnn` promise 链 + `jnn()`，日志 `zcode-plan verification queue slot acquired`。同一刻只产一个 | ❌ 无（DSH 会并发发请求，每个都独立 mint） |
+| **配置 TTL 缓存** | `f3()`：`expiresAt: t + 6e4`（**60 秒**）+ 在飞去重 `d3` | ❌ `index.ts` 用 `??=` 做**永久缓存** |
+| **结果观测** | `mnn({result: 'traceless_passed' \| 'interactive_displayed'})` 上报 ARMS，并维护两个计数 | ❌ 完全没有 |
+
+另有：**超时 120 秒**（`Htn = 12e4`，我们是 75 秒）；
+**重复提交检测**（`Pnn()` 记住上轮 `certifyId`，相同就警告
+`请求可能触发 F008 重复提交` —— 这正是 dsh-free-glm 里 `F008` 的来源）。
+
+#### 7.3 阿里云的限流是**双维度**且有**默认阈值**（官方文档）
+
+用户提供的文档
+（[功能相关问题](https://www.alibabacloud.com/help/zh/captcha/captcha2-0/user-guide/function-related-issues)
+与 [自定义策略](https://www.alibabacloud.com/help/zh/captcha/captcha2-0/user-guide/custom-policy)）：
+
+| 维度 | 默认限制 |
+|---|---|
+| **同设备每小时** | **150 次** ← **最紧的一条** |
+| 同设备每日 | 400 次 |
+| 同 IP 每小时 | 4000 次 |
+| 同 IP 每日 | 10000 次 |
+
+⇒ 文档明确「**基于 IP 或者设备维度**的安全策略阈值」是**两个独立维度、
+共同作用**。**设备维度 150/小时**才是我们真正的约束：
+一次多步任务每步 1 次，**加上我此前默认开启的预取池就是 2 次/步**。
+
+⚠ **这解释了实盘现象**：`session-eced01ed` 那种 246 步的长任务，
+加上 dsh-free-glm 同期在跑，撞穿「设备每小时 150」是**大概率**而非偶然。
+
+#### 7.4 本轮改了什么（四项，全部对齐官方）
+
+1. **预取池默认关闭**（`captcha-pool.ts` 的 `CAPTCHA_POOL_DEFAULT_ENABLED`）。
+   依据：① 官方根本没有预取；② dsh-free-glm 的池默认也是关的
+   （`=1` 才启用，注释「先观察稳定性」）；③ 它让消耗**翻倍**。
+   ⚠ **归因强度**：跨插件干扰有实证，但「预取池是压垮信誉的那一下」**未证实**——
+   翻转的理由是①②，不是把③当结论。
+2. **captcha 产出走全局串行队列**（新增 `serial-queue.ts`，接在
+   `ZcodeAuth.mintCaptcha` 的**取池之前**，故池的 prefetch 后台路径也被挡）。
+3. **captcha 配置改 60 秒 TTL 缓存**（新增 `ttl-cache.ts`，替换
+   `index.ts` 的 `??=` 永久缓存）。⚠ 旧写法还有第二个缺陷：
+   **首次失败会被永久固化**（`??=` 把回退兜底值也记住）。
+4. **观测**（`ZcodeAuth.captchaObservability()`）：计数
+   `tracelessPassed` / `interactiveDisplayed` / `failed`，
+   并在**被要求交互式验证时显式告警**。
+   ⚠ `interactive` 的判据是**轮询 DOM**（`#aliyunCaptcha-window-popup` 等
+   四个 id，取自 dsh-free-glm 的实测记录）——因为官方文档 Q9 明说
+   「该安全策略逻辑**不支持自定义，不对外透出**」，没有回调可用。
+   用「**曾经出现**」而非「此刻存在」：交互元素在验证完成后会被移除，
+   只在 success 那一刻查 DOM 会**漏报**（而那正是最需要知道的场景）。
+
+**回归**：`serial-queue.spec.ts`（13）+ `captcha-backoff.spec.ts`（9）+
+`captcha-pool.spec.ts`（9）+ **`zcode-captcha-guard.spec.ts`（6，接线验证）**。
+⚠ 最后一类**不能省**：本仓库历史上多次栽在「原语写好了但没接上」
+（`zcode-upstream.ts` 的 `fetchImpl` 曾是**死参数**）。
+反向验证：把 `CAPTCHA_POOL_DEFAULT_ENABLED` 改回 `true` ⇒ 池用例变红；
+去掉 `mintCaptcha` 的队列包装 ⇒ 接线用例的 `maxInFlight` 变 3（期望 1）。
+
+⚠ **写这类用例的两个坑**（都踩过）：
+- `ZcodeAuth extends Service`，构造时会调 `ctx.provide(...)` ⇒
+  **必须用真实的 `new Context()`**，手写对象桩会在构造期抛
+  `Cannot read properties of undefined (reading 'provide')`。
+- 测队列时**必须先排除预取池的干扰**（池命中不调底层 mint）——
+  默认已关闭，故天然走现产路径。
+
+#### 7.5 仍未做
+
+- **captcha 超时 75 秒 → 120 秒**（对齐官方 `Htn`）：官方值更长是给了
+  交互式验证（真人拖动）留时间；我们是无感验证，75 秒对**无感**够用。
+  若要支持「降级后让用户手动拖」，才需要调到 120 秒 —— 那是另一个功能。
+- **持久化 profile**：见上一节，结论仍未定。
+- **captcha 配置 TTL 的实盘验证**：60 秒取自官方同值，但我们**没有实测过**
+  服务端配置的实际变化频率。若发现 `sceneId` 变更后仍有延迟，
+  可下调 `CAPTCHA_CONFIG_TTL_MS`。
+
+### 八、⚠️⚠️ 多账号凭据被**跨账号覆盖**（真实数据破坏缺陷，2026-10-02）
+
+**这是本文件记录过的「构造全新对象抹掉字段」同型坑的第四次**，且这次
+**破坏了用户数据**（不是显示错误）。
+
+#### 8.1 用户报障
+
+> 登录了 2 个账号（**两个不同微信各自收到 bigmodel 登录通知**）。
+> 第二个账号有余额，但**插件里刷新积分显示 0**、发消息报
+> 「额度已用尽或没有可用权益」；而 **IDE 里同一个账号发消息能收到回复**。
+
+#### 8.2 根因（实测证据）
+
+`refreshAll()` 与 `refreshAccountCredential()` 都拿 `this.current()` 的结果
+**无条件写回目标 ref** —— 而 `current()` → `readCredentialFromPool()` 只取
+**池里第一个凭据可用的账号**。于是 30 分钟一轮的续期定时器（或面板「刷新」）
+把**账号 A 的凭据铺满了整个池**，抹掉账号 B 的真实凭据。
+
+**实测证据**（用户机器 `~/.dsh/.credentials.yaml`，两个 `ZCODE_ACCOUNT_*`
+逐字段比对，**ref 名与值均已脱敏**）：
+
+| 字段 | 账号条目 #1 | 账号条目 #2 |
+|---|---|---|
+| 凭据 ref 名 | `ZCODE_ACCOUNT_<A>` | `ZCODE_ACCOUNT_<B>` |
+| `zcode_jwt` 的 sha256 | `aa20f5d1…`（前 8 位） | **`aa20f5d1…`（相同）** |
+| `device_mid` | `be4c6392…`（前 8 位） | **`be4c6392…`（相同）** |
+| `account_label` | `<同一昵称>` | **`<同一昵称>`** |
+| `bigmodel_access_token` 指纹 | `fe31a108…`（前 8 位） | **`fe31a108…`（相同）** |
+
+⚠ **本文档刻意不写真实值**（ref 名会暴露账号编号、昵称是用户的微信账号名、
+`device_mid` 是设备标识）。需要复核时按下方方法自行从本机取。
+
+⇒ 两个条目**逐字节相同**，是**同一个账号占了两条**。
+用户确认「是两个不同微信账号」，故**只能是覆盖所致**。
+
+**症状为何极像服务端问题**：IDE 用它自己那份真实凭据（B）→ 正常；
+插件池里两条都是 A → A 已耗尽 → 报额度用尽。
+⚠ **排查要点：每当「IDE 能用而插件说没额度」，先怀疑凭据被覆盖，而不是配额。**
+
+#### 8.3 修法：**绝不跨账号写**
+
+ZCode **不可续期**（凭据是静态的、没有 refresh 端点），所以「刷新」唯一
+正确的语义是「**逐账号重新解析自己的 ref，再写回自己**」——
+与 `BuddyAuth.refreshAll` 的做法一致（那边也是逐账号读自己的 ref）。
+
+⚠ **`refreshAll` 不再使用 `current()`**；每个账号 `readCredentialFromRef(自己的 ref)`，
+解不出就**跳过并告警**，**绝不**用别的账号（或磁盘凭据）去填它。
+
+⚠ **为什么不用磁盘 `~/.zcode/v2/credentials.json` 兜底**（听起来合理，实际不可实施）：
+它是**单账号**格式，而池是**多账号**的 —— 我们**无法判断**那份磁盘凭据属于
+池里**哪一个**账号。拿它去补任意一条，等于重犯同一个错误（换成「单体覆盖」）。
+
+⚠ **旧注释的本意是错的**：「把磁盘上的最新凭据回写到每个账号的 ref，
+这样用户在官方客户端重新登录后新凭据能铺开到所有条目」——
+那个前提在**多账号池**下**不成立**：磁盘凭据只对应一个账号。
+
+#### 8.4 回归与**反向验证**
+
+`tests/unit/zcode-account-isolation.spec.ts`（6 条）：
+「A 绝不写进 B」「池顺序颠倒时同样不串」「某账号凭据不可用时跳过而不填别的」
+「`refreshAccountCredential` 只动目标 ref」「目标损坏时如实报错」
+「单账号失败不影响其余」。
+
+⚠ **已做反向验证**：把 `refreshAll` 改回「`current()` 一次然后写全部」⇒
+**3 条变红**，其中一条直接复现用户症状（`expected 'account-A' to be 'account-B'`）。
+
+⚠⚠ **反向验证本身踩了一次「假绿」**：第一次替换脚本因 **CRLF** 未匹配到方法结尾、
+**静默失败**，测试全绿 —— 差点据此认为「用例抓不住旧实现」。
+⇒ **改完代码做反向验证时，必须确认替换真的生效**（打印替换后的代码片段），
+否则「全绿」可能是「什么都没改」。
+
+#### 8.5 ⚠️ 两条既有测试此前**断言的是缺陷行为**（已改写）
+
+`zcode-wiring.spec.ts` 里：
+
+| 旧测试 | 问题 |
+|---|---|
+| `refreshAll 是「回写磁盘凭据」而不是续期，且逐账号隔离失败` | 测试名自称「隔离失败」，却断言 `REF_1` 与 `REF_2` **都被写入同一份磁盘凭据** —— 把 bug 固化成预期 |
+| `refreshAccountCredential 无凭据时如实抛错` | 断言的文案要求用户「去官方客户端重新登录」，而多账号下那**解决不了**该账号的问题 |
+
+⇒ 已改写为断言**正确语义**（逐账号各写各的；两个空 ref 保持空）。
+
+⚠ **教训**：测试名里出现「…失败」「…不隔离」这类**消极措辞**时，要停下来问
+「我是在断言**预期行为**，还是在记录**已知缺陷**？」后者应当写成 TODO
+或直接修掉，不该固化成绿色。
+
+#### 8.6 用户需要做的事（数据已被破坏，代码修复救不回来）
+
+⚠ **B 的原始凭据在那次覆盖中已被抹掉，无法从残留数据恢复**。
+用户需在 Jet Hub 里**重新登录**第二个微信账号。修复后的代码不会再覆盖它。
+
+### 九、重复添加同一账号的去重（2026-10-02）
+
+#### 9.1 ⚠⚠ 先纠正我写错过的判据：**`device_mid` 不能用来认账号**
+
+我最初告诉用户「判据可用 `device_mid` 或 JWT 的 `user_id`」——**前半句是错的**，
+写进文档会误导后来者。真相：
+
+| 字段 | 来源 | 同一账号重新登录 |
+|---|---|---|
+| `device_mid` | **我们随机生成**（`generateDeviceMid()`） | **会变** ⇒ **不可作标识** |
+| `user_id` | **服务端下发**（`user.data.user_id`） | **不变** ⇒ 正确判据 |
+
+依据（`zcode-login.ts` 的实测注释）：「同一 JWT 换任意随机 UUID 都返回 200」
+—— `device_mid` 的**值不被服务端绑定校验**，插件每次登录都会生成一个新的。
+
+⚠ 若照错判据实现，**同一账号重新登录一次就会被判成新账号**，
+去重功能**反向失效**（比不做还糟：用户以为去重了，实际每次登录都多一条）。
+`tests/unit/zcode-dedup.spec.ts` 里有一条**专门的反例**把它钉住。
+
+#### 9.2 `user_id` 此前**根本没被存进凭据**（去重的前提缺失）
+
+`startLogin` 组装 `ZcodeCredential` 时**丢掉了 `loginResult.userId`** ——
+登录响应里明明有（官方断言它是必需字段），但从未被搬进凭据。
+故修去重必须**先补这个字段**（`src/zcode.ts` 的 `ZcodeCredential.user_id`）。
+
+⚠ 该字段**可选**：2026-10-02 之前登录的凭据没有它。
+`isUsableZcodeCredential` **不得**因缺它而拒绝（否则老用户突然无法用）——
+已有用例锁住这点。
+
+#### 9.3 判据查询：新增 `findAccountIdByIdentityField`
+
+与既有的 `findAccountIdByCredential` **有意不同**（别合并）：
+
+| | `findAccountIdByCredential` | `findAccountIdByIdentityField` |
+|---|---|---|
+| 用途 | **限流记录归属** | **通用去重** |
+| 字段 | 写死两套（`access_key_id` / `access_token`） | 调用方指定 |
+| `enabled` | **只看已启用** | **不看**（停用账号同样占位置） |
+
+⚠ **必须容忍字段缺失**：读不到该字段的条目**跳过**（= 无法判断），
+而不是当成「不匹配」或报错 —— 前者漏判，后者让老用户添加不了账号。
+
+#### 9.4 时机与处置
+
+- **时机必须在登录成功之后**：登录前只有占位条目（无凭据、无 `user_id`），
+  无从判断。故去重在 `jet-hub-rpc.ts` 的 `started.result.then(...)` 里。
+- **处置是「停用 + 改名」，不是删除**：
+  前端 `login.poll` 靠「条目还在 + 凭据已写入」判断登录成功，
+  **删掉条目会显示成「登录失败」**（事实恰恰相反），
+  会误导用户反复重试。现在：`enabled: false`（⇒ 不参与选号，这就是去重的
+  实际效果）+ 昵称标「（重复，已停用）」+ 日志。
+- **保留原来那条不动**：它可能已被排序、改名或承载限流记录。
+
+#### 9.5 回归与反向验证
+
+- `tests/unit/zcode-dedup.spec.ts`（7 条）：`user_id` 能匹配 /
+  **`device_mid` 不能匹配**（反例）/ 缺字段时跳过 / 空 identity /
+  跨 provider 不误判 / 停用账号参与判重 / 老凭据仍可用
+- `tests/unit/zcode-rpc-login.spec.ts` 新增 2 条**接线验证**：
+  「同一账号添加两次 ⇒ 第二条被停用」「凭据里带上 user_id」
+
+⚠ **已做两次反向验证**（这次特别注意确认替换**真的生效** ——
+上一次因 CRLF 静默失败过）：
+- 删掉 `user_id` 的搬运 ⇒ **2 条变红**（含「添加两次」那条）
+- 短路 `findAccountIdByIdentityField` 调用（保留 user_id 存储）⇒
+  **1 条变红**（「添加两次」那条）
+⇒ 证明两类用例分别覆盖「字段没存」与「没做去重」两种失效。
+
+⚠ **写这类用例的脚手架坑**：`AccountPool` 是**真实**实现、会读写磁盘，
+必须 ① `mkdtempSync` + `DSH_JET_HUB_STATE_DIR` 隔离；
+② 用 `ctx.provide('credentials', fake)`（**不是**属性赋值 ——
+`AccountPool` 经 `ctx.credentials` 取服务）；
+③ **不要**用 `replaceAll`（那是 Jet Hub 的导入路径，语义不同；
+我第一版用它导致 3 条用例假失败）。
 

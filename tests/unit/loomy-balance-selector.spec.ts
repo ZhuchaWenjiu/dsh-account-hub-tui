@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from 'vitest'
 import { LOOMY } from '../../src/loomy-product.js'
 import {
   LOOMY_BALANCE_CACHE_TTL_MS,
+  LOOMY_BALANCE_ERROR_CACHE_TTL_MS,
   LoomyBalanceSelector,
 } from '../../src/loomy-balance-selector.js'
 import type { LoomyCredential } from '../../src/loomy.js'
@@ -43,6 +44,15 @@ function makeResolver(byRef: Record<string, LoomyCredential | undefined>) {
   return async (ref: string): Promise<LoomyCredential | undefined> => byRef[ref]
 }
 
+/**
+ * `select()` 现在返回判别联合（`{ok:true,…} | {ok:false,reason}`），
+ * 断言"选中了谁/其余额"统一走这两个取值器；断言"为什么没选中"看 `reason`。
+ */
+const pickedId = (r: Awaited<ReturnType<LoomyBalanceSelector['select']>>): string | undefined =>
+  r.ok ? r.account.id : undefined
+const pickedBalance = (r: Awaited<ReturnType<LoomyBalanceSelector['select']>>) =>
+  r.ok ? r.balance : undefined
+
 describe('LoomyBalanceSelector.balanceOf', () => {
   it('查到余额时返回 ok + 两个池', async () => {
     const fetcher = makeFetcher({ [CRED.access_token]: { balance: 4445, daily: 0 } })
@@ -72,6 +82,46 @@ describe('LoomyBalanceSelector.balanceOf', () => {
     // 两个余额字段都不该编造数字
     expect(balance.dailyBalance).toBeUndefined()
     expect(balance.permanentBalance).toBeUndefined()
+  })
+
+  /**
+   * ⚠️ **用户实际踩到的缺陷**（2026-09-29）：失败结果曾被按成功那份 60 秒 TTL
+   * 缓存 —— 一次网络抖动就让整池在 60 秒内全部判"不可用"，用户被告知
+   * 「今日额度都已用尽」而实际 4 个号里 3 个还有 4965/5000/5000。
+   * ⇒ 失败是瞬时状态，只该缓存很短的时间（5 秒）。
+   */
+  it('失败结果只按短 TTL 缓存，几秒后即重试（不等满 60 秒）', async () => {
+    const clock = { value: 1_700_000_000_000 }
+    const fetcher = makeFetcher({ [CRED.access_token]: 'error' })
+    const selector = new LoomyBalanceSelector({
+      product: LOOMY,
+      now: () => clock.value,
+      resolveCredential: makeResolver({ r1: CRED }),
+      fetcher: fetcher as unknown as typeof fetch,
+    })
+
+    expect((await selector.balanceOf({ id: 'a1', credentialRef: 'r1' })).ok).toBe(false)
+    expect(fetcher).toHaveBeenCalledTimes(1)
+
+    // 仍在 60 秒成功 TTL 内，但已超过 5 秒失败 TTL ⇒ 应该重查
+    clock.value += LOOMY_BALANCE_ERROR_CACHE_TTL_MS + 1_000
+    await selector.balanceOf({ id: 'a1', credentialRef: 'r1' })
+    expect(fetcher).toHaveBeenCalledTimes(2)
+  })
+
+  it('失败结果在短 TTL 内不重复请求（防同一轮里反复打）', async () => {
+    const clock = { value: 1_700_000_000_000 }
+    const fetcher = makeFetcher({ [CRED.access_token]: 'error' })
+    const selector = new LoomyBalanceSelector({
+      product: LOOMY,
+      now: () => clock.value,
+      resolveCredential: makeResolver({ r1: CRED }),
+      fetcher: fetcher as unknown as typeof fetch,
+    })
+    await selector.balanceOf({ id: 'a1', credentialRef: 'r1' })
+    clock.value += LOOMY_BALANCE_ERROR_CACHE_TTL_MS - 1_000
+    await selector.balanceOf({ id: 'a1', credentialRef: 'r1' })
+    expect(fetcher).toHaveBeenCalledTimes(1)
   })
 
   it('凭据未配置时返回 ok:false', async () => {
@@ -190,8 +240,8 @@ describe('LoomyBalanceSelector.select', () => {
       { id: 'a1', credentialRef: 'r1' },
       { id: 'a2', credentialRef: 'r2' },
     ])
-    expect(picked?.account.id).toBe('a2')
-    expect(picked?.balance.dailyBalance).toBe(3000)
+    expect(pickedId(picked)).toBe('a2')
+    expect(pickedBalance(picked)?.dailyBalance).toBe(3000)
   })
 
   it('都无今日额度时选有永久积分的', async () => {
@@ -210,7 +260,7 @@ describe('LoomyBalanceSelector.select', () => {
       { id: 'a1', credentialRef: 'r1' },
       { id: 'a2', credentialRef: 'r2' },
     ])
-    expect(picked?.account.id).toBe('a2')
+    expect(pickedId(picked)).toBe('a2')
   })
 
   /**
@@ -232,7 +282,7 @@ describe('LoomyBalanceSelector.select', () => {
       { id: 'a1', credentialRef: 'r1' },
       { id: 'a2', credentialRef: 'r2' },
     ])
-    expect(picked?.account.id).toBe('a1')
+    expect(pickedId(picked)).toBe('a1')
   })
 
   /**
@@ -254,7 +304,7 @@ describe('LoomyBalanceSelector.select', () => {
       { id: 'a1', credentialRef: 'r1' },
       { id: 'a2', credentialRef: 'r2' },
     ])
-    expect(picked?.account.id).toBe('a2')
+    expect(pickedId(picked)).toBe('a2')
   })
 
   it('全部查不到时仍返回第一个（不返回 undefined，避免直接判无账号）', async () => {
@@ -266,23 +316,25 @@ describe('LoomyBalanceSelector.select', () => {
     })
 
     const picked = await selector.select([{ id: 'a1', credentialRef: 'r1' }])
-    expect(picked?.account.id).toBe('a1')
-    expect(picked?.balance.ok).toBe(false)
+    expect(pickedId(picked)).toBe('a1')
+    expect(pickedBalance(picked)?.ok).toBe(false)
   })
 
-  it('候选为空时返回 undefined', async () => {
+  it('候选为空时返回 ok:false（exhausted）', async () => {
     const selector = new LoomyBalanceSelector({
       product: LOOMY,
       resolveCredential: makeResolver({}),
       fetcher: vi.fn() as unknown as typeof fetch,
     })
-    expect(await selector.select([])).toBeUndefined()
+    const result = await selector.select([])
+    expect(result.ok).toBe(false)
+    if (!result.ok) expect(result.reason).toEqual({ kind: 'exhausted' })
   })
 
   /**
    * ⚠️ **锁定永久积分**（用户需求）：只剩永久积分的账号不可用。
    */
-  it('锁定时只剩永久积分的账号不被选中（返回 undefined）', async () => {
+  it('锁定时只剩永久积分的账号不被选中', async () => {
     const fetcher = makeFetcher({ [CRED.access_token]: { balance: 9999, daily: 0 } })
     const selector = new LoomyBalanceSelector({
       product: LOOMY,
@@ -290,8 +342,42 @@ describe('LoomyBalanceSelector.select', () => {
       fetcher: fetcher as unknown as typeof fetch,
     })
 
-    const picked = await selector.select([{ id: 'a1', credentialRef: 'r1' }], { allowPermanent: false })
-    expect(picked).toBeUndefined()
+    const result = await selector.select([{ id: 'a1', credentialRef: 'r1' }], { allowPermanent: false })
+    expect(result.ok).toBe(false)
+    if (!result.ok) expect(result.reason).toEqual({ kind: 'exhausted' })
+  })
+
+  /**
+   * ⚠️ **用户实际踩到的缺陷**（2026-09-29）：4 个号里 3 个还有今日额度
+   * （4965 / 5000 / 5000），却被告知「今日赠送额度都已用尽」。
+   * 根因是余额查询失败（网络抖动 / 凭据正在续期）被判成"没额度"。
+   * ⇒ 有号查不到时原因必须是 `unknown`，文案要说"可能仍有额度、请重试"，
+   * 而不是让用户去解锁或白等一天。
+   */
+  it('有号查询失败时原因是 unknown（不谎报"额度已用尽"）', async () => {
+    const cred2: LoomyCredential = { ...CRED, access_token: 'T'.repeat(32) }
+    const fetcher = makeFetcher({
+      [CRED.access_token]: 'error',                            // 查不到
+      [cred2.access_token]: { balance: 14899, daily: 0 },      // 真的没今日额度
+    })
+    const selector = new LoomyBalanceSelector({
+      product: LOOMY,
+      resolveCredential: makeResolver({ r1: CRED, r2: cred2 }),
+      fetcher: fetcher as unknown as typeof fetch,
+    })
+
+    const result = await selector.select(
+      [{ id: 'a1', credentialRef: 'r1' }, { id: 'a2', credentialRef: 'r2' }],
+      { allowPermanent: false },
+    )
+    expect(result.ok).toBe(false)
+    if (!result.ok) {
+      expect(result.reason.kind).toBe('unknown')
+      if (result.reason.kind === 'unknown') {
+        expect(result.reason.errors).toHaveLength(1)
+        expect(result.reason.errors[0]).toContain('失效')
+      }
+    }
   })
 
   it('锁定时有今日额度的账号仍可被选中', async () => {
@@ -303,8 +389,8 @@ describe('LoomyBalanceSelector.select', () => {
     })
 
     const picked = await selector.select([{ id: 'a1', credentialRef: 'r1' }], { allowPermanent: false })
-    expect(picked?.account.id).toBe('a1')
-    expect(picked?.balance.dailyBalance).toBe(500)
+    expect(pickedId(picked)).toBe('a1')
+    expect(pickedBalance(picked)?.dailyBalance).toBe(500)
   })
 
   it('锁定时优先有今日额度的（跳过只剩永久积分的）', async () => {
@@ -323,7 +409,7 @@ describe('LoomyBalanceSelector.select', () => {
       { id: 'a1', credentialRef: 'r1' },
       { id: 'a2', credentialRef: 'r2' },
     ], { allowPermanent: false })
-    expect(picked?.account.id).toBe('a2')
+    expect(pickedId(picked)).toBe('a2')
   })
 
   /**
@@ -339,7 +425,7 @@ describe('LoomyBalanceSelector.select', () => {
     })
 
     const picked = await selector.select([{ id: 'a1', credentialRef: 'r1' }])
-    expect(picked?.account.id).toBe('a1')
+    expect(pickedId(picked)).toBe('a1')
   })
 
   it('并发查余额（不是串行 N 次等待）', async () => {

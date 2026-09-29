@@ -1,14 +1,22 @@
 import { describe, expect, it } from 'vitest'
 import { readFileSync } from 'node:fs'
+import { spawnSync } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
 import { dirname, resolve } from 'node:path'
 import {
   CREDITS_CAPABILITIES,
+  PERMANENT_LOCK_EXPIRING_WINDOW_DAYS,
   checkinProviders,
+  permanentLockCopy,
   supportsCreditBalance,
   supportsDailyCheckin,
   supportsOnboardingTasks,
+  supportsPermanentLock,
 } from '../../plugin-src/client/credits-capabilities.js'
+import { PERMANENT_LOCK_PROVIDERS } from '../../src/jet-hub-rpc.js'
+import { BUDDY_EXPIRING_WINDOW_DAYS } from '../../src/buddy-balance-rank.js'
+import { CODEBUDDY, WORKBUDDY } from '../../src/product.js'
+import { LOOMY } from '../../src/loomy-product.js'
 
 /**
  * 积分能力矩阵的回归测试。
@@ -199,8 +207,10 @@ describe('客户端积分请求门控（源码级回归）', () => {
     expect(normalized).toMatch(/canLoadCredits\s*\n\s*\? React\.createElement\('button'/)
     expect(normalized).toContain('showCredits: canLoadCredits')
     // AccountCard 必须真的消费 showCredits，否则传了也没用
+    // ⚠️ 窗口不能只取 4000：账号名 hover（packageTooltip / accountTitle）的
+    // 计算代码插在函数头部与 CreditBalanceRow 渲染之间，把间距撑大了。
     const cardStart = normalized.indexOf('function AccountCard(')
-    const cardBody = normalized.slice(cardStart, cardStart + 4000)
+    const cardBody = normalized.slice(cardStart, cardStart + 8000)
     expect(cardBody).toContain('showCredits')
     expect(cardBody).toMatch(/showCredits\s*\n?\s*\?[\s\S]*CreditBalanceRow/)
   })
@@ -231,4 +241,171 @@ describe('客户端积分请求门控（源码级回归）', () => {
     expect(renderBody, 'claimNotice 的 details 未被渲染').toContain('claimNotice.details')
     expect(renderBody).toContain('dim-jh-probeDetails')
   })
+})
+
+/**
+ * ⚠️ **「锁定永久积分」能力面**（用户需求：Loomy 已有，CodeBuddy / WorkBuddy 各加一个）。
+ *
+ * 这里最重要的是**前后端一致**：前端决定按钮是否出现、请求是否发出，
+ * 后端决定写入是否被接受。两边不一致就是「按钮出现了但点了报 bad-request」
+ * 或「功能存在却点不出来」—— 两种都比"没这个功能"更难解释。
+ */
+describe('永久积分锁定能力', () => {
+  /** 三个支持锁定永久积分的 provider（与后端白名单同一份事实）。 */
+  const SUPPORTED = [LOOMY.id, CODEBUDDY.id, WORKBUDDY.id]
+  const UNSUPPORTED = [
+    'codearts', 'lobsterai', 'qoder', 'qodercn', 'trae', 'cline', 'raccoon',
+  ]
+
+  it('前后端的支持面完全一致（逐个 provider 对账）', () => {
+    for (const id of SUPPORTED) {
+      expect(supportsPermanentLock(id), `${id} 应支持`).toBe(true)
+      expect(PERMANENT_LOCK_PROVIDERS.has(id), `${id} 后端应放行`).toBe(true)
+    }
+    for (const id of UNSUPPORTED) {
+      expect(supportsPermanentLock(id), `${id} 不应支持`).toBe(false)
+      expect(PERMANENT_LOCK_PROVIDERS.has(id), `${id} 后端应拒绝`).toBe(false)
+    }
+    // 白名单不得有多余项：前端不渲染却后端放行 = 死接口
+    expect([...PERMANENT_LOCK_PROVIDERS].sort()).toEqual([...SUPPORTED].sort())
+  })
+
+  /**
+   * ⚠️ 窗口天数必须**前后端同一个值**。前端只做展示，判据在后端；
+   * 数字写岔会让用户看到「提示说只烧 8 天内的，实际按 15 天筛号」。
+   */
+  it('前端窗口常量与后端 BUDDY_EXPIRING_WINDOW_DAYS 相同', () => {
+    expect(PERMANENT_LOCK_EXPIRING_WINDOW_DAYS).toBe(BUDDY_EXPIRING_WINDOW_DAYS)
+    expect(BUDDY_EXPIRING_WINDOW_DAYS).toBe(15)
+  })
+
+  /**
+   * ⚠️ 文案必须用**后端回传的窗口天数**渲染，而不是前端那个常量。
+   *
+   * 窗口可被 `DSH_BUDDY_EXPIRING_WINDOW_DAYS` 覆盖（实测 CodeBuddy 中国版的
+   * 积分包剩余密集落在 17～30 天，默认 15 天会让整池判成永久）。前端写死数字
+   * 就会出现「提示说只烧 15 天内的，实际按 31 天筛号」这种无法解释的偏差。
+   */
+  it('permanentLockCopy 采纳后端回传的窗口天数', () => {
+    expect(permanentLockCopy(CODEBUDDY.id, 31).lockTitle).toContain('31 天内到期')
+    expect(permanentLockCopy(WORKBUDDY.id, 31).unlockedNotice).toContain('31 天内到期')
+    expect(permanentLockCopy(CODEBUDDY.id, 31).days).toBe(31)
+    // 缺省时回落到默认常量（面板初次渲染、后端未回传时不能说谎说没窗口）
+    expect(permanentLockCopy(CODEBUDDY.id).days).toBe(PERMANENT_LOCK_EXPIRING_WINDOW_DAYS)
+    expect(permanentLockCopy(CODEBUDDY.id, undefined).days).toBe(15)
+    expect(permanentLockCopy(CODEBUDDY.id, null).days).toBe(15)
+    // ⚠️ 0 是合法值（「没有临时积分」），不能被 `||` 吞成默认值
+    expect(permanentLockCopy(CODEBUDDY.id, 0).days).toBe(0)
+    expect(permanentLockCopy(CODEBUDDY.id, 0).lockedNotice).toContain('0 天内到期')
+    // 非法值回落默认，不渲染出 NaN
+    expect(permanentLockCopy(CODEBUDDY.id, -1).days).toBe(15)
+    expect(permanentLockCopy(CODEBUDDY.id, 'abc').days).toBe(15)
+    expect(permanentLockCopy(CODEBUDDY.id, 15.6).days).toBe(16)
+    // Loomy 没有窗口概念：不受该参数影响
+    expect(permanentLockCopy(LOOMY.id, 31).days).toBeNull()
+    expect(permanentLockCopy(LOOMY.id, 31).lockedNotice).toContain('每日赠送额度')
+  })
+
+  it('未登记的 provider 一律不支持（默认关闭）', () => {
+    expect(supportsPermanentLock(undefined)).toBe(false)
+    expect(supportsPermanentLock('')).toBe(false)
+    expect(supportsPermanentLock('loomy-old')).toBe(false)
+  })
+
+  describe('permanentLockCopy 的按 provider 文案', () => {
+    /**
+     * 把 Loomy 的「每日赠送额度」套到两个 buddy 上是**实质性误导**：
+     * 它们没有每天刷新的额度池，签到得来的也是 14/30 天后到期的包。
+     */
+    it('buddy / workbuddy 说「N 天内到期」，不说「每日赠送」', () => {
+      for (const id of [CODEBUDDY.id, WORKBUDDY.id]) {
+        const copy = permanentLockCopy(id)
+        expect(copy.lockTitle).toContain('15 天内到期')
+        expect(copy.lockedTitle).toContain('15 天内到期')
+        expect(copy.lockedNotice).toContain('15 天内到期')
+        expect(copy.unlockedNotice).toContain('15 天内到期')
+        expect(copy.lockTitle).not.toContain('每日赠送')
+        expect(copy.lockedNotice).not.toContain('今日额度')
+      }
+    })
+
+    it('loomy 仍说「每日赠送额度」（它是当日到期的池，与 buddy 不同）', () => {
+      const copy = permanentLockCopy(LOOMY.id)
+      expect(copy.lockedNotice).toContain('每日赠送额度')
+      expect(copy.unlockedNotice).toContain('永久积分')
+      expect(copy.lockTitle).not.toContain('天内到期')
+    })
+
+    it('四个文案位都齐（面板直接取用，缺一个就渲染出 undefined）', () => {
+      for (const id of [...SUPPORTED, 'codearts']) {
+        const copy = permanentLockCopy(id)
+        for (const key of ['lockTitle', 'lockedTitle', 'lockedNotice', 'unlockedNotice']) {
+          expect(typeof copy[key], `${id}.${key}`).toBe('string')
+          expect(copy[key].length, `${id}.${key} 不能为空`).toBeGreaterThan(0)
+        }
+      }
+    })
+
+    it('未登记的 provider 回落到 Loomy 口径而不是崩（面板共用同一段代码）', () => {
+      expect(permanentLockCopy('codearts').lockedNotice).toContain('每日赠送额度')
+    })
+  })
+})
+
+/**
+ * ⚠️ **客户端源码不得有未声明变量**（真实事故，2026-09-29）。
+ *
+ * ## 事故经过
+ *
+ * 给积分行加「当日池分桶」时在 `AccountCard` 里写了
+ * `provider === 'loomy' ? '永久' : '长期'`，但**忘了把 `provider` 加进该组件的
+ * props 解构**。后果不是显示错，而是**整个 Jet Hub 设置页崩成白屏**：
+ *
+ * ```
+ * ReferenceError: provider is not defined
+ *     at AccountCard (client.js:926:1)
+ * slot entry crashed in 'settings.section'
+ * ```
+ *
+ * ## 为什么既有测试全绿却漏掉了
+ *
+ * 本仓库对 `plugin-src/client/*.js` 的测试几乎都是**源码字符串匹配**
+ * （`expect(hubSource).toContain('…')`）—— 它们只能证明"某段文字存在"，
+ * 证明不了"这段代码能跑"。而 `plugin-src/client/` 是**纯 JS**，`tsc -p
+ * tsconfig.json` 只编译 `src/`（TS），**根本不看它**；esbuild 打包也不做
+ * 未声明变量检查（它只做语法解析，`provider` 是合法标识符）。
+ *
+ * 于是这类错误唯一的发现时机就是**用户打开桌面版**。
+ *
+ * ## 这道闸的做法
+ *
+ * 用 `tsc --checkJs` 扫客户端源码，**只筛未声明变量两类诊断**
+ * （`TS2304` 找不到名称 / `TS2552` 找不到名称但给出相似建议）。
+ * 不筛其它诊断 —— 客户端 JS 没有类型标注，全量 `checkJs` 会产出大量
+ * JSDoc 风格与第三方类型噪音（实测 `react` 类型缺失、`@param {object}` 写法等），
+ * 那些不是我们要防的东西，混进来只会让人把这道闸关掉。
+ *
+ * ⚠️ 配置在仓库根的 `tsconfig.client-check.json`。
+ * ⚠️ 已做**反向验证**：把 `provider` 从 `AccountCard` 的参数里去掉，
+ * 本条会以 `TS2552: Cannot find name 'provider'` 变红。
+ */
+describe('客户端源码静态检查（防未声明变量崩页面）', () => {
+  it('plugin-src/client 下没有未声明变量（TS2304 / TS2552）', () => {
+    const here = dirname(fileURLToPath(import.meta.url))
+    const root = resolve(here, '../..')
+    const result = spawnSync(
+      process.execPath,
+      [resolve(root, 'node_modules/typescript/bin/tsc'), '-p', resolve(root, 'tsconfig.client-check.json')],
+      { cwd: root, encoding: 'utf8' },
+    )
+    const output = `${result.stdout ?? ''}${result.stderr ?? ''}`
+    // 只保留「找不到名称」两类：其余诊断（JSDoc 风格、第三方类型）不是本闸的目标。
+    const undeclared = output
+      .split('\n')
+      .filter((line) => /error TS(2304|2552):/.test(line))
+    expect(
+      undeclared,
+      `客户端源码有未声明变量，会在桌面版运行时抛 ReferenceError 并崩掉整个设置页：\n${undeclared.join('\n')}`,
+    ).toEqual([])
+  }, 120_000)
 })

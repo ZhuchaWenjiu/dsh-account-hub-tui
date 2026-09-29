@@ -78,16 +78,43 @@ describe('Loomy RPC 分派', () => {
   })
 
   /**
-   * ⚠️ **Loomy 永久积分锁定**端点（用户需求）。
+   * ⚠️ **永久积分锁定**端点（用户需求：Loomy 先做，CodeBuddy / WorkBuddy 后加）。
    *
-   * 锁定后选号只允许消耗今日赠送额度，永久积分不参与。
+   * 三个 provider 共用一个通用端点 `credits.permanentLock`（provider 维度），
+   * `loomy.permanentLock` 保留为**同一实现的历史别名** —— 老客户端 bundle 仍在
+   * 调它，直接删会让 Loomy 面板的按钮静默失效。
    */
-  it('新增了 loomy.permanentLock 端点（读 / 写两用）', () => {
+  it('通用端点与 Loomy 历史别名共用同一实现（读 / 写两用）', () => {
+    expect(rpcSource).toContain("case 'credits.permanentLock'")
     expect(rpcSource).toContain("case 'loomy.permanentLock'")
-    expect(rpcSource).toMatch(/pool\.loomyPermanentLocked\(\)/)
-    expect(rpcSource).toMatch(/pool\.setLoomyPermanentLocked\(/)
+    // 走 provider 维度的表，而不是老的单字段方法
+    expect(rpcSource).toMatch(/pool\.permanentLocked\(/)
+    expect(rpcSource).toMatch(/pool\.setPermanentLocked\(/)
     // locked 省略 = 只读
     expect(rpcSource).toMatch(/req\.locked === undefined/)
+    // ⚠️ 老别名必须忽略载荷里的 provider（否则老前端能借它越权改别的 provider）
+    expect(rpcSource).toMatch(/method === 'loomy\.permanentLock'/)
+  })
+
+  /**
+   * ⚠️ 两个 buddy 的响应必须**回传当前生效的窗口天数**。
+   *
+   * 窗口可被 `DSH_BUDDY_EXPIRING_WINDOW_DAYS` 覆盖，前端文案若继续用写死的
+   * 15 就会出现「提示说只烧 15 天内的、实际按 31 天筛号」。Loomy 没有窗口
+   * 概念，故只有 buddy 系带这个字段。
+   */
+  it('buddy 系的响应回传窗口天数（前端文案据此渲染）', () => {
+    expect(rpcSource).toMatch(/provider === CODEBUDDY\.id \|\| provider === WORKBUDDY\.id/)
+    expect(rpcSource).toMatch(/windowDays: buddyExpiringWindowDays\(\)/)
+    expect(rpcSource).toContain("from './buddy-balance-rank.js'")
+    expect(typesSource).toMatch(/interface RpcPermanentLockResponse \{[\s\S]*?windowDays\?: number/)
+  })
+
+  it('后端有 provider 白名单，且与 Loomy/Buddy 的支持面一致', () => {
+    expect(rpcSource).toMatch(/PERMANENT_LOCK_PROVIDERS[\s\S]{0,200}LOOMY\.id/)
+    expect(rpcSource).toContain('CODEBUDDY.id')
+    expect(rpcSource).toContain('WORKBUDDY.id')
+    expect(rpcSource).toMatch(/PERMANENT_LOCK_PROVIDERS\.has\(provider\)/)
   })
 
   /**

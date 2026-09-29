@@ -522,6 +522,7 @@ export class LoomyAdapter extends LlmAdapter {
       label: 'loomy',
       firstTokenTimeoutMs: resolveFirstTokenTimeoutMs(),
       chunkTimeoutMs: resolveChunkTimeoutMs(),
+      ...options.maxTokens === undefined ? {} : { maxTokens: options.maxTokens },
     })
   }
 }
