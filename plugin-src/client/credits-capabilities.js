@@ -193,6 +193,24 @@ export function supportsPermanentLock(provider) {
 }
 
 /**
+ * 该 provider 的余额是否**真的由多个资源包构成且有到期信息**（决定账号名 hover 要不要列包）。
+ *
+ * ⚠️ 只有 `buddy` / `workbuddy` / `lobsterai` 具备。这不是"避免冗余"，而是**防止显示错误信息**：
+ * - `loomy` 的 `packages` 是我们自己合成的两个条目（`makePackage('永久积分'…)` /
+ *   `makePackage('每日赠送'…)`），它们**没有** `deductionEndTime` → 按降级规则会被标成「永久」。
+ *   若不加这道门控，loomy 卡片上会出现「每日赠送 4992 / 4992 永久」——而那笔恰恰**当天就作废**，说反了。
+ * - `trae` 的有效期为 **31 天**（从起始日期算起）。服务端不返回独立的到期字段，
+ *   但规则明确 ⇒ 可以挂（后端已按"起始日期 + 31 天"计算 deductionEndTime）。
+ * - `qoder` / `qodercn`：套餐额度/资源包没有独立到期（统一"领取后 30 天"），但专用资源包有
+ *   `expiresAt` 字段 ⇒ 可挂（有到期信息的包显示日期，没有的显示"永久"）。
+ * - LobsterAI：有 `expiresAt` 字段（ISO 日期字符串），已明确过期判据。
+ */
+export function supportsCreditPackageList(provider) {
+  return provider === 'buddy' || provider === 'workbuddy' || provider === 'lobsterai'
+    || provider === 'qoder' || provider === 'qodercn' || provider === 'trae';
+}
+
+/**
  * 「锁定 / 解锁永久积分」按钮与提示的**按 provider 文案**。
  *
  * ## 为什么不能让三个 provider 共用一句

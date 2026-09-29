@@ -2,6 +2,7 @@ import * as React from 'react';
 
 import {
   supportsCreditBalance,
+  supportsCreditPackageList,
   supportsDailyCheckin,
   supportsOnboardingTasks,
   supportsRateLimit,
@@ -12,6 +13,7 @@ import {
 import { orderAfterDrop, dropPositionFromPointer } from './account-order.js';
 import {
   formatExpirySplitLine,
+  formatPackageTooltip,
   splitCreditsByExpiry,
   expiryBucketLabel,
   daysUntilExpiry,
@@ -381,7 +383,7 @@ function CreditBalanceRow({ balance, error, loading, windowDays }) {
       : null));
 }
 
-function AccountCard({ account, index, order, onToggle, onDelete, onRetest, onReset, onClaimOnboarding, onboardingBusy, busy, credits, creditsLoading, showCredits, windowDays, showRateLimitActions, drag }) {
+function AccountCard({ account, index, order, onToggle, onDelete, onRetest, onReset, onClaimOnboarding, onboardingBusy, busy, credits, creditsLoading, showCredits, showPackageList, windowDays, showRateLimitActions, drag }) {
   const rateLimits = account.modelRateLimits
     ? Object.entries(account.modelRateLimits).filter(([, v]) => v > Date.now())
     : [];
@@ -391,6 +393,24 @@ function AccountCard({ account, index, order, onToggle, onDelete, onRetest, onRe
   const hasAnyLimit = Boolean(account.modelRateLimits && Object.keys(account.modelRateLimits).length > 0);
   // 拖拽相关的状态与回调由 ProviderPanel 统一管理（它掌握整个列表顺序）。
   const dragProps = drag || {};
+
+  /**
+   * 账号名 / 状态标签 hover 时的资源包列表。
+   *
+   * ⚠️ 只在 `showPackageList` 为真时挂 —— 那是「余额真的由多个资源包构成」的
+   * 能力位（目前只有两个 buddy）。loomy 的 packages 是我们合成的两个池名，
+   * 且没有到期字段，列出来会把「每日赠送」标成**永久**（恰好说反）。
+   *
+   * ⚠️ `now` 在渲染时取：到期是时间的函数，宿主长期开着，缓存会让"8 天后"
+   * 一直显示成"8 天后"。
+   */
+  const packageTooltip = showPackageList && credits?.balance?.packages?.length
+    ? formatPackageTooltip(credits.balance.packages, { format: formatCredits, now: Date.now() })
+    : null;
+  // 有数据挂包列表；余额还没拉到时挂提示而不是空 title —— 否则用户 hover
+  // 一个看起来该有内容的名字却毫无反应，会以为是坏了。
+  const accountTitle = packageTooltip
+    ?? (showPackageList && creditsLoading ? '资源包加载中…' : undefined);
 
   return React.createElement('div', {
     className: 'dim-jh-accountCard',
@@ -427,11 +447,17 @@ function AccountCard({ account, index, order, onToggle, onDelete, onRetest, onRe
         title: account.enabled ? '已启用' : '已停用',
         'aria-hidden': 'true',
       }),
-      React.createElement('span', { className: 'dim-jh-accountName' },
+      React.createElement('span', {
+        className: 'dim-jh-accountName',
+        // 资源包列表（剩余/总量 + 到期时间）。仅 buddy 系挂，见 packageTooltip。
+        title: accountTitle,
+      },
         account.nickname || account.id),
       React.createElement('span', {
         className: 'dim-jh-accountTag',
         'data-tone': account.enabled ? 'on' : 'off',
+        // 同账号名：hover 出资源包列表（两处都挂，用户 hover 哪个都能看见）。
+        title: accountTitle,
       }, account.enabled ? '已启用' : '已停用')),
     React.createElement('dl', { className: 'dim-jh-accountMeta' },
       React.createElement('div', { className: 'dim-jh-metaRow' },
@@ -1624,6 +1650,10 @@ function ProviderPanel({ provider, rpcCall }) {
                 credits: credits[account.id],
                 creditsLoading: creditsLoading && credits[account.id] === undefined,
                 showCredits: canLoadCredits,
+                // 账号名 hover 列资源包：只有余额真由多个包构成的 provider 才挂
+                // （loomy 的池是我们合成的、无到期字段，列出来会把「每日赠送」
+                // 标成永久 —— 恰好说反）。
+                showPackageList: supportsCreditPackageList(provider),
                 // 「临时 / 永久」分桶的窗口天数（buddy 系才有值）。
                 windowDays: expiryWindowDays,
                 // 卡片级「重测 / 重置」：只对会返回限流错误的 provider 渲染。

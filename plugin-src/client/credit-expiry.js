@@ -122,3 +122,78 @@ export function formatExpirySplitLine(split, format) {
   if (expiring === null || permanent === null) return null;
   return `永久 ${permanent} · 临时 ${expiring}`;
 }
+
+/**
+ * 单个包的到期时间展示：**绝对日期 + 相对天数**，拿不到到期时间显示「永久」。
+ *
+ * ⚠️ 到期时间的来源优先序：`deductionEndTime`（毫秒）> `expiredTime`（字符串，如
+ * "2026-11-01 00:00:00"）。各 provider 的解析代码（lobsterai / qoder / trae）
+ * 已在后端把字符串归一化到 `deductionEndTime`（毫秒），所以大多数情况下只走
+ * 第一条路径 —— `expiredTime` 的兼容是给"后端没归一化的包"的兜底。
+ *
+ * ⚠️ 「永久」的判据是**服务端没给任何到期字段**。Qoder 的套餐额度/资源包
+ * 就没有独立到期（统一"领取后 30 天"是活动规则而非包字段），显示"永久"
+ * 比编造一个错误日期好。
+ */
+export function formatPackageExpiry(pkg, now) {
+  // 优先 deductionEndTime（毫秒，后端归一化），次 expiredTime（字符串，如 "2026-11-01 00:00:00"）
+  const dedEnd = Number(pkg && pkg.deductionEndTime);
+  let end = Number.isFinite(dedEnd) && dedEnd > 0 ? dedEnd : NaN;
+  if (!Number.isFinite(end)) {
+    const exp = pkg && pkg.expiredTime ? String(pkg.expiredTime) : '';
+    if (exp.length > 0) {
+      const ms = Date.parse(exp.replace(' ', 'T'));
+      if (Number.isFinite(ms) && ms > 0) end = ms;
+    }
+  }
+  if (!Number.isFinite(end) || end <= 0) return '永久';
+  const at = Number.isFinite(now) ? now : Date.now();
+  const date = new Date(end).toISOString().slice(0, 10);
+  const days = Math.ceil((end - at) / DAY_MS);
+  if (days <= 0) return `${date}（已过期）`;
+  return `${date}（${days} 天后）`;
+}
+
+/**
+ * 资源包列表的多行文本（账号名 hover 用）。
+ *
+ * ## 为什么按剩余量降序 + 截断
+ *
+ * 实测 CodeBuddy 中国版一个账号有 **105 个资源包**（多数是 30 天的运营裂变包）。
+ * 全列出来 tooltip 会长到无法阅读。⇒ 按**剩余量降序**取前 `maxRows` 个（用户关心
+ * 的是"还有钱的包"），其余汇总成一行给出**合计剩余**，不丢总量信息。
+ *
+ * @param packages - `balance.packages`。
+ * @param options.format - 数字格式化（与卡片总额同一个 `formatCredits`）。
+ * @param options.now - **渲染时**的当前时刻（到期是时间的函数，不能传缓存值）。
+ * @param options.maxRows - 最多列几个包。默认 12。
+ * @returns 多行文本；无包时返回 null（调用方据此不挂 title）。
+ */
+export function formatPackageTooltip(packages, options = {}) {
+  const { format, now = Date.now(), maxRows = 12 } = options;
+  if (!Array.isArray(packages) || packages.length === 0) return null;
+
+  // 只按剩余量降序（用户关心"还有钱的包"）。不做二级排序 ——
+  // `daysUntilExpiry` 会返回 null，相减得 NaN 会破坏比较器（V8 下顺序不可预期）。
+  // Array.prototype.sort 在现代引擎里是稳定的，剩余量相同的包天然保持服务端原序。
+  const sorted = [...packages].sort(
+    (a, b) => (Number(b && b.remaining) || 0) - (Number(a && a.remaining) || 0),
+  );
+  const lines = sorted.slice(0, maxRows).map(pkg => {
+    const name = (pkg && pkg.name) || '未命名';
+    const remaining = format ? format(Number(pkg && pkg.remaining) || 0) : String(pkg && pkg.remaining);
+    const total = format ? format(Number(pkg && pkg.total) || 0) : String(pkg && pkg.total);
+    const flags = pkg && pkg.active === false ? ' [已失效]' : '';
+    return `${name}  ${remaining} / ${total}  ${formatPackageExpiry(pkg, now)}${flags}`;
+  });
+
+  const rest = sorted.slice(maxRows);
+  if (rest.length > 0) {
+    const sum = rest.reduce(
+      (acc, p) => acc + (p && p.active !== false && Number.isFinite(Number(p.remaining)) ? Number(p.remaining) : 0),
+      0,
+    );
+    lines.push(`…另有 ${rest.length} 个包${sum > 0 ? `，合计剩余 ${format ? format(sum) : sum}` : ''}`);
+  }
+  return lines.join('\n');
+}

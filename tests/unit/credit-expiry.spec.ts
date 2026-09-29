@@ -14,8 +14,11 @@ import {
   daysUntilExpiry,
   expiryBucketLabel,
   formatExpirySplitLine,
+  formatPackageExpiry,
+  formatPackageTooltip,
   splitCreditsByExpiry,
 } from '../../plugin-src/client/credit-expiry.js'
+import { supportsCreditPackageList } from '../../plugin-src/client/credits-capabilities.js'
 import { splitBuddyCreditsByExpiry } from '../../src/buddy-balance-rank.js'
 import type { CreditBalance, CreditPackage } from '../../src/credits.js'
 
@@ -213,5 +216,126 @@ describe('formatExpirySplitLine（卡片那一行）', () => {
    */
   it('两桶皆 0 仍显示（这是锁定失效的线索）', () => {
     expect(formatExpirySplitLine({ expiring: 0, permanent: 0 }, format)).toBe('永久 0 · 临时 0')
+  })
+})
+
+/**
+ * 账号名 hover 的资源包列表（用户 2026-09-29 要求：显示「剩余/总量」与到期时间，
+ * 没有到期时间显示「永久」）。
+ */
+describe('formatPackageExpiry（单个包的到期列）', () => {
+  it('有到期时间：绝对日期 + 相对天数', () => {
+    expect(formatPackageExpiry(pkg({ deductionEndTime: NOW + 8 * DAY }), NOW))
+      .toBe('2026-10-09（8 天后）')
+  })
+
+  /** ⚠️ 用户明确要求的降级：拿不到到期时间显示「永久」。 */
+  it('无到期时间显示「永久」', () => {
+    for (const bad of [undefined, 0, Number.NaN, null]) {
+      expect(formatPackageExpiry(pkg({ deductionEndTime: bad as never }), NOW), String(bad)).toBe('永久')
+    }
+  })
+
+  it('已过期不显示「-3 天后」', () => {
+    expect(formatPackageExpiry(pkg({ deductionEndTime: NOW - 3 * DAY }), NOW))
+      .toBe('2026-09-28（已过期）')
+  })
+
+  /** 不足 1 天向上取整为 1，避免出现「0 天后」。 */
+  it('剩余不足 1 天显示 1 天后', () => {
+    expect(formatPackageExpiry(pkg({ deductionEndTime: NOW + 60_000 }), NOW))
+      .toBe('2026-10-01（1 天后）')
+  })
+})
+
+describe('formatPackageTooltip（包列表）', () => {
+  it('每行含名称、剩余/总量、到期时间', () => {
+    const text = formatPackageTooltip(
+      [pkg({ name: 'Bonus Pack', remaining: 250, total: 500, deductionEndTime: NOW + 8 * DAY })],
+      { format: v => String(v), now: NOW },
+    )
+    expect(text).toBe('Bonus Pack  250 / 500  2026-10-09（8 天后）')
+  })
+
+  it('无到期时间的包那一行显示「永久」', () => {
+    const text = formatPackageTooltip(
+      [pkg({ name: '拉新权益包', remaining: 100, deductionEndTime: undefined })],
+      { format: v => String(v), now: NOW },
+    )
+    expect(text).toContain('永久')
+    expect(text).toBe('拉新权益包  100 / 100  永久')
+  })
+
+  it('失效包带标记（用户要能看出那部分扣不到）', () => {
+    const text = formatPackageTooltip(
+      [pkg({ name: '过期包', active: false, remaining: 10 })],
+      { format: v => String(v), now: NOW },
+    )
+    expect(text).toContain('[已失效]')
+  })
+
+  /**
+   * ⚠️ 真实场景：实测 CodeBuddy 中国版一个账号有 **105 个资源包**。
+   * 不截断的话 tooltip 会长到无法阅读，所以按剩余量降序取前 N 个，
+   * 其余汇总成一行并给出**合计剩余**（不丢总量信息）。
+   */
+  it('包数超过 maxRows 时截断并汇总剩余合计', () => {
+    const many = Array.from({ length: 20 }, (_, i) => pkg({
+      name: `包${i}`,
+      remaining: i + 1,      // 1..20
+      total: 100,
+      deductionEndTime: NOW + 30 * DAY,
+    }))
+    const text = formatPackageTooltip(many, { format: v => String(v), now: NOW, maxRows: 12 })!
+    const lines = text.split('\n')
+    expect(lines).toHaveLength(13)
+    // 剩余量降序：最大的排第一，被截掉的是最小的
+    expect(lines[0]).toContain('包19')
+    expect(lines[11]).toContain('包8')
+    // 被截掉的是 remaining 1..7 与 8 ⇒ 合计 1+2+…+8 = 36
+    expect(lines[12]).toBe('…另有 8 个包，合计剩余 36')
+  })
+
+  it('汇总行不计入失效包（那部分扣不到）', () => {
+    const many = [
+      ...Array.from({ length: 12 }, (_, i) => pkg({ name: `有效${i}`, remaining: 100 })),
+      pkg({ name: '失效1', remaining: 50, active: false }),
+      pkg({ name: '有效13', remaining: 50 }),
+    ]
+    const text = formatPackageTooltip(many, { format: v => String(v), now: NOW, maxRows: 12 })!
+    expect(text.split('\n').at(-1)).toBe('…另有 2 个包，合计剩余 50')
+  })
+
+  it('空或非数组返回 null（调用方据此不挂 title）', () => {
+    const opts = { format: (v: number) => String(v), now: NOW }
+    expect(formatPackageTooltip([], opts)).toBeNull()
+    expect(formatPackageTooltip(undefined as never, opts)).toBeNull()
+  })
+})
+
+/**
+ * ⚠️ **能力门控**：只有余额真由多个资源包构成的 provider 才挂包列表。
+ *
+ * 这不是"避免冗余"，而是**防止显示错误信息**：loomy 的 packages 是后端合成的
+ * 两个条目（`makePackage('永久积分')` / `makePackage('每日赠送')`），它们
+ * **没有** `deductionEndTime` ⇒ 按降级规则会被标成「永久」。于是 loomy 卡片上
+ * 会出现「每日赠送 4992 / 4992 永久」—— 而那笔恰恰**当天就作废**，说反了。
+ */
+describe('supportsCreditPackageList 的门控', () => {
+  it('buddy 系 + lobsterai + qoder/qodercn + trae 为真', () => {
+    for (const p of ['buddy', 'workbuddy', 'lobsterai', 'qoder', 'qodercn', 'trae']) {
+      expect(supportsCreditPackageList(p), p).toBe(true)
+    }
+  })
+
+  /** 关键：loomy 虽支持「锁定永久积分」，但**不能**挂包列表。 */
+  it('loomy 为假（它的两个池是合成的、无到期字段，列出会把每日赠送标成永久）', () => {
+    expect(supportsCreditPackageList('loomy')).toBe(false)
+  })
+
+  it('其余 provider 与未知值一律为假（默认关闭）', () => {
+    for (const p of ['codearts', 'cline', 'raccoon', '', undefined]) {
+      expect(supportsCreditPackageList(p as never), String(p)).toBe(false)
+    }
   })
 })

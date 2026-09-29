@@ -206,8 +206,10 @@ describe('客户端积分请求门控（源码级回归）', () => {
     expect(normalized).toMatch(/canLoadCredits\s*\n\s*\? React\.createElement\('button'/)
     expect(normalized).toContain('showCredits: canLoadCredits')
     // AccountCard 必须真的消费 showCredits，否则传了也没用
+    // ⚠️ 窗口不能只取 4000：账号名 hover（packageTooltip / accountTitle）的
+    // 计算代码插在函数头部与 CreditBalanceRow 渲染之间，把间距撑大了。
     const cardStart = normalized.indexOf('function AccountCard(')
-    const cardBody = normalized.slice(cardStart, cardStart + 4000)
+    const cardBody = normalized.slice(cardStart, cardStart + 8000)
     expect(cardBody).toContain('showCredits')
     expect(cardBody).toMatch(/showCredits\s*\n?\s*\?[\s\S]*CreditBalanceRow/)
   })
