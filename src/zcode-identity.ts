@@ -101,13 +101,41 @@ export function buildZcodeSystemBlocks(
   const ephemeral = { type: 'ephemeral' as const }
   const stable = OFFICIAL_STABLE_SECTIONS.join('\n\n')
   const blocks: ZcodeTextBlock[] = [
-    { type: 'text', text: OFFICIAL_CLI_PREFIX, cache_control: ephemeral },
-    { type: 'text', text: stable, cache_control: ephemeral },
-    { type: 'text', text: buildEnvironmentSection(options), cache_control: ephemeral },
+    { type: 'text', text: OFFICIAL_CLI_PREFIX },
+    { type: 'text', text: stable },
+    { type: 'text', text: buildEnvironmentSection(options) },
   ]
   if (typeof callerSystem === 'string' && callerSystem.trim().length > 0) {
-    blocks.push({ type: 'text', text: callerSystem, cache_control: ephemeral })
+    blocks.push({ type: 'text', text: callerSystem })
   }
+  /**
+   * ★ **只在最后一块**打 prompt caching 断点（2026-09-30 调整；此前是每块都打）。
+   *
+   * ## 依据一：前缀式语义 ⇒ 一个断点就够
+   *
+   * Anthropic 的 prompt caching 是**前缀式**的：断点覆盖「**该断点之前的全部内容**」。
+   * 故一个位于**最后一块**的断点，其覆盖面**等于（且不小于）**每块各打一个。
+   * 多个断点只在「希望多个不同长度的前缀各自成缓存块」时才有额外意义。
+   *
+   * ## 依据二：断点有**数量上限**（Anthropic：单请求最多 4 个）
+   *
+   * 本函数产出 3-4 块（调用方的 system 存在时是 4 块）——「每块都打」正好**用满**
+   * 4 个预算，于是 tools 再也打不了点（见 `zcode-adapter.ts` 的
+   * `withToolCacheBreakpoint`：DSH 每步带 24 个工具、约 19KB schema）。
+   * 收敛成 1 个后，预算留给 tools，**总断点数 2 ≤ 4**。
+   *
+   * ## 依据三：调用方 system 必须落在断点内（本项目特有）
+   *
+   * `callerSystem` 是 DSH 的完整规范（本仓库的 `AGENTS.md` 就有数十 KB）。
+   * 断点若不在它之后，这段**每步都要重算 prefill** —— 而它恰恰是最大的可缓存前缀。
+   * 只给最后一块打点天然满足这一点（有 `callerSystem` 时最后一块就是它）。
+   *
+   * ⚠ 与官方「逐块打点」的形态有偏差，但**不影响准入**：3012 的判据是
+   * 身份块的**内容与结构**存在（`AGENTS.md` 与 `OFFICIAL_*` 注释都记过），
+   * `cache_control` 只是缓存提示，不参与风控判定。
+   */
+  const last = blocks[blocks.length - 1]
+  if (last !== undefined) last.cache_control = ephemeral
   return blocks
 }
 

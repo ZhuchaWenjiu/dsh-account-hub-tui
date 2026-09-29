@@ -333,10 +333,56 @@ function buildSdkInjectExpression(): string {
   })`
 }
 
+/**
+ * 一次 captcha 产出的**结果 + 观测**。
+ *
+ * `interactive` 的语义（对齐官方 `mnn` 的 `interactive_displayed`）：
+ * - `false` = **无感验证**直接通过（正常路径）
+ * - `true`  = 被要求**交互式验证**（滑块/拼图）⇒ **设备信誉可能已下降**
+ *
+ * ⚠ 判据是「曾经观察到交互元素」——因为阿里云的这一层**不对外透出**
+ *（官方文档 Q9 原文：「该安全策略逻辑不支持自定义，不对外透出」），
+ * 只能靠看 DOM。
+ */
+export interface CaptchaMintOutcome {
+  /** 产出的 param。 */
+  param: string
+  /** 本次是否被降级为交互式验证（`true` = 信誉预警信号）。 */
+  interactive: boolean
+}
+
 /** 构造「触发无感验证并等 param」的表达式。 */
 function buildMintExpression(config: ZcodeCaptchaConfig): string {
   return `new Promise((resolve) => {
     const done = (payload) => resolve(JSON.stringify(payload));
+    /**
+     * ★ **降级检测**（2026-10-01，对齐官方 \`mnn\` 的 interactive_displayed）。
+     *
+     * 我们调的是无感验证（\`startTracelessVerification\`）。阿里云若把本设备
+     * 判为风险用户，会**静默弹出交互式验证**（滑块/拼图）—— 而官方文档明确说
+     * 「该安全策略逻辑不支持自定义，不对外透出」（验证码 2.0 功能相关问题 Q9）。
+     * 也就是说**没有回调告诉我们被降级了**，只能自己看 DOM。
+     *
+     * ⇒ 轮询检测那些交互元素是否出现过，用一个标志记住「曾经出现过」。
+     *
+     * ⚠ 用「曾经出现」而不是「此刻存在」：交互元素在验证完成后会被 SDK 移除，
+     * 只在 success 那一刻查 DOM 会**漏报**（那正是最需要知道的场景）。
+     *
+     * ⚠ 选择器取自 dsh-free-glm 对空开源版 renderer 的实测记录
+     *（\`bench/CAPTCHA-SLIDER-ATTEMPT.md\` 的 2.1 节，四个 id 逐字一致）。
+     */
+    let sawInteractive = false;
+    const detectInteractive = () => {
+      try {
+        if (sawInteractive) return;
+        if (document.querySelector('#aliyunCaptcha-window-popup')
+          || document.querySelector('#aliyunCaptcha-sliding-slider')
+          || document.querySelector('#aliyunCaptcha-puzzle')) {
+          sawInteractive = true;
+        }
+      } catch (error) { /* 检测失败不影响产出 */ }
+    };
+    const pollTimer = setInterval(detectInteractive, 200);
     try {
       window.AliyunCaptchaConfig = ${JSON.stringify({ region: config.region, prefix: config.prefix })};
     } catch (error) { done({ stage: 'cfg-throw', err: String(error) }); }
@@ -352,26 +398,50 @@ function buildMintExpression(config: ZcodeCaptchaConfig): string {
             if (typeof instance.startTracelessVerification === 'function') {
               instance.startTracelessVerification();
             } else if (typeof instance.show === 'function') {
+              /**
+               * ⚠ 走 \`show()\` 说明 SDK 里**没有**无感验证能力 —— 那本身
+               * 就是一种降级形态（我们请求的是无感，拿到的是强制交互）。
+               */
+              sawInteractive = true;
               instance.show();
             }
           } catch (error) {
             done({ stage: 'call-throw', err: String((error && error.message) || error) });
           }
         },
-        success: (param) => done({ stage: 'success', param }),
-        fail: (error) => done({
-          stage: 'fail',
-          err: String((error && error.message) || JSON.stringify(error)),
-        }),
-        onError: (error) => done({
-          stage: 'onError',
-          err: String((error && error.message) || JSON.stringify(error)),
-        }),
+        success: (param) => {
+          /**
+           * ⚠ 收尾前再查一次 DOM（轮询间隔 200ms，可能在两次轮询之间就完成了）。
+           */
+          detectInteractive();
+          clearInterval(pollTimer);
+          done({ stage: 'success', param, interactive: sawInteractive });
+        },
+        fail: (error) => {
+          clearInterval(pollTimer);
+          done({
+            stage: 'fail',
+            err: String((error && error.message) || JSON.stringify(error)),
+            interactive: sawInteractive,
+          });
+        },
+        onError: (error) => {
+          clearInterval(pollTimer);
+          done({
+            stage: 'onError',
+            err: String((error && error.message) || JSON.stringify(error)),
+            interactive: sawInteractive,
+          });
+        },
       });
     } catch (error) {
+      clearInterval(pollTimer);
       done({ stage: 'init-throw', err: String((error && error.message) || error) });
     }
-    setTimeout(() => done({ stage: 'timeout' }), 60000);
+    setTimeout(() => {
+      clearInterval(pollTimer);
+      done({ stage: 'timeout', interactive: sawInteractive });
+    }, 60000);
   })`
 }
 
@@ -696,10 +766,57 @@ export class ZcodeCaptchaBrowser {
    * ⚠ 空闲阈值取 **8 秒**：实测 15 秒已失效，故留一半余量。
    * 偏保守只会多付一次新页面成本（约 3.7 秒），比 `F001` 让用户看到报错好。
    */
+  /**
+   * 产出 captcha param，**并报告本次是否被降级为交互式验证**。
+   *
+   * ## 为什么需要（对齐官方 ZCode 的观测，2026-10-01）
+   *
+   * 官方闭源版对每次产出结果都会区分并上报（`out/renderer/assets/styles-*.js`）：
+   *
+   * ```js
+   * mnn({ result: e ? 'interactive_displayed' : 'traceless_passed', … })
+   * // pnn() 里维护 traceless_passed_count / captcha_displayed_count
+   * ```
+   *
+   * 那是它判断**设备信誉是否在恶化**的手段 —— 而此前我们没有任何这个数，
+   * 排查「为什么突然 502 mint failed」时只能靠猜（这正是本次最缺的东西）。
+   *
+   * ⚠ 与 {@link mint} 的关系：那个是「只要 param」的既有签名（多处调用），
+   * 这个是它的**超集**，内部复用同一条产出路径 —— 不要各写一份。
+   */
+  async mintWithOutcome(
+    config: ZcodeCaptchaConfig = ZCODE_CAPTCHA_FALLBACK,
+    options: { signal?: AbortSignal } = {},
+  ): Promise<CaptchaMintOutcome> {
+    return await this.mintInternal(config, options)
+  }
+
+  /**
+   * 产出 captcha param。
+   *
+   * ## 复用策略（⚠ 空闲失效，见本方法上方的实测表）
+   *
+   * ```
+   * 距上次使用 < idleReuseMs（默认 8s） → 复用（快）
+   * 否则                              → 换新页面（对）
+   * 任一次 mint 失败（F001 等）        → 丢弃页面、换新重试一次
+   * ```
+   *
+   * ⚠ 空闲阈值取 **8 秒**：实测 15 秒已失效，故留一半余量。
+   * 偏保守只会多付一次新页面成本（约 3.7 秒），比 `F001` 让用户看到报错好。
+   */
   async mint(
     config: ZcodeCaptchaConfig = ZCODE_CAPTCHA_FALLBACK,
     options: { signal?: AbortSignal } = {},
   ): Promise<string> {
+    return (await this.mintInternal(config, options)).param
+  }
+
+  /** `mint` / `mintWithOutcome` 的共用实现（**唯一**的产出路径）。 */
+  private async mintInternal(
+    config: ZcodeCaptchaConfig,
+    options: { signal?: AbortSignal },
+  ): Promise<CaptchaMintOutcome> {
     await this.start()
     /**
      * ⚠ 最多两次：第一次用（可能复用的）页面，失败则**丢掉它换新**再试。
@@ -720,9 +837,9 @@ export class ZcodeCaptchaBrowser {
       const forceFresh = attempt > 1
       const page = await this.acquirePage(forceFresh, options.signal)
       try {
-        const param = await this.mintOnPage(page, config)
+        const outcome = await this.mintOnPage(page, config)
         page.lastUsedAt = Date.now()
-        return param
+        return outcome
       } catch (error) {
         lastError = error instanceof Error ? error : new Error(String(error))
         /**
@@ -756,7 +873,7 @@ export class ZcodeCaptchaBrowser {
   }
 
   /** 在**指定页面**上跑一次 captcha（不含页面获取/重试逻辑）。 */
-  private async mintOnPage(page: CaptchaPage, config: ZcodeCaptchaConfig): Promise<string> {
+  private async mintOnPage(page: CaptchaPage, config: ZcodeCaptchaConfig): Promise<CaptchaMintOutcome> {
     // ⚠ 每次重置 DOM（不重置时实测偶发失败）。
     await page.cdp.send('Runtime.evaluate', { expression: buildDomExpression(), returnByValue: true })
 
@@ -777,7 +894,7 @@ export class ZcodeCaptchaBrowser {
     }, 75_000)
 
     const raw = (minted as { result?: { value?: unknown } })?.result?.value
-    let parsed: { stage?: string; param?: string; err?: string }
+    let parsed: { stage?: string; param?: string; err?: string; interactive?: unknown }
     try {
       parsed = JSON.parse(String(raw)) as typeof parsed
     } catch {
@@ -793,7 +910,12 @@ export class ZcodeCaptchaBrowser {
     if (!verdict.ok) {
       throw new Error(`zcode: captcha param 不可用（${verdict.reason ?? '未知'}）`)
     }
-    return parsed.param
+    /**
+     * ⚠ `interactive` 缺失时取 `false`（保守）：我们**只在明确观察到弹窗时**
+     * 才认定被降级。宁可不报（少一次误导性告警），也不要把正常无感通过
+     * 错报成降级 —— 那会让用户以为信誉出了问题而去做无谓处置。
+     */
+    return { param: parsed.param, interactive: parsed.interactive === true }
   }
 
   /**

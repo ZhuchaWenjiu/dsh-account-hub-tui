@@ -5023,3 +5023,379 @@ mint 共用同一页面 —— captcha 是一次性的，必串状态）。
 - captcha 每请求现 mint（约 1.2 秒）**不是**本次卡住的原因：卡住前后的请求都正常，
   且 17:20 那次卡死后 19:59 的 zcode 请求又成功了 —— 若是 `pageBusy` 死锁，
   后续请求会**全部**一起卡。⇒ 别把 `imageUrls`/captcha 配额当成第一嫌疑人。
+
+---
+
+## ⚠️ ZCode 上游节流三件套（吸收自 `dsh-free-glm`，2026-09-30）
+
+**起因**：`dsh-free-glm` 的作者指出我们的瓶颈是「每请求 +1.2s captcha」。
+核对后确认：**这不仅对，而且还有第二处更大的漏算**（见第 4 条）。
+本次把那边已验证的三套机制搬了过来，并顺手补上了 prompt caching 断点。
+
+### 一、captcha **预取池**（`src/captcha-pool.ts`）
+
+**要解决的问题**：`zcode-captcha.ts` 实测「页面空闲 <8s 复用约 0.5 秒，
+更久（实测 15s 必 `F001`）要**新建页面约 3.7 秒**」，而 agent 多步循环的
+两步间隔**通常大于 8 秒** ⇒ 现产路径几乎每步都付建页面的钱。
+
+**关键依据（那边的实测，决定了「能提前产」这件事成立）**：
+
+| 生成后经过 | 使用结果 |
+|---|---|
+| 0 / 10 / 30 / 60 秒 | ✅ 可用 |
+| 120 秒 | ❌ 3007 |
+
+⇒ 「一次性」只指**用一次就作废**，**不指必须立刻用**。
+
+**实现要点（三条都是那边记过的坑）**：
+
+1. **现产之后也要补池**。少了它，首次请求现产后池永远空，优化形同虚设。
+2. **取走即补下一个**（不 await，不阻塞本次请求）。
+3. **预取要 inflight 去重**，否则每轮请求都叠一个预取，白耗 captcha 配额。
+4. ⚠ **`hasFresh()` 必须只读**（本次写单测时实测到的缺陷）：初版实现成
+   「调一次 `takeFresh()` 看结果」，而 `takeFresh()` 会清空池 ——
+   于是**看一眼就把预取好的 param 丢掉了**，池在诊断代码路过时静默失效。
+   修法：拆出 `peekFresh()`（只判不删）+ `takeFresh()`（删）。
+
+**开关**：`DSH_ZCODE_CAPTCHA_POOL=0` 关闭（关闭后与引入池之前逐字一致）；
+`DSH_ZCODE_CAPTCHA_POOL_TTL_MS` 调 TTL（默认 **30 秒** —— 比那边的 45 秒保守，
+因为**我们没有复测过**这个窗口，且两边的产出路径不同：它走壳内 renderer，
+我们走普通 Chromium CDP。若实测无 3007 可放宽）。
+
+**回归**：`tests/unit/captcha-pool.spec.ts`（9 条）。
+反向验证：删掉 `take()` 里现产后的 `prefetch()` ⇒ 第 1 条变红。
+
+### 二、上游**发车闸门**（`src/model-gate.ts`）
+
+**依据（那边分模型实测）**：`429` 里的 `3009 model concurrency limit exceeded`
+是**并发配额**（撞它时 token 还剩 299.4 万），且两个模型窗口明显不同：
+
+```
+GLM-5.3-Flash  605 次 200    0 次限流      ← 从未撞过
+GLM-5.3         74 次 200   21 次重试     6 次最终 429
+```
+
+⇒ **串行**（不重叠）+ **按模型最小间隔**（不挨太近）。加了之后 `3009` 21 → 1 次。
+参数落在 `zcode-product.ts`（`serializeUpstream` / `modelGapMs`：
+`glm-5.3` 350ms、`glm-5.3-flash` 0），**不要在适配器里写死**。
+
+⚠ **闸门只包 fetch，不包 captcha**：那边第一版把 mint 一起放进闸门，
+`mintMs` 从 200-500ms 暴涨到 **2500-3100ms**（变成「排在 N 个人后面再 mint」）。
+
+⚠ 与 `model-queue.ts` 分工不同：那个管**服务端指定的**排队时长（`10605`），
+这个管**客户端自保**的发车节流。
+
+**回归**：`tests/unit/model-gate.spec.ts`（8 条，含「等待期间中断必须生效」——
+否则前面某个请求挂住会把后面全部拖死）。
+
+### 三、额度用尽 / 无权益 → **标记 + 切号**
+
+**两种 429 的处置必须分开**（`isZcodeConcurrencyLimited` / `isZcodeQuotaExhausted`）：
+
+| 形态 | 判据 | 处置 |
+|---|---|---|
+| 并发限流 | `3009` | **退避重试**（`ZCODE.concurrencyRetryMax`=2，1500ms 线性退避），**不换号、不标记** |
+| 额度用尽 | `1005 exceed quota limit` / `1113 余额不足` | **标记该账号+该模型到 UTC+8 当日 24:00**，换下一个账号重发 |
+| 无权益 | **秒回空**（`EMPTY_RESPONSE` 且耗时 < `ZCODE_FAST_EMPTY_MS`=3 秒） | 同上（换号） |
+| 链路卡住 | 慢回空（≈180s） | 重试 / 排查，**不换号**（换号解决不了） |
+
+⚠ **`isZcodeQuotaExhausted` 必须先排除 `3009`** —— 否则会把一个完全可用的账号
+误标成「当日用尽」（与 qoder 那次「把 rate_limit 当 billing」同型）。
+
+⚠ **重试前必须重新 mint captcha**（一次性，沿用旧的必 `3007`）：
+实现上把 `mintCaptcha()` 放在**内层循环第一行**，天然满足。
+
+⚠ **`emitted` 闸**：一旦已向调用方 yield 过内容，就不许再切号/重试
+（否则用户看到两份输出）。HTTP 层错误与空响应都发生在输出之前，不受此限。
+
+⚠ **切号三件事**（与 `qoder-adapter.ts` 同因，缺一即空转）：
+① 标记用的是**局部可变**的 `activeAccountId`（不是回调，回调切号后不跟着变）；
+② 取号必须传 `tried`（池按手动顺序返回，刚失败的账号可能仍排第一）；
+③ `tried` 跨重试保留。回调由 `index.ts` 的 `activeZcodeAccountId` 提供，
+在 `resolveCredential` 里记录**实际返回的那个账号**。
+
+⚠ 无法再切时抛 **`QUOTA_EXCEEDED`**（**不在** harness 的
+`DEFAULT_RETRYABLE_CODES` 里）—— 不能落 `SERVER`，否则「今日额度已用尽」
+这种确定性错误会被白退避重试 5 次（约 15.5 秒）。
+
+**回归**：`tests/unit/zcode-throttle.spec.ts`（13 条：5 条纯函数 + 8 条行为，
+含「3009 不标记账号」「秒回空切号」「已产出内容后不切号」「tried 传下去」）。
+
+### 四、**prompt caching 断点**（本次额外发现的更大瓶颈）
+
+**用户反馈**：`dsh-free-glm` 的作者说我们「每请求 +1.2s」。
+captcha 只解释**一部分**；下面这条解释**每一步**的开销：
+
+`toAnthropicTools()` **从不产出 `cache_control`**，而 `system` 此前**每块都打**
+（3-4 块）—— 正好用满 Anthropic「单请求最多 4 个断点」的预算，
+于是 `tools` 再也打不了点。而 DSH 每步带 24 个工具、约 19KB schema
+（那边 P0-2 的实测原文），**每步全量重算这段 prefill**。
+
+**修法（两处）**：
+
+1. `zcode-identity.ts`：system **只在最后一块**打断点。前缀式缓存语义下，
+   一个位于末块的断点**覆盖面等于（不小于）**每块各打一个；
+   且「调用方 system（DSH 的 AGENTS.md，本仓库数十 KB）必须落在断点内」——
+   只打末块天然满足。
+2. `zcode-adapter.ts` 的 `withToolCacheBreakpoint()`：给**最后一个** tool 打断点
+   （前缀式 ⇒ 覆盖「system + 全部 tools」整段）。总断点数 = 2 ≤ 4。
+
+⚠ **不影响准入**：3012 的判据是身份块的**内容与结构**存在，
+`cache_control` 只是缓存提示。用例断言了「断点总数 ≤ 4」。
+
+**回归**：`tests/unit/zcode.spec.ts` 的「只在最后一块打 cache_control」等 3 条 +
+`zcode-throttle.spec.ts` 的「tools 断点真的进了请求体」。
+
+### 五、额度用尽时**必须说出真实原因**（用户报障，2026-10-01）
+
+**用户看到的原文**：
+
+> 本轮运行失败　`zcode: 模型返回了空响应（无任何 text / thinking / tool 内容）`
+> `EMPTY_RESPONSE`　（并伴随「已重试模型请求 (5/5)」）
+
+**两处都不对**：
+
+| 项 | 问题 |
+|---|---|
+| **文案** | 说的是**现象**（没收到内容），没说**原因**（额度用尽）—— 用户无从判断该等额度、换模型还是加账号 |
+| **错误码** | `EMPTY_RESPONSE` **在** harness 的 `DEFAULT_RETRYABLE_CODES` 里 ⇒ 这种**确定性**错误被白退避重试 5 次（约 15.5 秒，即截图里的 5/5） |
+
+⚠ **这与 qoder「110 额度错误落 `SERVER`」是同型缺陷**：
+**用错误码的默认归类代替了对业务语义的判断**（本文件 qoder 章节记过该教训）。
+
+**上游为什么回「空」而不是报错**：额度耗尽时请求**根本没送达模型**
+（对照那边的实测：`provider runtime headers` 请求从未出现），网关直接回
+**HTTP 200 + 空内容** —— 所以它**看起来**像空响应，实际是权益问题。
+
+**最可惜的地方：判据本来就是现成的**。`isFastEntitlementMiss()` 早就实现了
+「**秒回空**（<3s）= 该账号对该模型无权益」（依据：150-200ms 空响应
+vs 卡住形态的 ≈180000ms），但它此前**只用于决定「要不要切号」**，
+判据本身从未进入文案 —— 于是「无法再切号」那一步抛出的还是通用裸错误。
+
+**修法（`zcode-adapter.ts`）**：「秒回空」且**无法再切号**时 → 抛
+`zcodeEntitlementErrorMessage()` 的文案 + **`QUOTA_EXCEEDED`**
+（不在可重试集合里 ⇒ 立即失败）。
+
+⚠ **文案措辞必须诚实**：不断言是「额度用尽」还是「无权益」—— 两者在 wire 上
+**表现完全相同**（都是秒回空），我们**无法区分**。故写
+「额度已用尽或没有可用权益」并给出两种都能解决的建议。
+
+⚠ **不得在 `zcode-anthropic.ts` 的 SSE 层做这个分类**：那一层**拿不到耗时上下文**
+（它不知道自己跑了多久），若在那里武断报「额度用尽」，**慢回空**那条路径
+（链路故障，该重试）就会被误报成「换账号」。故该层保留通用文案与可重试的
+`EMPTY_RESPONSE`，**分类交给适配器**（它持有 `consumeStartedAt`）。
+
+**回归**：`tests/unit/zcode-throttle.spec.ts` 的
+「额度用尽：文案必须说出真实原因、错误码必须不可重试」段（3 条：
+无账号池时抛 `QUOTA_EXCEEDED` + 文案含真实原因且**不含**那句通用文案 +
+慢回空不得被误判 + 多账号时才提账号数）。
+反向验证：把错误码改回 `EMPTY_RESPONSE` ⇒ 第 1 条变红。
+
+### ⚠ 改完这些要做的两件事（同 zcode 其它改动）
+
+1. **两份 checkout 都要同步**（`D:\jet\code\js\dsh-codearts` 与
+   `D:\jet\code\js\deepseek-harness-codearts`），并各自 `pnpm build:all`。
+2. **必须重启宿主**才生效（插件模块在进程启动时读进内存）。
+
+### 六、会话实证：额度耗尽 + **两个插件抢同一份 captcha 信誉**（2026-10-01）
+
+**用户报障**：zcode 赠送额度用完后，界面报通用的「空响应」；并追问
+「我们哪里设置 zcode 保活频率的？用我们的 zcode 执行任务后用 dsh-free-glm
+执行会碰到错误，似乎我们保活频率太高了」。
+
+#### 6.1 先纠正一个归属：那条 `503 降级冷却` **不是我们抛的**
+
+用户贴的截图里的文案是 **`zcode-bridge:`** 开头 + 「降级冷却 / 连续 5 次失败 /
+约 233 秒后可重试」。两处都对得上 **dsh-free-glm 的桥**：
+
+- 前缀：我们的 provider 报错一律是 `zcode: `；`zcode-bridge:` 是它的 `PROVIDER` 名。
+- 逻辑：`mintBackoffUntilMs` + `noteMintFailure()` + 指数冷却、出口在
+  `dsh-free-glm/patches/zcodeBridgeServer.ts:3151`。
+
+⚠ **顺带回答「滑块要在哪做」**：必须在**开源版实例窗口**里做。
+dsh-free-glm 的桥只认源码检出的 `packages/desktop`（`appDirCandidates()`），
+官方闭源版起不来桥 ⇒ 闭源版窗口**永远不会弹**它那个验证。
+且**冷却期内桥直接返回 503、连 mint 都不发起**（`mintBackoffRemainingMs() > 0`），
+所以要在**冷却结束后**主动发一次对话才会弹滑块。
+
+#### 6.2 但用户的方向**成立**：确实在抢同一份设备信誉
+
+**关键证据（两个 session，同一台机器，时间相差约 1 分钟）**：
+
+| session | provider | 现象 |
+|---|---|---|
+| `session-eced01ed` | **`zcode`（我方）** | 14:26:53 起连续 **12 次**空响应失败（6 请求 × 2 turn），每次重试**都重新 mint 一个 captcha** |
+| `session-b0e4eb3f` | **`zcode-bridge`（dsh-free-glm）** | 开局第 1 步就报 **`502 Failed to mint auth material`** |
+
+⇒ captcha 信誉是**设备级**的（不是按插件算），我们多产的每个 captcha
+都在消耗它的额度。**两个都开着就是在互相抢。**
+
+⚠ **排查可复现**：会话内容在 `~/.dsh/sessions/<工作目录编码>/<session>/session.v4.jsonl.zstd`，
+用 Node 内置 `zlib.zstdDecompressSync` 解压（**无需装 zstd**）。
+字段是 `e.type` / `e.time` / `e.data`，**不是** `kind`/`timestamp` —— 我第一版按
+猜的字段名取时间线，全部取到空值。
+
+#### 6.3 修了什么（三处）
+
+**① 空响应必须说出真实原因**（见上一节）：秒回空 → `QUOTA_EXCEEDED`
++ 「额度已用尽或没有可用权益」。
+
+⚠ **判据用耗时是可行的，但要看对指标**：会话实测**单次请求耗时仅 125ms**
+（`step/start 14:26:53.069` → `attempt .194`），命中 3 秒阈值。
+⚠ 我一度把「重试间隔 6.858s」误当成「单次耗时」而以为修复失效 ——
+**重试间隔 ≠ 单次请求耗时**，两者在日志里长得像（都是相邻 attempt 的时间差）。
+`step/start → assistant/attempt` 的差才是单次耗时。
+
+**② HTTP `body === null` 分支也是同一缺口**（本轮新发现）：
+
+| 形态 | 分支 | 原先 |
+|---|---|---|
+| 200 + 空 SSE 流（0 帧） | `consumeAnthropicSse` 的 `!sawAny` | ① 已覆盖 |
+| 200 + **`body === null`** | `zcode-adapter.ts` 的 `response.body === null` | ❌ 抛裸 `EMPTY_RESPONSE` |
+
+后者**跳过整个 SSE 消费** ⇒ 哪怕 ① 修好，走这条路的用户仍看到通用文案
+且白重试。现已同样改为「先换账号，换不动就 `QUOTA_EXCEEDED` + 真实文案」。
+
+**③ captcha 产出失败退避**（`src/captcha-backoff.ts`，**本轮最重要**）：
+
+此前我们**完全没有**这个机制 —— 额度耗尽时连 mint 12 个 captcha。
+现按那边的做法（阈值 3、首次 1 分钟、指数翻倍、上限 30 分钟）加闸门：
+连续产出失败达阈值后**直接抛错、不再发起 mint**。
+那边的原话：「**继续请求不会让信誉恢复，只会更糟**」。
+
+- ⚠ **`steps` 必须用 `streak - threshold`**：用 `streak` 会让第 3 次失败
+  直接等到 `base × 8`（8 分钟），与「起步 1 分钟」的语义相反（用例守住了）。
+- ⚠ 冷却到点**只清冷却、不清 `streak`**：否则退避重新从 1 分钟起步，
+  达不到「指数」效果。
+- ⚠ **只对「产出失败」计数**（`mintOnPage` 抛错），不对「上游回 `3007`」计数 ——
+  后者归因不清（可能是服务端抖动），记成我们的信誉问题会误伤。
+- ⚠ 闸门放在 `mintCaptcha` 的**取池之前**：这样池的 `prefetch()` 后台路径
+  天然也被挡住，**不需要池自己判断退避**。
+- 关闭：`DSH_ZCODE_CAPTCHA_BACKOFF=0`。
+
+**回归**：`tests/unit/captcha-backoff.spec.ts`（7 条）+
+`zcode-throttle.spec.ts` 新增 2 条（HTTP 空 body 的文案与换账号）。
+反向验证：去掉 `remainingMs()` 的到点清零 ⇒ 「冷却到点后恢复」变红。
+
+#### 6.4 仍未做的两件事（需要用户拍板）
+
+1. **captcha 预取池默认值**：它让 mint 次数**翻倍**（每请求 1 次 + 后台预取 1 次），
+   是**唯一主动加倍**信誉消耗的改动。在信誉紧张的设备上是净负面。
+   建议把 `enabled` 默认值反转为 `false`（保留实现与开关）。
+   ⚠ **已实测存在跨插件干扰，但未实测「预取池是否是压垮信誉的那一下」** ——
+   不要把它当成已证结论。
+2. **持久化 captcha profile**：我们每次 `mkdtempSync` 新建临时 profile
+   （`zcode-captcha.ts:547`），而 dsh-free-glm 用 ZCode 实例的长期 profile
+   ⇒ 它的信誉能跨会话累积，我们不能。**但阿里云的信誉究竟按 IP、
+   按指纹还是两者加权，没有实测过** —— 若是按指纹，独立 profile 反而
+   保护了对方的信誉（各算各的）；若是按 IP，我们就是在直接抢。**结论未定，勿凭推断动手。**
+
+### 七、官方 ZCode 的 captcha 护栏（逆向 `app.asar` 实证，2026-10-01）
+
+**起因**：用户追问「zcode 如果每一步都认证一样也会碰到上限吧，是否它不是
+每步都用一个 captcha」。⇒ 去逆向**官方闭源版**安装目录核实。
+
+#### 7.1 怎么读的（可复现）
+
+官方安装版是 Electron 打包产物，源码在 `app.asar`（312 MB）：
+
+```
+C:\Users\Jet\AppData\Local\Programs\ZCode\resources\app.asar
+```
+
+⚠ **两个读取要点**（都踩过）：
+1. asar 头是 `[u32=4][u32 headerSize][u32 jsonSize][u32 jsonStrSize]`，
+   JSON 表从 **offset 16** 开始、长度 `headerSize - 8`。
+2. ⚠ **JSON 表尾部有填充字节**，直接 `JSON.parse` 会报
+   `Unexpected non-whitespace character after JSON` —— 必须
+   `s.slice(0, s.lastIndexOf('}') + 1)` 再 parse。
+3. 数据区起点 = `16 + jsonLen`；每个文件的 `offset` 是**相对数据区**的。
+
+captcha 代码在 `/out/renderer/assets/styles-*.js`（5.8 MB）——
+与 dsh-free-glm 记录的 `styles-S9_69L9k.js` 同一类产物。
+
+#### 7.2 官方**确实是每请求一个 captcha**——但有三层我们没有的护栏
+
+先回答用户的疑问：**不是复用**。证据：
+- 每个 model request 都走 `Fnn()` → `Mnn()` 重新产出，再经 `lnn()` 注入
+  `X-Aliyun-Captcha-Verify-Param` / `-Region` 两个头。
+- `Snn`（param 表）**只有 `set` / `delete`，没有 `get`** ——
+  它是**诊断记录表**，不是复用缓存。
+
+但官方有三层护栏，**我们此前一条都没有**：
+
+| 机制 | 官方实现（产物里的符号） | 我们此前 |
+|---|---|---|
+| **全局串行队列** | `wnn` promise 链 + `jnn()`，日志 `zcode-plan verification queue slot acquired`。同一刻只产一个 | ❌ 无（DSH 会并发发请求，每个都独立 mint） |
+| **配置 TTL 缓存** | `f3()`：`expiresAt: t + 6e4`（**60 秒**）+ 在飞去重 `d3` | ❌ `index.ts` 用 `??=` 做**永久缓存** |
+| **结果观测** | `mnn({result: 'traceless_passed' \| 'interactive_displayed'})` 上报 ARMS，并维护两个计数 | ❌ 完全没有 |
+
+另有：**超时 120 秒**（`Htn = 12e4`，我们是 75 秒）；
+**重复提交检测**（`Pnn()` 记住上轮 `certifyId`，相同就警告
+`请求可能触发 F008 重复提交` —— 这正是 dsh-free-glm 里 `F008` 的来源）。
+
+#### 7.3 阿里云的限流是**双维度**且有**默认阈值**（官方文档）
+
+用户提供的文档
+（[功能相关问题](https://www.alibabacloud.com/help/zh/captcha/captcha2-0/user-guide/function-related-issues)
+与 [自定义策略](https://www.alibabacloud.com/help/zh/captcha/captcha2-0/user-guide/custom-policy)）：
+
+| 维度 | 默认限制 |
+|---|---|
+| **同设备每小时** | **150 次** ← **最紧的一条** |
+| 同设备每日 | 400 次 |
+| 同 IP 每小时 | 4000 次 |
+| 同 IP 每日 | 10000 次 |
+
+⇒ 文档明确「**基于 IP 或者设备维度**的安全策略阈值」是**两个独立维度、
+共同作用**。**设备维度 150/小时**才是我们真正的约束：
+一次多步任务每步 1 次，**加上我此前默认开启的预取池就是 2 次/步**。
+
+⚠ **这解释了实盘现象**：`session-eced01ed` 那种 246 步的长任务，
+加上 dsh-free-glm 同期在跑，撞穿「设备每小时 150」是**大概率**而非偶然。
+
+#### 7.4 本轮改了什么（四项，全部对齐官方）
+
+1. **预取池默认关闭**（`captcha-pool.ts` 的 `CAPTCHA_POOL_DEFAULT_ENABLED`）。
+   依据：① 官方根本没有预取；② dsh-free-glm 的池默认也是关的
+   （`=1` 才启用，注释「先观察稳定性」）；③ 它让消耗**翻倍**。
+   ⚠ **归因强度**：跨插件干扰有实证，但「预取池是压垮信誉的那一下」**未证实**——
+   翻转的理由是①②，不是把③当结论。
+2. **captcha 产出走全局串行队列**（新增 `serial-queue.ts`，接在
+   `ZcodeAuth.mintCaptcha` 的**取池之前**，故池的 prefetch 后台路径也被挡）。
+3. **captcha 配置改 60 秒 TTL 缓存**（新增 `ttl-cache.ts`，替换
+   `index.ts` 的 `??=` 永久缓存）。⚠ 旧写法还有第二个缺陷：
+   **首次失败会被永久固化**（`??=` 把回退兜底值也记住）。
+4. **观测**（`ZcodeAuth.captchaObservability()`）：计数
+   `tracelessPassed` / `interactiveDisplayed` / `failed`，
+   并在**被要求交互式验证时显式告警**。
+   ⚠ `interactive` 的判据是**轮询 DOM**（`#aliyunCaptcha-window-popup` 等
+   四个 id，取自 dsh-free-glm 的实测记录）——因为官方文档 Q9 明说
+   「该安全策略逻辑**不支持自定义，不对外透出**」，没有回调可用。
+   用「**曾经出现**」而非「此刻存在」：交互元素在验证完成后会被移除，
+   只在 success 那一刻查 DOM 会**漏报**（而那正是最需要知道的场景）。
+
+**回归**：`serial-queue.spec.ts`（13）+ `captcha-backoff.spec.ts`（9）+
+`captcha-pool.spec.ts`（9）+ **`zcode-captcha-guard.spec.ts`（6，接线验证）**。
+⚠ 最后一类**不能省**：本仓库历史上多次栽在「原语写好了但没接上」
+（`zcode-upstream.ts` 的 `fetchImpl` 曾是**死参数**）。
+反向验证：把 `CAPTCHA_POOL_DEFAULT_ENABLED` 改回 `true` ⇒ 池用例变红；
+去掉 `mintCaptcha` 的队列包装 ⇒ 接线用例的 `maxInFlight` 变 3（期望 1）。
+
+⚠ **写这类用例的两个坑**（都踩过）：
+- `ZcodeAuth extends Service`，构造时会调 `ctx.provide(...)` ⇒
+  **必须用真实的 `new Context()`**，手写对象桩会在构造期抛
+  `Cannot read properties of undefined (reading 'provide')`。
+- 测队列时**必须先排除预取池的干扰**（池命中不调底层 mint）——
+  默认已关闭，故天然走现产路径。
+
+#### 7.5 仍未做
+
+- **captcha 超时 75 秒 → 120 秒**（对齐官方 `Htn`）：官方值更长是给了
+  交互式验证（真人拖动）留时间；我们是无感验证，75 秒对**无感**够用。
+  若要支持「降级后让用户手动拖」，才需要调到 120 秒 —— 那是另一个功能。
+- **持久化 profile**：见上一节，结论仍未定。
+- **captcha 配置 TTL 的实盘验证**：60 秒取自官方同值，但我们**没有实测过**
+  服务端配置的实际变化频率。若发现 `sceneId` 变更后仍有延迟，
+  可下调 `CAPTCHA_CONFIG_TTL_MS`。
+

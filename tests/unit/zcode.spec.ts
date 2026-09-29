@@ -264,9 +264,41 @@ describe('ZCode 官方身份块（3012 准入）', () => {
     expect(buildZcodeSystemBlocks('   ', { cwd: '.' })).toHaveLength(3)
   })
 
-  it('每个块都带 cache_control: ephemeral（官方如此）', () => {
+  /**
+   * ★ 断点策略（2026-09-30 调整，此前是「每块都打」）。
+   *
+   * ## 为什么改
+   *
+   * Anthropic 的 prompt caching 是**前缀式**的：一个断点覆盖「它之前的全部内容」，
+   * 故**一个位于最后一块的断点**与「每块各打一个」覆盖面相同。
+   * 而断点有**数量上限（4 个）**：每块都打（3-4 块）会把预算用光，
+   * 于是 `tools` 再也打不了点 —— 而 DSH 每步带 24 个工具、约 19KB schema
+   *（`dsh-free-glm` 的 P0-2 实测）。
+   *
+   * ⇒ 收敛成「只最后一块」，预算留给 `withToolCacheBreakpoint()`。
+   *
+   * 反向验证：改回「每块都打」⇒ 本条变红；同时断点总数会到 4-5 个，
+   * 撞上「最多 4 个」的上限。
+   */
+  it('★ 只在最后一块打 cache_control（断点预算留给 tools）', () => {
     const blocks = buildZcodeSystemBlocks('x', { cwd: '.' })
-    expect(blocks.every((b) => b.cache_control?.type === 'ephemeral')).toBe(true)
+    expect(blocks[blocks.length - 1]?.cache_control?.type).toBe('ephemeral')
+    // 前面的块不再单独打点 —— 前缀式语义下它们的覆盖面已被最后那个包含。
+    expect(blocks.slice(0, -1).every((b) => b.cache_control === undefined)).toBe(true)
+  })
+
+  it('★ system + tools 的断点总数不得超过 Anthropic 的上限（4）', () => {
+    const blocks = buildZcodeSystemBlocks('x', { cwd: '.' })
+    const systemBreakpoints = blocks.filter((b) => b.cache_control?.type === 'ephemeral').length
+    // tools 侧固定 1 个（`withToolCacheBreakpoint` 只给最后一个工具打点）。
+    const toolBreakpoints = 1
+    expect(systemBreakpoints + toolBreakpoints).toBeLessThanOrEqual(4)
+  })
+
+  it('有调用方 system 时断点落在**它**身上（那段最大、最值得缓存）', () => {
+    const blocks = buildZcodeSystemBlocks('MY-CALLER-PROMPT', { cwd: '.' })
+    expect(blocks[blocks.length - 1]?.text).toBe('MY-CALLER-PROMPT')
+    expect(blocks[blocks.length - 1]?.cache_control?.type).toBe('ephemeral')
   })
 
   it('environment 段含工作目录与平台（缺了会让模型用相对路径瞎猜）', () => {

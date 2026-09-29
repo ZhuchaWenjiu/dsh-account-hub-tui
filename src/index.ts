@@ -971,20 +971,40 @@ const zcode = new ZcodeAuth(ctx, { accountPool: pool })
 /**
  * captcha 配置：优先向服务端索取，失败回退内置兜底值。
  *
- * ⚠ 只在**首次需要时**拉一次并缓存（配置很少变），且失败**不阻塞**推理。
+ * ## ⚠ 这里**不再**做缓存（2026-10-01 修正）
+ *
+ * 旧实现是 `??=` 的**永久缓存**，两个缺陷（都已实测确认）：
+ *
+ * 1. **服务端换 `sceneId`／灰度切换后永不生效**（必须重启宿主才能跟上）；
+ * 2. **首次拉取失败会被永久固化** —— `??=` 连「回退到兜底值」这个结果
+ *    一起记住，此后即使服务端恢复也不会重试。
+ *
+ * 正确做法是官方 `f3()` 的语义：**60 秒 TTL + 在飞去重、失败不缓存**。
+ * 那个能力已下沉到 `ZcodeAuth.fetchCaptchaConfig()`
+ *（见其 `captchaConfigCacheInstance`），故这里只做「拿 → 回退」的编排。
  */
-let zcodeCaptchaConfigPromise: Promise<{ region: string; prefix: string; sceneId: string }> | undefined
 const resolveZcodeCaptchaConfig = async (): Promise<{ region: string; prefix: string; sceneId: string }> => {
-  zcodeCaptchaConfigPromise ??= (async () => {
-    const remote = await zcode.fetchCaptchaConfig().catch(() => undefined)
-    if (remote !== undefined) {
-      zcodeAdapter.setCaptchaConfig(remote)
-      return remote
-    }
-    return ZCODE_CAPTCHA_FALLBACK
-  })()
-  return await zcodeCaptchaConfigPromise
+  const remote = await zcode.fetchCaptchaConfig().catch(() => undefined)
+  if (remote !== undefined) {
+    zcodeAdapter.setCaptchaConfig(remote)
+    return remote
+  }
+  return ZCODE_CAPTCHA_FALLBACK
 }
+/**
+ * 「本次 ZCode 请求**实际使用**的账号 id」。
+ *
+ * ## 为什么需要（与 `activeQoderAccountId` 同因）
+ *
+ * 额度受限时适配器要**标记失败的账号**，而它能拿到的只有这个回调。
+ * 池的选号是即时决策，且**切号后回调不会跟着变** —— 若适配器改用
+ * 「池当前的默认账号」，切到 B 之后失败时会**再标记一次 A**，
+ * B 从未被标记，下次取号又把 B 选中，于是在 A/B 之间反复空转
+ * （`qoder-adapter.ts` 的 `switchAccountOnQuota` 注释里记了这条实测）。
+ *
+ * ⇒ 在 `resolveCredential` 里记录**实际返回的那个账号**，供适配器查询。
+ */
+const activeZcodeAccountId = new Map<string, string | undefined>()
 const zcodeAdapter = registerZcodeLlm(ctx, {
   credentialRef: credentialRef(ZCODE.defaultCredentialRef),
   resolveCredential: async (modelId?: string) => {
@@ -999,12 +1019,19 @@ const zcodeAdapter = registerZcodeLlm(ctx, {
      * 与 `ZcodeCredential` 无充分重叠，故经 `unknown` 转换。
      * 运行时安全性由 provider 过滤保证：查询用 `ZCODE.id`，取到的必是 zcode 凭据。
      */
-    if (available) return available.credential as unknown as ZcodeCredential
+    if (available) {
+      // 记下**实际返回的**账号：额度受限时适配器要标记的是它。
+      activeZcodeAccountId.set(ZCODE.id, available.entry.id)
+      return available.credential as unknown as ZcodeCredential
+    }
     /**
      * 账号池里没有条目时，落到 `ZcodeAuth.current()` ——
      * 它已经实现了「插件自存优先 → 官方客户端凭据回退」。
      * ⚠ 不要在这里重复实现那条优先级（重复必然漂移）。
+     *
+     * ⚠ 同时**清空**记录：没有账号条目可标记，留着旧 id 会误伤一个无辜账号。
      */
+    activeZcodeAccountId.set(ZCODE.id, undefined)
     return await zcode.current()
   },
   refresh: async () => {
@@ -1063,6 +1090,13 @@ const zcodeAdapter = registerZcodeLlm(ctx, {
   product: ZCODE,
   // 就绪判据 = 有可用凭据（插件自存或官方客户端凭据）。
   isReady: async () => (await zcode.current()) !== undefined,
+  /**
+   * 额度用尽 / 无权益时，适配器据此**标记失败的账号并切换**。
+   *
+   * 回调的是「本次实际使用的账号」（理由见 `activeZcodeAccountId` 的注释）——
+   * 不要改成 `pool.getAvailableAccount(...)` 之类「再问一次池」的实现。
+   */
+  currentAccountId: () => activeZcodeAccountId.get(ZCODE.id),
 })
 
 

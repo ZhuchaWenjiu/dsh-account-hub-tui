@@ -40,7 +40,11 @@ import {
   type ZcodeCredential,
 } from './zcode.js'
 import { ZCODE, type ZcodeProduct, type ZcodeRemoteModelLike } from './zcode-product.js'
-import { ZcodeCaptchaBrowser, ZCODE_CAPTCHA_FALLBACK } from './zcode-captcha.js'
+import { ZcodeCaptchaBrowser, ZCODE_CAPTCHA_FALLBACK, validateCaptchaParam } from './zcode-captcha.js'
+import { CaptchaPool, captchaPoolConfigFromEnv } from './captcha-pool.js'
+import { CaptchaBackoff, captchaBackoffConfigFromEnv, captchaQueueEnabledFromEnv, CAPTCHA_CONFIG_TTL_MS } from './captcha-backoff.js'
+import { SerialQueue } from './serial-queue.js'
+import { TtlCache } from './ttl-cache.js'
 import { generateDeviceMid, runZcodeLogin } from './zcode-login.js'
 import {
   claimZcodePlan,
@@ -99,6 +103,48 @@ export class ZcodeAuth extends Service {
    * 生命周期由 `stop()` 收尾。
    */
   private captchaBrowser: ZcodeCaptchaBrowser | undefined
+  /**
+   * captcha **预取池**（挂在与浏览器同一个生命周期上）。
+   *
+   * ⚠ 惰性创建：纯插件登录、从不用推理的用户不该为它做任何事。
+   */
+  private captchaPool: CaptchaPool | undefined
+  /**
+   * 最近一次 `mintCaptcha` 用的 captcha 配置。
+   *
+   * 池的 `mint` 回调不带参数（它的语义是「产一个 param」），故配置由这里传递。
+   * 配置来自服务端 `client/configs` 且极少变化，跟着最近一次调用走即可。
+   */
+  private captchaMintConfig: { region: string; prefix: string; sceneId: string } | undefined
+  /**
+   * captcha **产出失败退避**（设备级信誉保护）。
+   *
+   * ⚠ 与 `captchaPool` 不同，它**不惰性创建**：闸门要在第一次
+   * `mintCaptcha` 之前就生效，且构造它无任何副作用。
+   */
+  private readonly captchaBackoff: CaptchaBackoff
+  /**
+   * captcha 产出的**全局串行队列**（对齐官方 `jnn`/`wnn`）。
+   *
+   * ⚠ 必须是**实例字段**：队列靠共享的尾巴指针生效，每次新建等于没有队列。
+   */
+  private readonly captchaQueue: SerialQueue
+  /**
+   * captcha 产出的**观测计数**（对齐官方 `mnn` 的 ARMS 上报思路）。
+   *
+   * 官方把每次结果作为 `traceless_passed` / `interactive_displayed` 上报，
+   * 并维护两个计数器 —— 那是它判断「设备信誉是否在恶化」的手段。
+   * 我们至少要把这两个数**记下来并通过日志暴露**，否则降级发生时
+   * 用户和我们都没有任何趋势可看（这正是这次排查最缺的东西）。
+   */
+  private readonly captchaStats = {
+    /** 无感验证直接通过的次数。 */
+    tracelessPassed: 0,
+    /** 弹出了交互式验证（滑块/拼图）的次数 —— **升高的信号要警惕**。 */
+    interactiveDisplayed: 0,
+    /** 产出失败的次数。 */
+    failed: 0,
+  }
   /** 最近一次失败原因（供 `status()` 暴露给 UI）。 */
   private lastError: string | undefined
 
@@ -109,6 +155,14 @@ export class ZcodeAuth extends Service {
     this.fetchImpl = options.fetchImpl ?? fetch
     this.readCredential = options.readCredential ?? (() => readZcodeCredential())
     this.injectedPool = options.accountPool
+    this.captchaBackoff = new CaptchaBackoff({
+      /**
+       * 阈值与冷却沿用 `dsh-free-glm` 的实测值（同一个上游）。
+       * 关闭方式：`DSH_ZCODE_CAPTCHA_BACKOFF=0`（回到「每次都试」的旧行为）。
+       */
+      ...captchaBackoffConfigFromEnv(),
+    })
+    this.captchaQueue = new SerialQueue({ enabled: captchaQueueEnabledFromEnv() })
   }
 
   /** 凭据 ref 名（供 Jet Hub 展示）。 */
@@ -402,14 +456,46 @@ export class ZcodeAuth extends Service {
   }
 
   /**
-   * 拉取服务端下发的 captcha 配置。
+   * 拉取服务端下发的 captcha 配置（**带 60 秒 TTL 缓存**）。
+   *
+   * ## 为什么要缓存（对齐官方）
+   *
+   * 官方 `f3()` 对 captcha 配置做了 60 秒 TTL 缓存 + 在飞去重
+   *（`out/renderer/assets/styles-*.js` 的 `expiresAt: t + 6e4`）。
+   * 此前我们在 `index.ts` 用 `??=` 做**永久缓存** —— 两个问题：
+   *
+   * 1. **服务端换 `sceneId`／灰度切换后永不生效**（必须重启宿主）；
+   * 2. **首次拉取失败会被永久固化**（`??=` 把失败结果也记住）。
+   *
+   * 现在改成 {@link TtlCache}：60 秒后自动重取，**失败不缓存**。
    *
    * 失败返回 `undefined`，由调用方回退到 `ZCODE_CAPTCHA_FALLBACK`。
    */
   async fetchCaptchaConfig(): Promise<{ region: string; prefix: string; sceneId: string } | undefined> {
-    const credential = await this.current()
-    if (credential === undefined) return undefined
-    return await fetchZcodeCaptchaConfig(credential, this.fetchImpl)
+    /**
+     * ⚠ 缓存的是**配置**而不是「带凭据的请求」：凭据可能变（切号/重新登录），
+     * 故缓存的 `load` 每次都重新解析**当时**的凭据。
+     */
+    return await this.captchaConfigCacheInstance().get()
+  }
+
+  /** captcha 配置缓存（60 秒 TTL，对齐官方 `f3()`）。惰性创建。 */
+  private captchaConfigCache:
+    | TtlCache<{ region: string; prefix: string; sceneId: string } | undefined>
+    | undefined
+
+  private captchaConfigCacheInstance(): TtlCache<
+    { region: string; prefix: string; sceneId: string } | undefined
+  > {
+    this.captchaConfigCache ??= new TtlCache({
+      ttlMs: CAPTCHA_CONFIG_TTL_MS,
+      load: async () => {
+        const credential = await this.current()
+        if (credential === undefined) return undefined
+        return await fetchZcodeCaptchaConfig(credential, this.fetchImpl)
+      },
+    })
+    return this.captchaConfigCache
   }
 
   /** 查额度（Jet Hub 的「余额」用）。 */
@@ -431,22 +517,156 @@ export class ZcodeAuth extends Service {
   }
 
   /**
-   * 产出 captcha param（`ctx.zcodeAuth` 的公开入口，供 RPC 层调用）。
+   * 产出 captcha param（`ctx.zcodeAuth` 的公开入口，供 RPC 层与适配器调用）。
    *
-   * ⚠ 每次调用都产**新的**（一次性）。
-   * 缺浏览器时抛错 —— 调用方（`credits.claimAll`）会把它转成可读的
-   * failed outcome，而不是让整个端点失败。
+   * ## 走**预取池**（2026-09-30 新增）
+   *
+   * 每次请求现产的成本实测 0.5-3.7 秒（页面空闲 <8s 复用约 0.5s，更久则要
+   * 新建页面约 3.7s），而 agent 多步循环的两步间隔通常**大于 8 秒** ——
+   * 也就是说现产路径几乎每步都付新建页面的钱。
+   * {@link CaptchaPool} 把这段成本移到**后台**：上一轮结束时产好下一轮的 param。
+   *
+   * ⚠ 语义没变：池只存**尚未使用**的 param，取走即弃（复用必 `3007`）。
+   *
+   * 关闭方式：`DSH_ZCODE_CAPTCHA_POOL=0`（关闭后行为与引入池之前逐字一致）。
    *
    * ⚠ `options.signal` 会被透传到浏览器侧（取页等待 / 建连超时 / abort）——
    * 推理链路的「停止」能否生效就靠它（真实缺陷，2026-09-29）。
+   *
+   * ## ★ 产出失败会进入**指数退避**（2026-10-01 新增，会话实证驱动）
+   *
+   * `session-eced01ed` 里额度耗尽后连续 **12 次**空响应，而每次重试都重新
+   * mint 一个 captcha —— 在注定失败的情况下白耗 12 个配额，且**扣设备信誉**
+   * （同分钟另一个 session 就报 `502 Failed to mint auth material`）。
+   *
+   * 故这里加闸门：连续产出失败达阈值后，**直接抛错不再发起 mint**
+   * （那边注释原话：「继续请求不会让信誉恢复，只会更糟」）。
+   * 详见 {@link CaptchaBackoff}。
+   *
+   * ## ★★ 产出走**全局串行队列**（2026-10-01 新增，对齐官方）
+   *
+   * 官方闭源版把 captcha 产出链在一条全局 promise 上（`jnn`/`wnn`，
+   * 日志 `zcode-plan verification queue slot acquired`）——
+   * **同一时刻只产一个**。原因是阿里云按**设备维度**限流
+   * （官方文档：同设备每小时 150 次），并发产出是纯浪费。
+   *
+   * 而 DSH 会并发发请求（主回复 + 标题生成 + 压缩），此前每个都独立 mint。
    */
   async mintCaptcha(
     config?: { region: string; prefix: string; sceneId: string },
     options: { signal?: AbortSignal } = {},
   ): Promise<string> {
-    const resolved = config ?? await this.fetchCaptchaConfig() ?? ZCODE_CAPTCHA_FALLBACK
-    this.captchaBrowser ??= new ZcodeCaptchaBrowser()
-    return await this.captchaBrowser.mint(resolved, options)
+    /**
+     * ⚠ 闸门必须在**取池之前**：池的 `prefetch()` 后台路径也走同一个
+     * `mint` 回调，故它天然也被挡住（不需要池自己判断退避）。
+     */
+    const remainMs = this.captchaBackoff.remainingMs()
+    if (remainMs > 0) {
+      throw new Error(
+        `zcode: captcha 产出处于冷却中（连续 ${this.captchaBackoff.failureStreak()} 次失败），` +
+        `约 ${Math.ceil(remainMs / 1000)} 秒后可重试。` +
+        '这通常意味着设备信誉不足（上游把无感验证降级为滑块），' +
+        '继续重试只会让信誉更差 —— 请稍后再试。',
+      )
+    }
+
+    /**
+     * ⚠ 串行队列**包住整个「取配置 + 产出」**，而不是只包浏览器那一跳：
+     * 排队本身要尽早发生，否则 N 个并发调用会各自先把配置拉一遍再排队。
+     *
+     * ⚠ 队列**不吞中断**：等待期间 `signal` 中止会抛 `QueueAbortedError`。
+     */
+    return await this.captchaQueue.run(async () => {
+      const resolved = config ?? await this.fetchCaptchaConfig() ?? ZCODE_CAPTCHA_FALLBACK
+      // 池的 mint 回调不接受参数，故把「本次的 captcha 配置」记在实例字段上。
+      this.captchaMintConfig = resolved
+      return await this.captchaPoolInstance().take(options)
+    }, options)
+  }
+
+  /** 取（并惰性创建）captcha 预取池。 */
+  private captchaPoolInstance(): CaptchaPool {
+    this.captchaPool ??= new CaptchaPool({
+      mint: async (options) => {
+        try {
+          this.captchaBrowser ??= new ZcodeCaptchaBrowser()
+          const outcome = await this.captchaBrowser.mintWithOutcome(
+            this.captchaMintConfig ?? ZCODE_CAPTCHA_FALLBACK,
+            options,
+          )
+          /**
+           * ★ **观测**（对齐官方 `mnn` 的上报口径）：
+           * 记下本次是「无感直接通过」还是「弹了交互式验证」。
+           *
+           * ⚠ `interactiveDisplayed` 的**上升趋势**是设备信誉恶化的先行指标 ——
+           * 而此前我们完全没有这个数，排查时只能靠猜（这正是本次最缺的东西）。
+           */
+          if (outcome.interactive) this.captchaStats.interactiveDisplayed += 1
+          else this.captchaStats.tracelessPassed += 1
+          /**
+           * ⚠ **降级要显式告警**（不能只默默计数）：它意味着上游已把我们
+           * 当风险用户，继续高频请求只会更糟。
+           */
+          if (outcome.interactive) {
+            this.ctx.logger?.warn?.(
+              '[jet-hub] zcode captcha 被要求**交互式验证**（滑块/拼图）—— ' +
+              '设备信誉可能已下降；若频繁出现请降低调用频率或稍后再试。' +
+              `（累计：无感 ${this.captchaStats.tracelessPassed} 次 / ` +
+              `交互 ${this.captchaStats.interactiveDisplayed} 次）`,
+            )
+          }
+          /**
+           * ⚠ **只有真的产出成功才清零**。
+           *
+           * 注意成功在此处、而非在 `take()` 返回时判定：池命中时根本没调
+           * 这个回调，那种情况不该影响信誉计数（它说明本机产出能力正常）。
+           */
+          this.captchaBackoff.noteSuccess()
+          return outcome.param
+        } catch (error) {
+          this.captchaStats.failed += 1
+          const until = this.captchaBackoff.noteFailure()
+          if (until > 0) {
+            this.ctx.logger?.warn?.(
+              `[jet-hub] zcode captcha 连续产出失败 ${this.captchaBackoff.failureStreak()} 次，` +
+              `进入冷却约 ${Math.ceil((until - Date.now()) / 1000)} 秒（期间不再发起 mint）`,
+            )
+          }
+          throw error
+        }
+      },
+      ...captchaPoolConfigFromEnv(),
+      /**
+       * 入池与取出时各校验一次：阿里云 SDK 的**降级产物**看起来像正常返回值，
+       * 但发出去必然 `3007`（那边实测：合法 280 字符 vs 降级约 76 字符）。
+       * 宁可在本地丢掉重产，也不要让它变成用户可见的一次失败。
+       */
+      validate: (param) => validateCaptchaParam(param).ok,
+      onWarn: (message) => this.ctx.logger?.warn?.(message),
+    })
+    return this.captchaPool
+  }
+
+  /**
+   * captcha 产出的**观测快照**（供 Jet Hub / 诊断读取）。
+   *
+   * 对齐官方维护 `traceless_passed_count` / `captcha_displayed_count` 的思路：
+   * 用户与我们都该能看到「无感通过 vs 被要求交互」的比例趋势。
+   */
+  captchaObservability(): {
+    tracelessPassed: number
+    interactiveDisplayed: number
+    failed: number
+    failureStreak: number
+    queuePending: number
+    cooldownRemainingMs: number
+  } {
+    return {
+      ...this.captchaStats,
+      failureStreak: this.captchaBackoff.failureStreak(),
+      queuePending: this.captchaQueue.stats().pending,
+      cooldownRemainingMs: this.captchaBackoff.remainingMs(),
+    }
   }
 
   /**
@@ -700,6 +920,9 @@ export class ZcodeAuth extends Service {
    * （约 200-400MB，且用户没有界面能关掉它）。
    */
   stop(): void {
+    // 池先清空（在飞的预取会随浏览器关闭一起失败，失败已被池吞掉并只记日志）。
+    this.captchaPool?.clear()
+    this.captchaPool = undefined
     this.captchaBrowser?.dispose()
     this.captchaBrowser = undefined
   }

@@ -72,6 +72,47 @@ export interface ZcodeProduct {
    * （版本只是一个头）。
    */
   appVersionFallback: string
+  /**
+   * 上游请求**串行闸门**：同一时刻只允许一个请求发往上游。
+   *
+   * 依据（`dsh-free-glm` 的实测）：上游 `429 code:3009`
+   * （`model concurrency limit exceeded`）是**并发配额**，与剩余 token 无关。
+   * 并发发起必然有一个白撞。
+   */
+  serializeUpstream: boolean
+  /**
+   * 按模型的最小**发车间隔**（毫秒，键为小写模型 id）。
+   *
+   * 串行只保证「不重叠」，不保证「有间隔」—— 相邻两次放行可能只隔几十毫秒，
+   * 仍会撞并发窗口。那边的分模型实测：
+   * `glm-5.3-flash` 605 次 200 / 0 次限流，而 `glm-5.3` 74 次里 21 次限流
+   * ⇒ 两个模型的并发窗口**明显不同**，间隔要分别设（强加给 Flash 是纯损失）。
+   */
+  modelGapMs: Readonly<Record<string, number>>
+  /**
+   * 并发限流（`3009`）时**适配器内**的重试次数上限。
+   *
+   * ⚠ 与「额度类错误」的处理**完全不同**：并发限流等一下就过（重试），
+   * 额度用尽要换账号（见 {@link quotaSwitchMax}）。
+   */
+  concurrencyRetryMax: number
+  /** 并发限流重试的基础退避（毫秒，线性递增：base、2×base、…）。 */
+  concurrencyRetryBaseMs: number
+  /**
+   * 额度类错误（`1005 exceed quota limit` / `1113 余额不足`）时
+   * 最多切换几次账号。
+   *
+   * 取 2 = 「本账号 + 最多再试两个」，避免账号池很大时把整池都标记掉。
+   */
+  quotaSwitchMax: number
+  /**
+   * 是否给 tools 前缀打 **prompt caching 断点**。
+   *
+   * Anthropic 的缓存是**前缀式**的：在最后一个 tool 上打一个断点，
+   * 「system + 全部 tools」整段都进缓存。不打的话，DSH 每步请求都要
+   * 全量重算工具 schema 的 prefill（那边的实测：24 个工具、19492 字节）。
+   */
+  toolCacheBreakpoint: boolean
 }
 
 /**
@@ -195,6 +236,24 @@ export const ZCODE: ZcodeProduct = {
   requestTimeoutMs: 180_000,
   fallbackModels: ZCODE_FALLBACK_MODELS,
   appVersionFallback: ZCODE_APP_VERSION_FALLBACK,
+  /**
+   * 闸门与重试参数**全部照搬 `dsh-free-glm` 的实测值**。
+   *
+   * ⚠ 这些值是在**同一个上游**（`zcode.z.ai` 的免费额度通道）上实测出来的，
+   * 而并发配额是**服务端按模型 + 账号**计量的 —— 与我们走不走壳无关，
+   * 故可以直接沿用。将来若上游调整配额，改这里即可（不要在适配器里写死）。
+   */
+  serializeUpstream: true,
+  modelGapMs: {
+    // 那边实测：GLM-5.3 需要间隔（起步 350ms，21 次限流降到 1 次）。
+    'glm-5.3': 350,
+    // Flash 从未撞过限流 —— 强加间隔是纯粹的性能损失。
+    'glm-5.3-flash': 0,
+  },
+  concurrencyRetryMax: 2,
+  concurrencyRetryBaseMs: 1_500,
+  quotaSwitchMax: 2,
+  toolCacheBreakpoint: true,
 }
 
 /** 全部 ZCode 产品配置（当前只有一个，保留数组以便将来扩展）。 */
