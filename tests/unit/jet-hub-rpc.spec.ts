@@ -1839,12 +1839,17 @@ describe('provider.status / provider.setEnabled 端点', () => {
       // 加 Raccoon（第 9 个）时本地就因此踩过一次：`modelAdapters` 落到 `raccoon`
       // 上 → `listAllModels()` 读不到 → `provider.status` 的 total 恒为 0、
       // 三条用例假失败。改签名后请 `grep -n 'registerJetHubRpc(' tests/` 全部补齐。
+      // ⚠️ 合并上游 `qoderCn`（第 8 个）时**第四次**踩到同一个坑：git 认为本文件
+      // 「无冲突」（改动分散在不同段落），但 `qoderCn` 插入后这里的占位整体错位
+      // 一位 → `modelAdapters` 落到 `raccoon` 上 → 上面那三条用例再次假失败。
+      // **合并新增 provider 后必须重跑本组用例，不能只看 git 是否报冲突。**
       ctx as never, pool,
       {} as never, // codearts
       {} as never, // buddy
       {} as never, // workbuddy
       {} as never, // lobsterai
       {} as never, // qoder
+      {} as never, // qoderCn
       {} as never, // trae
       {} as never, // cline
       {} as never, // loomy
