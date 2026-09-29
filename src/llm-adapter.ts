@@ -11,7 +11,7 @@ import { settingsNamespaceFor } from './settings-compat.js'
 import { isCodeArtsBenefitModel } from './models.js'
 import { normalizeHarnessMessages } from './message-shape.js'
 import { signRequestHuawei } from './sign.js'
-import { createBlankReasoningSuppressor, createReasoningLoopDetector, hasUsableToolName, isReasoningLoopGuardEnabled, isTruncatedArguments, normalizeToolArguments, readWithIdleTimeout, resolveEmptyResponseReason, resolveToolPairing, stripCourseLeakFromHistoryContent, stripCourseLeakIfEnabled } from './sse.js'
+import { createBlankReasoningSuppressor, createReasoningLoopDetector, hasUsableToolName, isReasoningLoopGuardEnabled, isTruncatedArguments, normalizeToolArguments, readWithIdleTimeout, reasoningLoopFailure, resolveEmptyResponseReason, resolveToolPairing, stripCourseLeakFromHistoryContent, stripCourseLeakIfEnabled } from './sse.js'
 import type { CodeArtsCredential } from './types.js'
 
 export const CHAT_API_BASE = 'https://snap-access.cn-north-4.myhuaweicloud.com/api/v2'
@@ -1602,7 +1602,14 @@ export class CodeArtsAdapter extends LlmAdapter {
       ? stripCourseLeakIfEnabled(truncatedText)
       : textBlock !== undefined && textBlock.text !== ''
         ? stripCourseLeakIfEnabled(textBlock.text)
-        : reasoningBlock !== undefined && toolOrder.length === 0 && !reasoningHasDsml ? reasoningText : ''
+        // ⚠️ `!loopDetected` 门禁**不可省**：命中思考死循环时若仍做该回退，
+        // `visible` 会变成那段**被截断的循环垃圾**，于是下面的
+        // `reasoningLoopIsSoleOutput` 判据恒为假 → 永远落回 max-tokens，
+        // 「有分辨力的错误提示」在 codearts 这条路径上**静默失效**。
+        // 且把循环垃圾回填进正文正是本守卫要根除的问题（见上方注释）。
+        : reasoningBlock !== undefined && toolOrder.length === 0 && !reasoningHasDsml && !loopDetected
+          ? reasoningText
+          : ''
     /**
      * 本次响应**实际会发出的 `block-end` 数量**（＝真正落进 assistant 消息的块数）。
      *
@@ -1680,11 +1687,35 @@ export class CodeArtsAdapter extends LlmAdapter {
     // 非 stop —— 否则模型本意调工具、harness 却认为「正常答完了」，
     // 又是一次无报错中断（与 `openai-compat.ts` 同因同修）。
     const droppedUnnamedCalls = [...toolCalls.values()].some(block => !block.announced)
-    const reason = loopDetected
-      // 思考死循环：截断并报可重试。**优先级最高**（高于 tool_calls）——
-      // 循环中生成的工具调用参数不可信；且若无可用调用，落到 `stop` 会让
-      // 任务静默中断。
-      ? { kind: 'max-tokens' as const }
+    /**
+     * 思考死循环是否**是唯一的产出**（无可见正文、无工具调用）。
+     *
+     * ⚠️ 与 `buddy-adapter.ts` / `openai-compat.ts` 同因同修（Gitee !IKIZNK）：
+     * 只有该步没有可见产出时才报 `error` —— `error` 路径**不落
+     * `assistant/message`**（实测 219 会话里 222 例），有可见内容时报它会把内容
+     * 整块丢掉。
+     *
+     * ⚠️ 判据用 `visible`（＝真正会发出去的正文块文本）而**不是** `textBlock`：
+     * 本适配器有「正文为空且无工具调用时用推理文本回填正文」的回退（见下方
+     * `visible` 的定义），该回退会让正文块非空 —— 只看 `textBlock` 会误判成
+     * 「没有可见产出」，于是报 error 把那块回填文本静默丢掉。
+     * 为配合本判据，回退分支也已加上 `!loopDetected` 门禁（见下方注释）。
+     */
+    const reasoningLoopIsSoleOutput = loopDetected
+      && visible === ''
+      && toolOrder.length === 0
+    const reason = reasoningLoopIsSoleOutput
+      // 思考死循环且无可见产出：报**有分辨力的 error**（见 REASONING_LOOP_CODE）。
+      // ⚠️ 不能报 max-tokens —— UI 对它的固定文案是「已达到输出 token 上限」，
+      // 把「检测到死循环」误导成「额度用满」（真实缺陷，Gitee !IKIZNK）。
+      ? { kind: 'error' as const, failure: reasoningLoopFailure(
+          loopGuard?.diagnostics,
+          options.maxTokens,
+          'reasoning',
+        ) }
+      // 循环命中但另有可见产出：只能报 max-tokens（保住内容），不能报 error。
+      : loopDetected
+        ? { kind: 'max-tokens' as const }
       : finishReason === 'length'
         || (droppedUnnamedCalls && toolOrder.length === 0)
         ? { kind: 'max-tokens' as const }

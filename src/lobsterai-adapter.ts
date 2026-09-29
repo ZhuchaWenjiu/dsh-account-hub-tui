@@ -53,7 +53,7 @@ import {
   type LobsteraiErrorKind,
 } from './lobsterai-errors.js'
 import { normalizeHarnessMessages } from './message-shape.js'
-import { createBlankReasoningSuppressor, createReasoningLoopDetector, hasUsableToolName, isProseTruncatedByStopString, isReasoningLoopGuardEnabled, isTruncatedArguments, normalizeToolArguments, readWithIdleTimeout, resolveEmptyResponseReason, resolveToolPairing, splitThinkTaggedContent, stripBareThinkCloseTagIfEnabled, stripCourseLeakFromHistoryContent, stripCourseLeakIfEnabled } from './sse.js'
+import { createBlankReasoningSuppressor, createReasoningLoopDetector, hasUsableToolName, isProseTruncatedByStopString, isReasoningLoopGuardEnabled, isTruncatedArguments, normalizeToolArguments, readWithIdleTimeout, reasoningLoopFailure, resolveEmptyResponseReason, resolveToolPairing, splitThinkTaggedContent, stripBareThinkCloseTagIfEnabled, stripCourseLeakFromHistoryContent, stripCourseLeakIfEnabled } from './sse.js'
 
 /** 本适配器注册的 provider 路由名（历史常量，等价于 `LOBSTERAI.id`）。 */
 export const PROVIDER = 'lobsterai'
@@ -1637,10 +1637,26 @@ export class LobsteraiAdapter extends LlmAdapter {
     const proseCutByStopString = finishReason === 'stop'
       && toolOrder.length === 0
       && isProseTruncatedByStopString(emittedProse)
-    const reason = loopDetected
-      // 思考死循环：截断并报可重试。**优先级最高** —— 循环中生成的工具调用
-      // 参数不可信；且若无可用调用，落到 `stop` 会让任务静默中断。
-      ? { kind: 'max-tokens' as const }
+    /**
+     * 思考死循环是否**是唯一的产出**（无正文、无工具调用）。
+     *
+     * ⚠️ 与 `buddy-adapter.ts` 同因同修（Gitee !IKIZNK）：只有该步没有可见产出
+     * 时才报 `error` —— `error` 路径不落 `assistant/message`，有正文/工具调用时
+     * 报它会把可见内容丢掉。实测守卫命中 25 例全部只有思考。
+     */
+    const reasoningLoopIsSoleOutput = loopDetected
+      && emittedProse === ''
+      && toolOrder.length === 0
+    const reason = reasoningLoopIsSoleOutput
+      // 思考死循环且无可见产出：报有分辨力的 error（不能报 max-tokens，
+      // UI 会误显示「已达到输出 token 上限」）。
+      ? { kind: 'error' as const, failure: reasoningLoopFailure(
+          loopGuard?.diagnostics,
+          options.maxTokens,
+          'reasoning',
+        ) }
+      : loopDetected
+        ? { kind: 'max-tokens' as const }
       : finishReason === 'length'
         || (finishReason === undefined && toolOrder.length > 0)
         || argsTruncated

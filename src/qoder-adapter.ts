@@ -850,6 +850,7 @@ export class QoderAdapter extends LlmAdapter {
           label: 'qoder',
           firstTokenTimeoutMs: resolveFirstTokenTimeoutMs(),
           chunkTimeoutMs: resolveChunkTimeoutMs(),
+          ...options.maxTokens === undefined ? {} : { maxTokens: options.maxTokens },
         },
       )
       const iterator = inner[Symbol.asyncIterator]()

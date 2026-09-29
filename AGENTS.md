@@ -2897,12 +2897,11 @@ Let me write. / Writing. / Go. / OK. / Producing. / Let me output. / Final.
 
 **中断动作**：丢弃后续思考增量 → **`reader.cancel()` 中止上游**（真正止损，见下）
 → 收尾发**截断后的 reasoning block**（保留 `cutAt` 前的干净前缀）
-→ `finish` 报 **`max-tokens`**（标记为不完整，由用户/上层决定是否继续）。
+→ `finish` 报 **`error` + `REASONING_LOOP`**（**有分辨力**，见下节；2026-09-29 改判）。
 
 ⚠️ **「止损」这一步不可省**（终审 C1，已实测）：只跳过**下行**累积/发射、却把流读到底，
 则上游继续生成、**128000 token 照烧**（实测上游 200 帧被读 **200 帧**；守卫在 ~2304
-字符即命中，即 99.5% 额度仍被消耗）。且报障会话的 `turn/end` **本来就是 `max-tokens`**
-（分支前 `finishReason === 'length'` 已报同样 reason）—— 不止损就等于没修。
+字符即命中，即 99.5% 额度仍被消耗）。
 
 四个必须保留的实现要点：
 
@@ -2914,10 +2913,7 @@ Let me write. / Writing. / Go. / OK. / Producing. / Let me output. / Final.
    剩余行（**实测踩过**：五处首次插入全部误落内层，typecheck 与多数用例都不报错，
    只有「同帧 usage」用例抓到）。
    ⚠️ **绝不能 abort `options.signal`** —— 那是**调用方**信号，abort 会被上层报成
-   「用户取消」而非**标记为不完整**的 `max-tokens`（DSH 在 `max-tokens` 时
-   **不自动重试** —— `dsh-agent-loop` 直接 `return {kind:'max-tokens'}`，
-   UI 提示「发送"继续"可让模型接着输出」，即由**用户**决定是否继续）。
-   只 cancel reader。
+   「用户取消」（`aborted`）而非我们想要的 `error`。只 cancel reader。
    ⚠️ `reader.cancel()` 必须 `.catch(() => {})`：连接已断时会抛错，不吞掉会把
    「正常止损」变成一次失败。
    ⚠️ **不得用 `continue`**（Task 2 审查发现、已实测复现）：`continue` 跳过本帧
@@ -2938,6 +2934,158 @@ Let me write. / Writing. / Go. / OK. / Producing. / Let me output. / Final.
 回归用例：`tests/unit/reasoning-loop.spec.ts`（判据）、
 `tests/unit/reasoning-loop-adapter.spec.ts`（各适配器中断行为）；
 fixture 为**真实会话文本**（`tests/fixtures/reasoning-*.txt`）。
+
+#### ⚠️⚠️ 死循环中断**不得复用 `max-tokens`**：必须给有分辨力的错误（Gitee !IKIZNK）
+
+**真实缺陷**（用户报障，2026-09-29）：
+
+> 会话异常问题：**已达到输出 token 上限**回答被截断，已有输出保留在对话中。
+> 发送"继续"可让模型接着输出。
+
+用户的原话点明了性质：
+
+> 如果只是陷入思考循环的出错，就要给出**有分辨力**的错误提示，
+> 现在用「达到输出 token 上限」是**不对**的。
+
+**根因：DSH 客户端对 `max-tokens` 只有一句固定 i18n 文案，且不读适配器的 message。**
+`dsh-client-ui-chat/lib/client.js` 的 `message.maxTokens` / `.hint`：
+
+```
+已达到输出 token 上限 / 回答被截断，已有输出保留在对话中。发送"继续"可让模型接着输出。
+```
+
+⇒ 于是「**检测到死循环并主动止损**」被显示成「**token 用满了**」，
+而那句「发送继续可让模型接着输出」对死循环**恰好是错的建议**。
+
+**全库取证**（219 会话；脚本 `scripts/probe-max-tokens-provenance.mjs`）——
+`finish=max-tokens` 的 35 步里：
+
+| 归因 | 步数 | 占比 |
+|---|---|---|
+| **循环守卫截断**（**不是** token 上限）| **25** | **71%** |
+| 真·烧满额度（`output=32000/64000/128000`）| 5 | 14% |
+| 上游 `length` / 其他折叠 | 5 | 14% |
+
+⚠️ **判据（决定性，不依赖 usage）**：守卫命中时 `block-end` 只发**截断后的前缀**，
+而已流出的 delta 无法撤回 ⇒ **「流出思考总量 − 落块思考量」＝ 被截掉的量**。
+这 25 例的截掉量**恒为 1994~1999 字符**（= `minLoopChars` 默认 2000），
+被截段行去重率 **0.0114~0.0831**（阈值 `<0.35`），内容形如
+`OK. / Hmm. / Hmm. / …`（233× `Hmm.`）、`好。/ 执行。/（写。）/（结束。）`。
+
+⚠️ **这 25 例全部是真循环、零误报** —— 问题**不在判据，在上报方式**
+（脚本 `scripts/probe-loop-truncation-content.mjs` 逐例打印被截原文可复核）。
+
+**更严重的副作用：文案里的建议对死循环无效**（脚本
+`scripts/probe-continue-after-loop.mjs`）：25/25 例守卫命中之后，用户**都**被迫手动介入：
+
+```
+11×  "继续"
+ 9×  "继续上面未完成的任务"
+ 1×  "你陷入思考循环了，醒醒。继续上面未完成的任务"   ← 用户自己诊断出来了
+ 1×  "你的思考陷入死循环了，继续调查上面的问题"       ← 同上
+```
+
+且有会话**反复命中同一守卫**（`session-fa` 4 次、`session-8c` 4 次、`session-27` 3 次）。
+
+##### 修法：改报 `error` + `REASONING_LOOP`，**并带「无可见产出」门禁**
+
+为什么 `error` 能把文案送到用户眼前（两条都是实测/源码依据）：
+
+1. UI 的 `failureMessage()` 只对 `AUTH` / `QUOTA` / `ACCOUNT_QUOTA` /
+   `ACCOUNT_SIGNED_OUT` / `ACCOUNT_SIGN_IN_REQUIRED` 做**文案替换**，
+   **其余码一律原样显示我们的 message**（`dsh-client-ui-chat/lib/client.js`
+   的 `failureMessage`）。这正是用户说的「出错5次重试那里会显示失败原因」那条通道。
+2. UI 读的是 `reason.error`（`client.js` 的 `failureFrom`），而
+   `dsh-llm` 的 `LlmFailure` 形状是 `{message, code, …}` ⇒ **适配器给什么就显示什么**。
+
+⚠️ **但 `error` 路径会丢内容，故必须加门禁**（`dsh-agent-loop/lib/index.js`）：
+
+```js
+if (finish.kind === "error" || finish.kind === "aborted") {
+  live.settle("assistant/attempt", …)   // ← 只落 attempt（UI 不可见）
+  if (action?.kind !== "retry") throw new LlmError(finish.failure.message, …)
+}
+live.settle("assistant/message", …)     // ← error 走不到这里
+```
+
+即 **error 不落 `assistant/message`**，该步已产出内容不进会话历史。
+实测（`scripts/probe-error-finish-content-loss.mjs`）：**351 次 `finish=error` 里
+222 次该步没有 `assistant/message`** ⇒ 内容确实会丢。
+
+⇒ 故判据必须是「**只是**思考循环」（用户原话里的「只是」正是这层门禁）：
+
+| 命中时的产出 | 报什么 | 理由 |
+|---|---|---|
+| **只有思考**（实测 25/25 例都是）| `error` + `REASONING_LOOP` | 可见内容为零，报 error 不丢东西，文案有分辨力 |
+| 还有正文或工具调用 | `max-tokens`（保持原行为）| 报 error 会把可见内容整块丢掉，更糟 |
+
+实现：各适配器算 `reasoningLoopIsSoleOutput = loopDetected && emittedProse === '' && toolOrder.length === 0`。
+⚠️ **codearts（`llm-adapter.ts`）还有一层额外陷阱**：它有「正文为空且无工具调用时
+用**推理文本回填正文**」的 `visible` 回退 —— 回退一生效 `visible !== ''`，
+判据**恒为假**、永远落回误导性的 `max-tokens`（**静默失效**）。
+故该回退必须加 `!loopDetected` 门禁（顺带也修掉了「把循环垃圾回填进正文并持久化」）。
+
+##### 文案三要素（用户明确要求）
+
+用户原话：
+
+> 提示中要加上**当前窗口还有多少可用**，没有真的占满可以尝试继续任务
+
+故 `reasoningLoopFailure()`（`src/sse.ts`）产出：
+
+1. **真实原因**：`模型思考陷入病态重复，已中止本轮（**不是**输出 token 上限）。`
+2. **判据数值**：尾部 N 行里只有 M 行不重复（去重率 x.xxx，阈值 <0.35）、连续循环体量。
+3. **额度实况 + 建议**：`本次思考仅产出约 N 字符（约 K token），额度 L token 中**还剩约 R**（估算值）——额度没有占满，可以直接继续任务。`
+   并附「若继续后再次陷入同一循环，建议降低思考档位或更换模型」。
+
+⚠️ **额度是估算，必须如实标注**：`observedChars` 是**字符数**不是 token 数；
+守卫命中时 `reader.cancel()` 已中止上游，`usage` 帧**往往根本没到达**
+（实测 25 例中 **0 例**带 usage）。故用「约 1 token ≈ 3.5 字符」估算并写明「估算值」。
+系数 3.5 取中文（约 1:1.5~1:2）与英文短句（`OK.`/`Hmm.`，约 1:4~1:5）之间的**保守中值**
+—— 宁可低估剩余额度，也不要让用户以为还有很多而反复撞墙。
+⚠️ **拿不到 `maxTokens` 时不得编造数字**（与 `maxOutputTokens` 那条口径一致）：
+文案退化成「额度没有占满，可以直接继续任务」而不给具体数值。
+故 `ConsumeOpenAiSseOptions` 新增可选的 `maxTokens`，由四个调用方（cline / loomy /
+raccoon / qoder）透传 `options.maxTokens`。
+
+##### `REASONING_LOOP` **刻意不在**可重试集合里
+
+死循环是**确定性**病理（同上下文会稳定复现），若可重试则白退避 5 次
+（500/1000/2000/4000/8000 ≈ 15.5 秒）并**再烧一轮额度**，而每轮可能烧掉几十万 token。
+与 `QUOTA_EXCEEDED` / `PERMISSION_DENIED` 的既有口径一致。
+验证脚本 `scripts/probe-reasoning-loop-retry-codes.mjs`（只读 `dsh-llm` 产物，
+断言 `REASONING_LOOP`/`QUOTA_EXCEEDED`/`PERMISSION_DENIED` **不在**集合里，
+而 `SERVER`/`EMPTY_RESPONSE` **在** —— 后者是对照组，防止「不在」只是解析失败）。
+
+##### 回归与验证
+
+- 回归用例 `tests/unit/reasoning-loop-adapter.spec.ts`（30 条）：其中 4 条新增 ——
+  「文案有分辨力（含否定 token 上限、判据数值、剩余额度）」「拿不到 maxTokens 时不编造数字」
+  「另有工具调用时仍报 max-tokens（不丢内容）」「另有正文时仍报 max-tokens（不丢内容）」。
+- ⚠️ **已做反向验证**（三处变异，各自变红，证明非同义反复）：
+  ① `reasoningLoopIsSoleOutput → false`（退回 max-tokens）→ **6 条**变红；
+  ② 去掉「只是思考循环」门禁（恒为 true）→ **2 条**变红（正是内容保全那两条）；
+  ③ 去掉 codearts `visible` 回退的 `!loopDetected` 门禁 → **5 条**变红。
+- 端到端回放 `scripts/verify-reasoning-loop-error.mjs`：用**真实会话的 wire 分片**
+  （seq=1963，流出思考 57073 / 落块 55084 / 正文块 0 / 工具调用 0）重放，确认产出
+  `error` + `REASONING_LOOP`，文案含「不是 token 上限」「还剩约 111693」。
+- 取证脚本（均只读、离线、零额度）：`probe-max-tokens-provenance.mjs`（归因）、
+  `probe-loop-truncation-content.mjs`（被截原文）、`probe-continue-after-loop.mjs`
+  （用户后续消息）、`probe-guard-hit-block-mix.mjs`（命中时的落块构成）、
+  `probe-error-finish-content-loss.mjs`（error 路径丢内容）。
+
+⚠️ **排查这类问题的两个通用教训**（本缺陷踩过）：
+
+1. **会话日志里的 `data.stream` 是「合并形态」，不是原始 chunk 数组**：
+   形如 `{type:'reasoning-chunks', texts:[…]}` / `{type:'chunk', chunk:{…}}` 混排。
+   按 `item.chunk.type` 统计会**静默得到 0**（合并项没有 `.chunk`）——
+   我第一版探针据此得出「reasoning 帧 = 0」的**假象**。
+   文本量必须从 `texts[]` / `args[]` 累加（见 `probe-stream-shape.mjs`）。
+2. **按 `turn` 聚合会掩盖失败步**：一轮有几十步，前面正常步的 `assistant/message`
+   会让「本轮有内容」恒为真 ⇒ 得到「error 不丢内容」的**假阴性**。
+   必须按 **(turn, step)** 聚合，或直接看 `assistant/attempt` 里那个 `finish` chunk
+   （attempt **只在失败路径落盘**，本身就是「这步曾失败」的指纹）。
+
 
 #### ⚠️ 思考标签泄漏与「引用 `</think>` 导致对话中断」
 

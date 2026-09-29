@@ -45,6 +45,7 @@ import {
   isTruncatedArguments,
   normalizeToolArguments,
   readWithIdleTimeout,
+  reasoningLoopFailure,
   resolveEmptyResponseReason,
   resolveToolPairing,
   splitThinkTaggedContent,
@@ -367,6 +368,13 @@ export interface ConsumeOpenAiSseOptions {
   firstTokenTimeoutMs: number
   /** 两次 chunk 之间的空闲超时（毫秒）。 */
   chunkTimeoutMs: number
+  /**
+   * 本次请求的输出额度（token），用于死循环错误文案里的「还剩多少」。
+   *
+   * ⚠️ **可选，且拿不到时绝不编造数字**（与 `maxOutputTokens` 的口径一致）：
+   * 文案会退化成「额度没有占满，可以直接继续」而不给具体数值。
+   */
+  maxTokens?: number
 }
 
 /**
@@ -1108,10 +1116,41 @@ export async function* consumeOpenAiSse(
     && toolOrder.length === 0
     && isProseTruncatedByStopString(emittedProse)
 
-  const reason = loopDetected
-    // 思考死循环：截断并报可重试。优先级最高 —— 循环中生成的工具调用
-    // 参数不可信，且若无任何可用调用，落到 `stop` 会让任务静默中断。
-    ? { kind: 'max-tokens' as const }
+  /**
+   * 本次思考死循环是否**是唯一的产出**（无正文、无工具调用）。
+   *
+   * ⚠️ 这层门禁**不可省** —— 用户的要求正是「**如果只是**陷入思考循环的出错，
+   * 就要给出有分辨力的错误提示」：
+   *
+   * | 命中时的产出 | 报什么 | 为什么 |
+   * |---|---|---|
+   * | **只有思考**（实测 25/25 例都是这种）| `error` + `REASONING_LOOP` | 可见内容为零，报 error 不丢东西，且文案有分辨力 |
+   * | 还有正文或工具调用 | `max-tokens`（保持原行为）| error 路径**不落 `assistant/message`**，会把用户可见内容整块丢掉 |
+   *
+   * 后一行的代价已实测（`scripts/probe-error-finish-content-loss.mjs`）：
+   * `finish=error` 的步**确实不落 message**（219 会话里 222 例），
+   * 故有可见产出时**绝不能**走 error —— 那会把「文案误导」换成「内容消失」，更糟。
+   */
+  const reasoningLoopIsSoleOutput = loopDetected
+    && emittedProse === ''
+    && toolOrder.length === 0
+
+  const reason = reasoningLoopIsSoleOutput
+    // 思考死循环：报**有分辨力的 error**（见 REASONING_LOOP_CODE 的长注释）。
+    //
+    // ⚠️ **不能报 max-tokens**（真实缺陷，Gitee !IKIZNK）：UI 对 max-tokens 只有
+    // 一句固定文案「已达到输出 token 上限 / 发送"继续"可让模型接着输出」，
+    // 把「检测到死循环」误导成「额度用满」，且建议的「继续」往往立刻再次循环
+    // （实测 25 例全部由用户手动补「继续」，其中 2 次用户自己诊断出「陷入思考循环」）。
+    ? { kind: 'error' as const, failure: reasoningLoopFailure(
+        loopGuard?.diagnostics,
+        config.maxTokens,
+        'reasoning',
+      ) }
+    // 循环命中但**另有可见产出**：只能报 max-tokens（保住内容），
+    // 不能报 error（会丢内容）。见上面 `reasoningLoopIsSoleOutput` 的表格。
+    : loopDetected
+      ? { kind: 'max-tokens' as const }
     : finishReason === 'length'
     || incompleteTools
     || truncatedStream
