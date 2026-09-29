@@ -153,6 +153,26 @@ function makeRpc() {
   return { call, pool, credentials, calls }
 }
 
+/**
+ * 等某账号的登录流程完成（`login.poll` 报 done）或超时。
+ *
+ * ⚠ `account.create` 是**两步式**：立刻返回授权 URL，后台轮询等授权。
+ * 故测试里想「等这次添加真正落地」必须轮询，不能直接断言。
+ */
+async function waitForLogin(
+  call: (method: string, payload: unknown) => Promise<any>,
+  accountId: string,
+  timeoutMs = 10_000,
+): Promise<void> {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    const polled = await call('login.poll', { accountId, provider: ZCODE.id })
+    if (polled.value?.done === true) return
+    await new Promise((r) => setTimeout(r, 200))
+  }
+  throw new Error(`等待登录完成超时（${accountId}）`)
+}
+
 describe('ZCode Jet Hub 登录接入', () => {
   it('★ account.create 返回真实授权 URL（不是 unknown provider）', async () => {
     const { call } = makeRpc()
@@ -254,6 +274,78 @@ describe('ZCode Jet Hub 登录接入', () => {
       await new Promise((r) => setTimeout(r, 300))
     }
     expect(nickname).toBe('ZCode Spec 用户')
+  }, 20_000)
+
+  /**
+   * ★★ 去重的**接线验证**（2026-10-02）。
+   *
+   * ⚠ 为什么单独一条：`zcode-dedup.spec.ts` 测的是**判据本身**
+   * （`findAccountIdByIdentityField`），而这里测的是「**它真的被接进了
+   * 登录流程**」—— 本仓库历史上多次栽在「原语写好但没接上」
+   * （`zcode-upstream.ts` 的 `fetchImpl` 曾是死参数）。
+   */
+  it('★★ 同一账号添加两次：第二条被自动停用，不再重复消耗额度', async () => {
+    const { call, pool } = makeRpc()
+
+    // 第一次添加。
+    const first = await call('account.create', { provider: ZCODE.id })
+    const firstId = first.value.accountId
+    // 等它完成（凭据落盘 = `login.poll` 报 done）。
+    await waitForLogin(call, firstId)
+
+    // 第二次添加**同一个账号**（同一个 user_id = 'spec-user'）。
+    const second = await call('account.create', { provider: ZCODE.id })
+    const secondId = second.value.accountId
+    await waitForLogin(call, secondId)
+
+    // 等后台把第二条标停用。
+    const deadline = Date.now() + 10_000
+    let secondEntry
+    while (Date.now() < deadline) {
+      const accounts = await pool.listAllAccounts()
+      secondEntry = accounts.find((a) => a.id === secondId)
+      if (secondEntry?.enabled === false) break
+      await new Promise((r) => setTimeout(r, 300))
+    }
+
+    /**
+     * ★ 核心断言：第二条被**停用**（⇒ 不参与自动选号，这是去重的实际效果）。
+     *
+     * ⚠ 我们**刻意不删**它：前端 `login.poll` 靠「条目还在 + 凭据已写入」
+     * 判断登录成功，删掉会让它显示成「登录失败」，而事实恰恰相反。
+     */
+    expect(secondEntry?.enabled).toBe(false)
+    expect(String(secondEntry?.nickname)).toContain('重复')
+
+    // 第一条**保持可用**（它的排序/改名/限流记录都不该被牺牲）。
+    const firstEntry = (await pool.listAllAccounts()).find((a) => a.id === firstId)
+    expect(firstEntry?.enabled).toBe(true)
+  }, 30_000)
+
+  it('★ 凭据里带上了 user_id（去重的唯一前提）', async () => {
+    const { call, pool, credentials } = makeRpc()
+    const created = await call('account.create', { provider: ZCODE.id })
+    const accountId = created.value.accountId
+
+    const deadline = Date.now() + 10_000
+    let parsed: Record<string, unknown> | undefined
+    while (Date.now() < deadline) {
+      const entry = (await pool.listAllAccounts()).find((a) => a.id === accountId)
+      if (entry !== undefined) {
+        const stored = await credentials.resolve(entry.credentialRef)
+        if (stored !== undefined) {
+          parsed = JSON.parse(stored.value) as Record<string, unknown>
+          break
+        }
+      }
+      await new Promise((r) => setTimeout(r, 300))
+    }
+
+    /**
+     * ⚠ 此前 `startLogin` 组装凭据时**把 userId 丢掉了** —— 于是无从去重。
+     * 桩响应里 `user.user_id = 'spec-user'`（见文件上方 `makeCtx`）。
+     */
+    expect(parsed?.user_id).toBe('spec-user')
   }, 20_000)
 
   it('★ 授权发起失败时不留「幽灵账号」', async () => {

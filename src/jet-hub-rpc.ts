@@ -1199,9 +1199,64 @@ function registerJetHubEndpoints(
             createdAt: Date.now(),
           })
           started.result.then(async (saved) => {
-            await pool.updateAccount(id, {
-              nickname: `ZCode ${saved.credential.account_label ?? id}`,
-            })
+            /**
+             * ★★ **重复账号去重**（真实缺陷，2026-10-02）。
+             *
+             * ## 为什么必须做
+             *
+             * 同一账号点两次「添加账号」会得到**两条独立条目** ——
+             * 它们各自参与选号、各自消耗额度，而 UI 上看起来像两个账号
+             * （昵称也一样，无从分辨）。此前 `user_id` 甚至**没有被存进
+             * 凭据**，连判据都没有。
+             *
+             * ## 判据必须是 `user_id`，不能用 `device_mid`
+             *
+             * `device_mid` 在插件登录路径下由我们**随机生成**
+             * （`generateDeviceMid()`，实测其值不被服务端绑定校验）——
+             * **同一账号每次重新登录都会变**。拿它判重会把同一账号
+             * 判成不同账号，反而**永远去重不掉**。
+             * `user_id` 是**服务端下发**的稳定标识，才正确。
+             *
+             * ## 时机：必须在**登录成功之后**
+             *
+             * 登录前只有占位条目（无凭据、无 `user_id`），无从判断 ——
+             * 故去重放在这个回调里，不在 `addAccount` 之前。
+             *
+             * ## ⚠ 处置：**不删条目**，而是把它标成**停用**并改名
+             *
+             * 为什么不直接 `removeAccount(id)`：前端 `login.poll` 是靠
+             * 「条目还在 + 凭据已写入」判断登录成功的。
+             * **删掉条目会让它显示成「登录失败」**，而事实恰恰相反
+             * （登录成功了，只是这个账号已存在）—— 那会误导用户去反复重试。
+             *
+             * 停止则该条目：① 仍在列表里（`login.poll` 如实报告成功）；
+             * ② `enabled: false` ⇒ **不参与自动选号**（这是去重的实际效果）；
+             * ③ 昵称写明「重复」⇒ 用户一眼能看出发生了什么、可自行删除。
+             *
+             * ⚠ 保留**原来那条**（`existingId`）继续可用，不动它：它可能
+             * 已被排序、改名或承载限流记录，删它损失更大。
+             */
+            const userId = saved.credential.user_id
+            const label = saved.credential.account_label ?? id
+            if (typeof userId === 'string' && userId.length > 0) {
+              const existingId = await pool.findAccountIdByIdentityField(
+                ZCODE.id,
+                'user_id',
+                userId,
+              )
+              if (existingId.length > 0 && existingId !== id) {
+                ctx.logger.warn(
+                  `[jet-hub] zcode 该账号（user_id=${userId}）已存在于 ${existingId}，`
+                  + `新条目 ${id} 已自动停用（不参与选号）`,
+                )
+                await pool.updateAccount(id, {
+                  nickname: `ZCode ${label}（重复，已停用）`,
+                  enabled: false,
+                })
+                return
+              }
+            }
+            await pool.updateAccount(id, { nickname: `ZCode ${label}` })
           }).catch((error: unknown) => {
             ctx.logger.warn(`[jet-hub] background ${ZCODE.id} login failed for ${id}: ${String(error)}`)
             // 登录失败：移除占位条目，避免留下无凭据的幽灵账号

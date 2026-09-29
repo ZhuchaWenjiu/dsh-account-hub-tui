@@ -259,12 +259,40 @@ describe('ZCode 无实例依赖（核心架构声明）', () => {
   it('refreshAccountCredential 无凭据时如实抛错（不静默成功）', async () => {
     const ctx = makeCtx()
     const auth = new ZcodeAuth(ctx, { readCredential: () => undefined })
-    await expect(auth.refreshAccountCredential('R')).rejects.toThrow(/官方 ZCode 客户端/)
+    /**
+     * ⚠ 文案已随修复调整（2026-10-02）：现在报的是**该账号自己的凭据**不可用，
+     * 而不是「请去官方客户端重新登录」——因为后者会诱导用户去做一件
+     * **无法解决该问题**的事（多账号场景下磁盘凭据只对应一个账号）。
+     */
+    await expect(auth.refreshAccountCredential('R')).rejects.toThrow(/不可用或已损坏/)
   })
 
-  it('refreshAll 是「回写磁盘凭据」而不是续期，且逐账号隔离失败', async () => {
+  /**
+   * ★ 本条在 2026-10-02 被**改写**，因为它此前断言的是**缺陷行为**。
+   *
+   * ## 旧断言（错的）
+   *
+   * ```ts
+   * await auth.refreshAll(pool)   // pool 有两个空 ref 的账号
+   * expect(REF_1).toBe(磁盘凭据)   // ← 断言「都被写入同一份」
+   * expect(REF_2).toBe(磁盘凭据)   // ← 同上
+   * ```
+   *
+   * 测试名写着「逐账号隔离失败」，说明**作者当时就意识到这不隔离**，
+   * 却把它固化成预期。而它正是用户 2026-10-02 报障的根因：
+   * 单账号的磁盘凭据被铺进**每一个**账号条目，抹掉了其余账号的真实凭据。
+   *
+   * ## 新语义（正确）
+   *
+   * ZCode **不可续期**，故 `refreshAll` 做的是**逐账号对账**：
+   * 每个账号读**自己的** ref，能解出就写回自己，解不出就**跳过**。
+   * 它**绝不**使用磁盘凭据去填任意账号 —— 磁盘格式是单账号的，
+   * 无法判断它属于池里哪一个。
+   */
+  it('★ refreshAll 逐账号各写各的：不把磁盘凭据铺进（也不会覆盖）任何账号', async () => {
     const ctx = makeCtx()
     const credential = { zcode_jwt: 'a.b.c', device_mid: 'm' }
+    // 磁盘上有凭据（`readCredential` 是「官方客户端凭据」的读取入口）。
     const auth = new ZcodeAuth(ctx, { readCredential: () => credential })
     const pool = {
       listAccountsByProvider: () => [
@@ -272,9 +300,41 @@ describe('ZCode 无实例依赖（核心架构声明）', () => {
         { id: 'z2', credentialRef: 'REF_2' },
       ],
     } as unknown as AccountPool
+
     await auth.refreshAll(pool)
-    expect((await ctx.credentials.resolve('REF_1' as never))?.value).toBe(JSON.stringify(credential))
-    expect((await ctx.credentials.resolve('REF_2' as never))?.value).toBe(JSON.stringify(credential))
+
+    /**
+     * ★ 两个 ref 都是空的 ⇒ 都必须**保持空**（跳过），
+     * 绝不能被磁盘凭据填上（那是旧行为，也是数据破坏的来源）。
+     */
+    expect(await ctx.credentials.resolve('REF_1' as never)).toBeUndefined()
+    expect(await ctx.credentials.resolve('REF_2' as never)).toBeUndefined()
+  })
+
+  it('★ refreshAll 对「有自己凭据」的账号原样写回自己（不串号）', async () => {
+    const ctx = makeCtx()
+    const credA = { zcode_jwt: 'jwt-A', device_mid: 'mid-A', account_label: 'A' }
+    const credB = { zcode_jwt: 'jwt-B', device_mid: 'mid-B', account_label: 'B' }
+    await ctx.credentials.set('REF_A' as never, JSON.stringify(credA))
+    await ctx.credentials.set('REF_B' as never, JSON.stringify(credB))
+
+    // ⚠ 刻意让「磁盘凭据」是 A —— 旧实现会把它写进 B。
+    const auth = new ZcodeAuth(ctx, { readCredential: () => credA as never })
+    const pool = {
+      listAccountsByProvider: () => [
+        { id: 'a', credentialRef: 'REF_A' },
+        { id: 'b', credentialRef: 'REF_B' },
+      ],
+    } as unknown as AccountPool
+
+    await auth.refreshAll(pool)
+
+    // ★ B 必须仍是 B 自己（旧实现这里会变成 A）。
+    const gotB = JSON.parse((await ctx.credentials.resolve('REF_B' as never))?.value ?? '{}')
+    expect(gotB.zcode_jwt).toBe('jwt-B')
+    expect(gotB.account_label).toBe('B')
+    const gotA = JSON.parse((await ctx.credentials.resolve('REF_A' as never))?.value ?? '{}')
+    expect(gotA.zcode_jwt).toBe('jwt-A')
   })
 })
 

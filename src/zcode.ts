@@ -191,12 +191,41 @@ export interface ZcodeCredential {
   /** ZCode JWT（`zcodejwttoken`）—— 免费额度通道的 `Authorization: Bearer`。 */
   zcode_jwt: string
   /**
-   * 设备标识（`~/.zcode/v2/telemetry-state.json` 的 `deviceMid`）。
+   * 设备标识。
+   *
+   * 插件登录路径下由 `generateDeviceMid()` **自己随机生成**；
+   * 读官方客户端凭据时来自 `~/.zcode/v2/telemetry-state.json` 的 `deviceMid`。
    *
    * ⚠ **必需**：`billing/balance` 等端点缺它会返回
    * `400 {"code":3001,"msg":"parameter error"}`（实测）。
+   *
+   * ⚠⚠ **它不是账号标识，别拿它去重 / 认账号**：
+   * 插件登录时它由我们随机生成（实测其值不被服务端绑定校验），
+   * 同一账号**每次重新登录都会得到一个新值** —— 拿它判「是否同一账号」
+   * 会把同一账号判成不同账号。
    */
   device_mid: string
+  /**
+   * ★ **账号标识**（服务端下发的 `user.user_id`）。
+   *
+   * ## 为什么必须有（真实缺陷，2026-10-02）
+   *
+   * 它是**唯一**能判断「两条账号记录是不是同一个账号」的稳定标识 ——
+   * 但此前 `startLogin` 组装凭据时**把它丢掉了**（`loginResult.userId`
+   * 从未被搬进 credential），于是**无从去重**：同一账号点两次
+   * 「添加账号」就得到两条，两条各自消耗额度。
+   *
+   * ⚠ 与 `device_mid` 的关键差异（**别混用**）：
+   *
+   * | 字段 | 来源 | 同一账号多次登录 |
+   * |---|---|---|
+   * | `device_mid` | **我们随机生成** | **会变**（不可作标识） |
+   * | `user_id` | **服务端下发** | **不变**（正确的标识） |
+   *
+   * ⚠ 早期登录的凭据里**没有**这个字段 —— 读取时按 `undefined` 处理，
+   * 去重逻辑必须容忍缺失（回退或放弃去重，**不能报错**）。
+   */
+  user_id?: string
   /** 大模型 access token（`oauth:bigmodel:access_token`），备用身份。 */
   bigmodel_access_token?: string
   /** Coding Plan api-key（zai 侧），仅 ultra 通道需要。 */

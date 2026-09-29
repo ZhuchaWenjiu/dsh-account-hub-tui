@@ -533,6 +533,46 @@ export class AccountPool {
     }
   }
 
+  /**
+   * 按凭据里的**任意身份字段**查找同 provider 的已有账号。
+   *
+   * ## 与 {@link findAccountIdByCredential} 的区别
+   *
+   * 那个是**限流记录归属**专用，写死了「codearts 用 access_key_id、
+   * 其余用 access_token」两套字段名，且**只看已启用账号**。
+   * 本方法是**通用去重**用：调用方给字段名与值，且**不看 `enabled`** ——
+   * 停用的账号同样占着一个条目的位置，重复添加它仍是重复。
+   *
+   * ## 为什么必须容忍「字段缺失」
+   *
+   * 早期登录的凭据里可能**没有**该字段（例如 zcode 的 `user_id` 是
+   * 2026-10-02 才补上的）。此时**跳过该条目**（视为「无法判断」），
+   * 而不是把它当成「不匹配」或直接报错 —— 前者会漏判，
+   * 后者会让老用户根本添加不了账号。
+   *
+   * @param provider - provider id（如 `zcode`）。
+   * @param field - 凭据里用作身份判据的字段名（如 `user_id`）。
+   * @param identity - 要比对的值（空串直接返回 `''`，调用方据空串放弃去重）。
+   * @returns 匹配到的账号 id；无匹配返回空串。
+   */
+  async findAccountIdByIdentityField(
+    provider: string,
+    field: string,
+    identity: string,
+  ): Promise<string> {
+    if (identity.length === 0) return ''
+    for (const entry of this.readAccounts()) {
+      if (entry.provider !== provider) continue
+      const resolved = await this.resolveCredentialByRef(entry.credentialRef)
+      if (resolved === undefined) continue
+      const value = resolved[field]
+      // ⚠ 缺失该字段 ⇒ 无法判断，**跳过**（不是「不匹配」）。
+      if (typeof value !== 'string' || value.length === 0) continue
+      if (value === identity) return entry.id
+    }
+    return ''
+  }
+
   /** 按 id 查找账号条目（含已停用账号）。 */
   findAccount(id: string): ProviderAccountEntry | undefined {
     return this.readAccounts().find(a => a.id === id)

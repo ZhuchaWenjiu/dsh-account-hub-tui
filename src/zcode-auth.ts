@@ -383,6 +383,17 @@ export class ZcodeAuth extends Service {
          * 只需**稳定**（生成后持久化在凭据里，登录一次就固定）。
          */
         device_mid: generateDeviceMid(),
+        /**
+         * ★ **必须搬 `userId`**（真实缺陷，2026-10-02）。
+         *
+         * 它是**唯一**稳定的账号标识（服务端下发），也是「同一个账号
+         * 被添加两次」的**唯一**可靠判据。此前这一跳把它丢了，
+         * 于是无法去重 —— 同一账号点两次「添加账号」就得到两条。
+         *
+         * ⚠ 不要改用 `device_mid` 做判据：那是我们**随机生成**的，
+         * 同一账号重新登录会变（见 `zcode.ts` 的字段注释）。
+         */
+        ...loginResult.userId.length > 0 ? { user_id: loginResult.userId } : {},
         bigmodel_access_token: loginResult.bigmodelAccessToken,
         account_label: loginResult.displayName,
         app_version: options.appVersion ?? this.product.appVersionFallback,
@@ -847,51 +858,128 @@ export class ZcodeAuth extends Service {
   /**
    * 账号卡片「刷新」按钮。
    *
-   * ⚠ ZCode **不可续期**（凭据是静态的，没有 refresh 端点）——
-   * 但这个方法**仍要做实事**：重新解密磁盘凭据并回写，
-   * 使用户在官方客户端重新登录后点一下就能生效。
+   * ## ⚠⚠ 这里曾经有一个**数据破坏缺陷**（真实缺陷，2026-10-02）
    *
-   * 与 `LoomyAuth.refreshAccountCredential` 同型（那边是「探测有效性」）。
+   * **用户报障**：「登录了 2 个账号（两个不同微信各自收到 bigmodel 登录通知），
+   * 第二个账号有余额，但插件刷新积分显示 0，发消息报『额度已用尽』，
+   * 而 IDE 里同一个账号发消息能收到回复」。
+   *
+   * **根因**：本方法与 {@link refreshAll} 都拿 `this.current()` 的结果
+   * **无条件写回目标 ref** —— 而 `current()` 只返回**第一个凭据可用的账号**。
+   * 于是账号 A 的凭据被写进账号 B 的 ref，**B 的原始凭据被永久覆盖**。
+   *
+   * **实测证据**（用户机器 `~/.dsh/.credentials.yaml`）：两个条目的
+   * `zcode_jwt` 的 sha256、`device_mid`、`account_label`（同一昵称）、
+   * `bigmodel_access_token` **全部逐字节相同** —— 同一个账号占了两条。
+   * 用户确认「是两个不同微信账号」，故**只能是覆盖所致**。
+   *
+   * ⚠ **此处刻意不写真实值**：ref 名会暴露账号编号、昵称是用户的微信账号名、
+   * `device_mid` 是设备标识。需要复核时从本机凭据自行取。
+   *
+   * **症状为何那么像服务端问题**：IDE 用自己那份真实凭据（B）→ 正常；
+   * 插件池里两条都是 A → A 已耗尽 → 报额度用尽。
+   *
+   * ## 修法：**绝不跨账号写**
+   *
+   * ZCode **不可续期**（凭据是静态的，没有 refresh 端点），所以「刷新」
+   * 唯一正确的语义是：**重新解析该账号自己的 ref，再写回它自己**
+   * （用于「用户在别处更新了这个账号的凭据」这种情形）。
+   * 与 `BuddyAuth.refreshAll` 的做法一致（那边也是逐账号读自己的 ref）。
+   *
+   * ⚠ 传了 `refName` 就**只动那一个 ref**；没传才回退到当前账号自己的 ref。
+   * 无论如何**不会**拿到 A 的凭据去写 B。
    */
   async refreshAccountCredential(
     refName: string,
     pool?: AccountPool,
     accountId?: string,
   ): Promise<void> {
+    /**
+     * ⚠ 用**目标账号自己的** ref 重新解析凭据，而不是 `current()`。
+     *
+     * `current()` 的语义是「池里第一个可用账号」，与「要刷新的那个账号」
+     * 可能**不是同一个** —— 这正是那个数据破坏缺陷的成因。
+     */
+    const own = await this.readCredentialFromRef(refName as CredentialRef)
+    if (own !== undefined) {
+      await this.ctx.credentials.set(refName as CredentialRef, JSON.stringify(own))
+      return
+    }
     void pool
     void accountId
-    const credential = await this.current()
-    if (credential === undefined) {
-      throw new Error(
-        'ZCode 凭据不可用，请先在官方 ZCode 客户端重新登录' +
-        '（本插件读取 ~/.zcode/v2/credentials.json）。',
-      )
-    }
-    await this.ctx.credentials.set(refName as CredentialRef, JSON.stringify(credential))
+    /**
+     * 该 ref 自己解析不出凭据（未配置/损坏/被清空）。
+     *
+     * ## ⚠ 这里**刻意不做**「用磁盘凭据补上」的兜底（虽是旧行为）
+     *
+     * 旧实现拿 `current()` 写进来，**副作用**是「该账号凭据损坏时会被
+     * 别的账号填上」—— 那正是本次数据破坏的成因。而「用**官方客户端磁盘
+     * 凭据**补上」听起来像合理的兜底，实际**不可实施**：
+     *
+     * 磁盘 `~/.zcode/v2/credentials.json` 是**单账号**格式，而池是**多账号**的
+     * —— 我们**无法判断**那份磁盘凭据属于池里的**哪一个**账号。
+     * 拿它去补任意一个条目，等于重犯同一个错误（只是换成「单体覆盖」）。
+     *
+     * ⇒ 如实报错，让用户重新登录该账号。这是**唯一**不会造成数据破坏的选项。
+     */
+    throw new Error(
+      `ZCode 账号（${refName}）的凭据不可用或已损坏，请重新登录该账号` +
+      '（本插件不会用其它账号的凭据覆盖它）。',
+    )
   }
 
   /**
    * 批量续期（定时调度器调用）。
    *
-   * ⚠ ZCode **不可续期** —— 这里做的是「把磁盘上的最新凭据回写到
-   * 每个账号的 ref」，这样用户在官方客户端重新登录后，定时器
-   * 会自动把新凭据铺开到所有账号条目。
+   * ## ⚠⚠ 这里曾经是**跨账号覆盖**的第二个入口（真实缺陷，2026-10-02）
+   *
+   * 旧实现：
+   * ```ts
+   * const credential = await this.current()          // ← 只取「第一个可用账号」
+   * for (const account of accounts) {
+   *   await set(account.credentialRef, credential)   // ← 覆盖**每一个**账号
+   * }
+   * ```
+   * 于是 30 分钟一轮的定时器会把账号 A 的凭据**铺满整个池**，
+   * 抹掉其余账号的真实凭据（详见 {@link refreshAccountCredential} 的实测证据）。
+   *
+   * 旧注释的本意是「用户在官方客户端重新登录后，新凭据能铺开到所有条目」——
+   * 那个前提在**多账号池**下是**错的**：磁盘凭据只对应**一个**账号。
+   *
+   * ## 正确做法：逐账号、各写各的
+   *
+   * ZCode **不可续期**，故这里没有「续期」动作；做的是**逐账号对账**：
+   * 每个账号重新解析**自己的** ref，能解出就写回自己（规范化字段），
+   * 解不出就**跳过并告警**（不填别人的凭据）。
    *
    * ⚠ **只按 `refreshable` 过滤、不看 `enabled`**（`AGENTS.md` 既有约定：
    * 停用只影响自动选号，与凭据新鲜度无关）。
    */
   async refreshAll(pool: AccountPool): Promise<void> {
-    const credential = await this.current()
-    if (credential === undefined) return
     const accounts = pool.listAccountsByProvider(this.product.id)
     for (const account of accounts) {
+      const ref = account.credentialRef as CredentialRef
       try {
-        await this.ctx.credentials.set(
-          account.credentialRef as CredentialRef,
-          JSON.stringify(credential),
-        )
+        /**
+         * ⚠ **读该账号自己的 ref**（不是 `current()`）——这是本方法的关键。
+         */
+        const own = await this.readCredentialFromRef(ref)
+        if (own === undefined) {
+          /**
+           * ⚠ **跳过，而不是用别的账号填它**。
+           *
+           * 旧实现会在这里用 `current()` 覆盖 ⇒ 破坏该账号的真实凭据。
+           * 现在的选择是「什么都不做 + 留一条可排查的日志」——
+           * 数据完整性优先于「把字段补齐」。
+           */
+          this.ctx.logger?.warn?.(
+            `[jet-hub] zcode 账号 ${account.id} 的凭据不可用（跳过，不会用其它账号覆盖）`,
+          )
+          continue
+        }
+        await this.ctx.credentials.set(ref, JSON.stringify(own))
       } catch {
-        // 单个账号失败不影响其余。
+        // 单个账号失败不影响其余（与 BuddyAuth.refreshAll 同语义）。
       }
     }
   }
