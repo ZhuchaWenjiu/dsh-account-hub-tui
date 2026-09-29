@@ -33,12 +33,18 @@ import { credentialRef } from '@deepseek-ai/dsh-credentials'
 import { createUserMessage, LlmError } from '@deepseek-ai/dsh-llm'
 import { BuddyAdapter } from './buddy-adapter.js'
 import { LobsteraiAdapter } from './lobsterai-adapter.js'
+import { QoderAdapter } from './qoder-adapter.js'
+import { ClineAdapter } from './cline-adapter.js'
 import { TraeAdapter } from './trae-adapter.js'
 import { CodeArtsAdapter, isRateLimited, parseRateLimitError } from './llm-adapter.js'
 import { productById } from './product.js'
 import { lobsteraiProductById } from './lobsterai-product.js'
+import { qoderProductById } from './qoder-product.js'
+import { clineProductById } from './cline-product.js'
 import type { BuddyCredential } from './buddy.js'
 import type { LobsteraiCredential } from './lobsterai.js'
+import type { QoderCredential } from './qoder.js'
+import type { ClineCredential } from './cline.js'
 import type { TraeCredential } from './trae.js'
 import type {
   CodeArtsCredential,
@@ -60,10 +66,16 @@ const TRAE_PROVIDER_ID = 'trae'
 /**
  * 探测可能涉及的凭据联合类型。
  *
- * 提为具名别名而非在各处重复四元联合：新增 provider 时只需改这一处，
- * 避免签名与实现漂移（本文件已两次因「分派表没跟上新增 provider」出缺陷）。
+ * 提为具名别名而非在各处重复多元联合：新增 provider 时只需改这一处，
+ * 避免签名与实现漂移（本文件已三次因「分派表没跟上新增 provider」出缺陷）。
  */
-type ProbeCredential = CodeArtsCredential | BuddyCredential | LobsteraiCredential | TraeCredential
+type ProbeCredential =
+  | CodeArtsCredential
+  | BuddyCredential
+  | LobsteraiCredential
+  | QoderCredential
+  | ClineCredential
+  | TraeCredential
 
 /** 探测请求的提示语（与 e2e 探针保持一致，最大化可比性）。 */
 const PROBE_PROMPT = '只回答两个字：收到'
@@ -177,27 +189,46 @@ async function probeWithAdapter(
   // refresh 设为 no-op：探测不应触发全局续期流程（那会影响其他账号与
   // 其他并发会话），凭据真的过期就让它以 AUTH 失败并如实上报。
   //
-  // **四条产品线各自选适配器**，顺序不能颠倒也不能漏判：
+  // **六条产品线各自选适配器**，顺序不能颠倒也不能漏判：
   // - CodeBuddy 系（buddy / workbuddy）→ BuddyAdapter，按各自 product 发请求；
   // - LobsterAI → LobsteraiAdapter（自己的端点与头族）；
+  // - Qoder 系（qoder / qodercn）→ QoderAdapter（WASM 加密体 + 签名头族）；
+  // - Cline → ClineAdapter（WorkOS 凭据 + 自己的端点）；
   // - TRAE → TraeAdapter（SOLO 格式请求体 + Cloud-IDE-JWT 头族）；
   // - 其余（codearts）→ CodeArtsAdapter（华为云 HMAC 签名）。
   //
-  // ⚠️ **这个分派表已两次因「新增 provider 没同步」而出缺陷**，改它前先读完：
+  // ⚠️ **这个分派表已三次因「新增 provider 没同步」而出缺陷**，改它前先读完：
   //
   // 1. 初版只判断 `provider === 'buddy'` → workbuddy 落入 else，用华为云
   //    HMAC 签名去发 WorkBuddy 凭据而必然失败；
   // 2. 加了 lobsterai 分支后**仍漏掉 trae** → TRAE 账号同样落入 else，
   //    用 CodeArts 签名发 TRAE 请求而必然失败（2026-09-25 排查 workbuddy
   //    缺陷时发现，实测 `productById('trae')` 与 `lobsteraiProductById('trae')`
-  //    均为 undefined）。
+  //    均为 undefined）；
+  // 3. 加了 trae 分支后**仍漏掉 qoder / qodercn / cline** → 三者同样落入
+  //    else，被交给 CodeArtsAdapter 用华为云 HMAC 签名去发 Qoder / Cline
+  //    凭据。它们的「重测 / 重置」按钮**确实会渲染**（`RATE_LIMIT_CAPABILITIES`
+  //    对未登记的 provider 默认视为有限流，只有 loomy 显式登记为 false），
+  //    且 Qoder 的额度受限**每次都会**写 `modelRateLimits`（按 UTC+8 当日
+  //    24:00 标记），于是「点重测 → 拿到签名错误 → 标记也清不掉」成为稳定
+  //    可复现的死循环。
   //
   // 判据是「**该 provider 会不会写 `modelRateLimits`**」—— 写了才会有重测
-  // 按钮，才需要在这里分派。新增 provider 时务必同步本分支，
+  // 按钮，才需要在这里分派。当前会写的有：codearts / buddy / workbuddy /
+  // lobsterai / qoder / qodercn / trae / cline（只有 loomy **不写**，它的积分
+  // 耗尽时静默降级，前端也因此不渲染重测按钮）。新增 provider 时务必同步本分支，
   // 并补 `tests/unit/account-probe-adapter.spec.ts` 的对应用例。
   const buddyProduct = productById(entry.provider)
   const lobsteraiProduct = lobsteraiProductById(entry.provider)
-  let adapter: BuddyAdapter | LobsteraiAdapter | TraeAdapter | CodeArtsAdapter
+  const qoderProduct = qoderProductById(entry.provider)
+  const clineProduct = clineProductById(entry.provider)
+  let adapter:
+    | BuddyAdapter
+    | LobsteraiAdapter
+    | QoderAdapter
+    | ClineAdapter
+    | TraeAdapter
+    | CodeArtsAdapter
   if (buddyProduct !== undefined) {
     adapter = new BuddyAdapter({
       credentialRef: ref,
@@ -211,6 +242,24 @@ async function probeWithAdapter(
       resolveCredential: async () => credential as LobsteraiCredential,
       refresh: async () => {},
       product: lobsteraiProduct,
+    })
+  } else if (qoderProduct !== undefined) {
+    // Qoder 国际版与中国版**共用同一个适配器类**，差异全在 product 配置里
+    // （区域端点、client_id、模型表）。探测只发一次最小纯文本请求，不涉及
+    // 工具/图片，故除了 product 之外无需注入其它钩子；`uid` 由凭据自身携带
+    // （旧凭据缺 uid 时适配器会明确报错，而不是发出必然失败的请求）。
+    adapter = new QoderAdapter({
+      credentialRef: ref,
+      resolveCredential: async () => credential as QoderCredential,
+      refresh: async () => {},
+      product: qoderProduct,
+    })
+  } else if (clineProduct !== undefined) {
+    adapter = new ClineAdapter({
+      credentialRef: ref,
+      resolveCredential: async () => credential as ClineCredential,
+      refresh: async () => {},
+      product: clineProduct,
     })
   } else if (entry.provider === TRAE_PROVIDER_ID) {
     // TRAE 只有一个产品（`TRAE` 常量），没有 productById 式的查表，

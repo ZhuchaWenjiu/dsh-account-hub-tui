@@ -10,7 +10,7 @@
  * 真实但**在本文件内不会被构造** —— 若缺陷复发，workbuddy 分支会构造真实
  * CodeArtsAdapter 并发起网络请求，测试随即失败。
  */
-import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { LlmError } from '@deepseek-ai/dsh-llm'
 import type { ProbePool } from '../../src/account-probe.js'
 import type { ProviderAccountEntry } from '../../src/types.js'
@@ -48,6 +48,29 @@ vi.mock('../../src/trae-adapter.js', () => {
     }
   }
   return { TraeAdapter: MockTraeAdapter }
+})
+
+vi.mock('../../src/qoder-adapter.js', () => {
+  /**
+   * Qoder 的桩：记录构造与 `stream()` 入参。
+   *
+   * ⚠️ 这里**不用真实适配器**（与下面 Cline 那条用例的取舍不同）：Qoder 的推理
+   * 请求必须由内嵌 WASM 生成加密体与签名头（`src/qoder-wasm.ts`），单测里跑不通
+   * 真实链路，故只能以「构造了哪个适配器、带了哪份产品配置」作为判据。
+   */
+  class MockQoderAdapter {
+    static readonly instances: Array<{ product?: { id: string; encryptedInferBase: string } }> = []
+    static readonly streamOptions: Array<{ system?: string; messages?: unknown }> = []
+    constructor(options: { product?: { id: string; encryptedInferBase: string } }) {
+      MockQoderAdapter.instances.push(options)
+    }
+    // eslint-disable-next-line require-yield
+    async *stream(options: { system?: string; messages?: unknown }): AsyncGenerator<never> {
+      MockQoderAdapter.streamOptions.push(options)
+      throw new LlmError('频率限制', 'RATE_LIMIT')
+    }
+  }
+  return { QoderAdapter: MockQoderAdapter }
 })
 
 /**
@@ -110,6 +133,40 @@ async function codeartsInstances(): Promise<unknown[]> {
     CodeArtsAdapter: { instances: unknown[] }
   }
   return mod.CodeArtsAdapter.instances
+}
+
+/** 取 Qoder 桩的构造记录。 */
+async function qoderInstances(): Promise<Array<{ product?: { id: string; encryptedInferBase: string } }>> {
+  const mod = await import('../../src/qoder-adapter.js') as unknown as {
+    QoderAdapter: { instances: Array<{ product?: { id: string; encryptedInferBase: string } }> }
+  }
+  return mod.QoderAdapter.instances
+}
+
+/**
+ * 桩掉全局 `fetch` 并记录每次调用的 URL 与 init。
+ *
+ * 用途：**Cline 那条用例用真实 `ClineAdapter`**（它只需一次普通 HTTPS 请求，
+ * 单测里能跑通），从而可以断言「请求实际发往哪个 host、带的是哪一族请求头」——
+ * 这比「构造了哪个类」更贴近缺陷本身（用华为云 HMAC 签名去发 Cline 凭据）。
+ *
+ * ⚠️ 探测路径构造适配器时**不注入** `fetchImpl`，故适配器取的是全局 `fetch`，
+ * 必须在 `retestAccount` 之前把它替换掉，否则用例会真的发网络请求。
+ */
+function stubFetch(): Array<{ url: string; headers: Record<string, string> }> {
+  const calls: Array<{ url: string; headers: Record<string, string> }> = []
+  vi.stubGlobal('fetch', async (input: RequestInfo | URL, init?: RequestInit) => {
+    calls.push({
+      url: String(input),
+      headers: (init?.headers ?? {}) as Record<string, string>,
+    })
+    // 一律回 429：探测的结论是「仍受限」，但关键在于是**谁**把请求发到了**哪里**。
+    return new Response('{"error":"rate limit exceeded"}', {
+      status: 429,
+      headers: { 'content-type': 'application/json' },
+    })
+  })
+  return calls
 }
 
 function makeEntry(overrides: Partial<ProviderAccountEntry>): ProviderAccountEntry {
@@ -251,6 +308,124 @@ describe('account-probe 适配器选择 · TRAE 不得落入 CodeArts 分支', (
     expect(await codeartsInstances()).toHaveLength(1)
     expect(await traeInstances()).toHaveLength(0)
     expect(await adapterInstances()).toHaveLength(0)
+  })
+})
+
+/**
+ * 回归：**Qoder 系（qoder / qodercn）与 Cline 不得落入 CodeArts 分支**。
+ *
+ * ## 真实缺陷（本分派表第三次复发）
+ *
+ * 前两次是 `workbuddy` 与 `trae`（见上文两节）。补上 trae 之后，分支里仍缺
+ * `qoder` / `qodercn` / `cline` —— 三者一路落到 `else`，被交给
+ * `CodeArtsAdapter`（华为云 `SDK-HMAC-SHA256` 签名 + 华为云端点）去发
+ * Qoder / Cline 的凭据，探测**必然失败**。
+ *
+ * 与 workbuddy / trae 那两次不同的是，这三个 provider 的失败是**用户可见
+ * 且必然触发**的：
+ *
+ * - `RATE_LIMIT_CAPABILITIES` 对未登记的 provider **默认视为有限流**（刻意的，
+ *   避免新增 provider 时凭空丢掉按钮），故它们的「重测 / 重置」按钮**确实会渲染**；
+ * - 且 Qoder 的额度受限**每次都会**写 `modelRateLimits`（按 UTC+8 当日 24:00
+ *   标记该模型），于是「点了重测 → 报签名错误 → 标记还在」成为稳定可复现的死循环。
+ *
+ * ⚠️ 这三个 provider 的查表函数**本来就存在**（`qoderProductById` 一份覆盖
+ * 国际版与 CN、`clineProductById`），只是没被接上 —— 与 trae「压根没有查表
+ * 函数、只能按 provider id 特判」不同，所以修复只需接线，不需要新增数据。
+ */
+describe('account-probe 适配器选择 · qoder / qodercn / cline 不得落入 CodeArts 分支', () => {
+  beforeEach(async () => {
+    ;(await adapterInstances()).length = 0
+    ;(await streamOptions()).length = 0
+    ;(await traeInstances()).length = 0
+    ;(await traeStreamOptions()).length = 0
+    ;(await codeartsInstances()).length = 0
+    ;(await qoderInstances()).length = 0
+  })
+
+  afterEach(() => {
+    vi.unstubAllGlobals()
+  })
+
+  /**
+   * 断言里带上「产品配置指向哪个 host」：Qoder 国际版与 CN **共用同一个适配器类**，
+   * 只断言「构造了 QoderAdapter」无法发现「两站配置接反」——那会让请求打到错的
+   * 区域端点（`api2.qoder.sh` ↔ `gateway.qoder.com.cn`）。
+   */
+  it.each([
+    { provider: 'qoder', credentialRef: 'QODER_ACCOUNT_TEST', expectedHost: 'api2.qoder.sh' },
+    { provider: 'qodercn', credentialRef: 'QODERCN_ACCOUNT_TEST', expectedHost: 'gateway.qoder.com.cn' },
+  ])('$provider 账号走 QoderAdapter 而非 CodeArtsAdapter，且产品指向 $expectedHost', async ({ provider, credentialRef, expectedHost }) => {
+    // 即便缺陷复发（错误地走了真实 CodeArts 链路）也不该发出真实网络请求 ——
+    // CodeArtsAdapter 已被上面的 vi.mock 换成桩，这里再兜一层。
+    const calls = stubFetch()
+    const { retestAccount } = await import('../../src/account-probe.js')
+    const id = `${provider}-1`
+    const result = await retestAccount(makePool([makeEntry({ id, provider, credentialRef })]), id)
+
+    // 仍受限（桩抛限流错误），但关键在于是**由 QoderAdapter** 发起的
+    expect(result.tested).toBe(1)
+    expect(result.stillLimited).toHaveLength(1)
+
+    const qoder = await qoderInstances()
+    expect(qoder).toHaveLength(1)
+    expect(qoder[0]?.product?.id).toBe(provider)
+    expect(new URL(qoder[0]!.product!.encryptedInferBase).host).toBe(expectedHost)
+    // 核心断言：**没有**构造 CodeArtsAdapter（否则就是用华为云签名发 Qoder 请求）。
+    expect(await codeartsInstances()).toHaveLength(0)
+    // 桩适配器在构造后立刻抛错，故不该有任何真实请求发出。
+    expect(calls).toHaveLength(0)
+  })
+
+  /**
+   * Cline 这条用**真实 `ClineAdapter`**（只把全局 `fetch` 换掉），直接断言
+   * 「请求发往哪里、带哪一族头」—— 这正是缺陷的判据：
+   * 缺陷下请求会带着 `Authorization: SDK-HMAC-SHA256 …` 去华为云
+   * `snap-access.cn-north-4.myhuaweicloud.com`。
+   */
+  it('cline 账号走 ClineAdapter：请求发往 api.cline.bot 且绝无华为云 HMAC 签名头', async () => {
+    const calls = stubFetch()
+    const { retestAccount } = await import('../../src/account-probe.js')
+    const result = await retestAccount(makePool([makeEntry({
+      id: 'cline-1',
+      provider: 'cline',
+      credentialRef: 'CLINE_ACCOUNT_TEST',
+    })]), 'cline-1')
+
+    expect(result.tested).toBe(1)
+    expect(result.stillLimited).toHaveLength(1)
+
+    expect(calls).toHaveLength(1)
+    const url = new URL(calls[0]!.url)
+    expect(url.host).toBe('api.cline.bot')
+    expect(url.pathname).toBe('/api/v1/chat/completions')
+
+    const headers = calls[0]!.headers
+    // Cline 的头族：`Bearer workos:` 前缀令牌 + 产品的客户端标识头。
+    expect(headers.Authorization).toBe('Bearer workos:AT')
+    expect(headers['X-CLIENT-TYPE']).toBe('cline-sdk')
+    // 核心断言：**没有**华为云 SDK-HMAC-SHA256 签名头族。
+    const flat = Object.entries(headers).map(([key, value]) => `${key}: ${value}`).join('\n')
+    expect(flat).not.toContain('SDK-HMAC-SHA256')
+    expect(flat).not.toContain('SignedHeaders')
+
+    expect(await codeartsInstances()).toHaveLength(0)
+    expect(await qoderInstances()).toHaveLength(0)
+  })
+
+  it('codearts 账号仍然走 CodeArtsAdapter（else 分支没有被改坏）', async () => {
+    const calls = stubFetch()
+    const { retestAccount } = await import('../../src/account-probe.js')
+    await retestAccount(makePool([makeEntry({
+      id: 'ca-1',
+      provider: 'codearts',
+      credentialRef: 'CODEARTS_ACCOUNT_TEST',
+    })]), 'ca-1')
+
+    expect(await codeartsInstances()).toHaveLength(1)
+    // 反向对照：codearts 不该被分派给 Qoder / Cline 的链路。
+    expect(await qoderInstances()).toHaveLength(0)
+    expect(calls).toHaveLength(0)
   })
 })
 
