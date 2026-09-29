@@ -247,14 +247,14 @@ const STYLES = `
 .dim-jh-modalActions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 14px; }
 
 /* ── Cline「订阅额度」弹窗（官方额度窗口 + 请求记录）── */
-/* 账号块：每个账号独立一块 —— 多账号下必须一眼分清读数属于谁。 */
-.dim-jh-quotaAccounts { display: flex; flex-direction: column; gap: 12px; margin: 4px 0 8px; }
-.dim-jh-quotaAccount { border: 1px solid var(--dsw-alias-border-l2, #e5e5e5); border-radius: 8px; padding: 10px 12px; }
-.dim-jh-quotaAccountHead { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; margin-bottom: 8px; }
-.dim-jh-quotaAccountHead strong { min-width: 0; overflow: hidden; font-size: 13px; color: var(--dsw-alias-label-primary, #1f2329); text-overflow: ellipsis; white-space: nowrap; }
-/* 失败原因：必须允许换行 —— 网关文案较长，nowrap 会把它撑出弹窗
-   （与请求记录表格那次「429 文案把表格撑出横向滚动」同因）。 */
-.dim-jh-quotaAccountError { flex: 0 1 auto; min-width: 0; font-size: 12px; line-height: 17px; color: #d93025; word-break: break-word; }
+/* 账号翻页器:⚠️ **一次只看一个账号**(参考实现同款,多账号全铺开会让
+   额度卡与记录表都极长);额度窗口与请求记录**共享同一个索引**。 */
+.dim-jh-quotaPager { display: flex; align-items: center; gap: 10px; margin: 4px 0 12px; }
+.dim-jh-quotaArrow { flex: none; min-width: 30px; padding: 3px 8px; font-size: 14px; line-height: 18px; }
+.dim-jh-quotaAccountName { flex: 1 1 auto; min-width: 0; overflow: hidden; font-size: 13px; font-weight: 600; color: var(--dsw-alias-label-primary, #1f2329); text-overflow: ellipsis; white-space: nowrap; }
+.dim-jh-quotaIndex { flex: none; font-size: 11px; font-variant-numeric: tabular-nums; color: var(--dsw-alias-label-tertiary, #8f959e); }
+/* 当前账号查询失败的原因:必须允许换行 —— 网关文案较长,nowrap 会把它撑出弹窗。 */
+.dim-jh-quotaAccountError { margin: 0; font-size: 12px; line-height: 17px; color: #d93025; word-break: break-word; }
 .dim-jh-quotaNoWindow { margin: 0; font-size: 12px; color: var(--dsw-alias-label-tertiary, #8f959e); }
 .dim-jh-quotaWindows { display: flex; flex-direction: column; gap: 10px; margin: 0; padding: 0; list-style: none; }
 .dim-jh-quotaWindow { display: flex; flex-direction: column; gap: 4px; }
@@ -272,10 +272,17 @@ const STYLES = `
 .dim-jh-quotaReset { font-size: 11px; color: var(--dsw-alias-label-tertiary, #8f959e); }
 /* 请求记录区：与额度区用上边框分开 */
 .dim-jh-quotaLog { margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--dsw-alias-border-default, #e5e5e5); }
-.dim-jh-quotaSectionTitle { margin: 0 0 8px; font-size: 13px; font-weight: 600; color: var(--dsw-alias-label-primary, #1f2329); }
-.dim-jh-quotaAccountTabs { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 10px; }
-.dim-jh-quotaTab { max-width: 180px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.dim-jh-quotaLogAccount { margin: 0 0 10px; font-size: 12px; color: var(--dsw-alias-label-secondary, #555); }
+.dim-jh-quotaSectionTitle { margin: 0 0 4px; font-size: 13px; font-weight: 600; color: var(--dsw-alias-label-primary, #1f2329); }
+/* 说明「记录是本地流水」的提示:让用户知道重启会清空,而不是丢数据。 */
+.dim-jh-quotaLogHint { margin: 0 0 8px; font-size: 11px; line-height: 16px; color: var(--dsw-alias-label-tertiary, #8f959e); }
+/* token 用量:输入 + 输出分开展示 —— 合计会在「缓存命中/思考」上失真
+   (openai-compat 的 inputTokens 已剔除缓存命中部分);思考 token 另起一行。 */
+.dim-jh-quotaTokens { display: block; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.dim-jh-quotaTokenDetail { display: block; font-size: 11px; color: var(--dsw-alias-label-tertiary, #8f959e); white-space: nowrap; }
+/* 失败行:错误消息**随行**展示(colSpan 横跨数据列),整行用危险色区分
+   —— 收进 tooltip 用户永远看不到。 */
+.dim-jh-quotaTable tr[data-error="true"] td { color: #d93025; }
+.dim-jh-quotaError { font-size: 11.5px; line-height: 17px; word-break: break-word; }
 /* 表格容器：窄面板下横向滚动，而不是把列压到不可读。
    ⚠️ 溢出必须落在**这个容器**上；让表格自己溢出会把弹窗整体撑宽。 */
 .dim-jh-quotaTableWrap { overflow-x: auto; margin-bottom: 10px; }
@@ -294,7 +301,6 @@ const STYLES = `
 /* 上游/模型族另起一行:它与模型名是两个维度,拼在一起会让
    「同名不同上游」的行无法区分。 */
 .dim-jh-quotaModelType { display: block; font-size: 11px; color: var(--dsw-alias-label-tertiary, #8f959e); word-break: break-word; }
-.dim-jh-quotaLogError { margin: 0 0 10px; font-size: 12px; line-height: 17px; color: #d93025; word-break: break-word; }
 `
 
 let injected = false

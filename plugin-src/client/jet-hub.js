@@ -1095,6 +1095,25 @@ function formatTokenCount(value) {
   return Math.round(value).toLocaleString('zh-CN');
 }
 
+/** 毫秒 → 「320ms」/「4.2s」（≤1s 用毫秒，否则一位小数的秒）。 */
+function formatMs(ms) {
+  if (!Number.isFinite(ms) || ms <= 0) return '—';
+  if (ms < 1000) return `${Math.round(ms)}ms`;
+  return `${(ms / 1000).toFixed(1)}s`;
+}
+
+/**
+ * 延迟列：参考实现是**首块耗时与总延迟并列**（`time-to-first-chunk beside
+ * total latency`）—— 首块解释「多久才出字」，总延迟解释「这一笔一共多久」，
+ * 两个数回答的是不同的问题，缺一个都解释不了「感觉慢」。
+ */
+function formatLatency(ttftMs, totalMs) {
+  const parts = [];
+  if (Number.isFinite(ttftMs) && ttftMs > 0) parts.push(`首块 ${formatMs(ttftMs)}`);
+  if (Number.isFinite(totalMs) && totalMs > 0) parts.push(`共 ${formatMs(totalMs)}`);
+  return parts.length > 0 ? parts.join(' · ') : '—';
+}
+
 /**
  * 「订阅额度」面板：官方额度窗口 + 请求记录。
  *
@@ -1119,15 +1138,26 @@ function ClineQuotaPanel({ rpcCall, onClose }) {
   const mounted = React.useRef(true);
   React.useEffect(() => () => { mounted.current = false; }, []);
 
-  // 额度：每个账号一条读数。
+  // 额度：**每个账号一条读数，一次性全部取回** —— 所以翻页是纯本地操作，
+  // 切账号时额度区零延迟（参考实现同款：「箭头不随数据禁用」）。
   const [quota, setQuota] = React.useState([]);
   const [quotaPhase, setQuotaPhase] = React.useState('loading');
   const [quotaError, setQuotaError] = React.useState('');
 
-  // 请求记录：一次只看一个账号（与参考实现的「一次一个账号」一致）。
-  const [logAccountId, setLogAccountId] = React.useState('');
+  /**
+   * 浏览位置：**额度窗口与请求记录共享同一个索引** —— 切到谁，
+   * 两个区域就一起看到谁（用户要求的「统一切换」）。
+   *
+   * ⚠️ 参考实现踩过的坑：这个索引是纯本地状态，**不要用 useEffect 播种**
+   * （账号列表一到就 setXxx(0)）—— 那会让「浏览位置」与「显示的是谁」
+   * 在两次渲染之间短暂分叉。这里只在渲染期**纯计算**出当前账号，
+   * 越界时钳制但**不回写**（账号恢复后还能回到原位）。
+   */
+  const [viewIndex, setViewIndex] = React.useState(0);
+  /** 「重新读取记录」的触发器：刷新额度时一并重读当前账号的记录。 */
+  const [logNonce, setLogNonce] = React.useState(0);
+
   const [rows, setRows] = React.useState([]);
-  const [nextToken, setNextToken] = React.useState(undefined);
   const [logPhase, setLogPhase] = React.useState('idle');
   const [logError, setLogError] = React.useState('');
 
@@ -1140,9 +1170,6 @@ function ClineQuotaPanel({ rpcCall, onClose }) {
       const list = Array.isArray(res?.accounts) ? res.accounts : [];
       setQuota(list);
       setQuotaPhase('ready');
-      // 默认选中第一个账号；**只在尚未选择时**设置 —— 刷新额度不该把
-      // 用户正在翻看的那个账号的请求记录切走。
-      if (list.length > 0) setLogAccountId(prev => prev || list[0].accountId);
     } catch (caught) {
       if (!mounted.current) return;
       console.error('[jet-hub] load cline quota failed:', caught);
@@ -1153,22 +1180,14 @@ function ClineQuotaPanel({ rpcCall, onClose }) {
 
   React.useEffect(() => { void loadQuota(); }, [loadQuota]);
 
-  const loadLog = React.useCallback(async (accountId, cursor) => {
-    setLogPhase(cursor === undefined ? 'loading' : 'more');
+  const loadLog = React.useCallback(async (accountId) => {
+    setLogPhase('loading');
     setLogError('');
     try {
-      const res = await rpcCall('cline.requestLog', {
-        provider: 'cline',
-        accountId,
-        ...cursor === undefined ? {} : { cursor },
-      });
+      const res = await rpcCall('cline.requestLog', { provider: 'cline', accountId });
       if (!mounted.current) return;
-      const batch = Array.isArray(res?.rows) ? res.rows : [];
-      setRows(prev => (cursor === undefined ? batch : [...prev, ...batch]));
-      // 空串游标等同于「没有下一页」——否则会渲染出一个点了没反应的按钮。
-      setNextToken(typeof res?.nextToken === 'string' && res.nextToken.length > 0 ? res.nextToken : undefined);
-      // ⚠️ 端点把失败作为载荷回报，故这里必须判 `ok`。
-      if (res?.ok === false) setLogError(res.error || '请求记录查询失败');
+      // 记录是**本地流水**（一次性返回，无分页），整体替换。
+      setRows(Array.isArray(res?.rows) ? res.rows : []);
     } catch (caught) {
       if (!mounted.current) return;
       console.error('[jet-hub] load cline request log failed:', caught);
@@ -1178,18 +1197,24 @@ function ClineQuotaPanel({ rpcCall, onClose }) {
     }
   }, [rpcCall]);
 
-  // 切换账号 → 丢掉旧账号的行，重新读第一页。
-  React.useEffect(() => {
-    if (logAccountId === '') return;
-    setRows([]);
-    setNextToken(undefined);
-    void loadLog(logAccountId, undefined);
-  }, [logAccountId, loadLog]);
+  /** 当前浏览的账号：**渲染期纯计算**，越界钳制但不回写索引（见上）。 */
+  const viewAccount = quota.length > 0
+    ? quota[Math.min(viewIndex, quota.length - 1)]
+    : undefined;
+  const viewAccountId = viewAccount?.accountId ?? '';
 
-  const accountLabelOf = (id) => {
-    const entry = quota.find(q => q.accountId === id);
-    return entry?.nickname || id;
+  /** 箭头翻页：⚠️ **环绕** —— 末个账号的右箭头回第一个，否则用户会以为「后面没了」。 */
+  const stepView = (delta) => {
+    if (quota.length === 0) return;
+    setViewIndex(prev => ((prev + delta) % quota.length + quota.length) % quota.length);
   };
+
+  // 切到谁就拉谁的记录（额度区零延迟，只有这里需要网络）。
+  // ⚠️ 依赖是 accountId 与 logNonce：点「刷新」时额度与记录一起重读。
+  React.useEffect(() => {
+    if (viewAccountId === '') return;
+    void loadLog(viewAccountId);
+  }, [viewAccountId, logNonce, loadLog]);
 
   const renderQuota = () => {
     if (quotaPhase === 'loading' && quota.length === 0) {
@@ -1203,119 +1228,164 @@ function ClineQuotaPanel({ rpcCall, onClose }) {
     if (quota.length === 0) {
       return React.createElement('div', { className: 'dim-jh-empty' }, '尚未配置账号');
     }
-    return React.createElement('div', { className: 'dim-jh-quotaAccounts' },
-      quota.map(entry => React.createElement('div', {
-        key: entry.accountId,
-        className: 'dim-jh-quotaAccount',
-      },
-        React.createElement('div', { className: 'dim-jh-quotaAccountHead' },
-          React.createElement('strong', null, entry.nickname || entry.accountId),
-          entry.ok
-            ? null
-            : React.createElement('span', { className: 'dim-jh-quotaAccountError' },
-                entry.error || '额度查询失败')),
-        // ⚠️ 「查询失败」与「没有额度窗口」必须区分渲染：前者是错误（显示原因），
-        // 后者是事实（该账号没有这一层计量）。合并成一句会让用户以为额度没了。
-        entry.ok
-          ? (entry.windows.length === 0
-              ? React.createElement('p', { className: 'dim-jh-quotaNoWindow' }, '该账号没有额度窗口')
-              : React.createElement('ul', { className: 'dim-jh-quotaWindows' },
-                  entry.windows.map((win, index) => {
-                    const tone = quotaTone(win.percentUsed);
-                    const clamped = Number.isFinite(win.percentUsed)
-                      ? Math.min(100, Math.max(0, win.percentUsed))
-                      : 0;
-                    return React.createElement('li', {
-                      // key 用「类型 + 下标」：网关万一重复下发同一类型，
-                      // 只用 type 会触发 React 的重复 key 警告（参考实现在
-                      // 这里踩过一次，见其 `399bbe1` 提交的措辞）。
-                      key: `${win.type}-${index}`,
-                      className: 'dim-jh-quotaWindow',
+    const entry = viewAccount;
+    if (entry === undefined) return null;
+    // 账号翻页器:⚠️ **一次只看一个账号**(参考实现同款,多账号下全铺开会让
+    // 额度卡与记录表都变得极长);单账号时不渲染箭头(无处可去)。
+    const pager = React.createElement('div', { className: 'dim-jh-quotaPager' },
+      quota.length > 1
+        ? React.createElement('button', {
+            className: 'dim-jh-btn dim-jh-quotaArrow',
+            title: '上一个账号',
+            'aria-label': '上一个账号',
+            onClick: () => stepView(-1),
+          }, '‹')
+        : null,
+      React.createElement('strong', { className: 'dim-jh-quotaAccountName' },
+        entry.nickname || entry.accountId),
+      quota.length > 1
+        ? React.createElement('span', { className: 'dim-jh-quotaIndex' },
+            `${viewIndex + 1} / ${quota.length}`)
+        : null,
+      quota.length > 1
+        ? React.createElement('button', {
+            className: 'dim-jh-btn dim-jh-quotaArrow',
+            title: '下一个账号',
+            'aria-label': '下一个账号',
+            onClick: () => stepView(1),
+          }, '›')
+        : null);
+    return React.createElement('div', null,
+      pager,
+      // ⚠️ 「查询失败」与「没有额度窗口」分开渲染：前者是错误（显示原因），
+      // 后者是事实（该账号没有这一层计量）。合并成一句会让用户以为额度没了。
+      entry.ok
+        ? (entry.windows.length === 0
+            ? React.createElement('p', { className: 'dim-jh-quotaNoWindow' }, '该账号没有额度窗口')
+            : React.createElement('ul', { className: 'dim-jh-quotaWindows' },
+                entry.windows.map((win, index) => {
+                  const tone = quotaTone(win.percentUsed);
+                  const clamped = Number.isFinite(win.percentUsed)
+                    ? Math.min(100, Math.max(0, win.percentUsed))
+                    : 0;
+                  return React.createElement('li', {
+                    // key 用「类型 + 下标」：网关万一重复下发同一类型，
+                    // 只用 type 会触发 React 的重复 key 警告（参考实现在
+                    // 这里踩过一次，见其 `399bbe1` 提交的措辞）。
+                    key: `${win.type}-${index}`,
+                    className: 'dim-jh-quotaWindow',
+                  },
+                    React.createElement('div', { className: 'dim-jh-quotaWindowHead' },
+                      React.createElement('span', { className: 'dim-jh-quotaWindowName' },
+                        quotaWindowLabel(win.type)),
+                      React.createElement('span', {
+                        className: 'dim-jh-quotaWindowPercent',
+                        'data-tone': tone,
+                      }, formatQuotaPercent(win.percentUsed))),
+                    React.createElement('div', {
+                      className: 'dim-jh-quotaBar',
+                      role: 'progressbar',
+                      'aria-label': `${quotaWindowLabel(win.type)} 已用`,
+                      'aria-valuenow': Number.isFinite(win.percentUsed) ? win.percentUsed : 0,
+                      'aria-valuemin': 0,
+                      'aria-valuemax': 100,
                     },
-                      React.createElement('div', { className: 'dim-jh-quotaWindowHead' },
-                        React.createElement('span', { className: 'dim-jh-quotaWindowName' },
-                          quotaWindowLabel(win.type)),
-                        React.createElement('span', {
-                          className: 'dim-jh-quotaWindowPercent',
-                          'data-tone': tone,
-                        }, formatQuotaPercent(win.percentUsed))),
                       React.createElement('div', {
-                        className: 'dim-jh-quotaBar',
-                        role: 'progressbar',
-                        'aria-label': `${quotaWindowLabel(win.type)} 已用`,
-                        'aria-valuenow': Number.isFinite(win.percentUsed) ? win.percentUsed : 0,
-                        'aria-valuemin': 0,
-                        'aria-valuemax': 100,
-                      },
-                        React.createElement('div', {
-                          className: 'dim-jh-quotaBarFill',
-                          'data-tone': tone,
-                          style: { width: `${clamped}%` },
-                        })),
-                      win.resetsAt
-                        ? React.createElement('span', { className: 'dim-jh-quotaReset' },
-                            formatWindowReset(win.resetsAt))
-                        : null);
-                  })))
-          : null)));
+                        className: 'dim-jh-quotaBarFill',
+                        'data-tone': tone,
+                        style: { width: `${clamped}%` },
+                      })),
+                    win.resetsAt
+                      ? React.createElement('span', { className: 'dim-jh-quotaReset' },
+                          formatWindowReset(win.resetsAt))
+                      : null);
+                })))
+        : React.createElement('p', { className: 'dim-jh-quotaAccountError' },
+            entry.error || '额度查询失败'));
   };
 
   const renderLog = () => {
-    if (quota.length === 0) return null;
-    return React.createElement('div', { className: 'dim-jh-quotaLog' },
-      React.createElement('h3', { className: 'dim-jh-quotaSectionTitle' }, '请求记录'),
-      // 多账号才渲染切换器：单账号时它没有可去的地方（与额度卡片的约定一致）。
-      quota.length > 1
-        ? React.createElement('div', { className: 'dim-jh-quotaAccountTabs' },
-            quota.map(entry => React.createElement('button', {
-              key: entry.accountId,
-              className: 'dim-jh-btn dim-jh-quotaTab',
-              'data-kind': entry.accountId === logAccountId ? 'primary' : undefined,
-              onClick: () => setLogAccountId(entry.accountId),
-            }, entry.nickname || entry.accountId)))
-        : React.createElement('p', { className: 'dim-jh-quotaLogAccount' },
-            `账号：${accountLabelOf(logAccountId)}`),
-      logPhase === 'loading'
-        ? React.createElement('div', { className: 'dim-jh-empty' }, '正在读取请求记录…')
-        : rows.length === 0
-          ? React.createElement('div', { className: 'dim-jh-empty' },
-              logError === '' ? '暂无请求记录' : logError)
-          : React.createElement('div', { className: 'dim-jh-quotaTableWrap' },
-              React.createElement('table', { className: 'dim-jh-quotaTable' },
-                React.createElement('thead', null,
-                  React.createElement('tr', null,
-                    React.createElement('th', null, '时间'),
-                    React.createElement('th', null, '模型'),
-                    React.createElement('th', { className: 'dim-jh-quotaNumCol' }, 'TOKEN'),
-                    React.createElement('th', { className: 'dim-jh-quotaNumCol' }, '积分'))),
-                React.createElement('tbody', null,
-                  rows.map((row, index) => React.createElement('tr', {
-                    key: `${row.createdAt}-${index}`,
-                  },
-                    React.createElement('td', { className: 'dim-jh-quotaWhen' },
-                      formatLogTime(row.createdAt)),
-                    React.createElement('td', null,
-                      React.createElement('span', { className: 'dim-jh-quotaModel' }, row.model || '—'),
-                      // 上游/模型族作为次要信息：它与模型名是两个维度，
-                      // 合成一列会让「同名不同上游」的行无法区分。
-                      row.modelType && row.modelType !== row.model
-                        ? React.createElement('span', { className: 'dim-jh-quotaModelType' }, row.modelType)
-                        : null),
-                    React.createElement('td', { className: 'dim-jh-quotaNumCol' },
-                      formatTokenCount(row.totalTokens)),
-                    React.createElement('td', { className: 'dim-jh-quotaNumCol' },
-                      String(row.creditsUsed)))))),
-              // 翻页失败时**保留已加载的行**，只把原因显示在下方。
-              logError !== ''
-                ? React.createElement('p', { className: 'dim-jh-quotaLogError', role: 'alert' }, logError)
-                : null,
-              nextToken !== undefined
-                ? React.createElement('button', {
-                    className: 'dim-jh-btn',
-                    disabled: logPhase === 'more',
-                    onClick: () => void loadLog(logAccountId, nextToken),
-                  }, logPhase === 'more' ? '加载中…' : '加载更多')
-                : null));
+    if (viewAccountId === '') return null;
+    // 各层先拆成局部变量再组装:createElement 的多参嵌套极易数错括号,
+    // 首版就是在这里多/少一层导致 esbuild 语法错(拆开后每层独立可验证)。
+    const head = React.createElement(
+      'h3', { className: 'dim-jh-quotaSectionTitle' }, '请求记录');
+    const hint = React.createElement(
+      'p', { className: 'dim-jh-quotaLogHint' },
+      '是本插件发出的请求流水(进程内存,重启后清空),不是官方账单 —— '
+      + '官方渠道的消费在 Cline 自己的用量页里。');
+    const tableHead = React.createElement(
+      'thead', null,
+      React.createElement('tr', null,
+        React.createElement('th', null, '时间'),
+        React.createElement('th', null, '模型 / 上游'),
+        React.createElement('th', { className: 'dim-jh-quotaNumCol' }, 'TOKEN'),
+        React.createElement('th', { className: 'dim-jh-quotaNumCol' }, '延迟')));
+    const tableBody = React.createElement(
+      'tbody', null,
+      rows.flatMap((row, index) => {
+        const key = `${row.ts}-${index}`;
+        const cells = [
+          React.createElement(
+            'td', { className: 'dim-jh-quotaWhen' }, formatLogTime(row.ts)),
+          React.createElement(
+            'td', null,
+            React.createElement(
+              'span', { className: 'dim-jh-quotaModel' }, row.model || '—'),
+            // 上游与模型是两个维度:同模型可能由不同通道服务,拼一列会让
+            // 「同名不同上游」的行无法区分。
+            row.upstream
+              ? React.createElement(
+                  'span', { className: 'dim-jh-quotaModelType' }, row.upstream)
+              : null),
+          React.createElement(
+            'td', { className: 'dim-jh-quotaNumCol' },
+            // ⚠️ 输入/输出**分开**展示:合计会在「缓存命中/思考」上失真
+            // (openai-compat 的 inputTokens 已剔除缓存命中部分)。
+            React.createElement(
+              'span', { className: 'dim-jh-quotaTokens' },
+              `${formatTokenCount(row.inputTokens)} + ${formatTokenCount(row.outputTokens)}`),
+            // 思考 token:它是「首块慢」的主要解释(网关不流式输出思考,
+            // 思考量只在 usage 帧里),与普通 token 分开显示才看得到它去哪了。
+            typeof row.reasoningTokens === 'number' && row.reasoningTokens > 0
+              ? React.createElement(
+                  'span', { className: 'dim-jh-quotaTokenDetail' },
+                  `含思考 ${formatTokenCount(row.reasoningTokens)}`)
+              : null),
+          React.createElement(
+            'td', { className: 'dim-jh-quotaNumCol' },
+            formatLatency(row.ttftMs, row.totalMs)),
+        ];
+        const rowEl = React.createElement(
+          'tr', { key, 'data-error': row.error === undefined ? undefined : 'error' }, ...cells);
+        // ⚠️ 失败行:错误消息**随行**显示(参考实现同款,错误行 colSpan
+        // 横跨数据列) —— 收进 tooltip 用户永远看不到。
+        if (row.error !== undefined) {
+          return [
+            rowEl,
+            React.createElement(
+              'tr', { key: `${key}-err`, 'data-error': 'error' },
+              React.createElement(
+                'td', { colSpan: cells.length, className: 'dim-jh-quotaError' },
+                `失败：${row.error}`)),
+          ];
+        }
+        return [rowEl];
+      }));
+    const table = React.createElement(
+      'table', { className: 'dim-jh-quotaTable' }, tableHead, tableBody);
+    const wrap = React.createElement(
+      'div', { className: 'dim-jh-quotaTableWrap' }, table);
+    const empty = React.createElement(
+      'div', { className: 'dim-jh-empty' },
+      logError === ''
+        ? '暂无请求记录(面板打开后新发起的请求才会出现在这里)'
+        : logError);
+    const body = logPhase === 'loading'
+      ? React.createElement('div', { className: 'dim-jh-empty' }, '正在读取请求记录…')
+      : rows.length === 0 ? empty : wrap;
+    return React.createElement(
+      'div', { className: 'dim-jh-quotaLog' }, head, hint, body);
   };
 
   // 与登录弹窗、模型列表同款：直接渲染在组件树内，靠 position: fixed 覆盖全屏。
@@ -1338,7 +1408,8 @@ function ClineQuotaPanel({ rpcCall, onClose }) {
           React.createElement('button', {
             className: 'dim-jh-btn',
             disabled: quotaPhase === 'loading',
-            onClick: () => void loadQuota(),
+            title: '重新查询全部账号的订阅额度窗口，并重读当前账号的请求记录。',
+            onClick: () => { void loadQuota(); setLogNonce(n => n + 1); },
           }, quotaPhase === 'loading' ? '读取中…' : '刷新'),
           React.createElement('button', {
             className: 'dim-jh-btn',
@@ -1346,8 +1417,9 @@ function ClineQuotaPanel({ rpcCall, onClose }) {
             onClick: onClose,
           }, '完成'))),
       React.createElement('p', { className: 'dim-jh-modalHint' },
-        '额度窗口与请求记录都来自 Cline 官方网关（不是本地记账），与账号卡片上的「积分」是两份不同的读数：'
-        + '积分答「还剩多少」，额度答「各时间窗用掉百分之几」。'),
+        '额度窗口来自 Cline 官方网关；请求记录是本插件自己发出的请求流水（重启后清空）。'
+        + '两者与账号卡片上的「积分」是三份不同的读数：积分答「还剩多少」，'
+        + '额度答「各时间窗用掉百分之几」，记录答「每一笔发了多久、花了多少 token」。'),
       // ⚠️ 内容**必须**放进 .dim-jh-modalBody（flex:1; min-height:0; overflow-y:auto）。
       // .dim-jh-modal 是 max-height 有限的 flex **列**容器，子项默认不可收缩，
       // 内容直接铺在里面就会**画出弹窗边界之外** —— 首版正是漏了这一层：

@@ -439,34 +439,47 @@ export interface RpcClineQuotaResponse {
 }
 
 /**
- * RPC: 查询**请求记录**（网关自己的流水，按时间倒序）。
+ * RPC: 查询**请求记录**（本插件自己发出的推理请求流水，按时间倒序）。
  *
- * `cursor` 省略表示第一页；其值来自上一页响应的 `nextToken`。
+ * ⚠️ **不是**网关的 `/users/{id}/usages`（那是该账号在官方所有渠道的
+ * 消费账单：没有延迟/首块时间，表格字段也对不齐参考实现）。见
+ * `src/cline-request-log.ts`。
+ *
+ * `accountId` 必传：面板用**同一个**翻页索引同时切「额度窗口」与
+ * 「请求记录」，两个区域必须看同一个账号。
  */
 export interface RpcClineRequestLogRequest {
   provider: string
   accountId: string
-  /** 上一页的 `nextToken`；省略表示第一页。 */
-  cursor?: string
+  /** 最多返回多少条（省略用上限）。 */
+  limit?: number
 }
 
 /** 请求记录的一行。 */
 export interface RpcClineRequestLogRow {
-  createdAt: string
+  /** 请求**发起**时刻（毫秒时间戳）。 */
+  ts: number
+  /** 模型 id（wire 上的 `model`）。 */
   model: string
-  modelType: string
-  totalTokens: number
-  creditsUsed: number
-  costUsd: number
+  /** 模型族/上游（模型 id 的 `/` 前缀，如 `cline-pass`）。 */
+  upstream: string
+  /** 输入 token（未命中缓存的部分）。 */
+  inputTokens: number
+  /** 输出 token。 */
+  outputTokens: number
+  /** 思考 token（缺失时省略 —— 上游不给就没有）。 */
+  reasoningTokens?: number
+  /** 首个内容块耗时（毫秒）—— 解释「为什么等了这么久才出字」。 */
+  ttftMs: number
+  /** 全程耗时（毫秒）。 */
+  totalMs: number
+  /** 失败原因；成功行省略。 */
+  error?: string
 }
 
-/** RPC: 请求记录响应。 */
+/** RPC: 请求记录响应（最新在前）。 */
 export interface RpcClineRequestLogResponse {
-  ok: boolean
   rows: RpcClineRequestLogRow[]
-  /** 下一页游标；没有更多时为 undefined。 */
-  nextToken?: string
-  error?: string
 }
 
 /**

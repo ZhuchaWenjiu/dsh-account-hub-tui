@@ -64,7 +64,8 @@ import { claimQoderDailyCheckin, fetchQoderCreditBalance } from './qoder-credits
 import { isTraeRefreshable, traeCredentialExpiresAtMs, traeDisplayNickname } from './trae.js'
 import type { TraeCredential } from './trae.js'
 import { fetchClineCreditBalance } from './cline-credits.js'
-import { fetchClineRequestLog, fetchClineUsageLimits } from './cline-quota.js'
+import { fetchClineUsageLimits } from './cline-quota.js'
+import { clineUpstreamOf, readClineRequestHistory } from './cline-request-log.js'
 import {
   clineCredentialExpiresAtMs,
   isClineRefreshable,
@@ -2520,47 +2521,28 @@ function registerJetHubEndpoints(
         if (typeof req.accountId !== 'string' || req.accountId.trim().length === 0) {
           return { ok: false, error: { code: 'bad-request', message: 'accountId 不能为空' } }
         }
-        // 游标只允许字符串：数字/对象传进来会让 `?cursor=` 拼出无意义的值，
-        // 而网关对无法识别的游标**静默忽略**（回到第一页），表现为
-        // 「点了加载更多却看到同一批记录」—— 静默的错误最难排查，故直接拒。
-        if (req.cursor !== undefined && typeof req.cursor !== 'string') {
-          return { ok: false, error: { code: 'bad-request', message: 'cursor 必须是字符串' } }
-        }
-        const accounts = await pool.listAllAccounts()
-        const entry = accounts.find((a) => a.id === req.accountId)
-        if (entry === undefined) {
-          return { ok: false, error: { code: 'bad-request', message: `账号不存在：${req.accountId}` } }
-        }
-        const resolved = await ctx.credentials.resolve(credentialRef(entry.credentialRef))
-        if (!resolved) {
-          return { ok: false, error: { code: 'bad-request', message: '凭据未配置' } }
-        }
-        let credential: ClineCredential
-        try {
-          credential = JSON.parse(resolved.value) as ClineCredential
-        } catch {
-          return { ok: false, error: { code: 'bad-request', message: '凭据解析失败' } }
-        }
-        const result = await fetchClineRequestLog(credential, CLINE, fetch, {
-          ...req.cursor === undefined ? {} : { cursor: req.cursor },
-        })
-        // ⚠️ 与额度端点不同：这里把失败**作为 `ok:false` 的载荷**回报，
-        // 而不是 RPC 级错误 —— 因为它只影响「加载更多」这一处，
-        // 面板要把原因显示在表格下方并保留已加载的行。
+        // 记录是**本插件自己发出的请求流水**(进程内存,重启即丢,见
+        // src/cline-request-log.ts),不是网关的 /usages —— 后者记的是该账号
+        // 在官方所有渠道的消费:没有延迟/首块时间,表格字段也对不齐参考实现。
+        //
+        // ⚠️ `accountId` 必传(按账号过滤)——「订阅额度」面板用**同一个**
+        // 翻页索引同时切额度窗口与请求记录,两个区域必须看同一个账号。
+        // ⚠️ 记录可能是**失败**行(error 有值):失败的请求是排查
+        // 「为什么没回复」的第一线索,与成功行同表展示、错误消息随行给出。
         return {
           ok: true,
           value: {
-            ok: result.ok,
-            rows: result.rows.map((row) => ({
-              createdAt: row.createdAt,
+            rows: readClineRequestHistory({ accountId: req.accountId, limit: req.limit }).map((row) => ({
+              ts: row.ts,
               model: row.model,
-              modelType: row.modelType,
-              totalTokens: row.totalTokens,
-              creditsUsed: row.creditsUsed,
-              costUsd: row.costUsd,
+              upstream: clineUpstreamOf(row.model),
+              inputTokens: row.inputTokens,
+              outputTokens: row.outputTokens,
+              ...row.reasoningTokens !== undefined ? { reasoningTokens: row.reasoningTokens } : {},
+              ttftMs: row.ttftMs,
+              totalMs: row.totalMs,
+              ...row.error !== undefined ? { error: row.error } : {},
             })),
-            ...result.nextToken === undefined ? {} : { nextToken: result.nextToken },
-            ...result.error === undefined ? {} : { error: result.error },
           } satisfies RpcClineRequestLogResponse,
         }
       }

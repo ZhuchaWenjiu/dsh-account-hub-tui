@@ -1,21 +1,16 @@
 import { describe, expect, it, vi } from 'vitest'
 import {
   CLINE_USAGE_LIMITS_PATH,
-  fetchClineRequestLog,
   fetchClineUsageLimits,
-  parseClineRequestLog,
   parseClineUsageLimits,
 } from '../../src/cline-quota.js'
 import { CLINE } from '../../src/cline-product.js'
 import type { ClineCredential } from '../../src/cline.js'
-
 /**
- * ⚠️ 这两个 fixture 的**形状**取自参考实现
- * `github.com/codeOct/dsh-cline-pass`（额度管理与请求记录部分），并已在
+ * ⚠️ fixture 的**形状**取自参考实现
+ * `github.com/codeOct/dsh-cline-pass`（额度管理部分），并已在
  * **2026-09-29 用本机真实 Cline 账号实发核对**过：端点、信封、字段名与下面
- * 解析层读的完全一致（`data.limits[].{type,percentUsed,resetsAt}`、
- * `data.items[].{createdAt,aiModelName,aiModelTypeName,totalTokens,creditsUsed,costUsd}`
- * + `data.nextToken`）。
+ * 解析层读的完全一致（`data.limits[].{type,percentUsed,resetsAt}`）。
  *
  * 实测另有两个形态值得记住，已各自写进用例：
  * - `resetsAt` 带**纳秒**精度（9 位小数），如实测的 `2026-09-29T15:41:02.244817775Z`；
@@ -34,32 +29,7 @@ const LIMITS_FIXTURE = {
   },
 }
 
-const USAGES_FIXTURE = {
-  success: true,
-  data: {
-    nextToken: 'tok-next',
-    items: [
-      {
-        createdAt: '2026-09-29T07:12:00.000Z',
-        aiModelName: 'Deepseek-v4.1-Flash',
-        aiModelTypeName: 'cline-free',
-        totalTokens: 49,
-        creditsUsed: 0,
-        costUsd: 1320,
-      },
-      {
-        createdAt: '2026-09-29T06:30:00.000Z',
-        aiModelName: 'GLM-5.2',
-        aiModelTypeName: 'cline-pass',
-        promptTokens: 100,
-        completionTokens: 25,
-        creditsUsed: 3,
-        costUsd: 900,
-      },
-    ],
-  },
-}
-
+/** 凭据形态与实测一致（`account_id` 是 `usr-…`、令牌带 `workos:` 前缀）。 */
 const CRED: ClineCredential = {
   access_token: 'workos:eyJhbGciOiJSUzI1NiIs',
   refresh_token: 'tmgEeM2rd9ybYoWpXl8JqUfvK',
@@ -176,68 +146,6 @@ describe('parseClineUsageLimits', () => {
     }
   })
 })
-
-describe('parseClineRequestLog', () => {
-  it('解析实测形状的两行', () => {
-    const result = parseClineRequestLog(USAGES_FIXTURE)
-    expect(result.rows).toHaveLength(2)
-    expect(result.rows[0]).toEqual({
-      createdAt: '2026-09-29T07:12:00.000Z',
-      model: 'Deepseek-v4.1-Flash',
-      modelType: 'cline-free',
-      totalTokens: 49,
-      creditsUsed: 0,
-      costUsd: 1320,
-    })
-  })
-
-  /** 分页游标就是响应里的 `nextToken`（请求参数只认 `cursor`）。 */
-  it('取出 nextToken 作为下一页游标', () => {
-    expect(parseClineRequestLog(USAGES_FIXTURE).nextToken).toBe('tok-next')
-  })
-
-  /**
-   * `totalTokens` 缺省时由两个分量现算 —— 直接给 0 会让「有消耗但没记总量」
-   * 的行看起来像没花钱，而它是真实请求。
-   */
-  it('缺 totalTokens 时由 promptTokens + completionTokens 现算', () => {
-    expect(parseClineRequestLog(USAGES_FIXTURE).rows[1]!.totalTokens).toBe(125)
-  })
-
-  it('缺 aiModelName 时回落到 aiModelTypeName', () => {
-    const result = parseClineRequestLog({
-      success: true,
-      data: { items: [{ aiModelTypeName: 'cline-pass', totalTokens: 1 }] },
-    })
-    expect(result.rows[0]!.model).toBe('cline-pass')
-    expect(result.rows[0]!.modelType).toBe('cline-pass')
-  })
-
-  it('容忍 createdAt 的蛇形别名', () => {
-    const result = parseClineRequestLog({
-      success: true,
-      data: { items: [{ created_at: '2026-09-29T00:00:00.000Z', totalTokens: 1 }] },
-    })
-    expect(result.rows[0]!.createdAt).toBe('2026-09-29T00:00:00.000Z')
-  })
-
-  it('没有 nextToken 时不带该字段（而不是空串）', () => {
-    const result = parseClineRequestLog({ success: true, data: { items: [] } })
-    expect(result.nextToken).toBeUndefined()
-    expect(result.rows).toEqual([])
-  })
-
-  it('缺 items 字段时给出明确原因', () => {
-    expect(parseClineRequestLog({ success: true, data: {} }).error).toBe('响应缺少 items 字段')
-  })
-
-  it('垃圾输入返回错误而不抛错', () => {
-    for (const value of [undefined, null, 'str', 42, []]) {
-      expect(parseClineRequestLog(value).error, String(value)).toBeDefined()
-    }
-  })
-})
-
 describe('fetchClineUsageLimits', () => {
   it('用 users/me 拼 URL，并保留 workos: 前缀', async () => {
     const calls: { url: string; headers: Record<string, string> }[] = []
@@ -301,76 +209,3 @@ describe('fetchClineUsageLimits', () => {
   })
 })
 
-describe('fetchClineRequestLog', () => {
-  it('用 account_id 拼 URL（与余额端点同口径，不是 JWT 的 sub）', async () => {
-    const calls: string[] = []
-    const fetcher = vi.fn(async (url: string) => {
-      calls.push(url)
-      return new Response(JSON.stringify(USAGES_FIXTURE), { status: 200 })
-    }) as unknown as typeof fetch
-
-    const result = await fetchClineRequestLog(CRED, CLINE, fetcher)
-    expect(calls[0]).toBe('https://api.cline.bot/api/v1/users/usr-01M3BCV4FYCGJKAWD3MJG3DBQM/usages')
-    expect(result.ok).toBe(true)
-    expect(result.rows).toHaveLength(2)
-    expect(result.nextToken).toBe('tok-next')
-  })
-
-  /**
-   * ⚠️ 分页参数**只认 `cursor`**（`page` / `offset` / `nextToken` 会被静默忽略，
-   * 表现为「点了加载更多却看到同一批记录」）。故这里锁死 query 的形状。
-   */
-  it('传 cursor 时只加 ?cursor=（不是 page/offset）', async () => {
-    const calls: string[] = []
-    const fetcher = vi.fn(async (url: string) => {
-      calls.push(url)
-      return new Response(JSON.stringify(USAGES_FIXTURE), { status: 200 })
-    }) as unknown as typeof fetch
-
-    await fetchClineRequestLog(CRED, CLINE, fetcher, { cursor: 'tok-next' })
-    expect(calls[0]).toBe(
-      'https://api.cline.bot/api/v1/users/usr-01M3BCV4FYCGJKAWD3MJG3DBQM/usages?cursor=tok-next',
-    )
-    expect(calls[0]).not.toContain('page=')
-    expect(calls[0]).not.toContain('offset=')
-  })
-
-  it('空串游标视为第一页（不加 query）', async () => {
-    const calls: string[] = []
-    const fetcher = vi.fn(async (url: string) => {
-      calls.push(url)
-      return new Response(JSON.stringify(USAGES_FIXTURE), { status: 200 })
-    }) as unknown as typeof fetch
-
-    await fetchClineRequestLog(CRED, CLINE, fetcher, { cursor: '' })
-    expect(calls[0]).not.toContain('?')
-  })
-
-  /**
-   * ⚠️ 缺 account_id 时**不发请求**：路径里要有它，发出去必然 400。
-   * 这正是「对不支持的输入无条件发请求」那类缺陷的形态。
-   */
-  it('缺 account_id 时给出可操作原因且不发请求', async () => {
-    const fetcher = vi.fn(async () => new Response('{}', { status: 200 })) as unknown as typeof fetch
-    const result = await fetchClineRequestLog({ access_token: 'workos:a' }, CLINE, fetcher)
-    expect(result.ok).toBe(false)
-    expect(result.error).toContain('凭据缺少账号 id')
-    expect(fetcher).not.toHaveBeenCalled()
-  })
-
-  it('非 2xx 时带上 HTTP 状态码与服务端文案', async () => {
-    const fetcher = vi.fn(async () => new Response(JSON.stringify({ message: 'Invalid request format' }), { status: 400 })) as unknown as typeof fetch
-    const result = await fetchClineRequestLog(CRED, CLINE, fetcher)
-    expect(result.ok).toBe(false)
-    expect(result.error).toContain('HTTP 400')
-    expect(result.error).toContain('Invalid request format')
-  })
-
-  it('网络失败不抛错', async () => {
-    const fetcher = vi.fn(async () => { throw new Error('ETIMEDOUT') }) as unknown as typeof fetch
-    const result = await fetchClineRequestLog(CRED, CLINE, fetcher)
-    expect(result.ok).toBe(false)
-    expect(result.rows).toEqual([])
-    expect(result.error).toContain('ETIMEDOUT')
-  })
-})

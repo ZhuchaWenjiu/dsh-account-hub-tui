@@ -1,4 +1,8 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
+import {
+  recordClineRequest,
+  resetClineRequestHistory,
+} from '../../src/cline-request-log.js'
 import { readFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { dirname, resolve } from 'node:path'
@@ -1945,70 +1949,85 @@ describe('cline.quota / cline.requestLog 端点', () => {
   })
 
   describe('cline.requestLog', () => {
-    it('回传记录行与下一页游标', async () => {
-      stubFetch(() => new Response(JSON.stringify(USAGES_RESPONSE), { status: 200 }))
+    /** 种入一条本地流水记录(模块级可变状态,用例间会泄漏,须先清)。 */
+    const seedOne = (entry: Parameters<typeof recordClineRequest>[0]) => {
+      resetClineRequestHistory()
+      recordClineRequest(entry)
+    }
+
+    it('回传当前账号的记录,字段对齐参考实现', async () => {
+      seedOne({
+        model: 'cline-pass/deepseek-v4.1-flash',
+        accountId: 'acc-1',
+        inputTokens: 100,
+        outputTokens: 25,
+        reasoningTokens: 89,
+        ttftMs: 320,
+        totalMs: 4200,
+      })
       const { call } = setup()
       const result = await call('cline.requestLog', { provider: 'cline', accountId: 'acc-1' })
       expect(result.ok).toBe(true)
-      const value = result.value as { ok: boolean; rows: Array<{ model: string; totalTokens: number }>; nextToken?: string }
-      expect(value.ok).toBe(true)
+      const value = result.value as {
+        rows: Array<{ ts: number; model: string; upstream: string; inputTokens: number; outputTokens: number; reasoningTokens?: number; ttftMs: number; totalMs: number }>
+      }
       expect(value.rows).toHaveLength(1)
-      expect(value.rows[0]!.model).toBe('DeepSeek')
-      expect(value.rows[0]!.totalTokens).toBe(49)
-      expect(value.nextToken).toBe('tok-2')
+      expect(value.rows[0]).toEqual({
+        ts: expect.any(Number),
+        model: 'cline-pass/deepseek-v4.1-flash',
+        // 上游取模型 id 的「/ 前缀」—— 模型与上游是两个维度
+        upstream: 'cline-pass',
+        inputTokens: 100,
+        outputTokens: 25,
+        reasoningTokens: 89,
+        ttftMs: 320,
+        totalMs: 4200,
+      })
     })
 
-    it('用账号 id 拼路径，第一页不带 query', async () => {
-      const urls = stubFetch(() => new Response(JSON.stringify(USAGES_RESPONSE), { status: 200 }))
+    it('按 accountId 过滤:别的账号的记录不混进来', async () => {
+      seedOne({ model: 'm', accountId: 'acc-other', inputTokens: 1, outputTokens: 2, ttftMs: 3, totalMs: 4 })
       const { call } = setup()
-      await call('cline.requestLog', { provider: 'cline', accountId: 'acc-1' })
-      expect(urls[0]).toBe(
-        'https://api.cline.bot/api/v1/users/usr-01M3BCV4FYCGJKAWD3MJG3DBQM/usages',
-      )
+      const result = await call('cline.requestLog', { provider: 'cline', accountId: 'acc-1' })
+      expect(result.ok).toBe(true)
+      expect((result.value as { rows: unknown[] }).rows).toEqual([])
+    })
+
+    it('无记录时返回空数组(而不是错误)', async () => {
+      resetClineRequestHistory()
+      const { call } = setup()
+      const result = await call('cline.requestLog', { provider: 'cline', accountId: 'acc-1' })
+      expect(result.ok).toBe(true)
+      expect((result.value as { rows: unknown[] }).rows).toEqual([])
     })
 
     /**
-     * ⚠️ 分页参数只认 `cursor`。写成 `page`/`offset` 会被网关**静默忽略**，
-     * 表现为「点了加载更多还是同一批记录」—— 静默的错误最难排查。
+     * ⚠️ 失败行**随行回传 error**:失败的请求是排查「为什么没回复」的
+     * 第一线索(429 / 11140 安全策略 / 网络错误各是不同的原因)。
      */
-    it('传 cursor 时只加 ?cursor=（不带 page/offset）', async () => {
-      const urls = stubFetch(() => new Response(JSON.stringify(USAGES_RESPONSE), { status: 200 }))
+    it('失败行随行回传 error', async () => {
+      seedOne({
+        model: 'm', accountId: 'acc-1',
+        inputTokens: 0, outputTokens: 0, ttftMs: 0, totalMs: 5,
+        error: 'cline: transport error: ECONNRESET',
+      })
       const { call } = setup()
-      await call('cline.requestLog', { provider: 'cline', accountId: 'acc-1', cursor: 'tok-2' })
-      expect(urls[0]).toContain('?cursor=tok-2')
-      expect(urls[0]).not.toContain('page=')
-      expect(urls[0]).not.toContain('offset=')
+      const result = await call('cline.requestLog', { provider: 'cline', accountId: 'acc-1' })
+      const rows = (result.value as { rows: Array<{ error?: string }> }).rows
+      expect(rows[0]!.error).toContain('ECONNRESET')
     })
 
-    it('accountId 为空或账号不存在 → bad-request，且不发请求', async () => {
-      const urls = stubFetch(() => new Response(JSON.stringify(USAGES_RESPONSE), { status: 200 }))
+    it('非 cline 的 provider → bad-request(与额度端点同规)', async () => {
+      const { call } = setup()
+      for (const provider of ['buddy', 'qoder', '']) {
+        expect((await call('cline.requestLog', { provider, accountId: 'acc-1' })).ok, provider).toBe(false)
+      }
+    })
+
+    it('accountId 为空 → bad-request(不猜默认值)', async () => {
       const { call } = setup()
       expect((await call('cline.requestLog', { provider: 'cline', accountId: '' })).ok).toBe(false)
-      expect((await call('cline.requestLog', { provider: 'cline', accountId: 'nope' })).ok).toBe(false)
       expect((await call('cline.requestLog', { provider: 'cline' })).ok).toBe(false)
-      expect(urls).toEqual([])
-    })
-
-    it('cursor 非字符串 → bad-request（不猜默认值）', async () => {
-      const urls = stubFetch(() => new Response(JSON.stringify(USAGES_RESPONSE), { status: 200 }))
-      const { call } = setup()
-      expect((await call('cline.requestLog', { provider: 'cline', accountId: 'acc-1', cursor: 3 })).ok).toBe(false)
-      expect(urls).toEqual([])
-    })
-
-    /**
-     * ⚠️ 失败是**载荷**（`ok:false`）而不是 RPC 错误：面板要保留已加载的行，
-     * 只在表格下方显示原因。若回成 RPC 错误，面板会整块换成错误页。
-     */
-    it('端点失败时以 ok:false 载荷回报（不是 RPC 级错误）', async () => {
-      stubFetch(() => new Response(JSON.stringify({ message: 'Invalid request format' }), { status: 400 }))
-      const { call } = setup()
-      const result = await call('cline.requestLog', { provider: 'cline', accountId: 'acc-1' })
-      expect(result.ok).toBe(true)
-      const value = result.value as { ok: boolean; rows: unknown[]; error?: string }
-      expect(value.ok).toBe(false)
-      expect(value.rows).toEqual([])
-      expect(value.error).toContain('HTTP 400')
     })
   })
 })

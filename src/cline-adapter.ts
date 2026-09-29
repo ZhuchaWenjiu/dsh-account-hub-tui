@@ -47,6 +47,7 @@ import {
   type ClineProduct,
 } from './cline-product.js'
 import { projectRequestImage, type ImageRequestTarget } from './image-budget.js'
+import { recordClineRequest } from './cline-request-log.js'
 import {
   registerAdapterIdempotent,
   registerConfigurableProvidersIdempotent,
@@ -476,6 +477,10 @@ export class ClineAdapter extends LlmAdapter {
 
     const body = JSON.stringify(bodyObj)
 
+    // 计时起点:**首次发起请求**的时刻(图片读取/凭据解析不算 —— 那是本地开销,
+    // 记录的是「这笔请求等了多久」,与参考实现的 startedAt 同口径)。
+    const startedAt = Date.now()
+
     // 3. 发送请求（401/403 时刷新一次凭据后重试）
     //
     // ⚠️ **403 必须先排除「地域限制」**：它与凭据无关，续期在这里永远无用，
@@ -530,7 +535,11 @@ export class ClineAdapter extends LlmAdapter {
           currentAccountId = next.entry.id
           response = await this.send(credential, body, options)
           if (response.ok) {
-            yield* this.consume(response, options)
+            yield* this.consumeWithLog(response, options, {
+              model: options.model,
+              accountId: currentAccountId.length > 0 ? currentAccountId : (credential.account_id ?? ''),
+              startedAt,
+            })
             return
           }
           errorText = await response.text().catch(() => '')
@@ -548,8 +557,91 @@ export class ClineAdapter extends LlmAdapter {
       )
     }
 
-    // 5. 消费 SSE 流
-    yield* this.consume(response, options)
+    // 5. 消费 SSE 流(并记录请求流水,见 consumeWithLog)
+    yield* this.consumeWithLog(response, options, {
+      model: options.model,
+      accountId: credential.account_id ?? currentAccountId,
+      startedAt,
+    })
+  }
+
+  /**
+   * 消费 OpenAI 兼容 SSE 并**记录请求流水**（「订阅额度」面板的请求记录，
+   * 见 `src/cline-request-log.ts`）。
+   *
+   * 记录字段对齐参考实现（`github.com/codeOct/dsh-cline-pass` 的请求记录部分）：
+   * 总延迟、**首个内容块耗时（ttft）**、token 用量（含**思考 token** ——
+   * 它是解释「为什么等了这么久才出字」的关键数字：这个网关不流式输出思考内容，
+   * 思考量只出现在 usage 里）、失败原因。
+   *
+   * ⚠️ 与参考实现的**差异及理由**：
+   * - 不记 `ttfb`（响应体首字节）：本适配器只有单一网关、无 upstream 路由，
+   *   响应头到达与首块之间没有独立的「选路」阶段，展示位只剩两个 ——
+   *   表格显示「首块 / 总延迟」两个数即可。
+   * - 换号过程**不逐笔记**：只记**最终结果**一笔。参考实现会把 AUTH/QUOTA
+   *   的每次 attempt 都记成失败行；本适配器的 429 换号风暴（最多 3 轮）
+   *   会把 100 条上限刷满，而用户真正要看的是「这笔请求成了没、花了多少」，
+   *   「所有账号均不可用」这行已包含换号语义。
+   *
+   * ⚠️ **失败也必须记**：失败的请求是排查「为什么没回复」的第一线索
+   * （429 / 11140 安全策略 / 网络错误各是不同的原因）。记录本身绝不抛错
+   * （`recordClineRequest` 已兜底），记账失败不得反噬推理。
+   *
+   * @param meta - `accountId` 是**最终服务的那笔**账号（换号后即最后一个）。
+   */
+  private async *consumeWithLog(
+    response: Response,
+    options: GenerateOptions,
+    meta: { model: string; accountId: string; startedAt: number },
+  ): AsyncIterable<StreamChunk> {
+    /** 首个内容块耗时；0 表示还没有任何块到达。 */
+    let ttftMs = 0
+    /**
+     * usage 帧，**在它经过时捕获**：网关把它放在内容之后的最后一帧，
+     * 流结束才记账的前提是「这块真的被读到了」—— 若调用方中途 abort，
+     * usage 帧可能永远没被消费到，此时如实记 0 而不是编一个值。
+     */
+    let usage: { inputTokens: number; outputTokens: number; reasoningTokens?: number } | undefined
+    try {
+      for await (const chunk of this.consume(response, options)) {
+        if (ttftMs === 0) ttftMs = Date.now() - meta.startedAt
+        if (chunk.type === 'usage' && typeof chunk.usage === 'object' && chunk.usage !== null) {
+          usage = {
+            inputTokens: Number(chunk.usage.inputTokens ?? 0) || 0,
+            outputTokens: Number(chunk.usage.outputTokens ?? 0) || 0,
+            ...(typeof chunk.usage.reasoningTokens === 'number' && chunk.usage.reasoningTokens > 0
+              ? { reasoningTokens: chunk.usage.reasoningTokens }
+              : {}),
+          }
+        }
+        yield chunk
+      }
+    } catch (error) {
+      recordClineRequest({
+        model: meta.model,
+        accountId: meta.accountId,
+        inputTokens: usage?.inputTokens ?? 0,
+        outputTokens: usage?.outputTokens ?? 0,
+        ...(usage?.reasoningTokens !== undefined ? { reasoningTokens: usage.reasoningTokens } : {}),
+        ttftMs,
+        totalMs: Date.now() - meta.startedAt,
+        error: error instanceof Error ? error.message : String(error),
+      })
+      throw error
+    }
+    recordClineRequest({
+      model: meta.model,
+      accountId: meta.accountId,
+      ...(usage === undefined
+        ? { inputTokens: 0, outputTokens: 0 }
+        : {
+            inputTokens: usage.inputTokens,
+            outputTokens: usage.outputTokens,
+            ...(usage.reasoningTokens !== undefined ? { reasoningTokens: usage.reasoningTokens } : {}),
+          }),
+      ttftMs,
+      totalMs: Date.now() - meta.startedAt,
+    })
   }
 
   /** 消费 OpenAI 兼容 SSE（共享实现）。 */

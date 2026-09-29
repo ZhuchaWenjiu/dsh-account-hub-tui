@@ -591,6 +591,19 @@ describe('Cline 接线（源码级回归）', () => {
    * 改为逐字段断言，容忍新增字段与格式变化；而「订阅额度**只**给 cline」
    * 这条真正的不变式由 `credits-capabilities.spec.ts` 的行为级用例守住。
    */
+  /**
+   * ⚠️ 请求记录的**接线完整性**：stream() 有**两个**消费出口
+   * （换号成功后的 consume 与正常路径的 consume），漏掉任何一个，
+   * 那条路径上的请求就不会出现在「订阅额度 → 请求记录」里。
+   * 两个出口都必须走 consumeWithLog（它内部再调 this.consume）。
+   */
+  it('推理流在两个消费出口都记录请求流水', () => {
+    const source = read('src/cline-adapter.ts')
+    expect(source.match(/yield\* this\.consumeWithLog\(/g)).toHaveLength(2)
+    // 不得有绕过记录的消费出口（记录失败不反噬推理，但漏记会丢数据）
+    expect(source).not.toMatch(/yield\* this\.consume\(/)
+  })
+
   it('能力矩阵登记 cline 为「有余额、无签到、有订阅额度」', () => {
     const source = read('plugin-src/client/credits-capabilities.js')
     const entry = /cline:\s*Object\.freeze\(\{([^}]*)\}\)/.exec(source)
