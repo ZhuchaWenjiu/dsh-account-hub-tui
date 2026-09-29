@@ -36,6 +36,10 @@ import type { TraeCredential } from './trae.js'
 import type { ClineCredential } from './cline.js'
 import type { LoomyCredential } from './loomy.js'
 import type { RaccoonCredential } from './raccoon.js'
+import { MinimaxAuth } from './minimax-auth.js'
+import { registerMinimaxLlm } from './minimax-adapter.js'
+import { MINIMAX } from './minimax-product.js'
+import type { MinimaxCredential } from './minimax.js'
 
 export const name = 'codearts-auth'
 // `connection` 刻意不列入静态 inject：它只由 Web bundle（dsh-client-connection）
@@ -201,6 +205,7 @@ export function apply(ctx: Context): void {
   registerProviderSettings(
     ctx, 'llm-buddy', 'llm-workbuddy', 'llm-codearts', 'llm-lobsterai',
     'llm-qoder', 'llm-qodercn', 'llm-trae', 'llm-cline', 'llm-loomy', 'llm-raccoon',
+    'llm-minimax',
   )
   const service = new CodeArtsAuth(ctx)
   const pool = new AccountPool(ctx)
@@ -777,6 +782,81 @@ export function apply(ctx: Context): void {
     product: RACCOON,
   })
 
+  // ===== MiniMax Code（中国版）服务 =====
+  //
+  // ⚠️ 登录走 **OAuth 设备码 + PKCE**（与 Qoder 同型：不起本地监听端口，
+  // `startLogin` 立即返回 `verification_uri_complete`，后台轮询换 token）。
+  // 但协议族与其余九个都不同 —— 它是**首个 Anthropic Messages 协议族**的 provider。
+  //
+  // ⚠️ **本轮不实现推理**：账号余额不足（`insufficient_balance_error`），无法端到端
+  // 验证。适配器的 `stream()` 抛明确错误（**不静默返回空流** —— 静默会让 UI 表现为
+  // 「干净地停止、无任何报错」，是 Qoder 早期的同型缺陷）。
+  // 故**不传** `readImage` / `readImageRequest`（图片只在推理时有意义）。
+  //
+  // 服务名由 MinimaxAuth 依 product.id 派生，注册为 ctx.minimaxAuth。
+  // 不注册斜杠命令：入口在 Jet Hub 的 MiniMax 面板。
+  const minimax = new MinimaxAuth(ctx)
+  const minimaxAdapter = registerMinimaxLlm(ctx, {
+    credentialRef: credentialRef(MINIMAX.defaultCredentialRef),
+    resolveCredential: async (modelId?: string) => {
+      // provider 实参用 MINIMAX.id 而非字面量：写死字面量在改名/多产品场景下
+      // 会静默查不到账号（本插件在 workbuddy 上踩过同类坑）。
+      // ⚠️ 只从 minimax 自己的账号池取账号，回退到自己的单凭据 ref，
+      // 保证不会串用其它 provider 的凭据。
+      const available = await pool.getAvailableAccount(MINIMAX.id, modelId ?? '')
+      // `getAvailableAccount` 的凭据类型是 `CodeArtsCredential | BuddyCredential`
+      // 联合（历史遗留），与 `MinimaxCredential` 无充分重叠，故经 `unknown` 转换。
+      // 运行时安全性由 provider 过滤保证：查询用 `MINIMAX.id`，取到的必是 minimax 凭据。
+      if (available) return available.credential as unknown as MinimaxCredential
+      const resolved = await ctx.credentials.resolve(credentialRef(MINIMAX.defaultCredentialRef))
+      if (!resolved) return undefined
+      try {
+        return JSON.parse(resolved.value) as MinimaxCredential
+      } catch {
+        return undefined
+      }
+    },
+    refresh: async () => {
+      // ⚠️ MiniMax **有** refresh 端点（`/oauth2/token` 的 refresh_token 授权），
+      // 这里是真续期（与 Loomy 的「只能探测有效性」不同）。
+      //
+      // 仍须刷新**解析凭据时所用的那一个**账号，而不是默认单凭据 ref ——
+      // 否则续期的是另一份凭据，用户会看到「刚登录好却一直认证失败」。
+      const available = await pool.getAvailableAccount(MINIMAX.id, '')
+      if (available) {
+        // ⚠️ **必须传 pool + entry.id**：续期成功后要把新的 `expiresAt` 写回
+        // 账号池，否则 UI 会一直显示「已过期」而实际能正常发消息
+        //（真实缺陷：JWT 已续到 15:09、账号池仍是 12:02，相差 3.1 小时）。
+        //
+        // ⚠️ `getAvailableAccount` 返回 **`{ entry, credential }`** 两层 ——
+        // 账号 id 与 credentialRef 在 **`available.entry`** 里，**不是**
+        // `available.id` / `available.credentialRef`（那是 `undefined`，
+        // 会让续期**静默写不回账号池**）。
+        await minimax.refreshAccountCredential(
+          available.entry.credentialRef, pool, available.entry.id,
+        )
+      } else {
+        await minimax.refresh()
+      }
+    },
+    // 远端模型目录：委托给 MinimaxAuth.fetchModels（它负责 Bearer 头 + 信封解析）。
+    // ⚠️ **必须走远端** —— 客户端内置静态表只有 3 个模型，远端下发 4 个，
+    // 照抄内置表会漏掉 `MiniMax-M3.1-Flash-Preview`（用户截图里选中的那个）。
+    // 失败时返回兜底表（适配器侧也有兜底）。
+    fetchRemoteModels: () => minimax.fetchModels(pool),
+    // 图片字节桥接：模态按模型判定（远端 `modalities.input` 含 image，
+    // 只有 M3.1-Flash-Preview 与 M3 是）。适配器声明不支持时会**报错**，
+    // 不会把图片发出去让服务端 400。
+    // ⚠️ 实测 MiniMax 收 **裸 base64** 的 Anthropic `image.source.base64`
+    // （OpenAI 的 `image_url` 形状被服务端明确拒绝）。
+    // ⚠️ 暂**不接** `readImageRequest` 缩放桥接：MiniMax 的单图上限是
+    // 10 MiB（远端 `capabilities.max_image_bytes_inline`），未实测过超限行为，
+    // 不凭猜测加一层（Qoder/Raccoon 是**实测撞了体积限制**才接的）。
+    readImage: makeReadImage(ctx),
+    accountPool: pool,
+    product: MINIMAX,
+  })
+
   // 一次性修复**老账号**的昵称与凭据字段（与上面 WorkBuddy 的启动清理同类）。
   //
   // 早期实现把服务端的 `name` 直接当昵称用，而实测它是**自动生成的默认名**
@@ -852,6 +932,9 @@ export function apply(ctx: Context): void {
     ['loomy', (p) => loomy.refreshAll(p)],
     // raccoon **可续期**：只按 refreshable 过滤，且只续进入 lead 窗口的账号。
     ['raccoon', (p) => raccoon.refreshAll(p)],
+    // MiniMax **可续期**（refresh_token 授权，会轮换 refresh_token）。
+    // 与 raccoon 同款：只按 refreshable 过滤，不看 enabled。
+    ['minimax', (p) => minimax.refreshAll(p)],
   ]
 
   async function refreshAllCredentials(): Promise<void> {
@@ -940,8 +1023,9 @@ export function apply(ctx: Context): void {
     cline: clineAdapter,
     loomy: loomyAdapter,
     raccoon: raccoonAdapter,
+    minimax: minimaxAdapter,
   }
 
-  registerJetHubRpc(ctx, pool, service, buddy, workbuddy, lobsterai, qoder, qoderCn, trae, cline, loomy, raccoon, modelAdapters)
+  registerJetHubRpc(ctx, pool, service, buddy, workbuddy, lobsterai, qoder, qoderCn, trae, cline, loomy, raccoon, minimax, modelAdapters)
   ctx.provide('accountPool', pool)
 }

@@ -57,6 +57,10 @@
     "test:e2e:raccoon": "cross-env DSH_RACCOON_E2E=1 vitest run --config vitest.e2e.config.ts tests/e2e/raccoon-probe.e2e.spec.ts",
     "test:e2e:raccoon-chat": "cross-env DSH_RACCOON_CHAT_E2E=1 DSH_RACCOON_CHAT_E2E_CONFIRM=yes vitest run --config vitest.e2e.config.ts tests/e2e/raccoon-chat-probe.e2e.spec.ts",
     "test:e2e:raccoon-tools": "cross-env DSH_RACCOON_TOOLS_E2E=1 DSH_RACCOON_TOOLS_E2E_CONFIRM=yes vitest run --config vitest.e2e.config.ts tests/e2e/raccoon-tools-probe.e2e.spec.ts",
+    "test:e2e:minimax": "cross-env DSH_MINIMAX_E2E=1 vitest run --config vitest.e2e.config.ts tests/e2e/minimax-probe.e2e.spec.ts",
+    "test:e2e:minimax-claim": "cross-env DSH_MINIMAX_E2E=1 DSH_MINIMAX_CLAIM_E2E_CONFIRM=yes vitest run --config vitest.e2e.config.ts tests/e2e/minimax-claim-probe.e2e.spec.ts",
+    "test:e2e:minimax-chat": "cross-env DSH_MINIMAX_CHAT_E2E=1 DSH_MINIMAX_CHAT_E2E_CONFIRM=yes vitest run --config vitest.e2e.config.ts tests/e2e/minimax-chat-probe.e2e.spec.ts",
+    "test:e2e:minimax-image": "cross-env DSH_MINIMAX_IMAGE_E2E=1 DSH_MINIMAX_IMAGE_E2E_CONFIRM=yes vitest run --config vitest.e2e.config.ts tests/e2e/minimax-image-probe.e2e.spec.ts",
     "test:e2e:image-burst": "cross-env DSH_IMAGE_BURST_E2E=1 DSH_IMAGE_BURST_E2E_CONFIRM=yes vitest run --config vitest.e2e.config.ts tests/e2e/image-burst-cross-provider.e2e.spec.ts"
   },
   "dsh": {
