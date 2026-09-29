@@ -11,10 +11,17 @@ import type { ClineCredential } from '../../src/cline.js'
 
 /**
  * ⚠️ 这两个 fixture 的**形状**取自参考实现
- * `github.com/codeOct/dsh-cline-pass`（额度管理与请求记录部分），不是本机实测：
- * 本机没有可用的 Cline 凭据，无法实发核对。故字段名以参考实现为准，
- * 解析层对别名做了防御性读取（见 `parseClineRequestLog` 的 `created_at`）。
- * 若将来实测发现字段不同，**改解析层 + 本 fixture 一起改**，不要只改一边。
+ * `github.com/codeOct/dsh-cline-pass`（额度管理与请求记录部分），并已在
+ * **2026-09-29 用本机真实 Cline 账号实发核对**过：端点、信封、字段名与下面
+ * 解析层读的完全一致（`data.limits[].{type,percentUsed,resetsAt}`、
+ * `data.items[].{createdAt,aiModelName,aiModelTypeName,totalTokens,creditsUsed,costUsd}`
+ * + `data.nextToken`）。
+ *
+ * 实测另有两个形态值得记住，已各自写进用例：
+ * - `resetsAt` 带**纳秒**精度（9 位小数），如实测的 `2026-09-29T15:41:02.244817775Z`；
+ * - 用量为 0 的窗口 `resetsAt` 是**空串**。
+ *
+ * 若将来实测发现字段又变了，**改解析层 + 本 fixture 一起改**，不要只改一边。
  */
 const LIMITS_FIXTURE = {
   success: true,
@@ -91,6 +98,36 @@ describe('parseClineUsageLimits', () => {
   it('percentUsed 超额时如实透传 120（不夹取到 100）', () => {
     const result = parseClineUsageLimits(LIMITS_FIXTURE)
     expect(result.windows[2]!.percentUsed).toBe(120)
+  })
+
+  /**
+   * ⚠️ 实发核对（2026-09-29，真实 Cline 账号）发现 `resetsAt` 是**纳秒**精度
+   * （9 位小数）：`2026-09-29T15:41:02.244817775Z`。解析层必须**原样保留**
+   * （不要截断或归一化 —— 那会掩盖上游改动），且 `Date.parse` 能认它，
+   * 客户端据此算「N 小时后重置」。
+   */
+  it('resetsAt 纳秒精度原样保留，且 Date.parse 能解析', () => {
+    const iso = '2026-09-29T15:41:02.244817775Z'
+    const result = parseClineUsageLimits({
+      success: true,
+      data: { limits: [{ type: 'five_hour', percentUsed: 4, resetsAt: iso }] },
+    })
+    expect(result.windows[0]!.resetsAt).toBe(iso)
+    expect(Number.isFinite(Date.parse(iso))).toBe(true)
+  })
+
+  /**
+   * ⚠️ 实测形态：用量为 0 的窗口 `resetsAt` 是**空串**。
+   * 必须当成「没有重置时刻」而不是错误 —— 客户端据此**不渲染**那一行
+   * （显示空白的「重置」反而让人以为读取失败）。
+   */
+  it('resetsAt 为空串时保留空串且不算失败', () => {
+    const result = parseClineUsageLimits({
+      success: true,
+      data: { limits: [{ type: 'five_hour', percentUsed: 0, resetsAt: '' }] },
+    })
+    expect(result.windows[0]!.resetsAt).toBe('')
+    expect(result.error).toBeUndefined()
   })
 
   it('缺 type 的行被丢弃（无法归属到任何窗口）', () => {

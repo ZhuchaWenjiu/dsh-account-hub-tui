@@ -2876,18 +2876,47 @@ Cline 面板的账号管理区有一个**订阅额度**按钮（只在 Cline 出
   `flex-wrap: nowrap`，再塞一个必然溢出（「领取新手任务」当时就是这么被挤出去的）。
   且额度是**跨账号**读数，放面板级与语义一致。
 
-#### ⚠️ 验证边界（如实声明，别当成已实证）
+#### ✅ 验证状态（哪些已实证、哪些还没有）
 
-- **端点形状取自参考实现，本机没有可用 Cline 凭据，未做实发核对**。
-  `tests/unit/cline-quota.spec.ts` 的 fixture 同样据此写就。
-  **首次用真实账号验证时若发现字段不同**：改解析层（`src/cline-quota.ts`）与
-  fixture **一起改**，不要只改一边 —— 否则单测会在错误的形状上保持绿色。
-- 已做：`pnpm typecheck`、`pnpm test`（新增 42 条：`cline-quota` 30 条、
-  能力表 3 条、RPC 端点 9 条）、`pnpm build:all`。
-- 未做：GUI 点击级实测（`/api/jet-hub` 需浏览器登录态，直接调用返回 401，
-  与既有记录一致）。
-- **改了宿主侧（`src/`）需重启 DSH** 才生效；只改 `lib/client/jet-hub.js`
-  会被客户端 HMR 热加载（刷新页面即可，无需重启）。
+**已实发核对（2026-09-29，本机真实 Cline 账号，只读 GET、未触发续期）**：
+端点与响应形状与解析层**完全一致** ——
+
+- `/users/me/plan/usage-limits` → `data.limits[]`，`type` ∈
+  `five_hour` / `weekly` / `monthly`，带 `percentUsed` 与 `resetsAt`；
+- `/users/{account_id}/usages` → `data.items[]` + `data.nextToken`，行含
+  `createdAt` / `aiModelName` / `aiModelTypeName` / `totalTokens` /
+  `creditsUsed` / `costUsd`。**用 `account_id`（`usr-…`）实测可用**。
+
+两个实测形态已写进用例：
+
+- `resetsAt` 是**纳秒**精度（9 位小数），如 `2026-09-29T15:41:02.244817775Z`
+  —— 解析层**原样保留**（不截断、不归一化），`Date.parse` 可解析；
+- 用量为 0 的窗口 `resetsAt` 是**空串** —— 客户端因此**不渲染**那一行
+  （渲染一个空的「重置」会让人以为读取失败）。
+
+⚠️ 探针**没有入库**（`tests/e2e/tmp-*.ts` 用完即删）。需要复核时：照
+`tests/e2e/cline-credential.ts` 读凭据，再调 `fetchClineUsageLimits` /
+`fetchClineRequestLog` 即可（**只读、不要续期**）。
+
+⚠️ 顺带发现（**与本功能无关，刻意未改**）：`readClineCredentialsFromDshStore()`
+对本机当前的 `.credentials.yaml` 读出 **0 个账号** —— `extractYamlScalar` 取出的
+标量**尾部多 2 个杂字符**，`JSON.parse` 抛错后被该助手的 `catch` **静默跳过**。
+探针是靠「只取第一个完整 JSON 值」绕过的。若哪天别的 Cline e2e 报
+「0 个账号」，根因多半在这里，而不一定是凭据真的不存在。
+
+**已做**：`pnpm typecheck`、`pnpm test`（新增 54 条：`cline-quota` 32、
+能力表 3、RPC 端点 9、客户端接线 10）、`pnpm build:all`，并已安装到本机 profile
+（`lib/` 330 个文件**全量哈希一致**）。全量测试
+**1 failed | 3155 passed**，那 1 项是既有失败（`loomy-docs` 缺被 gitignore 的文档；
+另有 `cline-icon` 缺不入库脚本，属套件级加载失败）。
+
+**未做**：GUI 点击级实测（`/api/jet-hub` 需浏览器登录态，直接调用返回 401，
+与既有记录一致）。
+
+⚠️ **改了宿主侧（`src/`）必须重启 DSH 才生效**：客户端 bundle
+（`lib/client/jet-hub.js`）会被 `dsh-client-hmr` 热加载（刷新页面即可，无需重启），
+但 `cline.quota` / `cline.requestLog` 是**宿主侧**端点 —— 不重启只会看到
+「按钮出来了、点了报 unknown method」。
 
 ## 常见开发任务
 
