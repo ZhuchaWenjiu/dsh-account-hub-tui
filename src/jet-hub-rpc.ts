@@ -28,6 +28,9 @@ import type { LoomyAuth } from './loomy-auth.js'
 import type { LoomyCredential } from './loomy.js'
 import { RACCOON } from './raccoon-product.js'
 import type { RaccoonAuth } from './raccoon-auth.js'
+import type { ZcodeAuth } from './zcode-auth.js'
+import { ZCODE } from './zcode-product.js'
+import type { ZcodeCredential } from './zcode.js'
 import type { RaccoonCredential } from './raccoon.js'
 import type { StartedRaccoonLoginFlow } from './raccoon-login-page.js'
 import { LOOMY_TASK_POINTS, LOOMY_TASK_TITLES } from './loomy-onboarding.js'
@@ -637,6 +640,7 @@ export function registerJetHubRpc(
   cline: ClineAuth,
   loomy: LoomyAuth,
   raccoon: RaccoonAuth,
+  zcode: ZcodeAuth,
   /**
    * provider → 适配器实例（可选）。
    *
@@ -649,7 +653,7 @@ export function registerJetHubRpc(
   ctx.inject(['connection'], (connectionCtx) => {
     registerJetHubEndpoints(
       connectionCtx as Context, pool, codearts, buddy, workbuddy, lobsterai,
-      qoder, qoderCn, trae, cline, loomy, raccoon, modelAdapters,
+      qoder, qoderCn, trae, cline, loomy, raccoon, zcode, modelAdapters,
     )
   })
 }
@@ -708,6 +712,7 @@ function registerJetHubEndpoints(
   cline: ClineAuth,
   loomy: LoomyAuth,
   raccoon: RaccoonAuth,
+  zcode: ZcodeAuth,
   modelAdapters?: Readonly<Record<string, ModelCatalogSource>>,
 ): void {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -1160,6 +1165,49 @@ function registerJetHubEndpoints(
           })
 
           return { ok: true, value: { accountId: id, loginUrl: raccoonStarted.loginUrl } }
+        } else if (provider === ZCODE.id) {
+          /**
+           * zcode 走**两步式**（与 codearts / qoder 等同型）：
+           * 立刻返回官方授权 URL 让前端弹窗，后台轮询等服务端回调完成。
+           *
+           * ⚠ 必须**先返回 URL 再等结果** —— `window.open` 只在用户手势
+           * 窗口内有效（`AGENTS.md` 记过 CodeArts 早期「主页面被跳转」的
+           * 缺陷就是等授权完才返回 URL 导致的）。
+           *
+           * ## 与「读官方客户端凭据」的关系
+           *
+           * 早期实现是「确认磁盘上有一份官方客户端写的凭据」，
+           * 那要求用户先装并登录官方 ZCode —— 与「装完即用」冲突。
+           * 现在改为**插件自己走 OAuth**（实测 `/oauth/cli/init` →
+           * 浏览器授权 → `/oauth/cli/poll/{flow_id}` 完全跑通，
+           * 纯 HTTP、不经 `zcode://` 回调）。
+           *
+           * 若用户**已经**装并登录了官方客户端，则不必点这个按钮 ——
+           * `refreshAll` / 首次加载时会自动把官方凭据固化进来。
+           */
+          const started = await zcode.startLogin({ refName })
+          // 先登记占位条目（无凭据），使前端 `login.poll` 能立即看到该账号；
+          // 登录成功后再回填昵称。失败则删除占位条目。
+          await pool.addAccount({
+            id,
+            provider: ZCODE.id,
+            nickname: id,
+            enabled: true,
+            credentialRef: refName,
+            // ⚠ 静态凭据（JWT 无 exp），没有 refresh 端点 —— 恒 false。
+            refreshable: false,
+            createdAt: Date.now(),
+          })
+          started.result.then(async (saved) => {
+            await pool.updateAccount(id, {
+              nickname: `ZCode ${saved.credential.account_label ?? id}`,
+            })
+          }).catch((error: unknown) => {
+            ctx.logger.warn(`[jet-hub] background ${ZCODE.id} login failed for ${id}: ${String(error)}`)
+            // 登录失败：移除占位条目，避免留下无凭据的幽灵账号
+            void pool.removeAccount(id).catch(() => {})
+          })
+          return { ok: true, value: { accountId: id, loginUrl: started.loginUrl } }
         } else {
           return { ok: false, error: { code: 'bad-request', message: `unknown provider: ${provider}` } }
         }
@@ -1264,6 +1312,16 @@ function registerJetHubEndpoints(
               // 账号池，否则 UI 一直显示「已过期」（真实缺陷：JWT 已续到 15:09、
               // 账号池仍是 12:02，相差 3.1 小时，但功能完全正常）。
               await raccoon.refreshAccountCredential(entry.credentialRef, pool, entry.id)
+              break
+            case ZCODE.id:
+              /**
+               * zcode **没有 refresh 端点**（凭据是静态的，与 Loomy 同类）。
+               *
+               * 但这个方法仍做实事：**重读磁盘凭据并回写** —— 使用户在
+               * 官方 ZCode 客户端重新登录后，点「刷新」即可生效而无需
+               * 重启 DSH。凭据不可用时如实抛错（让用户知道要去官方客户端登录）。
+               */
+              await zcode.refreshAccountCredential(entry.credentialRef, pool, entry.id)
               break
             default:
               throw new Error(`Unknown provider: ${entry.provider}`)
@@ -1828,6 +1886,59 @@ function registerJetHubEndpoints(
             },
           }
         }
+        if (req.provider === ZCODE.id) {
+          /**
+           * ZCode 的「一键领取」= 补激活上报 → preview → 逐个 claim。
+           *
+           * ⚠ **每个 plan 都要重新产一个 captcha**（captcha 一次性，
+           * 复用会得 `3007`）—— 故不能复用 `collectClaimResults`
+           * 那套「一个凭据一次 claim」的形状（它假设 `claim()` 内部
+           * 自己处理幂等），这里自己遍历账号与 plan。
+           *
+           * ⚠ ZCode **没有**独立的「今日是否已领」端点，故不调
+           * `precheckStatus`（`claimDailyWith` **自带**激活上报与
+           * preview 查询，重复调用只会多发一次无谓请求）。
+           */
+          const results: RpcCreditsClaimAllResponse['results'] = []
+          const outcomes: ClaimOutcome[] = []
+          for (const account of accounts) {
+            const resolved = await ctx.credentials.resolve(credentialRef(account.credentialRef))
+            let accountOutcomes: ClaimOutcome[]
+            if (!resolved) {
+              accountOutcomes = [{ kind: 'failed', code: -1, message: '凭据未配置' }]
+            } else {
+              let credential: ZcodeCredential | undefined
+              try {
+                credential = JSON.parse(resolved.value) as ZcodeCredential
+              } catch {
+                credential = undefined
+              }
+              if (credential === undefined) {
+                accountOutcomes = [{ kind: 'failed', code: -1, message: '凭据解析失败' }]
+              } else {
+                /**
+                 * captcha 回调：每次都现产一个新 param。
+                 * 缺浏览器时抛错由 `claimDailyFor` 内部转成可读的
+                 * failed outcome（不让整个端点失败）。
+                 */
+                accountOutcomes = await zcode.claimDailyFor(credential, async () => {
+                  const config = await zcode.fetchCaptchaConfig().catch(() => undefined)
+                  return await zcode.mintCaptcha(config)
+                })
+              }
+            }
+            // ⚠ 一个账号可能有多条 outcome（多个 plan）——
+            // `RpcCreditsClaimAccountResult` 只装一条，故逐条展开。
+            for (const outcome of accountOutcomes) {
+              results.push({ accountId: account.id, nickname: account.nickname, outcome })
+              outcomes.push(outcome)
+            }
+          }
+          return {
+            ok: true,
+            value: { results, summary: computeClaimSummary(outcomes) } satisfies RpcCreditsClaimAllResponse,
+          }
+        }
         const product = productById(req.provider)
         if (product === undefined) {
           return { ok: false, error: { code: 'bad-request', message: `unsupported provider: ${req.provider}` } }
@@ -2061,6 +2172,87 @@ function registerJetHubEndpoints(
               // ⚠️ 查不到时带原因（**不显示成 0** —— 0 是「已用光」的语义，
               // 把「查询失败」显示成 0 会让用户以为自己积分没了）。
               ...balance === null ? { error: '积分查询失败（凭据失效或响应异常）' } : {},
+            })
+          }
+          return { ok: true, value: { accounts: values } satisfies RpcCreditsBalancesResponse }
+        }
+        if (req.provider === ZCODE.id) {
+          /**
+           * 余额来自 `GET /zcode-plan/billing/balance`（**只读**，无副作用）。
+           *
+           * ⚠ ZCode 的额度单位是 **token**，而 Jet Hub 这个字段的语义是
+           * 「积分」。两者量纲不同 —— 但都要展示，故这里如实返回数值
+           * 并在错误文案里说明来源。`balance: null` 表示**查不到**
+           * （不显示成 0，0 是「已用光」的语义）。
+           */
+          const values: RpcCreditsBalancesResponse['accounts'] = []
+          for (const account of accounts) {
+            const resolved = await ctx.credentials.resolve(credentialRef(account.credentialRef))
+            if (!resolved) {
+              values.push({
+                accountId: account.id, nickname: account.nickname,
+                balance: null, error: '凭据未配置',
+              })
+              continue
+            }
+            let credential: ZcodeCredential
+            try {
+              credential = JSON.parse(resolved.value) as ZcodeCredential
+            } catch {
+              values.push({
+                accountId: account.id, nickname: account.nickname,
+                balance: null, error: '凭据解析失败',
+              })
+              continue
+            }
+            const result = await zcode.fetchBalanceFor(credential)
+            if (result === undefined) {
+              values.push({
+                accountId: account.id, nickname: account.nickname,
+                balance: null, error: '额度查询失败（凭据失效或网络异常）',
+              })
+              continue
+            }
+            if (result.enterprise === true) {
+              // 企业版不下发额度数字、只给外部链接 —— 如实说明，不显示 0。
+              values.push({
+                accountId: account.id, nickname: account.nickname,
+                balance: null, error: '企业版账号不下发额度数字，请在 ZCode 内查看',
+              })
+              continue
+            }
+            values.push({
+              accountId: account.id,
+              nickname: account.nickname,
+              /**
+               * ⚠ `CreditBalance` 的形状是 `{total, packages[], expiredTotal?}`
+               * 这类**积分包**结构，而 ZCode 是「按日的 token 额度池」。
+               * 两者结构不同，故这里用**一个包**如实映射：
+               * `total` 填剩余额度、包名用上游的 `show_name`（模型名）。
+               * 这样 UI 能显示数值与来源，且不伪装成多包积分账户。
+               */
+              balance: {
+                total: result.remaining,
+                // ZCode 不在同一响应里区分「已失效包」，故为 0。
+                expiredTotal: 0,
+                packages: [{
+                  name: result.planName ?? 'ZCode 免费额度',
+                  // ⚠ 单位是 **token**（不是 credit）—— 如实标注，
+                  // 避免用户以为 ZCode 有 1 亿积分。
+                  unit: 'token',
+                  remaining: result.remaining,
+                  total: result.total,
+                  used: Math.max(0, result.total - result.remaining),
+                  active: true,
+                  // ZCode 的额度按日刷新（`period: 'one_time'` 的活动包到点失效），
+                  // 故周期起止都留空，只用 `expiredTime` 给到期时刻。
+                  cycleStartTime: '',
+                  cycleEndTime: '',
+                  expiredTime: result.expiresAt !== undefined
+                    ? new Date(result.expiresAt * 1000).toISOString()
+                    : '',
+                }],
+              },
             })
           }
           return { ok: true, value: { accounts: values } satisfies RpcCreditsBalancesResponse }

@@ -20,6 +20,11 @@ import { RaccoonAuth } from './raccoon-auth.js'
 import { LOOMY } from './loomy-product.js'
 import { LoomyBalanceSelector } from './loomy-balance-selector.js'
 import { RACCOON } from './raccoon-product.js'
+import { ZcodeAuth } from './zcode-auth.js'
+import { registerZcodeLlm } from './zcode-adapter.js'
+import { ZCODE } from './zcode-product.js'
+import { ZCODE_CAPTCHA_FALLBACK } from './zcode-captcha.js'
+import type { ZcodeCredential } from './zcode.js'
 import { AccountPool } from './account-pool.js'
 import { hasLegacyNamespaceRegistration, settingsOf, suppressAutoSettingsPage } from './settings-compat.js'
 import type { ImageRequestTarget } from './image-budget.js'
@@ -203,6 +208,7 @@ export function apply(ctx: Context): void {
   registerProviderSettings(
     ctx, 'llm-buddy', 'llm-workbuddy', 'llm-codearts', 'llm-lobsterai',
     'llm-qoder', 'llm-qodercn', 'llm-trae', 'llm-cline', 'llm-loomy', 'llm-raccoon',
+    'llm-zcode',
   )
   const service = new CodeArtsAuth(ctx)
   const pool = new AccountPool(ctx)
@@ -931,6 +937,132 @@ export function apply(ctx: Context): void {
     ctx.logger.warn(`[jet-hub] 修正 Raccoon 账号显示名失败：${String(error)}`)
   })
 
+// ===== ZCode（智谱 z.ai 免费额度通道）=====
+//
+// 形态与前面所有 provider **相同**：读凭据 → 直发远端。
+// 用户只需在官方 ZCode 客户端登录一次 —— 凭据就落在
+// `~/.zcode/v2/credentials.json`（AES-256-GCM 加密，公开算法），
+// 本插件纯 Node 解密即可，**不需要任何实例常驻**。
+//
+// 与其余 provider 的三处差异（全部实测）：
+//   1. 协议是 **Anthropic Messages**（不是 OpenAI 兼容）——
+//      见 `zcode-anthropic.ts` 的转换层。
+//   2. 每请求要产出一个**一次性**的阿里云 captcha（约 1.2 秒）——
+//      见 `zcode-captcha.ts`。
+//   3. 请求体必须带官方身份块与首轮日期块，否则上游回 `3012` ——
+//      见 `zcode-identity.ts`。
+//
+// ⚠ **可脱离官方客户端使用**：登录走官方 CLI 设备授权流
+// （`/oauth/cli/init` → 浏览器授权 → `/oauth/cli/poll/{flow_id}`，
+// 纯 HTTP，见 `zcode-login.ts`），且 `device_mid` **由插件自己生成**。
+// 若机器上已装并登录过官方客户端，也会自动读取它的凭据作为回退。
+//
+// ⚠ **不可续期**：凭据是静态的（JWT 的 payload 里没有 `exp`）。
+// 失效时上游回 401/1002，适配器归为 AUTH 并提示用户重新登录。
+//
+// 服务名注册为 ctx.zcodeAuth（由 `Service` 基类完成）。
+// 不注册斜杠命令：入口在 Jet Hub 的 ZCode 面板。
+//
+// ⚠ **必须把账号池传进去**：`ZcodeAuth.current()` 要从账号池里找用户在
+// Jet Hub 登录时创建的那个 ref（`ZCODE_ACCOUNT_XXXX`），而不是只认固定的
+// `ZCODE_CREDENTIAL`。不传的话「登录成功但面板显示未配置」——
+// 且该缺口会被「回退读官方凭据文件」掩盖，只有没装官方客户端的用户才看得到。
+const zcode = new ZcodeAuth(ctx, { accountPool: pool })
+/**
+ * captcha 配置：优先向服务端索取，失败回退内置兜底值。
+ *
+ * ⚠ 只在**首次需要时**拉一次并缓存（配置很少变），且失败**不阻塞**推理。
+ */
+let zcodeCaptchaConfigPromise: Promise<{ region: string; prefix: string; sceneId: string }> | undefined
+const resolveZcodeCaptchaConfig = async (): Promise<{ region: string; prefix: string; sceneId: string }> => {
+  zcodeCaptchaConfigPromise ??= (async () => {
+    const remote = await zcode.fetchCaptchaConfig().catch(() => undefined)
+    if (remote !== undefined) {
+      zcodeAdapter.setCaptchaConfig(remote)
+      return remote
+    }
+    return ZCODE_CAPTCHA_FALLBACK
+  })()
+  return await zcodeCaptchaConfigPromise
+}
+const zcodeAdapter = registerZcodeLlm(ctx, {
+  credentialRef: credentialRef(ZCODE.defaultCredentialRef),
+  resolveCredential: async (modelId?: string) => {
+    // 只从 zcode 自己的账号池取账号，回退到自己的单凭据 ref，
+    // 保证不会串用其它 provider 的凭据。
+    // provider 实参用 ZCODE.id 而非字面量：写死字面量在改名/多产品场景下
+    // 会静默查不到账号（本插件在 workbuddy 上踩过同类坑）。
+    // ⚠ `modelId` 透传：否则模型级限流标记被忽略（详见 buddy 处说明）。
+    const available = await pool.getAvailableAccount(ZCODE.id, modelId ?? '')
+    /**
+     * `getAvailableAccount` 的凭据类型是历史遗留的联合类型，
+     * 与 `ZcodeCredential` 无充分重叠，故经 `unknown` 转换。
+     * 运行时安全性由 provider 过滤保证：查询用 `ZCODE.id`，取到的必是 zcode 凭据。
+     */
+    if (available) return available.credential as unknown as ZcodeCredential
+    /**
+     * 账号池里没有条目时，落到 `ZcodeAuth.current()` ——
+     * 它已经实现了「插件自存优先 → 官方客户端凭据回退」。
+     * ⚠ 不要在这里重复实现那条优先级（重复必然漂移）。
+     */
+    return await zcode.current()
+  },
+  refresh: async () => {
+    // ⚠ ZCode **没有** refresh 端点（与 Loomy 恒 false 同类，但原因不同）：
+    // 凭据是**静态**的（在官方客户端登录一次就固定下来）。
+    // 这里做的是「重读磁盘凭据并回写账号条目」——
+    // 使用户在官方客户端重新登录后，本插件无需重启即可用上新凭据。
+    const credential = await zcode.current()
+    if (credential === undefined) return
+    const available = await pool.getAvailableAccount(ZCODE.id, '')
+    // ⚠ `getAvailableAccount` 返回的可能是 `null`（本仓库该 API 的约定），
+    // 只判 `undefined` 会漏掉它 —— 用显式判空覆盖两者。
+    if (available === null || available === undefined) return
+    try {
+      await ctx.credentials.set(
+        credentialRef(available.entry.credentialRef),
+        JSON.stringify(credential),
+      )
+    } catch {
+      // 回写失败不影响请求（请求走磁盘凭据）。静默即可。
+    }
+  },
+  // ⚠ captcha 是**一次性**的 —— 每次调用都必须现产一个新 param。
+  // 走 `zcode.mintCaptcha`：整个插件**共用一台**常驻浏览器
+  //（适配器自建会变成两台，白占 200MB）。
+  mintCaptcha: async () => {
+    const config = await resolveZcodeCaptchaConfig()
+    return await zcode.mintCaptcha(config)
+  },
+  captchaRegion: ZCODE_CAPTCHA_FALLBACK.region,
+  /**
+   * ⚠ **图片字节桥接** —— 这是图片能真正发出去的关键。
+   *
+   * DSH 的图片块只带 `attachment:{attachmentId}`，真正拿字节要经附件服务。
+   * 缺了这两项，`serializeMessages` 拿到**空映射**，图片会退化成
+   * `[image unavailable]` 占位符 —— 实测症状是模型回
+   * 「我在当前对话中没有收到任何图片」。
+   *
+   * ⚠ 与其余 provider 同款约定（十余处一致）：
+   *   - `readImage`：拿原始字节（内联为 data URL）
+   *   - `readImageRequest`：拿**按预算缩放后**的字节；**不可用时返回
+   *     `undefined`**（不抛错），适配器据此回退原图
+   */
+  readImage: makeReadImage(ctx),
+  // 图片请求版本（缩放）桥接：ZCode 免费通道的请求体没有实测硬上限，
+  // 但 base64 后的截图很大（2560×1600 各约 3.9 MB），两张就接近常见网关
+  // 的 10MB 门槛 —— 与 raccoon 的同因（issue !IKITT9 那一族）。
+  readImageRequest: makeReadImageRequest(ctx),
+  // 模型目录用静态白名单（实测可用的两个）—— 上游模型池含
+  // 实测返回空响应的两条（GLM-5-Turbo / GLM-5.2），故不枚举远端。
+  fetchRemoteModels: () => zcode.fetchModels(),
+  accountPool: pool,
+  product: ZCODE,
+  // 就绪判据 = 有可用凭据（插件自存或官方客户端凭据）。
+  isReady: async () => (await zcode.current()) !== undefined,
+})
+
+
   // 一次性修复**老 TRAE 账号**的展示名（与上面 Raccoon 同类，同因）：
   // 服务端 ScreenName 是**按 uid 自动生成的默认名**（`用户26815487395`），
   // 多账号无法区分；`GetUserInfo` 的 `NonPlainTextMobile`（脱敏手机号）可区分。
@@ -987,6 +1119,11 @@ export function apply(ctx: Context): void {
     ['loomy', (p) => loomy.refreshAll(p)],
     // raccoon **可续期**：只按 refreshable 过滤，且只续进入 lead 窗口的账号。
     ['raccoon', (p) => raccoon.refreshAll(p)],
+    // zcode **不可续期**（凭据是静态的）—— 但这个方法仍做实事：
+    // 把磁盘上最新的凭据回写到全部 zcode 账号，
+    // 使用户在官方客户端重新登录后无需重启 DSH。
+    // ⚠ 只按 `refreshable` 过滤、**不看 `enabled`**（AGENTS.md 既有约定）。
+    ['zcode', (p) => zcode.refreshAll(p)],
   ]
 
   async function refreshAllCredentials(): Promise<void> {
@@ -1034,6 +1171,10 @@ export function apply(ctx: Context): void {
       trae.stop()
       cline.stop()
       loomy.stop()
+      zcode.stop()
+      // ⚠ 必须 dispose captcha 浏览器 —— 否则会留下孤儿 chromium
+      //（约 200-400MB，且用户没有界面能关掉它）。
+      zcodeAdapter.stop()
     }, 'jet-hub: multi-account refresh scheduler')
   }).catch((error: unknown) => {
     // ⚠️ 原来这个 `.then()` **没有** `.catch()`：`listAllAccounts()` 一旦 reject
@@ -1056,6 +1197,9 @@ export function apply(ctx: Context): void {
     trae.stop()
     cline.stop()
     loomy.stop()
+    zcode.stop()
+    // 同上：captcha 浏览器必须随插件一起回收。
+    zcodeAdapter.stop()
   }, 'codearts-auth.scheduler (legacy)')
 
   // ===== Jet Hub RPC 注册 =====
@@ -1075,8 +1219,9 @@ export function apply(ctx: Context): void {
     cline: clineAdapter,
     loomy: loomyAdapter,
     raccoon: raccoonAdapter,
+      zcode: zcodeAdapter,
   }
 
-  registerJetHubRpc(ctx, pool, service, buddy, workbuddy, lobsterai, qoder, qoderCn, trae, cline, loomy, raccoon, modelAdapters)
+  registerJetHubRpc(ctx, pool, service, buddy, workbuddy, lobsterai, qoder, qoderCn, trae, cline, loomy, raccoon, zcode, modelAdapters)
   ctx.provide('accountPool', pool)
 }

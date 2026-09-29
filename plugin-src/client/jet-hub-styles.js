@@ -34,6 +34,11 @@ const STYLES = `
 .dim-jh-providerIcon.trae { background: white; }
 /* Raccoon Work（商汤）：官方图标是深蓝底白色面具，白底容器中显示清晰。 */
 .dim-jh-providerIcon.raccoon { background: white; }
+/*
+ * ZCode（智谱）：图标自带深色圆角底 + 青色 Z，本身即完整图形，
+ * 故容器保持透明（加白底反而会出现一圈突兀的方块）。
+ */
+.dim-jh-providerIcon.zcode { background: transparent; }
 
 /* provider 文案：align dsh-im .dim-channelCopy */
 .dim-jh-providerLabel { min-width: 0; display: grid; }

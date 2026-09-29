@@ -114,7 +114,7 @@ Tokens 福利）。
 凭据来自默认的新式 IAM OAuth 流程（含 `refresh_token`）。请求发起时会解析最新
 凭据，若已过期则先静默续期，再用新 AK/SK/SecurityToken 签名，无需重新打开浏览器。
 
-除 `codearts` 外，插件另注册九个独立的 provider 路由：`buddy`（见
+除 `codearts` 外，插件另注册十个独立的 provider 路由：`buddy`（见
 [buddy provider](#buddy-provider)）、`workbuddy`（见
 [WorkBuddy provider](#workbuddy-provider)）、`lobsterai`（见
 [LobsterAI provider](#lobsterai-provider有道龙虾)）、`qoder`（见
@@ -122,8 +122,9 @@ Tokens 福利）。
 [Qoder CN provider](#qoder-cn-providerqoder-中国版)）、`trae`（见
 [TRAE provider](#trae-provider字节跳动-trae)）、`cline`（见
 [Cline provider](#cline-provider)）、`loomy`（见
-[Loomy provider](#loomy-provider讯飞办公助手)）与 `raccoon`（见
-[Raccoon Work provider](#raccoon-work-provider商汤小浣熊)）。十者互不覆盖，可同时使用。
+[Loomy provider](#loomy-provider讯飞办公助手)）、`raccoon`（见
+[Raccoon Work provider](#raccoon-work-provider商汤小浣熊)）与 `zcode`（见
+[ZCode provider](#zcode-provider智谱-zai-免费额度)）。十一个互不覆盖，可同时使用。
 
 ## 凭证
 
@@ -1815,3 +1816,226 @@ pnpm test:e2e:raccoon-tools  # ⚠️ 发推理：验证 **tools 被端点接受
 ⚠️ **`raccoon-tools` 的判据是「响应里有结构化 `tool_calls`」**，
 不是「模型在正文里说它想调用工具」—— 后者正是 Qoder / TRAE 踩过的缺陷形态
 （插件没把 `tools` 发出去，模型只能用正文 XML 臆造，harness 认不出 → 任务终止）。
+
+---
+
+## ZCode provider（智谱 z.ai 免费额度）
+
+第十个 provider，id `zcode`，面板显示为 **ZCode (智谱)**。
+
+它把 **ZCode 官方客户端的免费额度通道**（智谱 z.ai Start Plan，
+`GLM-5.3-Flash`）接进 DSH。实测本机账号额度 **1 亿 token / 日**。
+
+### ⚠️ 与其余 provider 完全不同的四点
+
+| 维度 | ZCode | 对照 |
+|---|---|---|
+| **凭据来源** | **解密磁盘** `~/.zcode/v2/credentials.json` | 浏览器登录拿 token |
+| **协议** | **Anthropic Messages**（非 OpenAI 兼容） | 其余多为 OpenAI 格式 |
+| **每请求前置** | 产出一个**一次性**阿里云 captcha（约 1.2 秒） | 无 |
+| **请求体准入** | 必须带**官方身份块**（否则 `3012`） | 无 |
+
+### 凭据：**可以完全脱离官方客户端**
+
+两条路**并存**，插件自存优先：
+
+1. **插件内登录**（推荐，无需装任何东西）—— 走官方 CLI 设备授权流：
+
+   ```
+   ① POST /api/v1/oauth/cli/init        Bearer <自己生成的 32 字节 hex>
+        body: { provider: "bigmodel" }
+      → { flow_id, poll_token, authorize_url, expires_at, poll_interval_sec }
+   ② 用户在浏览器打开 authorize_url 完成授权
+   ③ GET /api/v1/oauth/cli/poll/{flow_id}
+      → { status: "pending" } 继续等
+      → { status: "ready", token, user, bigmodel: { access_token } }
+   ```
+
+   ⚠️ 这是**纯 HTTP**，不经 `zcode://` 自定义协议回调 —— 普通 Node 进程就能
+   走完（实测 ① 返回 200、③ 正常 `pending` 轮询）。它还**绕开了故障的**
+   `POST /api/v1/oauth/token`（该端点自 2026-09-28 起稳定 500 / code 2007）。
+
+2. **回退：读官方客户端凭据** —— 解密 `~/.zcode/v2/credentials.json`
+   （`enc:v1:` + AES-256-GCM，密钥由官方公开算法派生：
+   `sha256(ZCODE_CREDENTIAL_SECRET ?? \`zcode-credential-fallback:${platform}:${homedir}:${username}\`)`）。
+   「已经装了官方客户端并登录过」的用户**零操作**即可用。
+
+⚠️ **`device_mid` 由插件自己生成**（UUID v4），不再读官方
+`telemetry-state.json` —— 这是「脱离 IDE」的关键。实测依据：同一 JWT 换
+任意随机 UUID，`billing/balance` 都返回 200；而缺它才回
+`400 {"code":3001,"msg":"parameter error"}`。故它的**值**不被绑定校验，
+只需**稳定**（生成后持久化在凭据里，登录一次即固定）。
+
+⚠️ 凭据形状校验必须做：凭据存储里可能有任何字符串（用户手填、旧版本残留），
+`isUsableZcodeCredential()` 保证后续代码拿到的是完整对象。
+
+### captcha：唯一还需要浏览器的地方
+
+免费通道强制阿里云 captcha（缺失时上游回
+`400 {"code":3007,"msg":"captcha verify failed"}`）。它是**网页 SDK**，
+不是 Electron 专有 API：
+
+```
+script:  https://o.alicdn.com/captcha-frontend/aliyunCaptcha/AliyunCaptcha.js
+配置:    GET /api/v1/client/configs?platform=unknown  →  {region, prefix, sceneId}
+调用:    window.AliyunCaptchaConfig = { region, prefix }
+         initAliyunCaptcha({ SceneId, element, button, getInstance, success, … })
+取参:    getInstance 里调 instance.startTracelessVerification()（无感验证）
+```
+
+**三条实测得到的硬约束**：
+
+1. **`--headless=new` 过不了**，必须 **headful**（窗口移到屏幕外
+   `--window-position=-32000,-32000`，不进任务栏、不抢焦点，用户无感）。
+   实测矩阵（同一份代码，只换一个变量）：
+
+   | | `about:blank` | 真实 origin |
+   |---|---|---|
+   | **headless** | **0/3** | **0/3** |
+   | **headful** | 3/3 | **3/3（811ms）** |
+
+2. **页面必须是真实 https origin**（`https://zcode.z.ai/`），不能用 `about:blank`
+   —— 后者的 origin 是字符串 `"null"`，阿里云风控据此拒绝：
+
+   | origin | 同一页面连续 mint |
+   |---|---|
+   | `about:blank` | **1/3**（#2 起 `F001`） |
+   | **`https://zcode.z.ai/`** | **5/5，中位 426ms** |
+
+3. **可以复用同一个页面**（因为 origin 对了）+ 每次重置 DOM。
+   比「每次新建 page」快 **2.9 倍**（1246ms → 426ms）。
+
+⚠️ SDK 在**降级路径**下会产出**约 76 字符的垃圾 param**，发上游**必然 3007**。
+故 `validateCaptchaParam()` 会校验（长度 ≥200 且 `securityToken` ≥50），
+不合格**不发请求**（省一次注定失败的往返）。
+
+浏览器自动探测（`ZCODE_CHROME_PATH` 可显式指定）：
+scoop `chromium` → Chrome → Chromium → Edge。**常驻一台 + 复用页面**；
+并发 mint 会串行化（captcha param 一次性，共用页面会互相踩状态）；
+插件卸载时 `dispose()`（否则留孤儿进程约 200-400MB）。
+
+### ⚠️ 关于「更轻量的浏览器」：实测结论是**都不行**
+
+试过三个 obscura 构建（obscura-node 自带 0.1.8 / scoop 0.2.3 /
+官方 release `-stealth` 0.2.3）与 Lightpanda，**均无法跑通阿里云 captcha**：
+
+| 方案 | 结果 |
+|---|---|
+| obscura 0.2.3（官方 stealth，最完整构建） | ✗ `getInstance` 从不触发，**零阿里云网络请求** |
+| obscura 0.1.8（obscura-node 自带） | ✗ 与 0.2.3 **同样的**错误 |
+| Lightpanda | ✗ 特性清单**明确无 canvas/WebGL** |
+
+obscura 的根因是**引擎级缺口**（不是补几个 API 能解决）：
+
+```
+[error] Dynamic script fetch error: HTTP 0        ← 动态模块加载器失败
+[error] Couldn't find a style target              ← CSSOM 注入不工作
+[error] Dynamic script error: moveTo is not defined
+[error] Timer error: TypeError: Cannot read properties of undefined (reading 'prototype')
+```
+
+我试过**拦截 `HTMLCanvasElement.prototype.getContext`**（给 SDK 自建的 canvas
+注入带真实 VENDOR/RENDERER 的假 WebGL）+ 补 `Permissions` / `TouchEvent`：
+补丁确实生效、错误也变了，但暴露出 `Dynamic script fetch error: HTTP 0`
+这个**死结** —— FeiLin 无感引擎靠动态加载若干 JS 模块工作。
+
+⇒ **继续用 chromium**（scoop 已装，零新增安装；或用系统 Chrome / Edge）。
+
+`Playwright` 也能跑通（复用页面同样约 546ms），但它会引入依赖；
+当前手写 CDP 版本**零第三方依赖**且已优化到同等水平，故不引入。
+
+### 3012：判据是**请求体内容**，不是 HTTP 头
+
+上游对 `zcode-plan` 通道做内容检查。实测矩阵：
+
+| `system` 内容 | 字符数 | 结果 |
+|---|---|---|
+| 无 | 0 | ✗ 3012 |
+| 仅 `cliPrefix` | 42 | ✗ 3012 |
+| **`cliPrefix` + `stable`** | **2900** | **✓ 200** |
+
+⇒ 身份块必须**逐字**为官方文本且**处在开头**，调用方的 prompt 追加在最后。
+另外首轮 user 消息要带 `<system-reminder>` 日期块（官方称之为
+「3012 的最后一个开关」）。
+
+⚠️⚠️ **3012 有账号冷却惩罚**（30 分钟；24h 内第 3 次起 24h；**5 次停用**）。
+故 `httpErrorCodeForZcode()` 把它映射为 `PERMISSION`（**不可重试**），
+而 `3007` 映射为 `RATE_LIMIT`（可重试，换个新 param 就能过）。
+
+### 积分与签到
+
+- **余额**：`GET /api/v1/zcode-plan/billing/balance`
+  （⚠️ **需要** `Authorization: Bearer <zcodejwt>`，与 `preview` 不同）。
+- **每日领取**：`event/report`（补 `app_launch` + `app_daily_active`）
+  → `billing/preview` → `billing/claim`。
+
+⚠️ **补激活上报不能省**：不补这两条事件，`preview` 恒为空 `plans: []`
+（实测：补前空、补后立刻出现 plan）。「每日随机派发」不是随机推送，
+而是**服务端按活跃信号决定要不要给**。
+
+⚠️ **captcha 一次性** ⇒ 每个 plan 都要**重新 mint**（复用会得 `3007`）。
+
+⚠️ **`1003`（已领取）是幂等成功，不是错误** —— 当失败会让定时任务反复误报。
+
+⚠️ 能力矩阵登记为 `{ balance: true, dailyCheckin: true }`，
+但**额度单位是 token 而不是积分** —— 面板与 RPC 层如实标注量纲，不伪装。
+
+### 模型表是**静态白名单**
+
+上游模型池有 4 个，但 `GLM-5-Turbo` / `GLM-5.2` 实测**返回空响应**
+（0/3 正确，而 `GLM-5.3` 是 3/3），故只暴露实测可用的两个：
+
+| 模型 | 中位延迟 | 正确率 | 并发限流 |
+|---|---|---|---|
+| `GLM-5.3` | 4452ms | 8/14 | 撞过 21 次 3009 |
+| `GLM-5.3-Flash` | 4915ms | 10/15 | **0 次** |
+
+⚠️ `listModels` **不发网络请求**（枚举远端会列出用不了的模型）。
+
+### 显式不支持图片
+
+该通道的图片链路**未验证**，故适配器**显式拒绝**图片输入
+（`UNSUPPORTED_CONTENT`）—— 比静默丢图好（丢图会让模型看到空内容）。
+
+### 实测（本机，2026-09-29）
+
+```
+readZcodeCredential()   ✓  device_mid=72c145cd…  app_version=3.14.3
+fetchZcodeBalance()     ✓  GLM-5.3-Flash  remaining=99,999,344 / 100,000,000
+fetchZcodeCaptchaConfig ✓  {"region":"cn","prefix":"no8xfe","sceneId":"11xygtvd"}
+captcha mint            ✓  2339ms  len=280  securityToken=128
+真实推理（GLM-5.3-Flash）✓  3685ms  可见文本="正常"
+                            chunk 类型 = block-start, reasoning-delta, text-delta, block-end
+额度扣减                 ✓  used: 656 → 1475
+```
+
+### ⚠️ 与「本机 HTTP 桥」方案的关系
+
+PR 初版的实现是「读 `<dataBaseDir>/.zcode/v2/bridge-port.json` → 打本机桥
+→ 由 ZCode 实例代发上游」。那条路依赖一个**被补丁注入过的开源版实例**，
+而**官方闭源版不写那个发现文件** —— 故「装了 ZCode」并不等于「桥可用」。
+本实现改为**直连上游**（凭据解密 + captcha 由普通浏览器产出 +
+身份块满足准入），**不再需要任何实例常驻**。
+
+### 协议层：`zcode-anthropic.ts`
+
+ZCode 免费通道**只认 Anthropic Messages**（实测 `zcode-plan` 下的
+`openai` / 裸 `v1/chat/completions` 路径一律 `404 page not found`）。
+而 `openai-compat.ts` 的 `serializeMessages()` 产出 OpenAI 形态，
+故需要一层转换：
+
+| 维度 | OpenAI | Anthropic |
+|---|---|---|
+| system | `messages[0].role='system'` | **顶层 `system` 字段**（块数组） |
+| 工具声明 | `tools[].function.{name,parameters}` | **`tools[].{name,input_schema}`**（扁平） |
+| 工具调用 | `tool_calls[].function.arguments`（**字符串**） | `content[].{type:'tool_use',input}`（**对象**） |
+| 工具结果 | `{role:'tool', tool_call_id}` | `{role:'user', content:[{type:'tool_result'}]}` |
+| SSE 结束 | `data: [DONE]` | `message_stop` 事件（**无** `[DONE]`） |
+| 思考 | `delta.reasoning_content` | `thinking_delta` |
+
+⚠️ 两个最容易踩的：`tool_use.input` 是**对象**（不是 JSON 字符串）；
+工具结果必须包成 `role:'user'` 里的 `tool_result` 块。
+
+⚠️ **空响应必须显式抛 `EMPTY_RESPONSE`** —— Anthropic SSE 没有 `[DONE]`
+可做锚点，若不检查就会「干净地停止、无任何报错」
+（与 Qoder 那次静默失败的形态完全一致）。

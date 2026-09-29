@@ -175,6 +175,17 @@ const LOOMY_ICON = 'data:image/svg+xml,%3Csvg xmlns="http://www.w3.org/2000/svg"
  */
 const RACCOON_ICON = 'data:image/png;base64,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';
 
+/**
+ * ZCode（智谱）面板图标。
+ *
+ * 32×32 PNG（深色圆角底 + 青色 "Z"），内联 data URI —— 与其余 provider
+ * 的图标方式一致（bundle 里不放二进制资源文件）。
+ *
+ * ⚠️ 生成方式：纯 Node 手写 PNG（zlib deflate + CRC32），零第三方依赖。
+ * 重新生成见 `.tmp-zcode/icon-gen.mjs`（不入库的本地工具）。
+ */
+const ZCODE_ICON = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAAgklEQVR42u3XsRGAIAyF4UxgYe0g7j+FpZtgRwN36stLAhruqP+v4ICIdNaybsViy92yCj+CeMW7CO94gwgFRMUrIgFTAPbzgPe/Aa5nAInTAGicAtDE1QBtXAVgxGEAeuIpAFYYArDj81xEoQDLd+A1ID8k3wTkXDDEaDbEcBo1nl/XXoK4yMqvMgAAAABJRU5ErkJggg==';
+
 const PROVIDERS = Object.freeze([
   { id: 'codearts', label: 'CodeArts (华为云)', icon: CODEARTS_ICON, logoClass: 'codearts' },
   { id: 'buddy', label: 'CodeBuddy (腾讯)', icon: CODEBUDDY_ICON, logoClass: 'buddy' },
@@ -190,6 +201,19 @@ const PROVIDERS = Object.freeze([
   // ⚠️ 用『Raccoon (商汤)』而非『Raccoon Work (商汤)』—— 后者在 provider 列表里
   // **触发换行**（用户报障）。与 `RaccoonProduct.displayName` 保持一致。
   { id: 'raccoon', label: 'Raccoon (商汤)', icon: RACCOON_ICON, logoClass: 'raccoon' },
+  /**
+   * ZCode（智谱）—— 第十个 provider。
+   *
+   * ⚠️ 用『ZCode (智谱)』，与 `ZCODE.displayName` 保持一致；长度也刻意
+   * 控制在不会触发换行的范围内（Raccoon 那条用户报障过）。
+   *
+   * ⚠️ 它走**标准两步式登录**（与 codearts / qoder / trae 同型）：
+   * 后端立刻返回官方授权 URL（`https://bigmodel.cn/login?appId=zcode…`），
+   * 前端弹窗、用户在浏览器授权，后端轮询到 `status: "ready"` 后拿到 token。
+   * 故它**不需要任何特殊分支** —— 与其余 provider 共用同一条
+   * 「弹窗 + 登录轮询」路径。
+   */
+  { id: 'zcode', label: 'ZCode (智谱)', icon: ZCODE_ICON, logoClass: 'zcode' },
 ]);
 
 /**
@@ -280,19 +304,69 @@ function formatCredits(value) {
 }
 
 /**
+ * 把 **token 计数**格式化成人类可读的 `xx.yyM` / `x.yyK`。
+ *
+ * ## ⚠ 为什么需要它（真实缺陷）
+ *
+ * 用户报障：「智谱 plan 给的不是积分是 tokens，应该显示 `Token: xx.yyM` 这种格式」。
+ *
+ * 上游 `billing/balance` 的桶里有明确单位声明（实测）：
+ * ```json
+ * { "meter": "model_usage", "unit_type": "token",
+ *   "total_units": 100000000, "remaining_units": 94539275 }
+ * ```
+ * Host 侧已如实标注 `unit: 'token'`，但客户端此前**完全不消费 `unit`** ——
+ * 于是界面显示 `94539275`（无单位、看起来像 1 亿积分，量级也读不出来）。
+ *
+ * 规则（与常见 token 展示一致）：
+ *   - `>= 1e6` → `94.54M`
+ *   - `>= 1e3` → `945.39K`
+ *   - 其余     → 原样整数
+ *
+ * ⚠ 小数位**固定两位**（`94.54M` 而不是 `94.5M`）：token 余额的百位变化
+ * 对用户有意义（差 0.04M = 4 万 token），一位小数会把它们抹平。
+ */
+function formatTokens(value) {
+  if (typeof value !== 'number' || !Number.isFinite(value)) return null;
+  const abs = Math.abs(value);
+  if (abs >= 1e6) return `${(value / 1e6).toFixed(2)}M`;
+  if (abs >= 1e3) return `${(value / 1e3).toFixed(2)}K`;
+  return String(Math.round(value));
+}
+
+/**
+ * 按**单位**选择格式化函数。
+ *
+ * ⚠ 这是 `unit` 字段的唯一消费点 —— 加新单位（如 `credit`）时改这里，
+ * 不要在渲染处写 `if (provider === 'zcode')` 那种分支（会漏掉别的 provider）。
+ */
+function formatUnits(value, unit) {
+  if (unit === 'token') return formatTokens(value);
+  return formatCredits(value);
+}
+
+/** 单位的展示名（账号卡片上的标签）。 */
+function unitLabel(unit) {
+  return unit === 'token' ? 'Token' : '积分';
+}
+
+/**
  * 把一个包的明细格式化成 tooltip 的一行。
  *
  * ⚠️ 到期提示取 `deductionEndTime`（扣费截止），**不是** `cycleEndTime`：
  * 订阅套餐的计量周期是月度的（月底清零），但积分本身可以留到 8 年后 ——
  * 拿周期时间显示会让用户以为"永久积分只剩 2 天"。两者都没有时才不显示。
  *
+ * ⚠ 按**包自身**的 `unit` 格式化：同一 provider 的不同包可能单位不同
+ * （且 ZCode 的包是 token，`94539275` 直接显示读不出量级）。
+ *
  * @param pkg - 资源包。
  * @param windowDays - 后端回传的窗口天数（决定这一行标成「N 天内到期」还是「还有 N 天」）。
  * @param now - **渲染时**的当前时刻（分类是时间的函数，不能传缓存值）。
  */
 function formatPackageLine(pkg, windowDays, now) {
-  const remaining = formatCredits(pkg.remaining) ?? '?';
-  const total = formatCredits(pkg.total) ?? '?';
+  const remaining = formatUnits(pkg.remaining, pkg.unit) ?? '?';
+  const total = formatUnits(pkg.total, pkg.unit) ?? '?';
   const parts = [`${pkg.active ? '' : '[已失效] '}${pkg.name || '未命名'}: ${remaining} / ${total}`];
   const daysLeft = daysUntilExpiry(pkg, now);
   if (!pkg.active && pkg.expiredTime) parts.push(`失效于 ${pkg.expiredTime}`);
@@ -304,30 +378,43 @@ function formatPackageLine(pkg, windowDays, now) {
 }
 
 /**
- * 账号卡片上的积分余额行。
+ * 账号卡片上的余额行（积分 / Token 两种单位）。
  *
  * 三种状态严格区分，不能混为一谈：
- * - 查不到（balance 为 null）→ 显示原因，不要显示成 0 积分
+ * - 查不到（balance 为 null）→ 显示原因，不要显示成 0
  * - 查到了但余额为 0 → 显示 0
  * - 还没有结果 → 显示"读取中"
  *
+ * ## ⚠ 单位（真实缺陷）
+ *
+ * 用户报障：「智谱 plan 给的不是积分是 tokens，应该显示 `Token: xx.yyM` 这种格式」。
+ * ZCode 的 `billing/balance` 里 `unit_type: "token"`（实测），Host 已把它
+ * 透传成 `balance.unit` / `package.unit` —— 故**标签与数字都要按单位走**：
+ * 标签用 `Token`（不是「积分」），数字用 `94.54M`（不是 `94539275`）。
+ *
+ * ⚠ 判定取**首个有效包**的单位（Host 侧同一 provider 的包单位一致；
+ * 混合单位时以第一个为准，避免标签闪烁）。
+ *
  * @param windowDays - 后端 `credits.balances` 回传的「临时积分」窗口（天）。
- *   有它才显示**临时 / 长期**两桶（CodeBuddy / WorkBuddy / TRAE 带）。
+ *   有它才显示**临时 / 长期**两桶（CodeBuddy / WorkBuddy / TRAE / LobsterAI 带）。
  */
 function CreditBalanceRow({ balance, error, loading, windowDays, provider }) {
+  const all = balance?.packages || [];
+  // ⚠ 单位从**包**上取（ZCode 是 token，其余是积分），标签与格式化都按它走。
+  const unit = all.find(p => p && p.unit)?.unit;
+  const label = unitLabel(unit);
   if (loading) {
     return React.createElement('div', { className: 'dim-jh-metaRow' },
-      React.createElement('dt', null, '积分'),
+      React.createElement('dt', null, label),
       React.createElement('dd', { 'data-tone': 'muted' }, '读取中…'));
   }
   if (error || !balance) {
     return React.createElement('div', { className: 'dim-jh-metaRow' },
-      React.createElement('dt', null, '积分'),
+      React.createElement('dt', null, label),
       React.createElement('dd', { 'data-tone': 'warn', title: error || '查询失败' },
         error || '查询失败'));
   }
-  const total = formatCredits(balance.total) ?? '0';
-  const all = balance.packages || [];
+  const total = formatUnits(balance.total, unit) ?? '0';
   const activeCount = all.filter(p => p.active).length;
   /**
    * ⚠️ 分类在**渲染的这一刻**用当前时间现算，绝不存进 state、也不缓存到别处：
@@ -339,7 +426,10 @@ function CreditBalanceRow({ balance, error, loading, windowDays, provider }) {
    */
   const now = Date.now();
   const split = splitCreditsByExpiry(all, windowDays, now);
-  const expiryText = formatExpirySplitLine(split, formatCredits);
+  // ⚠ 数字按**单位**格式化（remote 引入的单位支持）：ZCode 的包是 token，
+  // 用 `formatCredits` 会把 94539275 显示成「9453.93万」而非「94.54M」。
+  const formatForUnit = (value) => formatUnits(value, unit);
+  const expiryText = formatExpirySplitLine(split, formatForUnit);
   // 明细放进 title，不占版面；账号卡片本身已经信息密集了
   const detail = [
     all.length > 1 ? `共 ${all.length} 个资源包，${activeCount} 个有效` : null,
@@ -357,18 +447,23 @@ function CreditBalanceRow({ balance, error, loading, windowDays, provider }) {
    */
   const poolSplitText = formatPoolSplitLine(
     all,
-    formatCredits,
+    formatForUnit,
     // Loomy 的另一个池就叫「永久积分」；Raccoon 的奖励/会员/充值三种池
     // 到期规则各不相同，不能统称永久。
     provider === 'loomy' ? '永久' : '长期',
   );
   return React.createElement('div', { className: 'dim-jh-metaRow' },
-    React.createElement('dt', null, '积分'),
+    // ⚠ 标签按单位走：ZCode 是 token，显示「Token」而不是「积分」。
+    React.createElement('dt', null, label),
     React.createElement('dd', {
       className: 'dim-jh-creditValue',
       title: detail || undefined,
     },
     React.createElement('strong', { className: 'dim-jh-creditTotal' }, total),
+    // 当日池分桶（loomy / raccoon）：`formatPoolSplitLine` 已覆盖原先硬编码的
+    // loomy 两池判据，且对 Raccoon 的「每日积分」同样成立（用户 2026-09-29 要求）。
+    // ⚠ 数字按**包自身的单位**格式化（remote 的单位支持）：池可能来自
+    // 不同 provider，不能假定都是积分。
     poolSplitText
       ? React.createElement('span', { className: 'dim-jh-creditPools' }, poolSplitText)
       : null,
@@ -391,7 +486,7 @@ function CreditBalanceRow({ balance, error, loading, windowDays, provider }) {
     // 失效额度单独提示：它们仍在服务端响应里，但不计入上面的数字
     balance.expiredTotal > 0
       ? React.createElement('span', { className: 'dim-jh-creditExpired' },
-          `另有 ${formatCredits(balance.expiredTotal)} 已失效`)
+          `另有 ${formatUnits(balance.expiredTotal, unit)} 已失效`)
       : null));
 }
 
@@ -1673,7 +1768,7 @@ function ProviderPanel({ provider, rpcCall }) {
                 // （loomy 的池是我们合成的、无到期字段，列出来会把「每日赠送」
                 // 标成长期 —— 恰好说反）。
                 showPackageList: supportsCreditPackageList(provider),
-                // 「临时 / 长期」分桶的窗口天数（buddy 系 + TRAE 才有值）。
+                // 「临时 / 长期」分桶的窗口天数（buddy 系 + TRAE + LobsterAI 才有值）。
                 windowDays: expiryWindowDays,
                 // 卡片级「重测 / 重置」：只对会返回限流错误的 provider 渲染。
                 showRateLimitActions: supportsRateLimit(provider),
