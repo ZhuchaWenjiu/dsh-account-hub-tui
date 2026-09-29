@@ -177,10 +177,14 @@ describe('Loomy 客户端接线', () => {
   /**
    * ⚠️ 两池必须**分开显示**（用户明确要求）：永久积分与每日赠送是两个
    * 分开计算的池，只显示合计会丢失这一信息。
+   *
+   * ⚠️ 判据已从「硬编码 loomy 的两个池名」改成通用的 `formatPoolSplitLine`
+   * （用户 2026-09-29 要求 Raccoon 的「每日积分」也按 loomy 那样显示）——
+   * 故这里断言的是**走那条通用函数**，而不是文件里出现两个池名字面量。
    */
-  it('账号卡片分开显示永久/每日两个池', () => {
-    expect(hubSource).toContain('永久积分')
-    expect(hubSource).toContain('每日赠送')
+  it('账号卡片走通用的当日池分桶（Loomy 与 Raccoon 共用）', () => {
+    expect(hubSource).toContain('formatPoolSplitLine')
+    expect(hubSource).toMatch(/formatPoolSplitLine\([\s\S]{0,200}provider === 'loomy' \? '永久' : '长期'/)
   })
 
   /**

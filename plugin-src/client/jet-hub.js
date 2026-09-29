@@ -2,6 +2,7 @@ import * as React from 'react';
 
 import {
   supportsCreditBalance,
+  supportsCreditPackageList,
   supportsDailyCheckin,
   supportsOnboardingTasks,
   supportsRateLimit,
@@ -12,6 +13,8 @@ import {
 import { orderAfterDrop, dropPositionFromPointer } from './account-order.js';
 import {
   formatExpirySplitLine,
+  formatPoolSplitLine,
+  formatPackageTooltip,
   splitCreditsByExpiry,
   expiryBucketLabel,
   daysUntilExpiry,
@@ -309,9 +312,9 @@ function formatPackageLine(pkg, windowDays, now) {
  * - 还没有结果 → 显示"读取中"
  *
  * @param windowDays - 后端 `credits.balances` 回传的「临时积分」窗口（天）。
- *   有它才显示**临时 / 永久**两桶（目前只有 CodeBuddy / WorkBuddy 带）。
+ *   有它才显示**临时 / 长期**两桶（CodeBuddy / WorkBuddy / TRAE 带）。
  */
-function CreditBalanceRow({ balance, error, loading, windowDays }) {
+function CreditBalanceRow({ balance, error, loading, windowDays, provider }) {
   if (loading) {
     return React.createElement('div', { className: 'dim-jh-metaRow' },
       React.createElement('dt', null, '积分'),
@@ -343,13 +346,22 @@ function CreditBalanceRow({ balance, error, loading, windowDays }) {
     ...all.map(pkg => formatPackageLine(pkg, windowDays, now)),
   ].filter(Boolean).join('\n');
   /**
-   * Loomy 的两个积分池必须**分开显示**（用户明确要求）。
+   * Loomy / Raccoon 的「当日刷新池」必须**单独显示**（用户明确要求）。
    *
-   * 判据是「恰好两个包且名字为已知池名」—— 其余 provider 的 packages 是
-   * 多个同类资源包（如 5 个 Bonus Pack），不适用这种展示。
+   * 两家的积分都由语义不同的池构成，其中有一个当日刷新（今天不用就没了）：
+   * - Loomy：`每日赠送`（每天 5000，消耗后不回补）+ `永久积分`
+   * - Raccoon：`每日积分`（`daily_points`）+ 奖励 / 会员 / 充值
+   *
+   * 判据是**池名**（见 `findDailyPool`），不是下标 —— Raccoon 的池是按
+   * 「服务端给了哪个字段」动态 push 的，下标会错位。
    */
-  const isLoomyTwoPools = all.length === 2
-    && all[0].name === '永久积分' && all[1].name === '每日赠送';
+  const poolSplitText = formatPoolSplitLine(
+    all,
+    formatCredits,
+    // Loomy 的另一个池就叫「永久积分」；Raccoon 的奖励/会员/充值三种池
+    // 到期规则各不相同，不能统称永久。
+    provider === 'loomy' ? '永久' : '长期',
+  );
   return React.createElement('div', { className: 'dim-jh-metaRow' },
     React.createElement('dt', null, '积分'),
     React.createElement('dd', {
@@ -357,20 +369,22 @@ function CreditBalanceRow({ balance, error, loading, windowDays }) {
       title: detail || undefined,
     },
     React.createElement('strong', { className: 'dim-jh-creditTotal' }, total),
-    isLoomyTwoPools
-      ? React.createElement('span', { className: 'dim-jh-creditPools' },
-          `永久 ${formatCredits(all[0].remaining) ?? '0'} · 每日 ${formatCredits(all[1].remaining) ?? '0'}`)
+    poolSplitText
+      ? React.createElement('span', { className: 'dim-jh-creditPools' }, poolSplitText)
       : null,
-    // 两个 buddy：按「会不会近期作废」分桶，与选号判据同一套规则。
+    // 两个 buddy + TRAE + LobsterAI：按「会不会近期作废」分桶，与选号判据同一套规则。
     // 这条也解释了「锁定永久积分后为什么没有可用账号」——临时桶是 0。
-    !isLoomyTwoPools && expiryText
+    // ⚠️ 用词「长期」不是「永久」：这些积分都有到期日，只是较远（用户定）。
+    // ⚠️ 与上面的池分桶互斥：有当日池的（loomy / raccoon）走池名分桶，
+    // 没有的走到期时间分桶。
+    !poolSplitText && expiryText
       ? React.createElement('span', {
           className: 'dim-jh-creditPools',
           title: `临时 = 距扣费截止不足 ${windowDays} 天（再不用就作废，优先消耗）；`
-            + '永久 = 其余积分（锁定永久积分后不参与消耗）。',
+            + '长期 = 其余积分（锁定永久积分后不参与消耗）。',
         }, expiryText)
       : null,
-    !isLoomyTwoPools && !expiryText && all.length > 1
+    !poolSplitText && !expiryText && all.length > 1
       ? React.createElement('span', { className: 'dim-jh-creditPackages' },
           `${activeCount}/${all.length} 个资源包有效`)
       : null,
@@ -381,7 +395,7 @@ function CreditBalanceRow({ balance, error, loading, windowDays }) {
       : null));
 }
 
-function AccountCard({ account, index, order, onToggle, onDelete, onRetest, onReset, onClaimOnboarding, onboardingBusy, busy, credits, creditsLoading, showCredits, windowDays, showRateLimitActions, drag }) {
+function AccountCard({ account, index, order, provider, onToggle, onDelete, onRetest, onReset, onClaimOnboarding, onboardingBusy, busy, credits, creditsLoading, showCredits, showPackageList, windowDays, showRateLimitActions, drag }) {
   const rateLimits = account.modelRateLimits
     ? Object.entries(account.modelRateLimits).filter(([, v]) => v > Date.now())
     : [];
@@ -391,6 +405,24 @@ function AccountCard({ account, index, order, onToggle, onDelete, onRetest, onRe
   const hasAnyLimit = Boolean(account.modelRateLimits && Object.keys(account.modelRateLimits).length > 0);
   // 拖拽相关的状态与回调由 ProviderPanel 统一管理（它掌握整个列表顺序）。
   const dragProps = drag || {};
+
+  /**
+   * 账号名 / 状态标签 hover 时的资源包列表。
+   *
+   * ⚠️ 只在 `showPackageList` 为真时挂 —— 那是「余额真的由多个资源包构成」的
+   * 能力位（目前只有两个 buddy）。loomy 的 packages 是我们合成的两个池名，
+   * 且没有到期字段，列出来会把「每日赠送」标成**永久**（恰好说反）。
+   *
+   * ⚠️ `now` 在渲染时取：到期是时间的函数，宿主长期开着，缓存会让"8 天后"
+   * 一直显示成"8 天后"。
+   */
+  const packageTooltip = showPackageList && credits?.balance?.packages?.length
+    ? formatPackageTooltip(credits.balance.packages, { format: formatCredits, now: Date.now() })
+    : null;
+  // 有数据挂包列表；余额还没拉到时挂提示而不是空 title —— 否则用户 hover
+  // 一个看起来该有内容的名字却毫无反应，会以为是坏了。
+  const accountTitle = packageTooltip
+    ?? (showPackageList && creditsLoading ? '资源包加载中…' : undefined);
 
   return React.createElement('div', {
     className: 'dim-jh-accountCard',
@@ -427,11 +459,17 @@ function AccountCard({ account, index, order, onToggle, onDelete, onRetest, onRe
         title: account.enabled ? '已启用' : '已停用',
         'aria-hidden': 'true',
       }),
-      React.createElement('span', { className: 'dim-jh-accountName' },
+      React.createElement('span', {
+        className: 'dim-jh-accountName',
+        // 资源包列表（剩余/总量 + 到期时间）。仅 buddy 系挂，见 packageTooltip。
+        title: accountTitle,
+      },
         account.nickname || account.id),
       React.createElement('span', {
         className: 'dim-jh-accountTag',
         'data-tone': account.enabled ? 'on' : 'off',
+        // 同账号名：hover 出资源包列表（两处都挂，用户 hover 哪个都能看见）。
+        title: accountTitle,
       }, account.enabled ? '已启用' : '已停用')),
     React.createElement('dl', { className: 'dim-jh-accountMeta' },
       React.createElement('div', { className: 'dim-jh-metaRow' },
@@ -451,8 +489,10 @@ function AccountCard({ account, index, order, onToggle, onDelete, onRetest, onRe
             balance: credits?.balance ?? null,
             error: credits?.error,
             loading: creditsLoading,
-            // 「临时 / 永久」分桶的窗口天数（仅 buddy 系有值）。
+            // 「临时 / 长期」分桶的窗口天数（buddy 系 + TRAE + LobsterAI 有值）。
             windowDays,
+            // 池名分桶（loomy / raccoon）要按 provider 决定另一个池的标签。
+            provider,
           })
         : null),
     rateLimits.length > 0
@@ -954,7 +994,7 @@ function ProviderPanel({ provider, rpcCall }) {
         next[item.accountId] = { balance: item.balance, error: item.error };
       }
       setCredits(next);
-      // 窗口天数随余额一起回来（仅 buddy 系带）——积分行据此分「临时 / 永久」。
+      // 窗口天数随余额一起回来（buddy 系 + TRAE 带）——积分行据此分「临时 / 长期」。
       setExpiryWindowDays(res?.windowDays ?? null);
     } catch (caught) {
       console.error('[jet-hub] load credits failed:', caught);
@@ -1620,11 +1660,20 @@ function ProviderPanel({ provider, rpcCall }) {
                 key: account.id,
                 account,
                 index,
+                // ⚠️ `provider` 必须传进来：积分行的**池名分桶**要按 provider
+                // 决定另一个池的标签（Loomy 是「永久」、Raccoon 是「长期」）。
+                // 漏传会在渲染时抛 `ReferenceError: provider is not defined`
+                // 并让整个 Jet Hub 设置页崩成白屏（真实事故，2026-09-29）。
+                provider,
                 busy: probeBusy !== null,
                 credits: credits[account.id],
                 creditsLoading: creditsLoading && credits[account.id] === undefined,
                 showCredits: canLoadCredits,
-                // 「临时 / 永久」分桶的窗口天数（buddy 系才有值）。
+                // 账号名 hover 列资源包：只有余额真由多个包构成的 provider 才挂
+                // （loomy 的池是我们合成的、无到期字段，列出来会把「每日赠送」
+                // 标成长期 —— 恰好说反）。
+                showPackageList: supportsCreditPackageList(provider),
+                // 「临时 / 长期」分桶的窗口天数（buddy 系 + TRAE 才有值）。
                 windowDays: expiryWindowDays,
                 // 卡片级「重测 / 重置」：只对会返回限流错误的 provider 渲染。
                 showRateLimitActions: supportsRateLimit(provider),

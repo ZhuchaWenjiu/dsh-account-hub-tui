@@ -13,9 +13,14 @@ import { describe, expect, it } from 'vitest'
 import {
   daysUntilExpiry,
   expiryBucketLabel,
+  findDailyPool,
   formatExpirySplitLine,
+  formatPackageExpiry,
+  formatPackageTooltip,
+  formatPoolSplitLine,
   splitCreditsByExpiry,
 } from '../../plugin-src/client/credit-expiry.js'
+import { supportsCreditPackageList } from '../../plugin-src/client/credits-capabilities.js'
 import { splitBuddyCreditsByExpiry } from '../../src/buddy-balance-rank.js'
 import type { CreditBalance, CreditPackage } from '../../src/credits.js'
 
@@ -151,6 +156,36 @@ describe('与后端 splitBuddyCreditsByExpiry 对账', () => {
     expect(splitCreditsByExpiry(packages, WINDOW_DAYS, later))
       .toEqual(backendSplit(packages, WINDOW_DAYS, later))
   })
+
+  /**
+   * ⚠️ **TRAE 真实数据**（用户报障的那个号，2026-09-29 抓包）：
+   * 「每月登录赠送 500」（`expire_time` 1790783999 = 2026-09-30 23:59:59）
+   * 与三个「签到奖励 150」（10/28·29·30 到期，各 +31 天）。
+   *
+   * 用户报障原文：「trae的积分没按长期、临时分开显示」。根因是 TRAE 分支
+   * **不回传 `windowDays`**，前端 `splitCreditsByExpiry` 拿不到窗口就返回 null、
+   * 不渲染分类行（那道门禁本身是对的：防止给"没有作废维度"的 provider
+   * 凭空渲染假分类行）。
+   *
+   * 这里锁死「TRAE 的真实到期数据 + 窗口 → 正确分桶」：
+   * 500 落在 15 天内 ⇒ 临时；三个 150 都在 15 天外 ⇒ 长期。
+   */
+  it('TRAE 真实数据分桶：9/30 到期的 500 是临时、三个 10/28+ 的 150 是长期', () => {
+    const base = NOW // 2026-10-01 前后的固定时刻由文件顶部的 NOW 提供
+    const traePackages = [
+      pkg({ name: '每月登录赠送', remaining: 500, deductionEndTime: base + 1 * DAY }),
+      pkg({ name: '签到奖励', remaining: 150, deductionEndTime: base + 28 * DAY }),
+      pkg({ name: '签到奖励', remaining: 150, deductionEndTime: base + 29 * DAY }),
+      pkg({ name: '签到奖励', remaining: 150, deductionEndTime: base + 30 * DAY }),
+    ]
+    expect(splitCreditsByExpiry(traePackages, WINDOW_DAYS, base))
+      .toEqual({ expiring: 500, permanent: 450 })
+    expect(formatExpirySplitLine(splitCreditsByExpiry(traePackages, WINDOW_DAYS, base), v => String(v)))
+      .toBe('长期 450 · 临时 500')
+    // 与后端同规则（TRAE 复用 buddy 的分桶判据，不存在第二套标准）
+    expect(splitCreditsByExpiry(traePackages, WINDOW_DAYS, base))
+      .toEqual(backendSplit(traePackages, WINDOW_DAYS, base))
+  })
 })
 
 describe('daysUntilExpiry / expiryBucketLabel', () => {
@@ -189,17 +224,17 @@ describe('formatExpirySplitLine（卡片那一行）', () => {
   const format = (v: number) => (Number.isInteger(v) ? String(v) : v.toFixed(2))
 
   /**
-   * ⚠️ **永久在前、临时在后**（用户 2026-09-29 要求）：与 Loomy 那行的
-   * 「永久 … · 每日 …」同一顺序，两个 provider 的卡片读起来才对齐。
+   * ⚠️ **长期在前、临时在后**（用户 2026-09-29 要求），且用词是「长期」不是
+   * 「永久」（用户 2026-09-29 纠正：buddy / TRAE 的积分都有到期日，只是较远）。
    *
    * 小数按两位显示（`100.50`）—— 与卡片上**总额**用的 `formatCredits` 同一口径，
    * 服务端精确值本就带小数（实测 `74.61000076`），这里不另立规则。
    */
-  it('永久在前、临时在后', () => {
+  it('长期在前、临时在后', () => {
     expect(formatExpirySplitLine({ expiring: 250, permanent: 100.5 }, format))
-      .toBe('永久 100.50 · 临时 250')
+      .toBe('长期 100.50 · 临时 250')
     expect(formatExpirySplitLine({ expiring: 74.61, permanent: 0 }, format))
-      .toBe('永久 0 · 临时 74.61')
+      .toBe('长期 0 · 临时 74.61')
   })
 
   it('分类不可用时返回 null（调用方据此不渲染）', () => {
@@ -208,10 +243,190 @@ describe('formatExpirySplitLine（卡片那一行）', () => {
 
   /**
    * 全 0 也要显示 —— 「临时 0」正是「锁定永久积分后为什么没有可用账号」的答案
-   * （实测中国版那个号就是永久 10064 · 临时 0：明明有分却全被判永久）。
+   * （实测中国版那个号就是长期 10064 · 临时 0：明明有分却全被判长期）。
    * 隐藏它会让用户对着有余额的卡片困惑。
    */
   it('两桶皆 0 仍显示（这是锁定失效的线索）', () => {
-    expect(formatExpirySplitLine({ expiring: 0, permanent: 0 }, format)).toBe('永久 0 · 临时 0')
+    expect(formatExpirySplitLine({ expiring: 0, permanent: 0 }, format)).toBe('长期 0 · 临时 0')
+  })
+})
+
+/**
+ * 「当日刷新池」的分池展示（Loomy / Raccoon）。
+ *
+ * 用户 2026-09-29 要求：「Raccoon 我看有当日积分？那应该按照 loomy 那样显示」。
+ *
+ * 与 `formatExpirySplitLine` 的区别：那个按**到期时间**分桶（buddy / TRAE /
+ * LobsterAI 的包带 `deductionEndTime`），这个按**池名**分（Loomy / Raccoon 的池
+ * 是服务端按语义分开下发的，没有到期字段）。两者互斥。
+ */
+describe('formatPoolSplitLine（当日池单独显示）', () => {
+  const format = (v: number) => (Number.isInteger(v) ? String(v) : v.toFixed(2))
+
+  /** Loomy 的真实形态：`makePackage('永久积分', …)` + `makePackage('每日赠送', …)`。 */
+  it('Loomy：永久在前、每日在后', () => {
+    const packages = [
+      pkg({ name: '永久积分', remaining: 15000 }),
+      pkg({ name: '每日赠送', remaining: 4992 }),
+    ]
+    expect(formatPoolSplitLine(packages, format, '永久')).toBe('永久 15000 · 每日 4992')
+  })
+
+  /**
+   * ⚠️ Raccoon 的池是按「服务端给了哪个字段」**动态 push** 的
+   * （`daily_points` 缺失时就没有这一项），故必须按**池名**识别，不能用下标。
+   * 这里把每日池放在**第二个**位置，锁死这一点。
+   */
+  it('Raccoon：按池名识别（每日积分在第二位也能找到）', () => {
+    const packages = [
+      pkg({ name: '奖励积分', remaining: 100 }),
+      pkg({ name: '每日积分', remaining: 500 }),
+      pkg({ name: '充值积分', remaining: 2000 }),
+    ]
+    // 其余池求和：100 + 2000 = 2100
+    expect(formatPoolSplitLine(packages, format, '长期')).toBe('长期 2100 · 每日 500')
+  })
+
+  it('没有当日池时返回 null（调用方据此不渲染，退回到期分桶）', () => {
+    expect(formatPoolSplitLine([pkg({ name: '奖励积分', remaining: 100 })], format)).toBeNull()
+    expect(formatPoolSplitLine([], format)).toBeNull()
+    expect(formatPoolSplitLine(undefined as never, format)).toBeNull()
+  })
+
+  it('findDailyPool 认得两个已知池名，认不出别的', () => {
+    expect(findDailyPool([pkg({ name: '每日赠送', remaining: 1 })])?.name).toBe('每日赠送')
+    expect(findDailyPool([pkg({ name: '每日积分', remaining: 1 })])?.name).toBe('每日积分')
+    expect(findDailyPool([pkg({ name: 'Bonus Pack', remaining: 1 })])).toBeNull()
+  })
+
+  /** 失效包不计入「其余池」合计（那部分扣不到），与 splitCreditsByExpiry 同口径。 */
+  it('其余池求和跳过失效包', () => {
+    const packages = [
+      pkg({ name: '每日积分', remaining: 500 }),
+      pkg({ name: '奖励积分', remaining: 100 }),
+      pkg({ name: '充值积分', remaining: 999, active: false }),
+    ]
+    expect(formatPoolSplitLine(packages, format, '长期')).toBe('长期 100 · 每日 500')
+  })
+})
+
+/**
+ * 账号名 hover 的资源包列表（用户 2026-09-29 要求：显示「剩余/总量」与到期时间，
+ * 没有到期时间显示「长期」）。
+ */
+describe('formatPackageExpiry（单个包的到期列）', () => {
+  it('有到期时间：绝对日期 + 相对天数', () => {
+    expect(formatPackageExpiry(pkg({ deductionEndTime: NOW + 8 * DAY }), NOW))
+      .toBe('2026-10-09（8 天后）')
+  })
+
+  /** ⚠️ 用户明确要求的降级：拿不到到期时间显示「长期」。 */
+  it('无到期时间显示「长期」', () => {
+    for (const bad of [undefined, 0, Number.NaN, null]) {
+      expect(formatPackageExpiry(pkg({ deductionEndTime: bad as never }), NOW), String(bad)).toBe('长期')
+    }
+  })
+
+  it('已过期不显示「-3 天后」', () => {
+    expect(formatPackageExpiry(pkg({ deductionEndTime: NOW - 3 * DAY }), NOW))
+      .toBe('2026-09-28（已过期）')
+  })
+
+  /** 不足 1 天向上取整为 1，避免出现「0 天后」。 */
+  it('剩余不足 1 天显示 1 天后', () => {
+    expect(formatPackageExpiry(pkg({ deductionEndTime: NOW + 60_000 }), NOW))
+      .toBe('2026-10-01（1 天后）')
+  })
+})
+
+describe('formatPackageTooltip（包列表）', () => {
+  it('每行含名称、剩余/总量、到期时间', () => {
+    const text = formatPackageTooltip(
+      [pkg({ name: 'Bonus Pack', remaining: 250, total: 500, deductionEndTime: NOW + 8 * DAY })],
+      { format: v => String(v), now: NOW },
+    )
+    expect(text).toBe('Bonus Pack  250 / 500  2026-10-09（8 天后）')
+  })
+
+  it('无到期时间的包那一行显示「长期」', () => {
+    const text = formatPackageTooltip(
+      [pkg({ name: '拉新权益包', remaining: 100, deductionEndTime: undefined })],
+      { format: v => String(v), now: NOW },
+    )
+    expect(text).toContain('长期')
+    expect(text).toBe('拉新权益包  100 / 100  长期')
+  })
+
+  it('失效包带标记（用户要能看出那部分扣不到）', () => {
+    const text = formatPackageTooltip(
+      [pkg({ name: '过期包', active: false, remaining: 10 })],
+      { format: v => String(v), now: NOW },
+    )
+    expect(text).toContain('[已失效]')
+  })
+
+  /**
+   * ⚠️ 真实场景：实测 CodeBuddy 中国版一个账号有 **105 个资源包**。
+   * 不截断的话 tooltip 会长到无法阅读，所以按剩余量降序取前 N 个，
+   * 其余汇总成一行并给出**合计剩余**（不丢总量信息）。
+   */
+  it('包数超过 maxRows 时截断并汇总剩余合计', () => {
+    const many = Array.from({ length: 20 }, (_, i) => pkg({
+      name: `包${i}`,
+      remaining: i + 1,      // 1..20
+      total: 100,
+      deductionEndTime: NOW + 30 * DAY,
+    }))
+    const text = formatPackageTooltip(many, { format: v => String(v), now: NOW, maxRows: 12 })!
+    const lines = text.split('\n')
+    expect(lines).toHaveLength(13)
+    // 剩余量降序：最大的排第一，被截掉的是最小的
+    expect(lines[0]).toContain('包19')
+    expect(lines[11]).toContain('包8')
+    // 被截掉的是 remaining 1..7 与 8 ⇒ 合计 1+2+…+8 = 36
+    expect(lines[12]).toBe('…另有 8 个包，合计剩余 36')
+  })
+
+  it('汇总行不计入失效包（那部分扣不到）', () => {
+    const many = [
+      ...Array.from({ length: 12 }, (_, i) => pkg({ name: `有效${i}`, remaining: 100 })),
+      pkg({ name: '失效1', remaining: 50, active: false }),
+      pkg({ name: '有效13', remaining: 50 }),
+    ]
+    const text = formatPackageTooltip(many, { format: v => String(v), now: NOW, maxRows: 12 })!
+    expect(text.split('\n').at(-1)).toBe('…另有 2 个包，合计剩余 50')
+  })
+
+  it('空或非数组返回 null（调用方据此不挂 title）', () => {
+    const opts = { format: (v: number) => String(v), now: NOW }
+    expect(formatPackageTooltip([], opts)).toBeNull()
+    expect(formatPackageTooltip(undefined as never, opts)).toBeNull()
+  })
+})
+
+/**
+ * ⚠️ **能力门控**：只有余额真由多个资源包构成的 provider 才挂包列表。
+ *
+ * 这不是"避免冗余"，而是**防止显示错误信息**：loomy 的 packages 是后端合成的
+ * 两个条目（`makePackage('永久积分')` / `makePackage('每日赠送')`），它们
+ * **没有** `deductionEndTime` ⇒ 按降级规则会被标成「永久」。于是 loomy 卡片上
+ * 会出现「每日赠送 4992 / 4992 永久」—— 而那笔恰恰**当天就作废**，说反了。
+ */
+describe('supportsCreditPackageList 的门控', () => {
+  it('buddy 系 + lobsterai + qoder/qodercn + trae 为真', () => {
+    for (const p of ['buddy', 'workbuddy', 'lobsterai', 'qoder', 'qodercn', 'trae']) {
+      expect(supportsCreditPackageList(p), p).toBe(true)
+    }
+  })
+
+  /** 关键：loomy 虽支持「锁定永久积分」，但**不能**挂包列表。 */
+  it('loomy 为假（它的两个池是合成的、无到期字段，列出会把每日赠送标成永久）', () => {
+    expect(supportsCreditPackageList('loomy')).toBe(false)
+  })
+
+  it('其余 provider 与未知值一律为假（默认关闭）', () => {
+    for (const p of ['codearts', 'cline', 'raccoon', '', undefined]) {
+      expect(supportsCreditPackageList(p as never), String(p)).toBe(false)
+    }
   })
 })

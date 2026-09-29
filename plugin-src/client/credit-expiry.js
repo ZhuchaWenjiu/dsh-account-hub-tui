@@ -30,9 +30,9 @@ const DAY_MS = 24 * 60 * 60 * 1000;
  * 归一化窗口天数：不可用时返回 **null**（调用方据此不显示分类行）。
  *
  * ⚠️ 必须显式挡住 `null` / `undefined`，不能直接 `Number(...)`：
- * `Number(null) === 0`，而**非 buddy provider 后端不带 windowDays**（它们的积分
- * 没有"会不会作废"这个维度），于是会被当成"窗口 0 天"、在卡片上凭空渲染出一行
- * 假的「临时 0 · 永久 N」。
+ * `Number(null) === 0`，而**不带 windowDays 的 provider**（它们的积分没有
+ * "会不会作废"这个维度）会被当成"窗口 0 天"、在卡片上凭空渲染出一行
+ * 假的「临时 0 · 长期 N」。
  *
  * 窗口实际由后端写死为 15 天（或经 `DSH_BUDDY_EXPIRING_WINDOW_DAYS` 放宽），
  * 这里只做防御性归一，不假设任何特定取值。
@@ -110,15 +110,154 @@ export function formatExpiryHint(pkg, windowDays, now) {
 }
 
 /**
- * 账号卡片上那行「永久 Y · 临时 X」的文案；无有效分类时返回 null。
+ * 账号卡片上那行「长期 Y · 临时 X」的文案；无有效分类时返回 null。
  *
- * ⚠️ **永久在前、临时在后**（用户 2026-09-29 定）：与 Loomy 那行的
+ * ⚠️ **长期在前、临时在后**（用户 2026-09-29 定）：与 Loomy 那行的
  * 「永久 … · 每日 …」同一顺序，两个 provider 的卡片读起来才对齐。
+ * ⚠️ 用词是「长期」不是「永久」（用户 2026-09-29 定）：buddy / TRAE 的积分
+ * 都有到期日，只是距现在较远 —— 说「永久」是错的（用户明确纠正过）。
  */
 export function formatExpirySplitLine(split, format) {
   if (!split) return null;
   const expiring = format(split.expiring);
   const permanent = format(split.permanent);
   if (expiring === null || permanent === null) return null;
-  return `永久 ${permanent} · 临时 ${expiring}`;
+  return `长期 ${permanent} · 临时 ${expiring}`;
+}
+
+/**
+ * **当日刷新池**的已知池名（服务端下发或我们合成的）。
+ *
+ * ## 为什么需要这份名单
+ *
+ * Loomy 与 Raccoon 的积分都由**多个语义不同的池**构成，其中有一个是
+ * **当日刷新**的（今天不用就没了）：
+ *
+ * | provider | 当日池 | 其余池 |
+ * |---|---|---|
+ * | Loomy | `每日赠送`（每天 5000，消耗后不回补） | `永久积分`（注册奖励 + 新手任务） |
+ * | Raccoon | `每日积分`（`daily_points`） | `奖励积分` / `会员积分` / `充值积分` |
+ *
+ * 只显示合计会丢掉最关键的信息：**今天有多少会作废**。用户明确要求
+ * 「有当日积分，那应该按照 loomy 那样显示」（2026-09-29）。
+ *
+ * ⚠️ 用**名字**识别而不是下标：Raccoon 的池是按「服务端给了哪个字段」动态
+ * push 的（`daily_points` 缺失时就没有这一项），下标会错位。
+ */
+export const DAILY_POOL_NAMES = ['每日赠送', '每日积分'];
+
+/**
+ * 找出当日刷新池；没有则返回 null（调用方据此不渲染分池行）。
+ *
+ * @param packages - `balance.packages`。
+ */
+export function findDailyPool(packages) {
+  if (!Array.isArray(packages)) return null;
+  return packages.find(pkg => pkg && DAILY_POOL_NAMES.includes(pkg.name)) ?? null;
+}
+
+/**
+ * 「长期 Y · 每日 X」—— 当日池单独显示，其余池求和。
+ *
+ * 与 {@link formatExpirySplitLine} 的区别：那个按**到期时间**分桶（buddy / TRAE
+ * 的包带 `deductionEndTime`），这个按**池名**分（Loomy / Raccoon 的池没有到期
+ * 字段，是服务端按语义分开下发的）。两者互斥：一个 provider 只走其中一条。
+ *
+ * ⚠️ 当日池用**自己的** remaining，不用求和 —— 它就是单独一池。
+ * ⚠️ 其余池求和时跳过失效包（那部分扣不到），与 `splitCreditsByExpiry` 同口径。
+ *
+ * @param packages - `balance.packages`。
+ * @param format - 数字格式化（与卡片总额同一个 `formatCredits`）。
+ * @param longTermLabel - 非当日池的标签。Loomy 用「永久」（它的池就叫永久积分），
+ *   Raccoon 用「长期」（奖励/会员/充值三种池的到期规则各不相同，不能统称永久）。
+ * @returns 文案；没有当日池时返回 null。
+ */
+export function formatPoolSplitLine(packages, format, longTermLabel = '长期') {
+  const daily = findDailyPool(packages);
+  if (daily === null) return null;
+  const restSum = packages.reduce((sum, pkg) => {
+    if (!pkg || pkg === daily) return sum;
+    if (pkg.active !== true) return sum;
+    const remaining = Number(pkg.remaining);
+    return Number.isFinite(remaining) && remaining > 0 ? sum + remaining : sum;
+  }, 0);
+  const dailyValue = format(Number(daily.remaining) || 0);
+  const restValue = format(restSum);
+  if (dailyValue === null || restValue === null) return null;
+  return `${longTermLabel} ${restValue} · 每日 ${dailyValue}`;
+}
+
+/**
+ * 单个包的到期时间展示：**绝对日期 + 相对天数**，拿不到到期时间显示「长期」。
+ *
+ * ⚠️ 到期时间的来源优先序：`deductionEndTime`（毫秒）> `expiredTime`（字符串，如
+ * "2026-11-01 00:00:00"）。各 provider 的解析代码（lobsterai / qoder / trae）
+ * 已在后端把字符串归一化到 `deductionEndTime`（毫秒），所以大多数情况下只走
+ * 第一条路径 —— `expiredTime` 的兼容是给"后端没归一化的包"的兜底。
+ *
+ * ⚠️ 「长期」的判据是**服务端没给任何到期字段**。Qoder 的套餐额度/资源包
+ * 就没有独立到期（统一"领取后 30 天"是活动规则而非包字段），显示"长期"
+ * 比编造一个错误日期好。
+ */
+export function formatPackageExpiry(pkg, now) {
+  // 优先 deductionEndTime（毫秒，后端归一化），次 expiredTime（字符串，如 "2026-11-01 00:00:00"）
+  const dedEnd = Number(pkg && pkg.deductionEndTime);
+  let end = Number.isFinite(dedEnd) && dedEnd > 0 ? dedEnd : NaN;
+  if (!Number.isFinite(end)) {
+    const exp = pkg && pkg.expiredTime ? String(pkg.expiredTime) : '';
+    if (exp.length > 0) {
+      const ms = Date.parse(exp.replace(' ', 'T'));
+      if (Number.isFinite(ms) && ms > 0) end = ms;
+    }
+  }
+  if (!Number.isFinite(end) || end <= 0) return '长期';
+  const at = Number.isFinite(now) ? now : Date.now();
+  const date = new Date(end).toISOString().slice(0, 10);
+  const days = Math.ceil((end - at) / DAY_MS);
+  if (days <= 0) return `${date}（已过期）`;
+  return `${date}（${days} 天后）`;
+}
+
+/**
+ * 资源包列表的多行文本（账号名 hover 用）。
+ *
+ * ## 为什么按剩余量降序 + 截断
+ *
+ * 实测 CodeBuddy 中国版一个账号有 **105 个资源包**（多数是 30 天的运营裂变包）。
+ * 全列出来 tooltip 会长到无法阅读。⇒ 按**剩余量降序**取前 `maxRows` 个（用户关心
+ * 的是"还有钱的包"），其余汇总成一行给出**合计剩余**，不丢总量信息。
+ *
+ * @param packages - `balance.packages`。
+ * @param options.format - 数字格式化（与卡片总额同一个 `formatCredits`）。
+ * @param options.now - **渲染时**的当前时刻（到期是时间的函数，不能传缓存值）。
+ * @param options.maxRows - 最多列几个包。默认 12。
+ * @returns 多行文本；无包时返回 null（调用方据此不挂 title）。
+ */
+export function formatPackageTooltip(packages, options = {}) {
+  const { format, now = Date.now(), maxRows = 12 } = options;
+  if (!Array.isArray(packages) || packages.length === 0) return null;
+
+  // 只按剩余量降序（用户关心"还有钱的包"）。不做二级排序 ——
+  // `daysUntilExpiry` 会返回 null，相减得 NaN 会破坏比较器（V8 下顺序不可预期）。
+  // Array.prototype.sort 在现代引擎里是稳定的，剩余量相同的包天然保持服务端原序。
+  const sorted = [...packages].sort(
+    (a, b) => (Number(b && b.remaining) || 0) - (Number(a && a.remaining) || 0),
+  );
+  const lines = sorted.slice(0, maxRows).map(pkg => {
+    const name = (pkg && pkg.name) || '未命名';
+    const remaining = format ? format(Number(pkg && pkg.remaining) || 0) : String(pkg && pkg.remaining);
+    const total = format ? format(Number(pkg && pkg.total) || 0) : String(pkg && pkg.total);
+    const flags = pkg && pkg.active === false ? ' [已失效]' : '';
+    return `${name}  ${remaining} / ${total}  ${formatPackageExpiry(pkg, now)}${flags}`;
+  });
+
+  const rest = sorted.slice(maxRows);
+  if (rest.length > 0) {
+    const sum = rest.reduce(
+      (acc, p) => acc + (p && p.active !== false && Number.isFinite(Number(p.remaining)) ? Number(p.remaining) : 0),
+      0,
+    );
+    lines.push(`…另有 ${rest.length} 个包${sum > 0 ? `，合计剩余 ${format ? format(sum) : sum}` : ''}`);
+  }
+  return lines.join('\n');
 }

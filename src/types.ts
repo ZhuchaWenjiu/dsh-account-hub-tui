@@ -378,16 +378,19 @@ export interface RpcCreditsBalanceAccount {
 export interface RpcCreditsBalancesResponse {
   accounts: RpcCreditsBalanceAccount[]
   /**
-   * 当前生效的「临时积分」窗口（天）—— **仅 CodeBuddy / WorkBuddy 返回**。
+   * 当前生效的「临时积分」窗口（天）—— **CodeBuddy / WorkBuddy / TRAE /
+   * LobsterAI 返回**。
    *
-   * 面板据此把每个资源包分成临时 / 永久两桶显示（`credit-expiry.js`），
+   * 面板据此把每个资源包分成临时 / 长期两桶显示（`credit-expiry.js`），
    * 且必须在**渲染时**用当前时刻现算 —— 分类是时间的函数，把结果存下来就会
-   * 让越线的包继续被当成永久（宿主长期开着，时间只向前流）。
+   * 让越线的包继续被当成长期（宿主长期开着，时间只向前流）。
    *
    * ⚠️ 为什么由后端回传而不是前端写死：窗口可被
    * `DSH_BUDDY_EXPIRING_WINDOW_DAYS` 覆盖，前端写死就会出现
    * 「提示说只烧 15 天内的、实际按 31 天筛号」。
-   * 其余 provider 没有「窗口」概念（Loomy 是服务端直接给的两个池），故不带。
+   * Loomy / Raccoon **不带**该字段：它们的积分由服务端按语义分成多个池下发
+   * （其中有「每日刷新」池），走的是**池名分桶**（`formatPoolSplitLine`），
+   * 不是到期时间分桶。Qoder 虽有包到期字段但未接入分桶展示（仅 hover 明细）。
    */
   windowDays?: number
 }

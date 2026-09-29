@@ -1884,7 +1884,17 @@ function registerJetHubEndpoints(
             fetchBalance: (credential, product) => fetchLobsteraiCreditBalance(credential, product),
             warn: (msg) => ctx.logger?.warn?.(msg),
           })
-          return { ok: true, value: { accounts: values } satisfies RpcCreditsBalancesResponse }
+          // ⚠️ LobsterAI 也回传窗口天数（用户报障「账号的积分没按长期、临时方式
+          // 显示」）：它的每个资源包都带 `expiresAt`（已归一化到
+          // `deductionEndTime`），面板要按到期远近分「长期 / 临时」。
+          // 窗口语义与 buddy / TRAE 一致，共用同一个环境变量。
+          return {
+            ok: true,
+            value: {
+              accounts: values,
+              windowDays: buddyExpiringWindowDays(),
+            } satisfies RpcCreditsBalancesResponse,
+          }
         }
         if (isQoderFamily(req.provider)) {
           const { product } = requireQoderFamily(req.provider)
@@ -1929,7 +1939,19 @@ function registerJetHubEndpoints(
             fetchBalance: (credential, product) => fetchTraeCreditBalance(credential as TraeCredential, product),
             warn: (msg) => ctx.logger?.warn?.(msg),
           })
-          return { ok: true, value: { accounts: values } satisfies RpcCreditsBalancesResponse }
+          // ⚠️ TRAE 也回传窗口天数：它的资源包现在带 `deductionEndTime`
+          // （条目级 `expire_time`，秒→毫秒），面板要按「长期 / 临时」分桶显示。
+          // 没有窗口天数前端会拒绝渲染分类行（见 credit-expiry.js 的
+          // normalizeWindowDays —— 非 buddy provider 不带该字段被视为
+          // "没有作废维度"，这是防止凭空渲染假分类行的门禁）。
+          // 窗口语义与 buddy 系一致：距到期不足 windowDays 的算「临时」。
+          return {
+            ok: true,
+            value: {
+              accounts: values,
+              windowDays: buddyExpiringWindowDays(),
+            } satisfies RpcCreditsBalancesResponse,
+          }
         }
         if (req.provider === CLINE.id) {
           // 余额来自 `GET /api/v1/users/{accountId}/balance`（实测

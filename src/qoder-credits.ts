@@ -245,6 +245,12 @@ function toPackage(
   const remaining = remainingRaw !== undefined
     ? Math.max(0, remainingRaw)
     : Math.max(0, totalValue - usedValue)
+  // 到期时间归一化：Qoder 的专用资源包用 expiredTime 字段（ISO 日期字符串）。
+  // 套餐额度/资源包没有独立到期（统一"领取后 30 天"），不设置 deductionEndTime，
+  // 前端 formatPackageExpiry 对 Qoder 的特定包名走"30 天内有效"的特殊显示。
+  const expMs = options.expiredTime && options.expiredTime.length > 0
+    ? Date.parse(options.expiredTime.replace(' ', 'T'))
+    : Number.NaN
   return {
     name,
     unit: readString(quota, 'unit') ?? 'credits',
@@ -255,6 +261,7 @@ function toPackage(
     cycleStartTime: '',
     cycleEndTime: '',
     expiredTime: options.expiredTime ?? '',
+    ...(Number.isFinite(expMs) ? { deductionEndTime: expMs } : {}),
   }
 }
 
