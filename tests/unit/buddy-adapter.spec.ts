@@ -964,6 +964,53 @@ describe('BuddyAdapter credential handling', () => {
     expect(seen!.get('User-Agent')).toBe('CodeBuddyIDE/1.106.1')
   })
 
+  /**
+   * 回归：凭据 domain 为**空串**时 X-Domain 必须回退到产品域名。
+   *
+   * `parseTokenData` → `readStringField` 在字段缺失时返回空串，故这是真实可达
+   * 的凭据形态。修复前 `??` 对空串不生效，这里发出的头是空值（已实测复现）。
+   *
+   * ⚠️ 上一条用例的凭据 domain 是 `'copilot.tencent.com'`（等于产品域名），
+   * 对「取谁的值」不敏感，故必须另写两条才能分别锁住空串与优先级两个子问题。
+   */
+  it('凭据 domain 为空串时 X-Domain 回退到产品域名', async () => {
+    let seen: Headers | undefined
+    const adapter = makeAdapter({
+      credential: makeCredential({ domain: '' }),
+      fetchImpl: async (_url, init) => {
+        seen = new Headers(init?.headers as HeadersInit)
+        return sseResponse('data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n')
+      },
+    })
+    await collectChunks(adapter, streamOptions)
+    expect(seen!.get('X-Domain')).toBe('copilot.tencent.com')
+  })
+
+  /**
+   * 回归：X-Domain 以**产品**为准，不跟随凭据里的历史域名。
+   *
+   * 真实场景——早期 workbuddy 指向中国版 `copilot.tencent.com`，改造为国际版后
+   * 旧凭据的 domain 仍是老域名。若 X-Domain 取凭据值，请求会打到
+   * `www.workbuddy.ai` 却声明自己属于 `copilot.tencent.com`，身份标识与 baseURL
+   * 自相矛盾；且同一账号的**聊天**（本处）与**积分**（`src/credits.ts` 的
+   * `checkinHeaders`，早已是「以产品为准」）会声明不同的 X-Domain。
+   * 本用例与 `tests/unit/credits.spec.ts` 的「凭据 domain 与产品不符时，以产品
+   * 配置为准」成对，锁死两条链路判定一致。
+   */
+  it('凭据 domain 与产品不符时，X-Domain 以产品配置为准', async () => {
+    let seen: Headers | undefined
+    const adapter = makeAdapter({
+      product: WORKBUDDY,
+      credential: makeCredential({ domain: 'copilot.tencent.com' }),
+      fetchImpl: async (_url, init) => {
+        seen = new Headers(init?.headers as HeadersInit)
+        return sseResponse('data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n')
+      },
+    })
+    await collectChunks(adapter, streamOptions)
+    expect(seen!.get('X-Domain')).toBe('www.workbuddy.ai')
+  })
+
   /** 抓取一次 stream() 实际发出的请求体；overrides 同时用于 adapter 与请求。 */
   async function captureBody(overrides: Record<string, unknown> = {}): Promise<Record<string, unknown>> {
     let body: Record<string, unknown> = {}
