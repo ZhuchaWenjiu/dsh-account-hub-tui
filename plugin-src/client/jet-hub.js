@@ -1348,8 +1348,14 @@ function ClineQuotaPanel({ rpcCall, onClose }) {
       React.createElement('p', { className: 'dim-jh-modalHint' },
         '额度窗口与请求记录都来自 Cline 官方网关（不是本地记账），与账号卡片上的「积分」是两份不同的读数：'
         + '积分答「还剩多少」，额度答「各时间窗用掉百分之几」。'),
-      renderQuota(),
-      renderLog()));
+      // ⚠️ 内容**必须**放进 .dim-jh-modalBody（flex:1; min-height:0; overflow-y:auto）。
+      // .dim-jh-modal 是 max-height 有限的 flex **列**容器，子项默认不可收缩，
+      // 内容直接铺在里面就会**画出弹窗边界之外** —— 首版正是漏了这一层：
+      // 额度卡 + 请求表把弹窗撑破，看起来像「弹窗位置不对、内容显示不对」。
+      // 模型列表弹窗的内容同样在 modalBody 里（见其 error/loading/empty 分支）。
+      React.createElement('div', { className: 'dim-jh-modalBody' },
+        renderQuota(),
+        renderLog())));
 }
 
 function ProviderPanel({ provider, rpcCall }) {

@@ -22,6 +22,7 @@ const read = (rel: string) => readFileSync(resolve(here, '../..', rel), 'utf8')
 
 describe('Cline 订阅额度：客户端接线', () => {
   const client = read('plugin-src/client/jet-hub.js')
+  const styles = read('plugin-src/client/jet-hub-styles.js')
 
   it('从能力表导入 supportsSubscriptionQuota', () => {
     expect(client).toContain('supportsSubscriptionQuota,')
@@ -95,5 +96,33 @@ describe('Cline 订阅额度：客户端接线', () => {
   /** 多账号才渲染切换器（单账号时它没有可去的地方）。 */
   it('多账号才渲染账号切换器', () => {
     expect(client).toMatch(/quota\.length > 1[\s\S]{0,200}?dim-jh-quotaAccountTabs/)
+  })
+
+  /**
+   * ⚠️ 内容**必须**放进 `.dim-jh-modalBody`（flex:1; min-height:0; overflow-y:auto）。
+   * `.dim-jh-modal` 是 max-height 有限的 flex **列**容器，子项默认不可收缩，
+   * 内容直接铺在里面就会**画出弹窗边界之外** —— 首版正是漏了这一层：
+   * 额度卡 + 请求表把弹窗撑破，用户报「弹窗位置不对、内容显示不对」。
+   * 模型列表弹窗的内容同样在 modalBody 里（见其 error/loading/empty 分支）。
+   */
+  it('弹窗内容在 .dim-jh-modalBody 滚动区里（不直接铺在 .dim-jh-modal）', () => {
+    expect(client).toMatch(/dim-jh-modalBody'[\s\S]{0,80}?renderQuota\(\),[\s\S]{0,40}?renderLog\(\)\)/)
+  })
+
+  /**
+   * ⚠️ 数字列右对齐必须用**复合选择器**：单独 `.dim-jh-quotaNumCol` 的优先级
+   * 是 (0,1,0)，压不过 `.dim-jh-quotaTable th/td` 的 (0,1,1)，`text-align:right`
+   * 会**静默失效** —— 表头左对齐、数据右对齐，列就错位。参考实现 README 里
+   * 「429 错误行撑宽请求记录表格」正是同一个选择器强度问题。
+   */
+  it('数字列右对齐用复合选择器（不被 th/td 的左对齐压过）', () => {
+    expect(styles).toMatch(/\.dim-jh-quotaTable (td|th)\.dim-jh-quotaNumCol/)
+    // 不得再有「裸类名 + text-align:right」的失效写法。
+    expect(styles).not.toMatch(/^\.dim-jh-quotaNumCol \{[^}]*text-align:\s*right/m)
+  })
+
+  /** 时间列定宽：防时间戳被截断（参考实现实测 82px；数值允许调整，意图必须保留）。 */
+  it('时间列定宽（防时间戳被截断）', () => {
+    expect(styles).toMatch(/\.dim-jh-quotaTable td\.dim-jh-quotaWhen \{[^}]*width:/)
   })
 })

@@ -2918,6 +2918,37 @@ Cline 面板的账号管理区有一个**订阅额度**按钮（只在 Cline 出
 但 `cline.quota` / `cline.requestLog` 是**宿主侧**端点 —— 不重启只会看到
 「按钮出来了、点了报 unknown method」。
 
+### ⚠️ 修复记录：首版弹窗漏了 `.dim-jh-modalBody` + 数字列右对齐被压过
+（2026-09-29 用户报障：「弹窗位置不正确。内容显示不正确」）
+
+**根因一（位置）**：弹窗内容直接铺在 `.dim-jh-modal` 里，没包 `.dim-jh-modalBody`。
+
+`.dim-jh-modal` 是 `max-height: min(640px, calc(100vh - 48px))` 的 flex **列**容器，
+子项默认不可收缩（没有 `min-height: 0` / `overflow`），内容一多就
+**画出弹窗边界之外** —— 额度卡 + 请求表叠加，视觉上就是「弹窗错位、内容错乱」。
+
+**修法**：内容包进 `.dim-jh-modalBody`（`flex: 1 1 auto; min-height: 0;
+overflow-y: auto`，见样式）。模型列表弹窗同款 —— 它的 error / loading /
+empty / 列表四个分支**全部**在 modalBody 里，只有 modalHead / modalHint /
+筛选条 / 批量工具条在外面。
+
+**根因二（内容）**：`.dim-jh-quotaNumCol { text-align: right }` 的优先级
+**(0,1,0)**，压不过 `.dim-jh-quotaTable th/td { text-align: left }` 的
+**(0,1,1)** —— 右对齐**静默失效**：表头左对齐、数据右对齐，列错位。
+
+**修法**：复合选择器
+`.dim-jh-quotaTable td.dim-jh-quotaNumCol, .dim-jh-quotaTable th.dim-jh-quotaNumCol`。
+这正是参考实现 README 里「429 错误行撑宽请求记录表格」的**同一个选择器强度
+问题**（那边是 `(0,1,1)` 的 `td{white-space:nowrap}` 压过 `(0,1,0)` 的
+`.cp-history-error`，解法同样是复合选择器）。
+
+⚠️ 两条都已有**反向验证**（注入缺陷 → 对应断言变红，其余 8 条不受影响），
+用例在 `tests/unit/cline-quota-panel.spec.ts` 的
+「弹窗内容在 .dim-jh-modalBody 滚动区里」与「数字列右对齐用复合选择器」。
+
+顺带吸收参考实现的既有经验：时间列**定宽 82px**（防时间戳被截断）、
+模型名 `word-break: break-word`（长模型名不撑宽表格）。
+
 ## 常见开发任务
 
 ### 新增功能

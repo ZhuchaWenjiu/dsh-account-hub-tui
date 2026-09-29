@@ -282,12 +282,18 @@ const STYLES = `
 .dim-jh-quotaTable { width: 100%; border-collapse: collapse; font-size: 12px; }
 .dim-jh-quotaTable th, .dim-jh-quotaTable td { padding: 6px 8px; text-align: left; vertical-align: top; border-bottom: 1px solid var(--dsw-alias-border-l2, #eee); }
 .dim-jh-quotaTable th { font-weight: 600; color: var(--dsw-alias-label-secondary, #555); white-space: nowrap; }
-.dim-jh-quotaNumCol { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
-.dim-jh-quotaWhen { white-space: nowrap; color: var(--dsw-alias-label-secondary, #555); }
-.dim-jh-quotaModel { display: block; color: var(--dsw-alias-label-primary, #1f2329); }
-/* 上游/模型族另起一行：它与模型名是两个维度，拼在一起会让
+/* 数字列右对齐:⚠️ 必须用**复合选择器** —— 单独 .dim-jh-quotaNumCol 的优先级
+   是 (0,1,0),压不过 .dim-jh-quotaTable th/td 的 (0,1,1),text-align:right 会
+   **静默失效**:表头左对齐、数据右对齐,列就错位。参考实现的 README 里
+   「429 错误行撑宽请求记录表格」正是同一个选择器强度问题,解法也是复合选择器。 */
+.dim-jh-quotaTable td.dim-jh-quotaNumCol, .dim-jh-quotaTable th.dim-jh-quotaNumCol { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+/* 时间列定宽:参考实现实测 82px 可完整显示「MM-DD HH:mm」不被截断;
+   同样用复合选择器,避免被 .dim-jh-quotaTable th 的声明压过。 */
+.dim-jh-quotaTable td.dim-jh-quotaWhen { width: 82px; white-space: nowrap; color: var(--dsw-alias-label-secondary, #555); }
+.dim-jh-quotaModel { display: block; overflow: hidden; color: var(--dsw-alias-label-primary, #1f2329); word-break: break-word; }
+/* 上游/模型族另起一行:它与模型名是两个维度,拼在一起会让
    「同名不同上游」的行无法区分。 */
-.dim-jh-quotaModelType { display: block; font-size: 11px; color: var(--dsw-alias-label-tertiary, #8f959e); }
+.dim-jh-quotaModelType { display: block; font-size: 11px; color: var(--dsw-alias-label-tertiary, #8f959e); word-break: break-word; }
 .dim-jh-quotaLogError { margin: 0 0 10px; font-size: 12px; line-height: 17px; color: #d93025; word-break: break-word; }
 `
 
