@@ -23,6 +23,7 @@ import type { QoderAuth } from './qoder-auth.js'
 import type { TraeAuth } from './trae-auth.js'
 import type { ClineAuth } from './cline-auth.js'
 import { LOOMY } from './loomy-product.js'
+import { buddyExpiringWindowDays } from './buddy-balance-rank.js'
 import type { LoomyAuth } from './loomy-auth.js'
 import type { LoomyCredential } from './loomy.js'
 import { RACCOON } from './raccoon-product.js'
@@ -67,7 +68,7 @@ import {
   type ClaimOutcome,
   type CreditBalance,
 } from './credits.js'
-import { CODEBUDDY, productById, type BuddyProduct } from './product.js'
+import { CODEBUDDY, WORKBUDDY, productById, type BuddyProduct } from './product.js'
 import {
   claimLobsteraiDailyCheckin,
   fetchLobsteraiCreditBalance,
@@ -126,7 +127,8 @@ import type {
   RpcOnboardingClaimRequest,
   RpcOnboardingClaimResponse,
   RpcLoomyPermanentLockRequest,
-  RpcLoomyPermanentLockResponse,
+  RpcPermanentLockRequest,
+  RpcPermanentLockResponse,
   RpcModelListRequest,
   RpcModelListResponse,
   RpcModelSetDisabledRequest,
@@ -263,6 +265,26 @@ export function buildRaccoonNickname(
   if (suffix.length > 0) return `Raccoon ${suffix}`
   return fallbackId
 }
+
+/**
+ * 支持「锁定永久积分」的 provider 白名单。
+ *
+ * ⚠️ **必须与前端 `credits-capabilities.js` 的 `supportsPermanentLock` 一致**：
+ * 前端拿它决定要不要渲染按钮、要不要发读取请求；后端拿它拒绝越权写入。
+ * 两边不一致的后果是「按钮出现但点了报错」或「功能存在却点不出来」。
+ *
+ * 只有这三家有两个可分的积分池：
+ * - Loomy：服务端直接给 `dailyBalance`（当日到期）与 `balance`（永久）；
+ * - CodeBuddy / WorkBuddy：要从资源包列表按**扣费截止距今是否满 15 天**现算
+ *   （判据见 `buddy-balance-rank.ts`，实测两站形状不同但都成立）。
+ * 其余渠道（CodeArts / LobsterAI / Qoder / TRAE / Cline / Raccoon）的积分
+ * 模型里没有「会不会作废」这一层区分，登记进来只会多一个无效开关。
+ */
+export const PERMANENT_LOCK_PROVIDERS: ReadonlySet<string> = new Set([
+  LOOMY.id,
+  CODEBUDDY.id,
+  WORKBUDDY.id,
+])
 
 /**
  * 汇总一次批量领取的结果。
@@ -1400,26 +1422,64 @@ function registerJetHubEndpoints(
       }
 
       /**
-       * Loomy「锁定永久积分」开关（读 / 写）。
+       * 「锁定永久积分」开关（读 / 写，**provider 维度**）。
        *
-       * **用户需求**：锁定后选号只允许消耗今日赠送额度，永久积分不参与 ——
+       * **用户需求**：锁定后选号只允许消耗**会近期作废**的积分，永久积分不参与 ——
        * 只剩永久积分的账号在锁定期间等同于不可用（「锁定后没有临时积分后找
        * 可用账号就是没有可用账号」）。解锁后恢复「没临时积分就用永久积分」。
        *
-       * ⚠️ 这是**全局**开关（不分账号），持久化在 `$DSH_HOME/jet-hub/state.json`
-       * 的 `loomyPermanentLocked` 字段（或老契约的 settings 文档）。
+       * 三个 provider 都有这件事，但「什么算永久积分」不同（Loomy 看服务端的每日
+       * 池字段；两个 buddy 看资源包扣费截止距今是否满 15 天，判据见
+       * `buddy-balance-rank.ts`）。**语义相同、判据不同**，故共用一个端点与一张
+       * 持久化表，而不是各加一条 case —— 平行分支越多，漏接概率越高。
+       *
+       * ⚠️ 开关是 **provider 级**（不分账号），持久化在
+       * `$DSH_HOME/jet-hub/permanent-locks.json` 的 `locks` 表里（**不放 state.json**：
+        * 那份文档同机多 profile 共享，另一条工作区的旧版本整体重写它时不会带上
+        * 自己不认识的键 —— 理由见 `src/permanent-lock-store.ts` 文件头）
+       * （`loomyPermanentLocked` 是同一值的兼容副本，见 `jet-hub-store.ts`）。
        *
        * ⚠️ `locked` 省略时**只读**（供面板初始化），给出布尔值才写入。
        */
+      case 'credits.permanentLock':
+      /**
+       * Loomy 的历史端点名 —— 与上面**同一实现**，只是 provider 固定为 loomy
+       * （老客户端 bundle 仍在调它，直接删会让 Loomy 面板的按钮静默失效）。
+       */
       case 'loomy.permanentLock': {
-        const req = payload as RpcLoomyPermanentLockRequest
+        const req = payload as RpcPermanentLockRequest & RpcLoomyPermanentLockRequest
+        // 老端点不认 provider 参数：即便载荷里带了也别照着执行。
+        const provider = method === 'loomy.permanentLock'
+          ? LOOMY.id
+          : (typeof req.provider === 'string' ? req.provider.trim() : '')
+        if (!PERMANENT_LOCK_PROVIDERS.has(provider)) {
+          return {
+            ok: false,
+            error: { code: 'bad-request', message: `该 provider 不支持锁定永久积分：${provider || '(空)'}` },
+          }
+        }
+        /**
+         * 组装响应。
+         *
+         * ⚠️ 两个 buddy 必须**回传当前生效的窗口天数**：窗口可被
+         * `DSH_BUDDY_EXPIRING_WINDOW_DAYS` 覆盖，前端文案若继续写死 15 就会
+         * 与真实判据不一致（用户看到「只烧 15 天内的」而实际按 31 天筛号）。
+         * Loomy 没有窗口概念 → 不带该字段。
+         */
+        const lockResponse = (): RpcPermanentLockResponse => ({
+          provider,
+          locked: pool.permanentLocked(provider),
+          ...(provider === CODEBUDDY.id || provider === WORKBUDDY.id
+            ? { windowDays: buddyExpiringWindowDays() }
+            : {}),
+        })
         if (req.locked === undefined) {
-          return { ok: true, value: { locked: pool.loomyPermanentLocked() } satisfies RpcLoomyPermanentLockResponse }
+          return { ok: true, value: lockResponse() }
         }
         if (typeof req.locked !== 'boolean') {
           return { ok: false, error: { code: 'bad-request', message: 'locked 必须是布尔值' } }
         }
-        await pool.setLoomyPermanentLocked(req.locked)
+        await pool.setPermanentLocked(provider, req.locked)
         // ⚠️ 与 `model.setDisabled` 同理：本次写入会改变**选号结果**
         // （进而改变哪些账号会被使用），故广播一次让界面重新读取状态。
         // 包 try/catch：通知失败不能反噬已经落盘的开关。
@@ -1428,7 +1488,7 @@ function registerJetHubEndpoints(
         } catch (error) {
           ctx.logger?.warn?.(`[jet-hub] 广播 llm/adapters-updated 失败（不影响已保存的开关）: ${String(error)}`)
         }
-        return { ok: true, value: { locked: pool.loomyPermanentLocked() } satisfies RpcLoomyPermanentLockResponse }
+        return { ok: true, value: lockResponse() }
       }
 
       /**
@@ -1991,7 +2051,17 @@ function registerJetHubEndpoints(
           resolve: (ref) => ctx.credentials.resolve(ref),
           warn: (msg) => ctx.logger?.warn?.(msg),
         })
-        return { ok: true, value: { accounts: values } satisfies RpcCreditsBalancesResponse }
+        // ⚠️ 只有 buddy 系会走到这里（`productById` 只认 CodeBuddy / WorkBuddy），
+        // 而它们正是唯一需要「窗口天数」的 provider：面板要把资源包分成
+        // 临时 / 永久两桶显示，窗口必须**由后端给出**（可被
+        // DSH_BUDDY_EXPIRING_WINDOW_DAYS 覆盖），前端写死就会与选号判据分叉。
+        return {
+          ok: true,
+          value: {
+            accounts: values,
+            windowDays: buddyExpiringWindowDays(),
+          } satisfies RpcCreditsBalancesResponse,
+        }
       }
 
       // ── 模型列表可见性（黑名单开关）──

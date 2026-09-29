@@ -161,15 +161,94 @@ export function supportsRateLimit(provider) {
 }
 
 /**
- * 该 provider 是否支持「锁定永久积分」（只允许消耗每日赠送额度）。
+ * 「锁定永久积分」窗口：距**扣费截止**不足 15 天的积分算临时（会很快作废，优先烧掉），
+ * 其余算永久。
  *
- * ⚠️ 目前只有 Loomy 具备：它有两个独立的积分池（永久 / 每日赠送），
- * 而其他渠道的积分模型不同（无「永久 vs 每日」的区分）。
+ * ⚠️ 必须与后端 `src/buddy-balance-rank.ts` 的 `BUDDY_EXPIRING_WINDOW_DAYS` 一致 ——
+ * 前端只做展示，判据在后端；这里写的数字若与后端不同，用户会看到「提示说只烧
+ * 8 天内的，实际按 15 天筛号」这种无法解释的偏差。
+ */
+export const PERMANENT_LOCK_EXPIRING_WINDOW_DAYS = 15;
+
+/**
+ * 该 provider 是否支持「锁定永久积分」（只消耗会近期作废的积分）。
  *
- * 为 false 时面板**不得**渲染该按钮，也不得发起 `loomy.permanentLock`。
+ * ⚠️ 目前三家具备，**理由各不相同**：
+ * - `loomy`：服务端直接给两个池 —— `dailyBalance`（**当日**到期，次日重发）
+ *   与 `balance`（注册奖励 + 新手任务，不过期）。
+ * - `buddy` / `workbuddy`：一个账号常同时有多个资源包，**没有现成字段**，
+ *   要按包的 `DeductionEndTime` 距今是否满 {@link PERMANENT_LOCK_EXPIRING_WINDOW_DAYS}
+ *   天现算（实测国际版是「Bonus Pack 14 天 + Free Plan 扣费截止 8 年后」，
+ *   中国版是「体验版套餐 + 30/365 天的拉新与裂变包」）。
+ *
+ * 其余渠道的积分模型里没有「会不会作废」这一层区分，登记进来只会多一个无效按钮。
+ *
+ * ⚠️ 必须与后端 `src/jet-hub-rpc.ts` 的 `PERMANENT_LOCK_PROVIDERS` 一致：
+ * 不一致会出现「按钮渲染出来了，点了却报 bad-request」。
+ *
+ * 为 false 时面板**不得**渲染该按钮，也不得发起 `credits.permanentLock`。
  */
 export function supportsPermanentLock(provider) {
-  return provider === 'loomy';
+  return provider === 'loomy' || provider === 'buddy' || provider === 'workbuddy';
+}
+
+/**
+ * 「锁定 / 解锁永久积分」按钮与提示的**按 provider 文案**。
+ *
+ * ## 为什么不能让三个 provider 共用一句
+ *
+ * 「临时积分」在三家的含义不同：Loomy 是**当天**发放的赠送额度，两个 buddy 是
+ * **N 天内会作废**的资源包。共用「只消耗每日赠送额度」这句话，buddy 用户会以为
+ * 锁上后每天刷新的额度还在优先消耗 —— 而它每天根本拿不到新额度（签到得来的也是
+ * 14/30 天后到期的包）。文案必须说清「保住的是什么、先烧的是什么、什么时候会
+ * 没有可用账号」。
+ *
+ * @param provider - provider id。
+ * @param windowDays - 后端回传的**当前生效窗口**（`credits.permanentLock` 的
+ *   `windowDays`）。⚠️ 必须用它渲染，不能用本文件的默认常量：窗口可被
+ *   `DSH_BUDDY_EXPIRING_WINDOW_DAYS` 覆盖，写死会出现「提示说 15 天、实际按
+ *   31 天筛号」。缺省（未读到 / Loomy）时回落到默认常量。
+ * @returns 四个文案位：未锁定态的按钮标题 / 已锁定态的按钮标题 /
+ *          锁定成功提示 / 解锁成功提示。
+ */
+export function permanentLockCopy(provider, windowDays) {
+  if (provider === 'buddy' || provider === 'workbuddy') {
+    const days = normalizeWindowDays(windowDays);
+    return Object.freeze({
+      days,
+      lockTitle: `锁定永久积分后只消耗「${days} 天内到期」的积分包（那部分再不用就作废）。这类积分用尽后将没有可用账号。点此锁定。`,
+      lockedTitle: `当前已锁定永久积分：只消耗「${days} 天内到期」的积分包。这类积分用尽后将没有可用账号。点此解锁。`,
+      lockedNotice: `已锁定永久积分：只消耗 ${days} 天内到期的积分包。这类积分用尽后将无可用账号。`,
+      unlockedNotice: `已解锁永久积分：${days} 天内到期的积分用尽后，会继续使用更晚到期的积分。`,
+    });
+  }
+  return Object.freeze({
+    days: null,
+    lockTitle: '锁定永久积分后只消耗每日赠送额度（今日额度用尽即无可用账号），可保住永久积分。点此锁定。',
+    lockedTitle: '当前已锁定永久积分：只消耗每日赠送额度。今日额度用尽后将没有可用账号。点此解锁。',
+    lockedNotice: '已锁定永久积分：只消耗每日赠送额度。今日额度用尽后将无可用账号。',
+    unlockedNotice: '已解锁永久积分：今日额度用尽后会继续使用永久积分。',
+  });
+}
+
+/**
+ * 归一化后端回传的窗口天数：非法值（缺省 / null / 空串 / 非数字 / 负数）
+ * 回落到默认常量。
+ *
+ * ⚠️ 三条边界都要顾：
+ * 1. **`undefined` / `null` 必须回落默认**，不能走 `Number(null) === 0` 这条路 ——
+ *    面板挂载初期或 Loomy（没有窗口概念）都会给到 null，若当成 0 就渲染出
+ *    「只消耗 0 天内到期的积分」这种荒谬提示。
+ * 2. ⚠️ 但**数字 `0` 是合法值**（表示「没有临时积分」），不能被 `||` 静默换成
+ *    默认 —— 与本仓库 `DSH_QODER_QUEUE_TIMEOUT_MS` 那条同一个坑。
+ * 3. 小数按四舍五入显示（`15.6 → 16`），避免出现「15.6 天内到期」这种读不顺的文案。
+ */
+function normalizeWindowDays(value) {
+  if (value === undefined || value === null || value === '') {
+    return PERMANENT_LOCK_EXPIRING_WINDOW_DAYS;
+  }
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed >= 0 ? Math.round(parsed) : PERMANENT_LOCK_EXPIRING_WINDOW_DAYS;
 }
 
 /**

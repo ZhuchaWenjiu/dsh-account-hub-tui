@@ -51,20 +51,29 @@ export const JET_HUB_NS = 'jet-hub'
  */
 export type ModelDisableMap = Record<string, Record<string, boolean>>
 
+/** 各 provider 的「锁定永久积分」开关：provider id → 已锁定。 */
+export type PermanentLockMap = Record<string, boolean>
+
 /** 持久化文档结构（两种后端共用）。 */
 export interface JetHubState {
   accounts: ProviderAccountEntry[]
   disabledModels: ModelDisableMap
   /**
-   * Loomy「锁定永久积分」开关（用户要求持久化）。
+   * Loomy「锁定永久积分」开关 —— **镜像字段，不是权威**。
    *
-   * 锁定后选号**只允许消耗今日赠送额度**，永久积分不参与 —— 只剩永久积分的
-   * 账号在锁定期间等同于不可用（用户语义：「没有临时积分后找可用账号就是
-   * 没有可用账号」）。
+   * 权威值在 `$DSH_HOME/jet-hub/permanent-locks.json`（见
+   * `src/permanent-lock-store.ts`）。本字段仍**继续同源写出**，理由有两条：
    *
-   * ⚠️ 这是**全局**开关（不分账号），也是本状态文档的**第三个字段**：
-   * 三处写入点（`writeAccounts` / `writeModels` / `replaceAll`）都必须携带它，
-   * 漏一处就会被整体写入抹掉（与 `disabledModels` 当年踩过的坑同型）。
+   * 1. **同机多 profile**：`state.json` 是 dsh home 级共享文档，另一条工作区里
+   *    的**旧版本代码**只认这一个字段（它读它、也原样写回它）。镜像保持一致，
+   *    web / tui / headless 侧的 Loomy 锁定才不会与 desktop 侧脱节；
+   * 2. **升级前的磁盘状态只有本字段**：新文档不存在时要靠它把老用户的锁定
+   *    迁移进来（迁移判据见 `permanent-lock-store.ts` —— 只在**新文档不存在**时
+   *    生效，避免把已解除的锁定重新打开）。
+   *
+   * ⚠️ 反过来，**新字段绝不能只住在这里**：本文档是整体替换语义，旧代码全量
+   * 重写时不会携带它不认识的任何键 —— 把锁定表放这儿会被静默抹掉，而解锁的
+   * 后果是真把永久积分烧掉（不可撤回）。这正是把表拆到独立文档的原因。
    */
   loomyPermanentLocked?: boolean
 }
@@ -93,6 +102,44 @@ const jetHubSchema = Schema.object({
   disabledModels: Schema.dict(Schema.any()).default({}),
   loomyPermanentLocked: Schema.boolean().default(false),
 })
+
+/**
+ * 归一化「锁定永久积分」开关表。
+ *
+ * 与 `sanitizeDisabledModels` 同款口径：**只保留显式 `true`**，其余值（`false` /
+ * 字符串 / 对象）一律丢弃 —— 于是「缺键」与「值为 false」在语义上完全一致
+ * （未锁定），文档也不会随开关操作累积噪音。
+ * ⚠️ 单测专门覆盖「`{ loomy: 'yes' }` 不得判成已锁定」这一类脏数据。
+ */
+export function sanitizePermanentLocks(raw: unknown): PermanentLockMap {
+  if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) return {}
+  const result: PermanentLockMap = {}
+  for (const [provider, value] of Object.entries(raw as Record<string, unknown>)) {
+    if (value === true && provider.length > 0) result[provider] = true
+  }
+  return result
+}
+
+/**
+ * 把**老的单字段**并进锁定表 —— 仅用于「独立文档尚不存在」的那一次迁移。
+ *
+ * 背景：锁定开关早于 `permanent-locks.json` 存在，住在 state.json 的
+ * `loomyPermanentLocked` 里，老用户磁盘上只有它。不并进来的话，升级后 Loomy 的
+ * 锁定会**静默消失**（用户看到的是「永久积分被烧掉了」且毫无提示）——
+ * 那是最坏的一类回归。
+ *
+ * ⚠️ 调用方**只能在新文档不存在时**用它（`PermanentLockStore.load()` 的
+ * `exists: false`）。新文档一旦存在就以它为准：否则用户在 desktop 里解锁 Loomy
+ * 之后（表里没有 `loomy` 键 = 未锁定），只要镜像字段因为任何原因还留着
+ * `true`，锁定就会被重新打开 —— 那种"解不掉"的开关比丢状态更难排查。
+ */
+export function mergeLegacyLoomyLock(
+  locks: PermanentLockMap,
+  legacyLoomyLocked: unknown,
+): PermanentLockMap {
+  if (locks.loomy === undefined && legacyLoomyLocked === true) return { ...locks, loomy: true }
+  return locks
+}
 
 /**
  * 把读到的原始值归一化为 {@link ModelDisableMap}。
@@ -151,13 +198,17 @@ class SettingsStore implements JetHubStore {
 
   load(): JetHubState | undefined {
     const value = this.scope.get() as
-      | { accounts?: unknown; disabledModels?: unknown; loomyPermanentLocked?: unknown }
+      | {
+        accounts?: unknown
+        disabledModels?: unknown
+        loomyPermanentLocked?: unknown
+      }
       | undefined
     if (value === undefined || value === null) return undefined
     return {
       accounts: sanitizeAccounts(value.accounts),
       disabledModels: sanitizeDisabledModels(value.disabledModels),
-      // 老文档没有该字段 → 缺省 false（解锁），与既有行为一致。
+      // 只是**镜像**（权威表在 permanent-locks.json）；老文档没这个键 → false。
       loomyPermanentLocked: value.loomyPermanentLocked === true,
     }
   }
@@ -166,6 +217,8 @@ class SettingsStore implements JetHubStore {
     await this.scope.replace({
       accounts: state.accounts,
       disabledModels: state.disabledModels,
+      // 镜像字段由 AccountPool 与独立文档**同源写出**：同机上只认这个字段的
+      // 旧版本代码（其它 profile）读它、也会原样写回它，故两边不会脱节。
       loomyPermanentLocked: state.loomyPermanentLocked === true,
     })
   }
@@ -271,7 +324,7 @@ class FileStore implements JetHubStore {
       return {
         accounts: sanitizeAccounts(value.accounts),
         disabledModels: sanitizeDisabledModels(value.disabledModels),
-        // 老文档没有该字段 → 缺省 false（解锁），与既有行为一致。
+        // 只是镜像（权威表在 permanent-locks.json）；老文档没这个键 → false。
         loomyPermanentLocked: value.loomyPermanentLocked === true,
       }
     } catch (error) {
@@ -311,7 +364,12 @@ class FileStore implements JetHubStore {
       const accounts = extractCredentialRefNames(readFileSync(credentialsPath, 'utf-8'))
         .flatMap(ref => accountFromCredentialRef(ref) ?? [])
       if (accounts.length === 0) return undefined
-      const state: JetHubState = { accounts, disabledModels: {}, loomyPermanentLocked: false }
+      const state: JetHubState = {
+        accounts,
+        disabledModels: {},
+        // 凭据文件里没有任何锁定信息 → 镜像写 false（权威表另有其文档）。
+        loomyPermanentLocked: false,
+      }
       try {
         this.write(state)
       } catch (error) {

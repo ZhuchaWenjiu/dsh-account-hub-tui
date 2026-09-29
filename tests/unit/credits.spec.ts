@@ -578,4 +578,78 @@ describe('积分余额查询', () => {
 
     expect(seen?.get('X-Domain')).toBe('www.workbuddy.ai')
   })
+
+  /**
+   * ⚠️ **`DeductionEndTime` 必须带出来** —— 它是「锁定永久积分」唯一的判据来源。
+   *
+   * 实测（2026-09-29，两站真实账号）：有效包的 `ExpiredTime` **一律是空串**
+   * （它只在包真正失效后才回填），`CycleEndTime` 对套餐又是月度值
+   * （WorkBuddy 的 Free Plan：周期 9-30 结束、扣费截止却在 2034 年）。
+   * 只有 `DeductionEndTime` 同时区分得开「Bonus Pack 14 天」与「套餐 8 年」。
+   * 见 `buddy-balance-rank.ts` 的对照表。
+   */
+  describe('DeductionEndTime（扣费截止）解析', () => {
+    const DAY = 24 * 60 * 60 * 1000
+
+    function stub(accounts: unknown[]) {
+      return (async () => new Response(JSON.stringify({
+        code: 0,
+        data: { Response: { Data: { Accounts: accounts } } },
+      }), { status: 200 })) as unknown as typeof fetch
+    }
+
+    it('带出毫秒时间戳（实测国际版两包的形状）', async () => {
+      const ded = Date.UTC(2026, 9, 7)
+      const balance = await fetchCreditBalance(makeCredential(), WORKBUDDY, stub([
+        { PackageName: 'Bonus Pack', Status: 0, CycleCapacityRemainPrecise: '250', DeductionEndTime: ded },
+      ]))
+      expect(balance!.packages[0]!.deductionEndTime).toBe(ded)
+    })
+
+    it('服务端未下发时保持 undefined（不编造成 0）', async () => {
+      const balance = await fetchCreditBalance(makeCredential(), CODEBUDDY, stub([
+        { PackageName: 'CodeBuddy个人体验版', Status: 0, CycleCapacityRemainPrecise: '0' },
+      ]))
+      expect(balance!.packages[0]!.deductionEndTime).toBeUndefined()
+      // 其余 provider 的包对象没有这个键 → 不能被凭空补上
+      expect('deductionEndTime' in balance!.packages[0]!).toBe(false)
+    })
+
+    /**
+     * ⚠️ 扣费截止已过但 `Status` 仍为 0（服务端还没来得及标 3）时判**失效**。
+     * 留成有效会让选号器把一笔已经作废的余额当成可用额度，
+     * 于是「锁定期间明明没钱却选了它」。
+     */
+    it('扣费截止已过 → active: false', async () => {
+      const past = Date.now() - DAY
+      const balance = await fetchCreditBalance(makeCredential(), WORKBUDDY, stub([
+        { PackageName: 'Bonus Pack', Status: 0, CycleCapacityRemainPrecise: '100', DeductionEndTime: past },
+      ]))
+      expect(balance!.packages[0]!.active).toBe(false)
+      expect(balance!.total).toBe(0)
+      // 失效包的余额单独汇总，供 UI 提示「另有 N 已失效」
+      expect(balance!.expiredTotal).toBe(100)
+    })
+
+    it('扣费截止在未来的包不受影响（实测最小的一档是 8～9 天）', async () => {
+      const future = Date.now() + 9 * DAY
+      const balance = await fetchCreditBalance(makeCredential(), WORKBUDDY, stub([
+        { PackageName: 'Bonus Pack', Status: 0, CycleCapacityRemainPrecise: '250', DeductionEndTime: future },
+      ]))
+      expect(balance!.packages[0]!.active).toBe(true)
+      expect(balance!.total).toBe(250)
+    })
+
+    it('脏值（非数字 / 0 / 负数）不算到期也不写入字段', async () => {
+      const balance = await fetchCreditBalance(makeCredential(), CODEBUDDY, stub([
+        { PackageName: 'A', Status: 0, CycleCapacityRemainPrecise: '1', DeductionEndTime: 'soon' },
+        { PackageName: 'B', Status: 0, CycleCapacityRemainPrecise: '1', DeductionEndTime: 0 },
+        { PackageName: 'C', Status: 0, CycleCapacityRemainPrecise: '1', DeductionEndTime: -1 },
+      ]))
+      for (const pkg of balance!.packages) {
+        expect(pkg.deductionEndTime).toBeUndefined()
+        expect(pkg.active).toBe(true)
+      }
+    })
+  })
 })

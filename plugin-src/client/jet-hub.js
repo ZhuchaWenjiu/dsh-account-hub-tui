@@ -6,9 +6,16 @@ import {
   supportsOnboardingTasks,
   supportsRateLimit,
   supportsPermanentLock,
+  permanentLockCopy,
   checkinProviders,
 } from './credits-capabilities.js';
 import { orderAfterDrop, dropPositionFromPointer } from './account-order.js';
+import {
+  formatExpirySplitLine,
+  splitCreditsByExpiry,
+  expiryBucketLabel,
+  daysUntilExpiry,
+} from './credit-expiry.js';
 import {
   allModelsDisabled,
   disablingLeavesNoEnabledAccount,
@@ -269,14 +276,27 @@ function formatCredits(value) {
   return Number.isInteger(value) ? String(value) : value.toFixed(2);
 }
 
-/** 把一个包的明细格式化成 tooltip 的一行。 */
-function formatPackageLine(pkg) {
+/**
+ * 把一个包的明细格式化成 tooltip 的一行。
+ *
+ * ⚠️ 到期提示取 `deductionEndTime`（扣费截止），**不是** `cycleEndTime`：
+ * 订阅套餐的计量周期是月度的（月底清零），但积分本身可以留到 8 年后 ——
+ * 拿周期时间显示会让用户以为"永久积分只剩 2 天"。两者都没有时才不显示。
+ *
+ * @param pkg - 资源包。
+ * @param windowDays - 后端回传的窗口天数（决定这一行标成「N 天内到期」还是「还有 N 天」）。
+ * @param now - **渲染时**的当前时刻（分类是时间的函数，不能传缓存值）。
+ */
+function formatPackageLine(pkg, windowDays, now) {
   const remaining = formatCredits(pkg.remaining) ?? '?';
   const total = formatCredits(pkg.total) ?? '?';
   const parts = [`${pkg.active ? '' : '[已失效] '}${pkg.name || '未命名'}: ${remaining} / ${total}`];
-  // 失效包显示它自己的失效时间，有效包显示本周期结束时间
+  const daysLeft = daysUntilExpiry(pkg, now);
   if (!pkg.active && pkg.expiredTime) parts.push(`失效于 ${pkg.expiredTime}`);
-  else if (pkg.cycleEndTime) parts.push(`本周期至 ${pkg.cycleEndTime}`);
+  else if (daysLeft !== null) {
+    const label = expiryBucketLabel(pkg, windowDays, now);
+    parts.push(`距到期 ${Math.ceil(daysLeft)} 天${label ? `（${label}）` : ''}`);
+  } else if (pkg.cycleEndTime) parts.push(`本周期至 ${pkg.cycleEndTime}`);
   return parts.join(' · ');
 }
 
@@ -287,8 +307,11 @@ function formatPackageLine(pkg) {
  * - 查不到（balance 为 null）→ 显示原因，不要显示成 0 积分
  * - 查到了但余额为 0 → 显示 0
  * - 还没有结果 → 显示"读取中"
+ *
+ * @param windowDays - 后端 `credits.balances` 回传的「临时积分」窗口（天）。
+ *   有它才显示**临时 / 永久**两桶（目前只有 CodeBuddy / WorkBuddy 带）。
  */
-function CreditBalanceRow({ balance, error, loading }) {
+function CreditBalanceRow({ balance, error, loading, windowDays }) {
   if (loading) {
     return React.createElement('div', { className: 'dim-jh-metaRow' },
       React.createElement('dt', null, '积分'),
@@ -301,10 +324,24 @@ function CreditBalanceRow({ balance, error, loading }) {
         error || '查询失败'));
   }
   const total = formatCredits(balance.total) ?? '0';
-  // 明细放进 title，不占版面；账号卡片本身已经信息密集了
-  const detail = (balance.packages || []).map(formatPackageLine).join('\n');
   const all = balance.packages || [];
   const activeCount = all.filter(p => p.active).length;
+  /**
+   * ⚠️ 分类在**渲染的这一刻**用当前时间现算，绝不存进 state、也不缓存到别处：
+   * 「临时 / 永久」等于「距扣费截止是否满 N 天」，而宿主长期开着、时间只向前流 ——
+   * 一笔距到期 15 天 30 秒的余额，用户什么都不做，半分钟后就越过线。
+   * 存下来的分类会同时骗到用户（面板说没临时积分，其实有了）和排查者
+   * （明明越线却按永久选号）。渲染节拍由「挂载 / 切 provider / 点刷新积分」提供，
+   * 数字本身也正是这些时刻才重拉，无需额外的常驻定时器。
+   */
+  const now = Date.now();
+  const split = splitCreditsByExpiry(all, windowDays, now);
+  const expiryText = formatExpirySplitLine(split, formatCredits);
+  // 明细放进 title，不占版面；账号卡片本身已经信息密集了
+  const detail = [
+    all.length > 1 ? `共 ${all.length} 个资源包，${activeCount} 个有效` : null,
+    ...all.map(pkg => formatPackageLine(pkg, windowDays, now)),
+  ].filter(Boolean).join('\n');
   /**
    * Loomy 的两个积分池必须**分开显示**（用户明确要求）。
    *
@@ -324,7 +361,16 @@ function CreditBalanceRow({ balance, error, loading }) {
       ? React.createElement('span', { className: 'dim-jh-creditPools' },
           `永久 ${formatCredits(all[0].remaining) ?? '0'} · 每日 ${formatCredits(all[1].remaining) ?? '0'}`)
       : null,
-    !isLoomyTwoPools && all.length > 1
+    // 两个 buddy：按「会不会近期作废」分桶，与选号判据同一套规则。
+    // 这条也解释了「锁定永久积分后为什么没有可用账号」——临时桶是 0。
+    !isLoomyTwoPools && expiryText
+      ? React.createElement('span', {
+          className: 'dim-jh-creditPools',
+          title: `临时 = 距扣费截止不足 ${windowDays} 天（再不用就作废，优先消耗）；`
+            + '永久 = 其余积分（锁定永久积分后不参与消耗）。',
+        }, expiryText)
+      : null,
+    !isLoomyTwoPools && !expiryText && all.length > 1
       ? React.createElement('span', { className: 'dim-jh-creditPackages' },
           `${activeCount}/${all.length} 个资源包有效`)
       : null,
@@ -335,7 +381,7 @@ function CreditBalanceRow({ balance, error, loading }) {
       : null));
 }
 
-function AccountCard({ account, index, order, onToggle, onDelete, onRetest, onReset, onClaimOnboarding, onboardingBusy, busy, credits, creditsLoading, showCredits, showRateLimitActions, drag }) {
+function AccountCard({ account, index, order, onToggle, onDelete, onRetest, onReset, onClaimOnboarding, onboardingBusy, busy, credits, creditsLoading, showCredits, windowDays, showRateLimitActions, drag }) {
   const rateLimits = account.modelRateLimits
     ? Object.entries(account.modelRateLimits).filter(([, v]) => v > Date.now())
     : [];
@@ -405,6 +451,8 @@ function AccountCard({ account, index, order, onToggle, onDelete, onRetest, onRe
             balance: credits?.balance ?? null,
             error: credits?.error,
             loading: creditsLoading,
+            // 「临时 / 永久」分桶的窗口天数（仅 buddy 系有值）。
+            windowDays,
           })
         : null),
     rateLimits.length > 0
@@ -812,6 +860,17 @@ function ProviderPanel({ provider, rpcCall }) {
   const [credits, setCredits] = React.useState({});
   const [creditsLoading, setCreditsLoading] = React.useState(false);
   /**
+   * 后端回传的「临时积分」窗口（天）—— 仅 CodeBuddy / WorkBuddy 有值。
+   *
+   * 两个来源写同一个值（同一后端函数解析 `DSH_BUDDY_EXPIRING_WINDOW_DAYS`）：
+   * `credits.balances`（积分行的分桶显示）与 `credits.permanentLock`
+   * （按钮文案）。互为备份：不支持余额查询时按钮 tooltip 仍有正确天数。
+   *
+   * ⚠️ 这里存的是**窗口配置**，不是分类结果 —— 分类每次渲染现算（见
+   * `CreditBalanceRow`），因为它是时间的函数。
+   */
+  const [expiryWindowDays, setExpiryWindowDays] = React.useState(null);
+  /**
    * 弹窗被拦截时展示给用户手动打开的登录链接。
    *
    * 保留它而不是直接失败：弹窗拦截取决于浏览器设置，用户手动点一下就能继续，
@@ -895,6 +954,8 @@ function ProviderPanel({ provider, rpcCall }) {
         next[item.accountId] = { balance: item.balance, error: item.error };
       }
       setCredits(next);
+      // 窗口天数随余额一起回来（仅 buddy 系带）——积分行据此分「临时 / 永久」。
+      setExpiryWindowDays(res?.windowDays ?? null);
     } catch (caught) {
       console.error('[jet-hub] load credits failed:', caught);
       if (!mounted.current) return;
@@ -939,13 +1000,17 @@ function ProviderPanel({ provider, rpcCall }) {
   const canClaimOnboarding = supportsOnboardingTasks(provider);
 
   /**
-   * Loomy「锁定永久积分」（全局开关，持久化在宿主侧）。
+   * 「锁定永久积分」（**provider 级**开关，持久化在宿主侧）。
    *
-   * 锁定后选号**只允许消耗今日赠送额度**；永久积分不参与，故只剩永久积分的
-   * 账号在锁定期间等同于不可用（用户语义：「锁定后没有临时积分后找可用账号
-   * 就是没有可用账号」）。
+   * CodeBuddy / WorkBuddy / Loomy **共用这一个开关位**（各自一份状态），
+   * 但「临时积分」的含义不同 —— 文案由 `permanentLockCopy(provider)` 给出，
+   * 不在这里写死（把 Loomy 的「每日赠送额度」套到 buddy 上会误导用户）。
    */
   const canLockPermanent = supportsPermanentLock(provider);
+  // 窗口天数用上面与余额共用的 `expiryWindowDays`（两个来源同值，互为备份）。
+  // ⚠️ 文案必须用它渲染：窗口可被 `DSH_BUDDY_EXPIRING_WINDOW_DAYS` 覆盖，
+  // 前端写死 15 就会出现「提示说只烧 15 天内的、实际按 31 天筛号」。
+  const lockCopy = permanentLockCopy(provider, expiryWindowDays);
   const [permanentLocked, setPermanentLocked] = React.useState(false);
   const [lockBusy, setLockBusy] = React.useState(false);
   const [lockNotice, setLockNotice] = React.useState(null);
@@ -961,8 +1026,10 @@ function ProviderPanel({ provider, rpcCall }) {
     let alive = true;
     void (async () => {
       try {
-        const res = await rpcCall('loomy.permanentLock', {});
-        if (alive) setPermanentLocked(res?.locked === true);
+        const res = await rpcCall('credits.permanentLock', { provider });
+        if (!alive) return;
+        setPermanentLocked(res?.locked === true);
+        setExpiryWindowDays(res?.windowDays ?? null);
       } catch (caught) {
         // 读失败不阻塞面板：保持「解锁」这一保守默认值（与后端缺省一致）。
         console.error('[jet-hub] load permanent lock failed:', caught);
@@ -978,14 +1045,13 @@ function ProviderPanel({ provider, rpcCall }) {
     setLockBusy(true);
     setLockNotice(null);
     try {
-      const res = await rpcCall('loomy.permanentLock', { locked: next });
+      const res = await rpcCall('credits.permanentLock', { provider, locked: next });
       if (!mounted.current) return;
       setPermanentLocked(res?.locked === true);
+      setExpiryWindowDays(res?.windowDays ?? null);
       setLockNotice({
         tone: 'ok',
-        text: next
-          ? '已锁定永久积分：只消耗每日赠送额度。今日额度用尽后将无可用账号。'
-          : '已解锁永久积分：今日额度用尽后会继续使用永久积分。',
+        text: next ? lockCopy.lockedNotice : lockCopy.unlockedNotice,
       });
     } catch (caught) {
       console.error('[jet-hub] toggle permanent lock failed:', caught);
@@ -1443,14 +1509,14 @@ function ProviderPanel({ provider, rpcCall }) {
               onClick: () => void runLimitAction('resetAll'),
             }, '重置所有')
           : null,
-        // 锁定永久积分（仅 Loomy）：只消耗每日赠送额度，保住永久积分。
+        // 锁定永久积分：只消耗会近期作废的积分，保住长期积分。
+        // 文案按 provider 给（Loomy 是「每日赠送额度」，两个 buddy 是
+        // 「15 天内到期的积分包」）—— 见 permanentLockCopy 的说明。
         canLockPermanent
           ? React.createElement('button', {
               className: 'dim-jh-btn',
               'data-kind': permanentLocked ? 'primary' : undefined,
-              title: permanentLocked
-                ? '当前已锁定永久积分：只消耗每日赠送额度。今日额度用尽后将没有可用账号。点此解锁。'
-                : '锁定永久积分后只消耗每日赠送额度（今日额度用尽即无可用账号），可保住永久积分。点此锁定。',
+              title: permanentLocked ? lockCopy.lockedTitle : lockCopy.lockTitle,
               disabled: lockBusy,
               onClick: () => void togglePermanentLock(),
             }, lockBusy
@@ -1558,6 +1624,8 @@ function ProviderPanel({ provider, rpcCall }) {
                 credits: credits[account.id],
                 creditsLoading: creditsLoading && credits[account.id] === undefined,
                 showCredits: canLoadCredits,
+                // 「临时 / 永久」分桶的窗口天数（buddy 系才有值）。
+                windowDays: expiryWindowDays,
                 // 卡片级「重测 / 重置」：只对会返回限流错误的 provider 渲染。
                 showRateLimitActions: supportsRateLimit(provider),
                 onToggle: toggleAccount,

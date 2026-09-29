@@ -11,8 +11,10 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
   createJetHubStore,
+  mergeLegacyLoomyLock,
   sanitizeAccounts,
   sanitizeDisabledModels,
+  sanitizePermanentLocks,
 } from '../../src/jet-hub-store.js'
 import type { ProviderAccountEntry } from '../../src/types.js'
 
@@ -88,12 +90,19 @@ describe('老契约后端（SettingsStore）', () => {
       disabledModels: { buddy: { 'glm-5.2': true } },
       loomyPermanentLocked: false,
     })
+    // ⚠️ 锁定表**不进**这份文档：它是同机多 profile 共享的，旧版本代码全量重写
+    // 时不会携带自己不认识的键 —— 表放这儿会被静默抹掉（详见
+    // src/permanent-lock-store.ts 的文件头）。表住 permanent-locks.json。
+    expect('permanentLocks' in payloads[0]!).toBe(false)
   })
 
   /**
-   * ⚠️ 老契约后端也必须持久化锁定开关（用户要求「需要支持持久化」）。
+   * ⚠️ 老契约后端也必须持久化锁定**镜像**（用户要求「需要支持持久化」）。
+   *
+   * 镜像的意义：另一条工作区里的旧版本代码只认 `loomyPermanentLocked`
+   * （它读它、也原样写回它），保持一致才能让那一侧的 Loomy 面板不显示错值。
    */
-  it('Loomy 永久积分锁定在 settings 后端可读回', async () => {
+  it('Loomy 永久积分锁定镜像在 settings 后端可读回', async () => {
     let saved: Record<string, unknown> | undefined
     const scope = {
       get: () => saved,
@@ -102,7 +111,33 @@ describe('老契约后端（SettingsStore）', () => {
     const store = createJetHubStore(makeCtx({ register: () => scope, describe: () => [] }))
     await store.save({ accounts: [], disabledModels: {}, loomyPermanentLocked: true })
     expect(saved?.loomyPermanentLocked).toBe(true)
+    expect('permanentLocks' in saved!).toBe(false)
     expect(store.load()?.loomyPermanentLocked).toBe(true)
+  })
+
+  /**
+   * ⚠️ 本后端**只负责镜像**：即使调用方误把表塞进 state（类型上已无该字段，
+   * 故用 `as never` 模拟"有人改回来"），也不得落进共享文档 —— 那等于重新制造
+   * "被另一条工作区的旧版本全量重写抹掉"这个缺陷（表的家在 permanent-locks.json）。
+   */
+  it('误传的 permanentLocks 不会落进共享文档', async () => {
+    let saved: Record<string, unknown> | undefined
+    const scope = {
+      get: () => saved,
+      replace: async (section: object) => { saved = section as Record<string, unknown> },
+    }
+    const store = createJetHubStore(makeCtx({ register: () => scope, describe: () => [] }))
+    await store.save({
+      accounts: [],
+      disabledModels: {},
+      loomyPermanentLocked: true,
+      permanentLocks: { buddy: true, workbuddy: true },
+    } as never)
+    // 镜像正常写出，表本体被丢弃
+    expect(saved?.loomyPermanentLocked).toBe(true)
+    expect('permanentLocks' in saved!).toBe(false)
+    // 读回来的类型也没有它（AccountPool 不可能误把它当权威）
+    expect('permanentLocks' in (store.load() ?? {})).toBe(false)
   })
 })
 
@@ -118,20 +153,46 @@ describe('文件后端（FileStore）', () => {
     expect(reader.load()).toEqual({
       accounts: [ACCOUNT],
       disabledModels: { buddy: { 'glm-5.2': true } },
-      // 新字段缺省 false（解锁）—— 与既有行为一致
+      // 镜像字段缺省 false（解锁）—— 与既有行为一致
       loomyPermanentLocked: false,
     })
+    // 落盘文本里也不该出现锁定表（它属于 permanent-locks.json）
+    expect(readFileSync(statePath, 'utf-8')).not.toContain('permanentLocks')
   })
 
   /**
-   * ⚠️ Loomy「锁定永久积分」必须**跨重启持久化**（用户明确要求）。
+   * ⚠️ 锁定态必须**跨重启持久化**（用户在 Loomy 上明确要求，
+   * CodeBuddy / WorkBuddy 沿用同一约定）。这里验证的是镜像字段那一半；
+   * 权威表的后端由 `permanent-lock-store.spec.ts` 覆盖。
    */
-  it('Loomy 永久积分锁定可跨实例读回', async () => {
+  it('Loomy 永久积分锁定镜像可跨实例读回', async () => {
     const writer = createJetHubStore(makeCtx(undefined))
     await writer.save({ accounts: [], disabledModels: {}, loomyPermanentLocked: true })
 
     const reader = createJetHubStore(makeCtx(undefined))
     expect(reader.load()?.loomyPermanentLocked).toBe(true)
+  })
+
+  /**
+   * ⚠️ 中间版本曾把 `permanentLocks` 写进这份**共享文档**，那批磁盘状态如今
+   * 可能还带着它。新版必须**忽略**它（不读、不因此改变镜像值）—— 否则
+   * 「读一份随时会被旧版本抹掉的文档」这条错误路径又被允许了。
+   */
+  it('文档里残留的 permanentLocks 被忽略', () => {
+    mkdirSync(join(dir, 'jet-hub'), { recursive: true })
+    writeFileSync(
+      join(dir, 'jet-hub', 'state.json'),
+      JSON.stringify({
+        accounts: [],
+        disabledModels: {},
+        loomyPermanentLocked: false,
+        permanentLocks: { buddy: true, workbuddy: true },
+      }),
+      'utf-8',
+    )
+    const state = createJetHubStore(makeCtx(undefined)).load()
+    expect(state?.loomyPermanentLocked).toBe(false)
+    expect('permanentLocks' in (state ?? {})).toBe(false)
   })
 
   it('老文档没有该字段时缺省为 false（不误锁）', () => {
@@ -230,5 +291,38 @@ describe('归一化', () => {
   it('文件文档里非对象内容按空处理', () => {
     writeFileSync(join(dir, 'raw.json'), '[]', 'utf-8')
     expect(sanitizeAccounts(JSON.parse(readFileSync(join(dir, 'raw.json'), 'utf-8')))).toEqual([])
+  })
+
+  it('锁定表只保留显式 true，其余值与非对象输入按空处理', () => {
+    expect(sanitizePermanentLocks({
+      buddy: true,
+      workbuddy: false,
+      loomy: 'yes',
+      '': true,
+      trae: 1,
+    })).toEqual({ buddy: true })
+    expect(sanitizePermanentLocks(undefined)).toEqual({})
+    expect(sanitizePermanentLocks(['buddy'])).toEqual({})
+    expect(sanitizePermanentLocks('buddy')).toEqual({})
+  })
+
+  /**
+   * 老状态文档（升级前写的）只有 `loomyPermanentLocked` 一个字段。
+   *
+   * ⚠️ 不合并的后果不是显示问题，而是**行为**问题：升级后 Loomy 的锁定
+   * 静默失效 → 选号继续消耗永久积分 → 用户损失无法撤回。
+   */
+  it('老字段并入表：仅在表里没有 loomy 项时生效', () => {
+    expect(mergeLegacyLoomyLock({}, true)).toEqual({ loomy: true })
+    expect(mergeLegacyLoomyLock({}, false)).toEqual({})
+    expect(mergeLegacyLoomyLock({}, 'yes')).toEqual({})
+    // 表里已有 loomy 项时**表优先**（无论 true 还是缺键都由表决定）
+    expect(mergeLegacyLoomyLock({ loomy: true, buddy: true }, false)).toEqual({ loomy: true, buddy: true })
+    const merged = mergeLegacyLoomyLock({ buddy: true }, true)
+    expect(merged).toEqual({ buddy: true, loomy: true })
+    // 返回新对象，不修改入参（表是进程内权威副本，被改会污染池状态）
+    const input = { buddy: true }
+    mergeLegacyLoomyLock(input, true)
+    expect(input).toEqual({ buddy: true })
   })
 })

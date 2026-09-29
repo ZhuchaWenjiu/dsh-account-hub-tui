@@ -113,11 +113,17 @@ describe('Loomy 客户端接线', () => {
   })
 
   /**
-   * ⚠️ **锁定永久积分**（用户需求）：面板级一个开关，锁定后只消耗今日额度。
+   * ⚠️ **锁定永久积分**（用户需求）：面板级一个开关，Loomy 锁定后只消耗今日额度。
+   *
+   * 端点已通用化为 `credits.permanentLock`（CodeBuddy / WorkBuddy 共用），
+   * 故这里断言的是「带 provider 的通用调用」而不是老的裸端点名 ——
+   * ⚠️ **漏传 provider 会锁错对象**（三个 provider 各有一份状态）。
    */
-  it('Loomy 渲染「锁定 / 解锁永久积分」按钮并走 loomy.permanentLock', () => {
+  it('Loomy 渲染「锁定 / 解锁永久积分」按钮并走通用 credits.permanentLock', () => {
     expect(hubSource).toContain('supportsPermanentLock')
-    expect(hubSource).toContain("'loomy.permanentLock'")
+    expect(hubSource).toContain("'credits.permanentLock'")
+    expect(hubSource).toMatch(/rpcCall\('credits\.permanentLock', \{ provider \}\)/)
+    expect(hubSource).toMatch(/rpcCall\('credits\.permanentLock', \{ provider, locked: next \}\)/)
     // 文案随状态切换
     expect(hubSource).toContain("'解锁永久积分'")
     expect(hubSource).toContain("'锁定永久积分'")
@@ -125,7 +131,23 @@ describe('Loomy 客户端接线', () => {
 
   it('锁定状态在面板挂载时读取一次（且只对支持的 provider 发请求）', () => {
     expect(hubSource).toMatch(/if \(!canLockPermanent\) return undefined/)
-    expect(hubSource).toMatch(/rpcCall\('loomy\.permanentLock', \{\}\)/)
+    expect(hubSource).toMatch(/rpcCall\('credits\.permanentLock', \{ provider \}\)/)
+  })
+
+  /**
+   * ⚠️ 文案必须**按 provider 取**：把 Loomy 的「每日赠送额度」套到两个 buddy 上，
+   * 用户会以为锁上后每天有新的额度可烧 —— 而它们拿到的其实是 14/30 天后到期的包。
+   *
+   * ⚠️ 还要带**后端回传的窗口天数**：窗口可被环境变量覆盖，前端写死数字就会出现
+   * 「提示说只烧 15 天内的、实际按 31 天筛号」。
+   */
+  it('锁定文案走 permanentLockCopy(provider, windowDays)，不在面板里写死说法', () => {
+    expect(hubSource).toContain('permanentLockCopy')
+    expect(hubSource).toMatch(/const lockCopy = permanentLockCopy\(provider, expiryWindowDays\)/)
+    expect(hubSource).toMatch(/title: permanentLocked \? lockCopy\.lockedTitle : lockCopy\.lockTitle/)
+    expect(hubSource).toMatch(/text: next \? lockCopy\.lockedNotice : lockCopy\.unlockedNotice/)
+    // 三处都要存窗口天数：余额查询、锁定读取、锁定切换（与积分行共用同一个 state）
+    expect(hubSource.match(/setExpiryWindowDays\(res\?\.windowDays \?\? null\)/g)).toHaveLength(3)
   })
 
   /**

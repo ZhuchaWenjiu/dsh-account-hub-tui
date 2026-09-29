@@ -1915,6 +1915,221 @@ ctx.remote.$on('credentials/reference-updated', () => this.catalog.refresh())
 `listed`）：用过滤后的集合会让「关掉其中一个同名模型」改变另一个的变体标记，
 名字随开关跳变。
 
+## ⚠️ 「锁定永久积分」三家**共用一张表与一个端点**，但判据必须各算
+
+**用户需求**：为 codebuddy 与 workbuddy 加入永久积分锁定，类似 loomy 的锁定/解锁
+永久积分；差别是 loomy 的到期积分是**当日**到期，两个 buddy 的到期是**一个月或更久**，
+且「区分永久积分的方法可能稍有差异」。
+
+**用户 2026-09-29 定下的四条口径**（不要擅自改）：
+
+| 项 | 规则 |
+|---|---|
+| 判据 | 距**扣费截止**不足 **15 天** ⇒ 临时（优先烧）；≥ 15 天 ⇒ 永久 |
+| 余额口径 | `CycleCapacityRemain`（本计费周期剩余，= IDE 顶部 `Credits Balance` 口径） |
+| 开关粒度 | **provider 级**（CodeBuddy 与 WorkBuddy 各一份，互不影响） |
+| 选号策略 | 与 loomy 同构：有临时积分的号优先 → 只剩永久 → 无/查不到；**档内保持手动顺序** |
+
+### 区分永久积分**只能看 `DeductionEndTime`**（实测 2026-09-29，两站真实账号）
+
+| 包 | `ExpiredTime` | `CycleEndTime` | **`DeductionEndTime`** | 归入 |
+|---|---|---|---|---|
+| WorkBuddy「Bonus Pack」 | `''` | 9 天后 | **9 天后** | 临时 |
+| WorkBuddy「Free Plan Subscription」 | `''` | **2 天后** | **3008 天后** | 永久 |
+| CodeBuddy「个人体验版」 | `''` | 已过期 | 3008 天后 | 永久（本周期已无余额） |
+| CodeBuddy「拉新权益包 / 国内运营裂变包」 | `''` | 同下 | **17～208 天后** | ≥15 天者永久 |
+
+⚠️ **三个看着像判据、其实都不能用的字段**（每一条都足以让功能静默失效）：
+
+- **`ExpiredTime` 没有区分力**：有效包**一律是空串** —— 它是包**真正失效之后**
+  由服务端回填的动作时间（此时 `Status` 已变 3、余额已归零），不是「预定失效时间」。
+  既有的 `parseCreditPackage` 本来就把它用于失效判定，但**不能**反过来用它分池。
+- **`CycleEndTime` 会把套餐误判成「马上作废」**：订阅包的计量周期是月度的
+  （WorkBuddy Free Plan：周期 9-01→9-30，只剩 2 天），而扣费截止在 8 年后。
+  用它 ⇒ 套餐被划进临时桶 ⇒ 锁定**形同虚设**（该保的照烧）。
+- **终身口径 `CapacityRemain` 会虚增可用额度**：实测体验版**终身**剩 500 而
+  **本周期**剩 0，那 500 实际扣不到（`TotalCycles=1 / RemainCycles=0`，周期不刷新）。
+  用它 ⇒ 账号「看起来有钱却用不了」，锁定期间的可用判定也会错。
+
+⇒ 实现：`CreditPackage` 新增**可选** `deductionEndTime?: number`（由
+`parseCreditPackage` 从 `DeductionEndTime` 带出；`> 0` 才写，缺失 = 未知），
+`splitBuddyCreditsByExpiry()` 据此现算两桶。顺带把「扣费截止已过」并入 `active`
+失效判定（实测有效包的该字段都在未来，故这条只会捞出真正作废的包）。
+
+⚠️ **到期时间未知（缺失 / 0 / NaN）归入永久桶**：保守方向 —— 最坏是少用一个号，
+而不是把长期积分当快到期烧掉（不可逆损失）。
+
+### 为什么不复用 loomy 那份（`loomy-balance-rank.ts`）
+
+loomy 的两个池是**服务端直接给的字段**（`dailyBalance` / `balance`），buddy 要
+**从包列表按到期时间现算**。压成一份代码得把「什么叫临时」参数化成回调，
+那会让本文件最有价值的东西（**15 天这条线怎么来的**）从注释里消失。
+⇒ 新增 `src/buddy-balance-rank.ts` + `src/buddy-balance-selector.ts`，
+**同构但独立**；两站各持一个 selector 实例（余额缓存不串味）。
+
+### ⚠️ 锁定表必须住**独立文档**，不能住 `state.json`（同机多 profile 会抹掉它）
+
+**用户 2026-09-29 定案**（我先放错位置，被这条真实约束纠正）。
+
+关键事实：`$DSH_HOME/jet-hub/state.json` 是 **dsh home 级、同机多 profile 共享**的
+（`resolveJetHubHome` 只看 home，不看 profile），而本机现状是两个工作区并存 ——
+`desktop` profile link 到 `dsh-codearts`（本仓库，带锁定功能），
+`web` / `tui` / `headless` profile link 到 `deepseek-harness-codearts`
+（另一条 minimax 工作区，**不认识锁定表**）。用户刻意让它们互不影响。
+
+于是把 `permanentLocks` 放进 state.json 会这样失效：
+
+| 步骤 | 发生什么 |
+|---|---|
+| 1 | desktop 写入 `permanentLocks: { buddy: true }` |
+| 2 | 用户在 web 侧触发**任意一次**整体写入（加删账号 / 改模型开关 / 命中限流标记） |
+| 3 | 旧代码 `store.save(全量 state)` 只带它认识的三个键 ⇒ `permanentLocks` **被抹掉** |
+| 4 | desktop 读回 ⇒ CodeBuddy / WorkBuddy **静默解锁** ⇒ 继续消耗永久积分（**不可撤回**） |
+
+⇒ 表落在 **`$DSH_HOME/jet-hub/permanent-locks.json`**（`src/permanent-lock-store.ts`），
+旧代码从不读写它。**新增任何"跨版本共存"的字段时都要过一遍这个判断**：
+共享文档 + 整体替换语义 ⇒ 只有对方也认识的字段才安全。
+
+- ⚠️ `state.json` 里仍写 `loomyPermanentLocked`，但它是**镜像**不是权威：
+  旧代码读它、也原样写回它，保持一致才能让另一侧的 Loomy 面板不显示错值，
+  且回退版本时不会"锁定悄悄失效"。由 `AccountPool.lockFields()` 同源写出。
+- ⚠️ **迁移判据必须是「独立文档不存在」**（`load()` 返回 `exists: false`），
+  不能是「表里缺该键」。缺键的语义是**用户明确解锁了**；此时若回看镜像里那个
+  陈旧的 `true`，就会出现**解不掉的开关**（比丢状态更难排查）。
+  迁移出的内容要**立即固化**，否则每次冷启动都重新读那个会被改动的镜像。
+- ⚠️ 文档损坏时按「存在但空表」处理，**不**回落到镜像 —— 同上理由。
+- ⚠️ 写入顺序：**先权威、再镜像**；镜像失败只 warn 不上抛（否则一次 settings
+  后端抖动会让面板按钮报错，而开关其实已生效）。
+- ⚠️ 解锁是**删键**而不是写 `false`（与黑名单同款约定：只认显式 `true`）。
+- ⚠️ **备份**：表不在 `getStateSnapshot()` 里了，导出必须走
+  `permanentLocksSnapshot()`（漏改 = 备份里的锁定永远是空表）。导入侧
+  `locksFromPayload()` 三态仍需分清：有表 = 整体替换；只有老字段 = 恢复/解锁
+  Loomy 那一项（`false` 是**明确的**不锁，传 `{}`）；两者都没有 = 传
+  `undefined` 让池**保持当前值**（否则导入老备份会静默解锁）。
+- ⚠️ **测试必须隔离 home**：`vitest.config.ts` 已全局设
+  `DSH_JET_HUB_STATE_DIR` 到临时目录，但**用例间的清理钩子要注册在模块顶层** ——
+  本文件有多个**平级**的顶层 `describe`，钩子挂在某个 describe 内部时其余
+  describe 拿不到，于是 `permanent-locks.json` 在用例间残留，"默认未锁定"
+  会被前一条用例写入的值污染（实测踩过：9 条莫名失败）。
+
+**怎么复核这条风险是真的**（不是推演）：`scripts/probe-cross-profile-overwrite.mjs`
+（本地、零网络）用**另一条工作区的真实编译产物**当"旧代码"跑一次 `addAccount`，
+实测：塞在 `state.json` 里的表**被抹掉**，而 `permanent-locks.json` 里的
+`buddy` / `workbuddy` / `loomy` 三把锁全部健在。自动触发条件也不是"用户主动加账号"：
+旧代码有 **每 30 分钟的续期定时器**（`REFRESH_INTERVAL_MS`）与 8 处
+`updateModelRateLimit` 调用（一次对话命中限流即写）；且覆盖是**整份文档级、不分
+provider** —— web 侧 qoder / trae / loomy 等账号被写一次，同样会抹掉 desktop 侧
+给 CodeBuddy 上的锁。
+
+### ⚠️ 分类是时间的函数：**缓存原料，绝不缓存分类结果**
+
+**用户 2026-09-29 提出**：dsh 宿主长期开着，时间向前流动 —— 现在不是临时积分的包，
+过一阵（距扣费截止跌破 15 天）就变成临时积分。所以分类**不能算一次就固定**。
+
+⇒ 两处都按「只缓存原料」实现：
+
+| 位置 | 缓存什么 | 每次做什么 |
+|---|---|---|
+| `BuddyBalanceSelector`（选号） | `get-user-resource` 的**原始 `CreditBalance`**，TTL 60 秒 | 命中缓存也调 `classify()` 重新分桶 + 定档，并**重读窗口 env** |
+| `CreditBalanceRow`（面板） | 不缓存分类 | 每次渲染传 `Date.now()` 现算（`splitCreditsByExpiry` 是纯函数） |
+
+⚠️ **TTL 的唯一职责是抑制网络请求**，绝不能顺手把 `split` / `tier` 一起缓存住。
+一笔距到期 15 天 + 30 秒的余额，在 60 秒 TTL 内就越过了线 —— 冻结分类会让选号
+继续按「永久」处理一笔其实马上作废的积分（锁定时更糟：本该可用的号被判成不可用）。
+⇒ `balanceOf` 拆成 `fetchSource()`（网络，缓存）+ `classify()`（纯计算，每次做）。
+
+⚠️ **Loomy 那份（`loomy-balance-selector.ts`）缓存的是服务端给的两个数字**
+（`dailyBalance` / `balance`），里面不含「按 now 现算」的成分，所以它没有这个问题
+—— **不是漏改，不要"顺手统一"**。
+
+⚠️ 前端**不需要常驻定时器**：渲染节拍由「挂载 / 切 provider / 点刷新积分」提供，
+而数字本身也正是这些时刻才重拉。分类只是渲染时现算的派生值，页面活着就自动跟上。
+
+### ⚠️ 展示与选号的判据必须**逐条一致**（用对账用例锁，不是靠"看起来一样"）
+
+前端 `plugin-src/client/credit-expiry.js` 是后端 `src/buddy-balance-rank.ts`
+`splitBuddyCreditsByExpiry()` 的**展示侧复刻**。两者一旦漂移，用户就会看到
+「面板说还有 250 临时积分，选号却说没号可用」——**任何单侧用例都发现不了**。
+
+⇒ `tests/unit/credit-expiry.spec.ts` 用同一组 fixture（含恰好 15 天的边界、
+失效包、到期未知、脏值、浮点尾数、时间前进 40 秒越线）喂两侧并断言结果相同。
+⚠️ 已做**反向验证**：把前端边界从 `<` 改成 `<=` → 2 条变红（其中 1 条正是对账）。
+
+⚠️ 窗口天数只能**由后端回传**（`credits.balances` 与 `credits.permanentLock` 都带
+`windowDays`，前端存进同一个 state），不能在前端写死 15 —— 否则用户设了
+`DSH_BUDDY_EXPIRING_WINDOW_DAYS=31` 后，面板说「只烧 15 天内的」而实际按 31 天筛号。
+
+⚠️ 前端归一化窗口要显式挡 `null`/`undefined`：`Number(null) === 0`，而**非 buddy
+provider 后端不带该字段**，不挡住就会在它们的卡片上凭空渲染一行假的
+「临时 0 · 永久 N」。窗口实际恒为 15（或经 env 放宽），不存在"设成 0"的用法。
+
+⚠️ tooltip 的到期天数取 `deductionEndTime`，**不是 `cycleEndTime`**：套餐的计量
+周期是月度的（月底清零），拿它显示会让用户以为"永久积分只剩 2 天"。
+
+### RPC：一条实现 + 一个历史别名
+
+`credits.permanentLock { provider, locked? }`（`locked` 省略 = 只读）。
+`loomy.permanentLock` 保留为**别名**（老客户端 bundle 仍调它，删了会让 Loomy
+面板按钮静默失效），且该别名**忽略载荷里的 provider**（固定 loomy，否则老前端
+能借它越权改别的 provider）。白名单 `PERMANENT_LOCK_PROVIDERS`
+= `{loomy, buddy, workbuddy}`，与前端 `supportsPermanentLock` **必须一致** ——
+单测 `credits-capabilities.spec.ts` 逐个 provider 对账两边。
+
+⚠️ **不要**为每个 provider 各加一条 case：本仓库已经因此坏过
+（「WorkBuddy 的刷新按钮一直坏着」就是漏接平行分支）。
+
+### ⚠️ 文案必须按 provider 取，且**天数由后端回传**
+
+- `permanentLockCopy(provider, windowDays)`：loomy 说「每日赠送额度」，
+  两个 buddy 说「N 天内到期的积分包」。把 loomy 那句套到 buddy 上是**实质性误导**
+  —— buddy 没有每天刷新的额度池（签到得来的也是 14/30 天后到期的包）。
+- ⚠️ 窗口可被 `DSH_BUDDY_EXPIRING_WINDOW_DAYS` 覆盖，故响应带 `windowDays`
+  回传、前端据此渲染。写死 15 会出现「提示说只烧 15 天、实际按 31 天筛号」。
+- ⚠️ 前端归一化要区分 `null/undefined`（回落默认，**不能**当 0 ——
+  `Number(null) === 0`）与数字 `0`（合法，语义是「没有临时积分」）。
+  写 `|| 默认值` 会吞掉 0，与 Qoder 排队超时那条同一个坑。
+
+### ⚠️ 中国版在默认窗口下的必然结果（**不是缺陷**，但要说清）
+
+实测 CodeBuddy 中国版账号的赠送包**按 30 天发放**，「距到期」天然落在 17～30 天
+⇒ 默认 15 天下**整池 10064 积分全算永久** ⇒ 锁上立刻「无可用账号」。
+这是用户定的判据的直接推论。逃生门：`DSH_BUDDY_EXPIRING_WINDOW_DAYS=31`
+（实测改后 6264.61 划为临时、3799.99 仍永久，锁定可正常选号）。
+报错文案用 `buddyExpiringWindowDays()` **运行时解析**，不写死常量。
+
+### ⚠️ 锁定时绝不可落到 `getAvailableAccount` 兜底
+
+`pickBuddyAccount()` 返回 `kind:'locked'` 时 `index.ts` 必须**抛明确错误**
+（告诉用户去哪个面板解锁）。落到既有的池兜底会绕过锁定、照样消耗永久积分，
+使锁定形同虚设 —— loomy 当初就是这条，单测里也专门钉住「编排函数体内不出现
+`getAvailableAccount`」。未锁定时的 `exhausted`（凭据都坏了）才允许兜底，
+且必须把 `tried` 传给 `getAvailableAccount` 的排除集合，否则会原地打转。
+
+### 回归用例
+
+- `tests/unit/buddy-balance-rank.spec.ts`（37 条）：窗口边界（14d / 恰好 15d /
+  差 1ms）、失效包跳过、到期未知归永久、本周期口径、锁定降档、稳定排序、
+  环境变量解析（含 **0 合法**）、脏值。
+- `tests/unit/buddy-balance-selector.spec.ts`（25 条）：TTL 缓存与 invalidate、
+  凭据失败/异常/null 三种失败形态、锁定不被选中、解锁保持既有行为、
+  编排换号循环、`locked` vs `exhausted`、env 窗口生效。
+- `tests/unit/credits.spec.ts` 的「DeductionEndTime 解析」段（5 条）：带出毫秒、
+  缺失不编造、过期判 `active:false`、脏值。
+- `tests/unit/jet-hub-store.spec.ts` / `account-pool.spec.ts`：表与老字段同源、
+  三处整体写入不互相抹掉、跨实例读回、脏表按空、replaceAll 三态。
+- `tests/unit/buddy-permanent-lock.spec.ts`（12 条）：`index.ts` **接线**源码断言
+  （两个 selector 各绑自己的 product、候选先过滤再分档、锁定分支不兜底、
+  兜底传 `tried`）+ 行为级「两站不串味」。
+- `tests/unit/loomy-client.spec.ts` / `loomy-rpc-dispatch.spec.ts` /
+  `credits-capabilities.spec.ts`：通用端点 + 别名、provider 白名单两边对账、
+  文案带 windowDays。
+- ⚠️ 已做**反向验证**：阈值改 7 天 ⇒ 9 条变红；去掉锁定降档那一行 ⇒ 6 条变红；
+  把 `locked` 的 throw 改成兜底 ⇒ 接线用例变红。
+- 排查脚本（只读、零额度、**不入库**）：`scripts/probe-buddy-resource-raw.mts`
+  （打印两站资源包原始形状与到期分布，判据的取证来源）、
+  `scripts/probe-buddy-permanent-lock.mts`（用真实凭据跑一遍拆分与选号，
+  可加 `DSH_BUDDY_EXPIRING_WINDOW_DAYS` 看放宽窗口的效果）。
+
 ## 目录门控：没有已登录账号就隐藏整个 provider
 
 **需求**：「如果某供应商没有已登录的账号，就不显示该供应商的所有模型，这样对

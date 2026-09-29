@@ -170,6 +170,28 @@ export interface CreditPackage {
   cycleEndTime: string
   /** 该包自身的失效时间（可能为空 = 无固定失效时间） */
   expiredTime: string
+  /**
+   * 该包的**扣费截止时间**（毫秒时间戳；实测缺失或 0 = 服务端未下发）。
+   *
+   * ⚠️ **这才是「这批积分什么时候作废」的字段**，与 `expiredTime` 不是一回事：
+   * 实测（2026-09-29，两站各取真实账号）有效包的 `ExpiredTime` **一律为空串**，
+   * 它只在包**真正失效之后**由服务端回填（此时 `Status` 已变 3、余额已归零）；
+   * 而 `DeductionEndTime` 在包还有效时就有值，且两站的实测分布差距极大：
+   *
+   * | 包 | `DeductionEndTime` 距今 | `CycleEndTime` 距今 |
+   * |---|---|---|
+   * | WorkBuddy「Bonus Pack」 | 9 天 | 9 天 |
+   * | WorkBuddy「Free Plan Subscription」 | **3008 天** | 2 天 |
+   * | CodeBuddy「拉新权益包 / 国内运营裂变包」 | 17～208 天 | 同左或更长 |
+   * | CodeBuddy「个人体验版」 | 3008 天 | 已到期 |
+   *
+   * ⇒ 判「会不会近期作废」**只能用本字段**：套餐（订阅）包的周期虽短，
+   * 扣费截止却在 8 年后，取 `CycleEndTime` 会把每月刷新的套餐误判成快作废。
+   *
+   * ⚠️ 可选字段：其余 provider 的余额解析器（loomy / qoder / trae / …）不产出它，
+   * 依赖方必须把 `undefined` 当作「到期时间未知」而不是「已过期」。
+   */
+  deductionEndTime?: number
 }
 
 /** 账号的积分余额汇总。 */
@@ -437,10 +459,14 @@ function parseCreditPackage(entry: Record<string, unknown>): CreditPackage {
   const unit = readString(entry, 'CapacityUnit') || readString(entry, 'OriginUnit')
   const status = entry.Status
   const expiredTime = readString(entry, 'ExpiredTime')
-  // 失效判定：Status 显式为已过期，或存在已过去的 ExpiredTime
+  // 扣费截止时间（毫秒）。0 / 缺失 = 服务端未下发，按「未知」处理而非「已过期」。
+  const deductionEndTime = readNumber(entry, 'DeductionEndTime')
+  // 失效判定：Status 显式为已过期，或存在已过去的 ExpiredTime，
+  // 或扣费截止已过（实测有效包的该字段都在未来，故这条只会捞出真正作废的包）。
   const expiredAt = expiredTime.length > 0 ? Date.parse(expiredTime.replace(' ', 'T')) : Number.NaN
   const active = status !== PACKAGE_STATUS_EXPIRED
     && !(Number.isFinite(expiredAt) && Date.now() >= expiredAt)
+    && !(deductionEndTime > 0 && Date.now() >= deductionEndTime)
   return {
     name,
     unit,
@@ -451,6 +477,7 @@ function parseCreditPackage(entry: Record<string, unknown>): CreditPackage {
     cycleStartTime: readString(entry, 'CycleStartTime'),
     cycleEndTime: readString(entry, 'CycleEndTime'),
     expiredTime,
+    ...deductionEndTime > 0 ? { deductionEndTime } : {},
   }
 }
 

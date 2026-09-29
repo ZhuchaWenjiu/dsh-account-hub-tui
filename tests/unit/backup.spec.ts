@@ -2,11 +2,13 @@ import { describe, it, expect } from 'vitest'
 import { credentialRef } from '@deepseek-ai/dsh-credentials'
 import {
   BackupFormatError,
+  assertBackupPayload,
   exportBackup,
   importBackup,
   type BackupCredentials,
   type BackupPool,
 } from '../../src/backup.js'
+import { BACKUP_FORMAT, BACKUP_VERSION } from '../../src/types.js'
 import type { JetHubState } from '../../src/jet-hub-store.js'
 import type { ProviderAccountEntry } from '../../src/types.js'
 
@@ -37,15 +39,36 @@ function createCredentials(): BackupCredentials & { store: Map<string, string> }
 }
 
 /** 内存账号池（记录最后一次 replaceAll 调用）。 */
-function createPool(initial?: JetHubState): BackupPool & { replaced: { accounts: ProviderAccountEntry[]; disabledModels: Record<string, Record<string, boolean>> } | null } {
+function createPool(initial?: JetHubState): BackupPool & {
+  replaced: {
+    accounts: ProviderAccountEntry[]
+    disabledModels: Record<string, Record<string, boolean>>
+    /** 第三参：`undefined` = 备份里没有锁定信息（池应保持当前值）。 */
+    permanentLocks?: Record<string, boolean>
+  } | null
+} {
   let state = initial ?? { accounts: [], disabledModels: {} }
-  const record: { replaced: { accounts: ProviderAccountEntry[]; disabledModels: Record<string, Record<string, boolean>> } | null } = { replaced: null }
+  const record: { replaced: {
+    accounts: ProviderAccountEntry[]
+    disabledModels: Record<string, Record<string, boolean>>
+    permanentLocks?: Record<string, boolean>
+  } | null } = { replaced: null }
   return {
     get replaced() { return record.replaced },
-    getStateSnapshot: () => ({ accounts: [...state.accounts], disabledModels: { ...state.disabledModels } }),
-    replaceAll: async (accounts, disabledModels) => {
+    getStateSnapshot: () => ({
+      accounts: [...state.accounts],
+      disabledModels: { ...state.disabledModels },
+      ...state.loomyPermanentLocked !== undefined ? { loomyPermanentLocked: state.loomyPermanentLocked } : {},
+    }),
+    // 锁定表的权威在独立文档里，备份导出单独取这一份。
+    permanentLocksSnapshot: () => ({ ...(state.permanentLocks ?? {}) }),
+    replaceAll: async (accounts, disabledModels, permanentLocks) => {
       state = { accounts: [...accounts], disabledModels: { ...disabledModels } }
-      record.replaced = { accounts: [...accounts], disabledModels: { ...disabledModels } }
+      record.replaced = {
+        accounts: [...accounts],
+        disabledModels: { ...disabledModels },
+        ...(permanentLocks === undefined ? {} : { permanentLocks }),
+      }
       return undefined
     },
   }
@@ -321,5 +344,116 @@ describe('backup round-trip', () => {
     // 账号与黑名单还原
     expect(targetPool.replaced!.accounts.map(a => a.id)).toEqual(['codearts-a1', 'buddy-b2'])
     expect(targetPool.replaced!.disabledModels).toEqual({ qoder: { qfmodel: true } })
+  })
+})
+
+/**
+ * ⚠️ **永久积分锁定表**的导出 / 导入（CodeBuddy 与 WorkBuddy 加入后新增）。
+ *
+ * 这件事的风险与其他字段不同：**误解锁的后果是用户真的把永久积分烧掉**，
+ * 不可撤回。所以「备份里没说」与「备份里说不锁」必须区分开。
+ */
+describe('永久积分锁定表', () => {
+  /** 造一份合法载荷（只关心锁定相关字段）。 */
+  function payloadOf(extra: Record<string, unknown> = {}): Record<string, unknown> {
+    return {
+      format: BACKUP_FORMAT,
+      version: BACKUP_VERSION,
+      exportedAt: '2026-09-29T00:00:00.000Z',
+      credentials: {},
+      accounts: [],
+      disabledModels: {},
+      ...extra,
+    }
+  }
+
+  it('导出同时写新表与 Loomy 兼容副本（同源）', async () => {
+    const pool = createPool({
+      accounts: [],
+      disabledModels: {},
+      permanentLocks: { buddy: true, loomy: true },
+    })
+    const { payload } = await exportBackup(pool, createCredentials())
+    expect(payload.permanentLocks).toEqual({ buddy: true, loomy: true })
+    expect(payload.loomyPermanentLocked).toBe(true)
+  })
+
+  it('导出时表为空 → 兼容副本必须是 false（不能让 Loomy 跟着 buddy 一起锁上）', async () => {
+    const pool = createPool({ accounts: [], disabledModels: {}, permanentLocks: { buddy: true } })
+    const { payload } = await exportBackup(pool, createCredentials())
+    expect(payload.permanentLocks).toEqual({ buddy: true })
+    expect(payload.loomyPermanentLocked).toBe(false)
+  })
+
+  it('导入新表 → 整体替换（buddy 的锁定不丢，未记录的 provider 被解锁）', async () => {
+    const pool = createPool()
+    await importBackup(createCredentials(), pool, payloadOf({
+      permanentLocks: { buddy: true, workbuddy: true },
+    }))
+    expect(pool.replaced!.permanentLocks).toEqual({ buddy: true, workbuddy: true })
+  })
+
+  /**
+   * ⚠️ 老备份（本次改动之前导出的）只有 `loomyPermanentLocked` 一个字段。
+   * 不认它 = 导入老备份后 Loomy 的锁定悄悄失效；
+   * 把它当「无从得知」= 用户明明在备份里说过「锁着」却解了。
+   */
+  it('导入只有老字段且为 true 的老备份 → 恢复 Loomy 那一项', async () => {
+    const pool = createPool()
+    await importBackup(createCredentials(), pool, payloadOf({ loomyPermanentLocked: true }))
+    expect(pool.replaced!.permanentLocks).toEqual({ loomy: true })
+  })
+
+  /** 老字段为 false 是**明确的「不锁」**，与「没有这个字段」不同。 */
+  it('导入只有老字段且为 false 的老备份 → 明确解锁（传空表，不是 undefined）', async () => {
+    const pool = createPool()
+    await importBackup(createCredentials(), pool, payloadOf({ loomyPermanentLocked: false }))
+    expect(pool.replaced!.permanentLocks).toEqual({})
+  })
+
+  /**
+   * ⚠️ 两个字段都没有（更早的备份）→ 必须传 `undefined`，
+   * 让池**保持当前值**；传空表会把用户的锁定静默清空。
+   */
+  it('两个字段都没有时传 undefined（保持当前锁定状态）', async () => {
+    const pool = createPool()
+    await importBackup(createCredentials(), pool, payloadOf())
+    expect(pool.replaced).not.toBeNull()
+    expect(pool.replaced!.permanentLocks).toBeUndefined()
+  })
+
+  it('新表存在时仍以老字段补齐表里没有的 Loomy 项（两处口径不分裂）', async () => {
+    const pool = createPool()
+    await importBackup(createCredentials(), pool, payloadOf({
+      permanentLocks: { buddy: true },
+      loomyPermanentLocked: true,
+    }))
+    expect(pool.replaced!.permanentLocks).toEqual({ buddy: true, loomy: true })
+  })
+
+  it('表里的脏值被过滤（只认显式 true）', async () => {
+    const pool = createPool()
+    await importBackup(createCredentials(), pool, payloadOf({
+      permanentLocks: { buddy: 'yes', workbuddy: true, loomy: false },
+    }))
+    expect(pool.replaced!.permanentLocks).toEqual({ workbuddy: true })
+  })
+
+  it('permanentLocks 是数组时拒绝整份备份（typeof [] 也是 object，必须单独判）', async () => {
+    const pool = createPool()
+    expect(() => assertBackupPayload(payloadOf({ permanentLocks: ['buddy'] })))
+      .toThrowError(BackupFormatError)
+  })
+
+  it('round-trip 锁定状态不丢', async () => {
+    const source = createPool({
+      accounts: [],
+      disabledModels: {},
+      permanentLocks: { buddy: true, workbuddy: true },
+    })
+    const { payload } = await exportBackup(source, createCredentials())
+    const target = createPool()
+    await importBackup(createCredentials(), target, payload)
+    expect(target.replaced!.permanentLocks).toEqual({ buddy: true, workbuddy: true })
   })
 })
