@@ -4906,3 +4906,120 @@ pnpm test:e2e:raccoon-tools  # ⚠️ 发推理：**tools 是否被接受**（�
 - `400 100006 captcha_verify_error` —— 滑块过期，需重新过验证。
 - `400 100002 params_invalid_error` —— 手机号格式或验证码错。
 - `400 100003 params_encryted_error` —— 手机号**未加密**或加密格式不对。
+
+## ⚠️ ZCode（智谱）provider：「卡住 + 停止按钮无效」的两个根因（真实缺陷，2026-09-29）
+
+**用户报障原文**：
+
+> zcode 执行任务会卡住……显示「**深度求索中，用时 5分27秒...**」，
+> 还没有继续输出推理或者思考……此时**停止按钮点击都没反应**，
+> 我重启后才能让这个任务停止。
+
+### 一、先记住这条判据：日志里的收尾事件可能是**伪造的**
+
+排查时**不要**看到 `turn/end{kind:'interrupted'}` 就以为「turn 正常结束过」。
+`dsh-session` 的 `openTurnClosers()`（`lib/types/repair.js`）会在加载会话时给
+**打开的 turn** 补一份合成收尾，并且**复用最后一个真实事件的时间戳**
+（原文：*"The last real event supplies the seq base and the timestamp for the
+synthetic closers"*）。
+
+⇒ **判据：`step/end` 与 `step/start` 同一毫秒 + `turn/end{kind:'interrupted'}`**
+= 那不是真收尾，**这个 turn 从未结束**（适配器的 generator 挂在某个 `await` 上）。
+
+本机实测三次（全是 `zcode/GLM-5.3-Flash`）：
+
+| 会话 | `step/start` | 最后一个真实事件 | 无输出时长 |
+|---|---|---|---|
+| `session-a77ed457` | 17:20:57.353 | 17:38:14.442 | **1018.7 秒**（用户看到的「5分27秒」正在其中） |
+| `session-fe7a9979` | 20:00:25.179 | 20:00:25.179（即 start 本身） | 直到重启宿主 |
+| `session-2271311d` | 20:10:59.738 | 20:10:59.738 | 直到切换模型 |
+
+### 二、根因 A（本次直接原因）：流式读取阶段**既无超时、也失了中断通道**
+
+`src/zcode-adapter.ts` 旧实现把清理放在 **`fetch` 的 `finally`** 里 ——
+那个 `finally` 在「响应头一到」就执行：
+
+```ts
+try { response = await this.fetchImpl(..., { signal: controller.signal }) }
+finally {
+  clearTimeout(timer)                                    // ← 流还没读，超时就被清了
+  options.signal?.removeEventListener('abort', onAbort)  // ← 中断通道也被摘了
+}
+yield* consumeAnthropicSse(response.body, ...)           // ← 这一段无超时、无中断
+```
+
+而 `src/zcode-anthropic.ts` 的 `iterateSseFrames` 里是裸的
+`await reader.read()`，且 `finally` 只有 `releaseLock()`。
+
+⇒ 上游（免费通道首字节实测有 20 秒以上长尾，也会整段静默）一旦不吐数据：
+`read()` 永远挂着、**`abort` 唤不醒它**、180 秒的 `requestTimeoutMs` 形同虚设、
+用户点「停止」也到不了 controller —— **只能重启宿主**。
+
+**修法**（三处，缺一不可）：
+
+1. `iterateSseFrames(body, { signal })`：abort 时**主动 `reader.cancel()`**
+   （取消底层流会让挂起的 `read()` 立刻以 `{done:true}` 收尾，这是**唯一**能唤醒
+   它的手段）；循环顶部再判一次 `aborted` 兜底。
+2. `finally` 里**先 `await reader.cancel()` 再 `releaseLock()`** ——
+   `releaseLock()` **不关闭底层流**，上游连接会继续生成并**白扣额度**。
+3. `zcode-adapter.ts`：把超时/中断的作用域提升到**整轮**
+   （`stream()` 负责建 `AbortController` + 计时器，`streamScoped()` 干活），
+   并把 `controller.signal` 一路传进 SSE 消费；超时收尾抛 **`TIMEOUT`**
+   （可重试），**但用户中断必须原样上抛**（否则用户主动取消会被白重试）。
+
+⚠️ 可作对照的实现：`D:\jet\code\js\dsh-free-glm\src\adapter.ts` 早已修过同型三处
+（[L1897-1900](file:///D:/jet/code/js/dsh-free-glm/src/adapter.ts) 清理覆盖全流程、
+[L712-729](file:///D:/jet/code/js/dsh-free-glm/src/adapter.ts) 把超时 signal 传进 SSE、
+[L921-948](file:///D:/jet/code/js/dsh-free-glm/src/adapter.ts) `cancel()` 再 `releaseLock()`），
+注释原文就是「**`abort` 不会唤醒 `reader.read()`**」「超时失去全部作用，请求可无限挂起」。
+
+### 三、根因 B（同型的第二颗雷）：captcha 侧有无超时的等待，且失败后**把闸门焊死**
+
+`src/zcode-captcha.ts`：
+
+| 位置 | 旧行为 | 后果 |
+|---|---|---|
+| `acquirePage` 取页 | `while (this.pageBusy) await sleep(50)` —— **无上限、不看 signal** | 一旦标志没被复位就**永久自旋** |
+| `acquirePage` 建连 | `await new Promise(... ws 'open' ...)` —— **无超时** | Chromium 僵死时 `open`/`error` 都不来 ⇒ 永久挂起 |
+| `acquirePage` 建页 | `await browser.send('Target.createTarget')` 在 try **之外** | CDP 抛错后 `pageBusy` 不复位 |
+| `mint()` 的 `finally` | `if (this.reusablePage === page) this.releasePage(page)` | catch 里已 `discardPage()` 把 `reusablePage` 置空 ⇒ 条件**恒为假** ⇒ `pageBusy` **永不复位** |
+
+最后一条是**致命**的：它让「一次 captcha 失败」升级成「此后每次 mint 都死锁」——
+adapter 的 `await this.mintCaptcha()` 永不返回，请求根本不发出，UI 永远「深度求索中」。
+
+**修法**：取页自旋加 `pageWaitTimeoutMs`（默认 30s）+ 判 signal；建连加
+`connectTimeoutMs`（默认 10s）；`createTarget` 包进 try；`mint()` 的 `finally`
+改成 **`else this.pageBusy = false`**（无条件复位）；`mint(config, { signal })`
+与 `ZcodeAuth.mintCaptcha` / `index.ts` 的注入点**逐层透传 signal**。
+
+⚠️ 超时**不**复位别人的 `pageBusy`（此刻它属于另一个持有者，越权复位会让两个
+mint 共用同一页面 —— captcha 是一次性的，必串状态）。
+
+### 四、回归用例与**反向验证**
+
+`tests/unit/zcode-stream-hang.spec.ts`（8 条，全部毫秒级、零网络、零额度）：
+
+| 用例 | 反向验证（改回旧行为 ⇒ 变红） |
+|---|---|
+| abort 唤醒挂起的 read | 去掉 abort→`cancel` 注册 ⇒ **红**（挂到用例超时） |
+| 中断必须真的 cancel 底层流 | 同上 ⇒ 红 |
+| 消费方 `break` 时必须取消底层流 | 去掉 `finally` 的 `reader.cancel()` ⇒ 红（仅此条红） |
+| 200 + 整段静默 ⇒ `TIMEOUT` | 不把 signal 传进 SSE 消费 ⇒ **红（挂 5s 超时）** |
+| 用户中断**不得**翻译成 `TIMEOUT` | 同上 ⇒ 红 |
+| 取页等待有上限 | 去掉 deadline 判定 ⇒ **红（挂 5s 超时）** |
+| `mintOnPage` 失败后 `pageBusy` 必须复位 | `finally` 改回条件式 ⇒ 红 |
+
+⚠️ 写这类用例时**判据是「在有限时间内结束」**：唤醒/超时/复位任一失效，
+用例呈**挂起直到 vitest 超时**，而不是干脆的断言失败 —— 那正是线上那条路径的形状。
+
+### 五、其它必须记住的点
+
+- **两次 checkout 都要改**：`D:\jet\code\js\dsh-codearts` 与
+  `D:\jet\code\js\deepseek-harness-codearts` 是同一插件的两份链接目录，而
+  `~/.dsh/profiles/web/pnpm-lock.yaml` link 的是**后者**（GUI 加载它）、
+  `desktop` 用前者。改完两份 `src/` 都要 `pnpm build:all`，且**必须重启宿主**才生效。
+- `requestTimeoutMs`（`zcode-product.ts`，180s）现在**覆盖整轮**（含 captcha 与流读取），
+  不再是「只到响应头」。
+- captcha 每请求现 mint（约 1.2 秒）**不是**本次卡住的原因：卡住前后的请求都正常，
+  且 17:20 那次卡死后 19:59 的 zcode 请求又成功了 —— 若是 `pageBusy` 死锁，
+  后续请求会**全部**一起卡。⇒ 别把 `imageUrls`/captcha 配额当成第一嫌疑人。

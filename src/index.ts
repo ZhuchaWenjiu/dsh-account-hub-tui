@@ -1030,9 +1030,12 @@ const zcodeAdapter = registerZcodeLlm(ctx, {
   // ⚠ captcha 是**一次性**的 —— 每次调用都必须现产一个新 param。
   // 走 `zcode.mintCaptcha`：整个插件**共用一台**常驻浏览器
   //（适配器自建会变成两台，白占 200MB）。
-  mintCaptcha: async () => {
+  //
+  // ⚠ `options.signal` 必须继续往下传：captcha 侧的取页等待与建连历史上有
+  // 无超时的路径，不传就等于「用户点停止也停不下来」（真实缺陷，2026-09-29）。
+  mintCaptcha: async (options?: { signal?: AbortSignal }) => {
     const config = await resolveZcodeCaptchaConfig()
-    return await zcode.mintCaptcha(config)
+    return await zcode.mintCaptcha(config, options)
   },
   captchaRegion: ZCODE_CAPTCHA_FALLBACK.region,
   /**

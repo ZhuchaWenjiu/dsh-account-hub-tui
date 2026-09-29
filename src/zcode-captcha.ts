@@ -403,6 +403,23 @@ export interface ZcodeCaptchaBrowserOptions {
    * 设成 0 等于「每次新建」（慢但不会因空闲失败）。
    */
   idleReuseMs?: number
+  /**
+   * 等**别的 mint** 让出页面时的上限（毫秒，默认 30000）。
+   *
+   * ⚠ 这不是「性能参数」而是**防死锁参数**（真实缺陷，2026-09-29）：
+   * 取页是 `while (pageBusy) await sleep(50)` 的自旋，一旦某个持有者没能
+   * 复位标志，这里就是**永久自旋** —— 而它既不看 signal 也没有上限，
+   * 表现为「请求根本不发出、UI 永远深度求索中、点停止也无反应」。
+   * 有界失败远好于永久挂起（失败会被上报成错误，挂起只能重启宿主）。
+   */
+  pageWaitTimeoutMs?: number
+  /**
+   * 新建页面时等待 CDP WebSocket `open` 的上限（毫秒，默认 10000）。
+   *
+   * ⚠ 同理是防死锁：旧实现只等 `open` / `error` 两个事件，Chromium 僵死时
+   * **两个都不来**，于是永久挂起（且因为不抛错，`pageBusy` 也不会复位）。
+   */
+  connectTimeoutMs?: number
 }
 
 /**
@@ -679,7 +696,10 @@ export class ZcodeCaptchaBrowser {
    * ⚠ 空闲阈值取 **8 秒**：实测 15 秒已失效，故留一半余量。
    * 偏保守只会多付一次新页面成本（约 3.7 秒），比 `F001` 让用户看到报错好。
    */
-  async mint(config: ZcodeCaptchaConfig = ZCODE_CAPTCHA_FALLBACK): Promise<string> {
+  async mint(
+    config: ZcodeCaptchaConfig = ZCODE_CAPTCHA_FALLBACK,
+    options: { signal?: AbortSignal } = {},
+  ): Promise<string> {
     await this.start()
     /**
      * ⚠ 最多两次：第一次用（可能复用的）页面，失败则**丢掉它换新**再试。
@@ -690,8 +710,15 @@ export class ZcodeCaptchaBrowser {
     const attempts = 2
     let lastError: Error | undefined
     for (let attempt = 1; attempt <= attempts; attempt += 1) {
+      /**
+       * ⚠ 每轮先看中断：用户点了「停止」就不该再开新一轮
+       * （否则会出现「停了还在后台 mint」的错觉）。
+       */
+      if (options.signal?.aborted === true) {
+        throw lastError ?? new Error('zcode: captcha 产出已取消')
+      }
       const forceFresh = attempt > 1
-      const page = await this.acquirePage(forceFresh)
+      const page = await this.acquirePage(forceFresh, options.signal)
       try {
         const param = await this.mintOnPage(page, config)
         page.lastUsedAt = Date.now()
@@ -708,7 +735,21 @@ export class ZcodeCaptchaBrowser {
           await sleep(300)
         }
       } finally {
+        /**
+         * ⚠⚠ **必须无条件复位 `pageBusy`**（真实缺陷，2026-09-29）。
+         *
+         * 旧写法是 `if (this.reusablePage === page) this.releasePage(page)` ——
+         * 而 catch 里已经 `discardPage(page)`（它把 `reusablePage` 置空），
+         * 于是这个条件**恒为假**，`pageBusy` 永远停在 `true`。
+         * 下一次 `acquirePage()` 就卡在 `while (this.pageBusy) await sleep(50)`
+         * 里永久自旋 ⇒ 适配器的 `await this.mintCaptcha()` 永不返回，
+         * 请求根本不发出，UI 永远「深度求索中」。
+         *
+         * 故这里补上 else 分支：`pageBusy = false` 原本只出现在
+         * `releasePage` / `kill` 里，而那两条都不是本路径的必然出口。
+         */
         if (this.reusablePage === page) this.releasePage(page)
+        else this.pageBusy = false
       }
     }
     throw lastError ?? new Error('zcode: captcha 产出失败（未知原因）')
@@ -773,9 +814,29 @@ export class ZcodeCaptchaBrowser {
    * 踩状态。故用 `busy` 标志把取页串起来 —— 并发调用会排队，
    * 而不是拿到同一个页面。
    */
-  private async acquirePage(forceFresh = false): Promise<CaptchaPage> {
-    // 等前一个 mint 让出页面。
-    while (this.pageBusy) await sleep(50)
+  private async acquirePage(forceFresh = false, signal?: AbortSignal): Promise<CaptchaPage> {
+    /**
+     * ⚠ 等待必须**有界且可取消**（真实缺陷，2026-09-29）。
+     *
+     * 旧实现是裸的 `while (this.pageBusy) await sleep(50)`：一旦某个持有者
+     * 没能复位标志（见 `mint()` 的 finally），这里就是**永久自旋** ——
+     * 而它既不看 signal 也没有上限，于是表现为「请求根本不发出 +
+     * 用户点停止也无反应」，只能重启宿主。
+     *
+     * ⚠ 超时**不**复位 `pageBusy`：此刻它属于**另一个**持有者，
+     * 越权复位会让两个 mint 同时用同一页面（captcha 是一次性的，必串状态）。
+     */
+    const waitTimeoutMs = this.options.pageWaitTimeoutMs ?? 30_000
+    const deadline = Date.now() + waitTimeoutMs
+    while (this.pageBusy) {
+      if (signal?.aborted === true) throw new Error('zcode: captcha 取页等待已取消')
+      if (Date.now() >= deadline) {
+        throw new Error(
+          `zcode: captcha 页面被占用超过 ${waitTimeoutMs}ms（疑似上一次 mint 未归还）`,
+        )
+      }
+      await sleep(50)
+    }
     this.pageBusy = true
 
     const idleReuseMs = this.options.idleReuseMs ?? 8_000
@@ -795,10 +856,21 @@ export class ZcodeCaptchaBrowser {
       this.pageBusy = false
       throw new Error('zcode: 浏览器未就绪')
     }
-    const created = await browser.send('Target.createTarget', { url: 'about:blank' }) as {
-      targetId?: unknown
+    /**
+     * ⚠ `createTarget` 必须包在 try 里（真实缺陷，2026-09-29）：它走 CDP，
+     * 超时（30s）或浏览器僵死时会**抛错**，而旧代码把它放在 try 之外 ——
+     * 抛出后 `pageBusy` 不复位 ⇒ 后续**每一次** mint 都在自旋里死等。
+     */
+    let targetId: string | undefined
+    try {
+      const created = await browser.send('Target.createTarget', { url: 'about:blank' }) as {
+        targetId?: unknown
+      }
+      targetId = typeof created.targetId === 'string' ? created.targetId : undefined
+    } catch (error) {
+      this.pageBusy = false
+      throw error
     }
-    const targetId = typeof created.targetId === 'string' ? created.targetId : undefined
     if (targetId === undefined) {
       this.pageBusy = false
       throw new Error('zcode: 无法新建页面 target')
@@ -814,9 +886,36 @@ export class ZcodeCaptchaBrowser {
         throw new Error('zcode: 新页面没有可用的调试地址')
       }
       ws = new WebSocket(target.webSocketDebuggerUrl)
+      const connectTimeoutMs = this.options.connectTimeoutMs ?? 10_000
       await new Promise<void>((resolve, reject) => {
-        ws?.addEventListener('open', () => resolve(), { once: true })
-        ws?.addEventListener('error', () => reject(new Error('zcode: 连接新页面失败')), { once: true })
+        /**
+         * ⚠ **必须有超时**（真实缺陷，2026-09-29）：旧实现只等 `open` / `error`，
+         * 而 Chromium 僵死时**两个事件都不会来** —— 永久挂起；更糟的是
+         * 它不抛错，`pageBusy` 也就不会复位（下一轮直接死锁）。
+         *
+         * ⚠ signal 也要接进来：用户点「停止」时不该继续等建连。
+         */
+        let settled = false
+        let timer: ReturnType<typeof setTimeout> | undefined
+        const cleanup = (): void => {
+          if (timer !== undefined) clearTimeout(timer)
+          signal?.removeEventListener('abort', onAbort)
+        }
+        const done = (settle: () => void): void => {
+          if (settled) return
+          settled = true
+          cleanup()
+          settle()
+        }
+        const onAbort = (): void => done(() => reject(new Error('zcode: 连接新页面已取消')))
+        timer = setTimeout(
+          () => done(() => reject(new Error(`zcode: 连接新页面超时（${connectTimeoutMs}ms）`))),
+          connectTimeoutMs,
+        )
+        timer.unref?.()
+        ws?.addEventListener('open', () => done(resolve), { once: true })
+        ws?.addEventListener('error', () => done(() => reject(new Error('zcode: 连接新页面失败'))), { once: true })
+        signal?.addEventListener('abort', onAbort, { once: true })
       })
       const cdp = new CdpConnection(ws)
       await cdp.send('Page.enable')

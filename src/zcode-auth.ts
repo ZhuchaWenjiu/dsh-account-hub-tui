@@ -436,11 +436,17 @@ export class ZcodeAuth extends Service {
    * ⚠ 每次调用都产**新的**（一次性）。
    * 缺浏览器时抛错 —— 调用方（`credits.claimAll`）会把它转成可读的
    * failed outcome，而不是让整个端点失败。
+   *
+   * ⚠ `options.signal` 会被透传到浏览器侧（取页等待 / 建连超时 / abort）——
+   * 推理链路的「停止」能否生效就靠它（真实缺陷，2026-09-29）。
    */
-  async mintCaptcha(config?: { region: string; prefix: string; sceneId: string }): Promise<string> {
+  async mintCaptcha(
+    config?: { region: string; prefix: string; sceneId: string },
+    options: { signal?: AbortSignal } = {},
+  ): Promise<string> {
     const resolved = config ?? await this.fetchCaptchaConfig() ?? ZCODE_CAPTCHA_FALLBACK
     this.captchaBrowser ??= new ZcodeCaptchaBrowser()
-    return await this.captchaBrowser.mint(resolved)
+    return await this.captchaBrowser.mint(resolved, options)
   }
 
   /**

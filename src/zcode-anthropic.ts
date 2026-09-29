@@ -284,12 +284,37 @@ export interface SseFrame {
  */
 export async function* iterateSseFrames(
   body: ReadableStream<Uint8Array>,
+  options: { signal?: AbortSignal } = {},
 ): AsyncIterable<SseFrame> {
   const reader = body.getReader()
   const decoder = new TextDecoder()
+  const signal = options.signal
   let buffer = ''
+  /**
+   * ★★ **中断必须在「读挂起」时也生效**（真实缺陷，2026-09-29）。
+   *
+   * 只在循环顶部检查 `signal.aborted` 是**不够的**：一旦上游建立了连接却不吐
+   * 数据（智谱免费通道首字节实测有 20 秒以上长尾，也会整段静默），
+   * `await reader.read()` 就永远挂着 —— 而它**不会被 abort 唤醒**。
+   *
+   * 症状（用户报障，本机三次实测）：UI 永远停在「深度求索中，用时 5分27秒…」，
+   * 模型既不输出推理也不输出正文，**「停止」按钮点了没反应**，只能重启宿主。
+   * 会话日志里的收尾事件 `step/end` + `turn/end{kind:'interrupted'}` 与
+   * `step/start` **同一毫秒** —— 那是 `dsh-session` 的 `openTurnClosers()`
+   * repair 时合成的（「复用最后一个真实事件的时间戳」），
+   * 真相是这个 turn **从未结束**。
+   *
+   * ⇒ 故在 abort 时**主动 `reader.cancel()`**：取消底层流会让挂起的 `read()`
+   * 立刻以 `{ done: true }` 收尾。这是唯一能唤醒它的手段。
+   */
+  const onAbort = (): void => {
+    void reader.cancel().catch(() => {})
+  }
+  signal?.addEventListener('abort', onAbort, { once: true })
   try {
     for (;;) {
+      // 兜底：cancel 未生效（或 signal 在 read 之前就已 abort）时也能退出。
+      if (signal?.aborted === true) break
       const { done, value } = await reader.read()
       if (done) break
       buffer += decoder.decode(value, { stream: true })
@@ -307,6 +332,18 @@ export async function* iterateSseFrames(
     const tail = parseFrame(buffer)
     if (tail !== undefined) yield tail
   } finally {
+    signal?.removeEventListener('abort', onAbort)
+    /**
+     * ⚠ 必须**先 `cancel()` 再 `releaseLock()`**（同型缺陷，参照
+     * `dsh-free-glm` 的 `adapter.ts`）：`releaseLock()` **不关闭底层流**，
+     * 只解除 reader 的占用 ⇒ 上游连接会一直挂着、继续生成并**白扣额度**。
+     * 流已正常读完时 `cancel()` 是 no-op，故无条件调用是安全的。
+     */
+    try {
+      await reader.cancel()
+    } catch {
+      /* 流可能已关闭或已被取消 —— 不影响主流程 */
+    }
     reader.releaseLock()
   }
 }
@@ -361,7 +398,7 @@ export function parseFrame(raw: string): SseFrame | undefined {
  */
 export async function* consumeAnthropicSse(
   body: ReadableStream<Uint8Array>,
-  options: { label: string; model: string },
+  options: { label: string; model: string; signal?: AbortSignal },
 ): AsyncIterable<StreamChunk> {
   /**
    * ## 为什么**先缓冲再发射**（而不是边收边发）
@@ -442,7 +479,8 @@ export async function* consumeAnthropicSse(
     return block
   }
 
-  for await (const frame of iterateSseFrames(body)) {
+  // ⚠ 必须把 signal 透传下去：中断/超时要能在「读挂起」时唤醒（见 `iterateSseFrames`）。
+  for await (const frame of iterateSseFrames(body, { signal: options.signal })) {
     const eventName = frame.event
     if (frame.data.length === 0) continue
 

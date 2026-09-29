@@ -140,8 +140,12 @@ export interface ZcodeAdapterOptions {
    *
    * 由 `index.ts` 注入（它持有 `ZcodeAuth`，能从服务端拉 captcha 配置并
    * 驱动浏览器）。缺省时适配器会自建一个常驻浏览器。
+   *
+   * ⚠ `options.signal` 必须被**透传**到浏览器侧（`ZcodeCaptchaBrowser.mint`）：
+   * captcha 的取页等待与 WebSocket 建连历史上都没有超时，
+   * 不透传就等于「用户点停止也停不下来」（真实缺陷，2026-09-29）。
    */
-  mintCaptcha?: () => Promise<string>
+  mintCaptcha?: (options?: { signal?: AbortSignal }) => Promise<string>
   /** captcha 的区域（进 `x-aliyun-captcha-verify-region`）。 */
   captchaRegion?: string
   /** 拉取远端模型目录；缺省用兜底表。 */
@@ -371,10 +375,13 @@ export class ZcodeAdapter extends LlmAdapter {
   }
 
   /** 取得 captcha param（注入优先，否则自建常驻浏览器）。 */
-  private async mintCaptcha(): Promise<string> {
-    if (this.options.mintCaptcha !== undefined) return await this.options.mintCaptcha()
+  private async mintCaptcha(options: { signal?: AbortSignal } = {}): Promise<string> {
+    if (this.options.mintCaptcha !== undefined) return await this.options.mintCaptcha(options)
     if (this.captchaBrowser === undefined) this.captchaBrowser = new ZcodeCaptchaBrowser()
-    return await this.captchaBrowser.mint(this.captchaConfig ?? ZCODE_CAPTCHA_FALLBACK)
+    return await this.captchaBrowser.mint(
+      this.captchaConfig ?? ZCODE_CAPTCHA_FALLBACK,
+      options,
+    )
   }
 
   /** 允许外部（`index.ts`）设置服务端下发的 captcha 配置。 */
@@ -382,7 +389,56 @@ export class ZcodeAdapter extends LlmAdapter {
     this.captchaConfig = config
   }
 
+  /**
+   * ★★ 超时与中断的**作用域**：必须覆盖整轮
+   * （captcha 产出 → 请求 → **流式读取**）。
+   *
+   * ## 为什么必须搬到这一层（真实缺陷，2026-09-29）
+   *
+   * 旧实现把 `setTimeout(abort)` 与 `removeEventListener('abort')` 放在
+   * **`fetch` 的 `finally`** 里 —— 那个 `finally` 在「响应头回来」时**就已执行**，
+   * 于是：
+   *
+   * 1. **流式读取阶段完全没有超时**：`requestTimeoutMs`（180s）形同虚设；
+   * 2. **用户中断的通道在流开始之前就被摘掉**：`options.signal` 的 abort
+   *    不再转发给 `controller`，`response.body` 的读取永不中止。
+   *
+   * 两者叠加的后果正是用户报障（本机实测三次、含一次 1018.7 秒）：
+   * UI 停在「深度求索中，用时 5分27秒…」不动，模型既不输出思考也不输出正文，
+   * **「停止」按钮点了没反应，只能重启宿主**。
+   *
+   * ⚠ 会话日志里的收尾事件 `step/end` + `turn/end{kind:'interrupted'}` 与
+   * `step/start` **同一毫秒** —— 那是 `dsh-session` 的 `openTurnClosers()`
+   * 在 repair 时**合成**的（它「复用最后一个真实事件的时间戳」），
+   * 真相是这个 turn **从未结束**。排查时别被它误导。
+   */
   async *stream(options: GenerateOptions): AsyncIterable<StreamChunk> {
+    const controller = new AbortController()
+    const timeoutMs = this.product.requestTimeoutMs
+    const timer = setTimeout(() => controller.abort(), timeoutMs)
+    timer.unref?.()
+    // 把调用方的 signal（harness 的用户中断）串进来，作用于**整轮**。
+    const onAbort = (): void => controller.abort()
+    options.signal?.addEventListener('abort', onAbort, { once: true })
+    try {
+      yield* this.streamScoped(options, controller, timeoutMs)
+    } finally {
+      clearTimeout(timer)
+      options.signal?.removeEventListener('abort', onAbort)
+    }
+  }
+
+  /**
+   * `stream()` 的实际实现。
+   *
+   * ⚠ `controller` 由调用方传入（而不是在这里新建）：它的 signal 必须同时
+   * 管住 **captcha 产出** 与 **SSE 读取**，见 `stream()` 的说明。
+   */
+  private async *streamScoped(
+    options: GenerateOptions,
+    controller: AbortController,
+    timeoutMs: number,
+  ): AsyncIterable<StreamChunk> {
     /**
      * ## 图片：**支持**（曾经误判为不支持，且实现里根本没有图片代码）
      *
@@ -492,7 +548,10 @@ export class ZcodeAdapter extends LlmAdapter {
     }
 
     // 2. 产出一个新鲜 captcha（一次性！）
-    const captchaParam = await this.mintCaptcha()
+    //
+    // ⚠ 也必须吃 signal：captcha 侧存在**无超时的等待**（见 `zcode-captcha.ts`），
+    // 一旦命中就是无输出的永久挂起 —— 与流式读取那条通道同型。
+    const captchaParam = await this.mintCaptcha({ signal: controller.signal })
 
     /**
      * 3. 构造请求体（**Anthropic Messages 格式**）。
@@ -564,14 +623,6 @@ export class ZcodeAdapter extends LlmAdapter {
       },
     })
 
-    const controller = new AbortController()
-    const timeoutMs = this.product.requestTimeoutMs
-    const timer = setTimeout(() => controller.abort(), timeoutMs)
-    timer.unref?.()
-    // 把调用方的 signal 串进来（harness 的用户中断）。
-    const onAbort = (): void => controller.abort()
-    options.signal?.addEventListener('abort', onAbort, { once: true })
-
     let response: Response
     try {
       response = await this.fetchImpl(ZCODE_PLAN_MESSAGES_URL, {
@@ -582,14 +633,26 @@ export class ZcodeAdapter extends LlmAdapter {
       })
     } catch (error) {
       if (options.signal?.aborted) throw error
+      /**
+       * ⚠ 超时必须归 `TIMEOUT`（它在 harness 的可重试集合里），不能混进 `TRANSPORT`：
+       * 两者语义不同，文案也不该说「传输错误」。
+       *
+       * ⚠ 这里**不再** `clearTimeout` / `removeEventListener` —— 清理已上移到
+       * `stream()` 的 finally（覆盖整轮）。旧实现在我脚下就清理，
+       * 于是流式读取阶段既无超时、也失了中断通道（见 `stream()` 的说明）。
+       */
+      if (controller.signal.aborted) {
+        throw new LlmError(
+          `zcode: 请求超时（${timeoutMs}ms 内未完成）—— 上游可能长时间不返回数据`,
+          'TIMEOUT',
+          { cause: error as Error },
+        )
+      }
       throw new LlmError(
         `zcode: 请求失败：${error instanceof Error ? error.message : String(error)}`,
         'TRANSPORT',
         { cause: error as Error },
       )
-    } finally {
-      clearTimeout(timer)
-      options.signal?.removeEventListener('abort', onAbort)
     }
 
     if (!response.ok) {
@@ -604,7 +667,38 @@ export class ZcodeAdapter extends LlmAdapter {
       throw new LlmError('zcode: 上游返回了空响应体', 'EMPTY_RESPONSE')
     }
 
-    yield* consumeAnthropicSse(response.body, { label: 'zcode', model: options.model })
+    /**
+     * ⚠ 超时收尾必须报 `TIMEOUT`，不能退化成「空回复」之类的模糊错误。
+     *
+     * 触发路径：上游回 200 但**长时间不吐任何数据** → 上一层的 timer 到点
+     * `controller.abort()` → `iterateSseFrames` 的 abort 监听 `reader.cancel()`
+     * 唤醒挂起的 `read()` → 流以「一帧都没有」结束。若不在这里翻译，
+     * 用户看到的就是 `EMPTY_RESPONSE`（说不清是超时还是模型抽风）。
+     *
+     * ⚠ 判据必须排除**用户中断**：那种情况该原样上抛，
+     * 让 harness 归为 aborted（而不是当成可重试的失败）。
+     */
+    const timedOut = (): boolean =>
+      controller.signal.aborted && options.signal?.aborted !== true
+    const timeoutError = (cause?: unknown): LlmError =>
+      new LlmError(
+        `zcode: 请求超时（${timeoutMs}ms 内未完成）—— 上游可能长时间不返回数据`,
+        'TIMEOUT',
+        cause === undefined ? undefined : { cause: cause as Error },
+      )
+
+    // ⚠ signal 必须传进 SSE 消费：它是「读挂起」时唯一能唤醒读取的东西。
+    try {
+      yield* consumeAnthropicSse(response.body, {
+        label: 'zcode',
+        model: options.model,
+        signal: controller.signal,
+      })
+    } catch (error) {
+      if (timedOut()) throw timeoutError(error)
+      throw error
+    }
+    if (timedOut()) throw timeoutError()
   }
 
   /** 释放自建的浏览器（由 `index.ts` 的 cleanup 调用）。 */
