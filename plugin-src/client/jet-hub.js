@@ -505,17 +505,32 @@ function AccountCard({ account, index, order, provider, onToggle, onDelete, onRe
    * 账号名 / 状态标签 hover 时的资源包列表。
    *
    * ⚠️ 只在 `showPackageList` 为真时挂 —— 那是「余额真的由多个资源包构成」的
-   * 能力位（目前只有两个 buddy）。loomy 的 packages 是我们合成的两个池名，
-   * 且没有到期字段，列出来会把「每日赠送」标成**永久**（恰好说反）。
+   * 能力位（buddy 系 / lobsterai / qoder / qodercn / trae）。loomy 的 packages
+   * 是我们合成的两个池名，且没有到期字段，列出来会把「每日赠送」标成**长期**
+   * （恰好说反）。
    *
-   * ⚠️ `now` 在渲染时取：到期是时间的函数，宿主长期开着，缓存会让"8 天后"
-   * 一直显示成"8 天后"。
+   * ⚠️ `now` 在渲染时取：过滤与排序都是时间的函数，宿主长期开着，缓存会让
+   * 已过期的包继续显示、或"8 天后"一直不变。
+   *
+   * ⚠️ 列表**只含还能用的包**（已消耗为 0 / 已过期 / 已失效的都被过滤掉），
+   * 且按**到期时间升序**排（最快到期在最上）。两者都在
+   * `formatPackageTooltip` 内部完成 —— 那是所有 provider 共用的，
+   * 故此处无需按 provider 分支。
+   *
+   * ⚠️ 数字按**包自身单位**格式化：ZCode 的包是 token，用 `formatCredits`
+   * 会把 94539275 显示成「9453.93万」而非「94.54M」。
    */
-  const packageTooltip = showPackageList && credits?.balance?.packages?.length
-    ? formatPackageTooltip(credits.balance.packages, { format: formatCredits, now: Date.now() })
+  const hoverPackages = credits?.balance?.packages;
+  const packageTooltip = showPackageList && hoverPackages?.length
+    ? formatPackageTooltip(hoverPackages, {
+        format: (value) => formatUnits(value, hoverPackages.find(p => p && p.unit)?.unit),
+        now: Date.now(),
+      })
     : null;
-  // 有数据挂包列表；余额还没拉到时挂提示而不是空 title —— 否则用户 hover
+  // 有可用包才挂列表；余额还没拉到时挂提示而不是空 title —— 否则用户 hover
   // 一个看起来该有内容的名字却毫无反应，会以为是坏了。
+  // ⚠️ 包全不可用时 `packageTooltip` 为 null，此时**不挂** title（而不是挂空串）：
+  // 那种情况说明"这个号确实没有可用资源包了"，浮层里没什么可说的。
   const accountTitle = packageTooltip
     ?? (showPackageList && creditsLoading ? '资源包加载中…' : undefined);
 

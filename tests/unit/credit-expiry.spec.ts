@@ -1,5 +1,6 @@
 /**
- * 面板展示用的「临时 / 永久」分桶（`plugin-src/client/credit-expiry.js`）。
+ * 面板展示用的「临时 / 长期」分桶与**资源包列表排序**
+ * （`plugin-src/client/credit-expiry.js`）。
  *
  * ## 本文件最重要的职责：与后端**对账**
  *
@@ -10,6 +11,9 @@
  * 故下面用同一组 fixture（含边界与脏值）喂两侧，逐条断言结果相同。
  */
 import { describe, expect, it } from 'vitest'
+import { readFileSync } from 'node:fs'
+import { fileURLToPath } from 'node:url'
+import { dirname, resolve } from 'node:path'
 import {
   daysUntilExpiry,
   expiryBucketLabel,
@@ -18,6 +22,7 @@ import {
   formatPackageExpiry,
   formatPackageTooltip,
   formatPoolSplitLine,
+  packageExpiryMs,
   splitCreditsByExpiry,
 } from '../../plugin-src/client/credit-expiry.js'
 import { supportsCreditPackageList } from '../../plugin-src/client/credits-capabilities.js'
@@ -357,44 +362,191 @@ describe('formatPackageTooltip（包列表）', () => {
     expect(text).toBe('拉新权益包  100 / 100  长期')
   })
 
-  it('失效包带标记（用户要能看出那部分扣不到）', () => {
-    const text = formatPackageTooltip(
-      [pkg({ name: '过期包', active: false, remaining: 10 })],
-      { format: v => String(v), now: NOW },
-    )
-    expect(text).toContain('[已失效]')
+  /**
+   * ⚠️ **只列还能用的包**（用户 2026-09-29 要求）：
+   * 「已经消耗为0的过滤掉，已经过期的过滤掉」。
+   *
+   * 三条过滤规则：`remaining <= 0` / 到期时刻已过 / `active === false`。
+   */
+  it('已消耗为 0 的包不显示', () => {
+    const text = formatPackageTooltip([
+      pkg({ name: '有余额', remaining: 100, deductionEndTime: NOW + 8 * DAY }),
+      pkg({ name: '已用完', remaining: 0, deductionEndTime: NOW + 8 * DAY }),
+    ], { format: v => String(v), now: NOW })!
+    expect(text).toContain('有余额')
+    expect(text).not.toContain('已用完')
+    expect(text.split('\n')).toHaveLength(1)
+  })
+
+  /** 负余额（服务端计量回滚等异常）同样过滤 —— 它不可能"还能用"。 */
+  it('负余额的包不显示', () => {
+    const text = formatPackageTooltip([
+      pkg({ name: '正常', remaining: 10 }),
+      pkg({ name: '负数', remaining: -5 }),
+    ], { format: v => String(v), now: NOW })!
+    expect(text).not.toContain('负数')
+  })
+
+  /**
+   * ⚠️ **已过期必须按 `now` 现算，不能只判 `active`**：实测各 provider 的
+   * `active` 口径不一致 —— TRAE / Qoder 的 `active` **恒为 true**，
+   * 只判它会让已过期的包继续显示成"（已过期）"。
+   */
+  it('已过期的包不显示（即使 active 仍为 true）', () => {
+    const text = formatPackageTooltip([
+      pkg({ name: '还有效', remaining: 100, deductionEndTime: NOW + 8 * DAY }),
+      pkg({ name: '已过期但active为true', remaining: 100, active: true, deductionEndTime: NOW - 1 }),
+    ], { format: v => String(v), now: NOW })!
+    expect(text).toContain('还有效')
+    expect(text).not.toContain('已过期但active为true')
+  })
+
+  it('被标记失效的包不显示', () => {
+    const text = formatPackageTooltip([
+      pkg({ name: '有效包', remaining: 10 }),
+      pkg({ name: '失效包', active: false, remaining: 10 }),
+    ], { format: v => String(v), now: NOW })!
+    expect(text).toContain('有效包')
+    expect(text).not.toContain('失效包')
+  })
+
+  /**
+   * ⚠️ 全部被过滤掉时返回 **null**（不是空串）：调用方据此不挂 title，
+   * 否则用户 hover 会看到一个空浮层。
+   */
+  it('全部不可用时返回 null（不挂空 title）', () => {
+    const opts = { format: (v: number) => String(v), now: NOW }
+    expect(formatPackageTooltip([pkg({ name: '用完', remaining: 0 })], opts)).toBeNull()
+    expect(formatPackageTooltip([pkg({ name: '过期', remaining: 5, deductionEndTime: NOW - 1 })], opts)).toBeNull()
+    expect(formatPackageTooltip([pkg({ name: '失效', active: false, remaining: 5 })], opts)).toBeNull()
+  })
+
+  /**
+   * ⚠️ **主排序键 = 到期时刻升序**（用户 2026-09-29 要求）：
+   * 「最快到期的排到最上面，最晚到期的排到最下面」。
+   *
+   * 本函数是所有挂了包列表的 provider（buddy / workbuddy / lobsterai /
+   * qoder / qodercn / trae）**共用**的，故此用例同时锁死了那六家的行为。
+   */
+  it('按到期时间升序：最快到期在最上、最晚到期在最下', () => {
+    const text = formatPackageTooltip([
+      pkg({ name: '最晚', remaining: 100, deductionEndTime: NOW + 300 * DAY }),
+      pkg({ name: '最快', remaining: 100, deductionEndTime: NOW + 2 * DAY }),
+      pkg({ name: '中间', remaining: 100, deductionEndTime: NOW + 30 * DAY }),
+    ], { format: v => String(v), now: NOW })!
+    const lines = text.split('\n')
+    expect(lines[0]).toContain('最快')
+    expect(lines[1]).toContain('中间')
+    expect(lines[2]).toContain('最晚')
+  })
+
+  /**
+   * ⚠️ 到期时间**未知**的包必须**沉底**（视为最晚到期）。
+   * 它们是「长期」那一档 —— 若按 0 处理会跑到最上面，恰好说反。
+   */
+  it('到期时间未知的沉底（它不是"最快到期"）', () => {
+    const text = formatPackageTooltip([
+      pkg({ name: '无到期', remaining: 999, deductionEndTime: undefined }),
+      pkg({ name: '30天', remaining: 1, deductionEndTime: NOW + 30 * DAY }),
+      pkg({ name: '2天', remaining: 1, deductionEndTime: NOW + 2 * DAY }),
+    ], { format: v => String(v), now: NOW })!
+    const lines = text.split('\n')
+    expect(lines[0]).toContain('2天')
+    expect(lines[1]).toContain('30天')
+    expect(lines[2]).toContain('无到期')
+    expect(lines[2]).toContain('长期')
+  })
+
+  /** 次级键：同一到期时刻内按剩余量降序（保留"先看还有钱的包"）。 */
+  it('同一到期时刻内按剩余量降序', () => {
+    const same = NOW + 5 * DAY
+    const text = formatPackageTooltip([
+      pkg({ name: '少', remaining: 10, deductionEndTime: same }),
+      pkg({ name: '多', remaining: 900, deductionEndTime: same }),
+      pkg({ name: '中', remaining: 100, deductionEndTime: same }),
+    ], { format: v => String(v), now: NOW })!
+    const lines = text.split('\n')
+    expect(lines[0]).toContain('多')
+    expect(lines[1]).toContain('中')
+    expect(lines[2]).toContain('少')
+  })
+
+  /** 到期时刻相同时也必须结果确定（不能依赖引擎的稳定排序）。 */
+  it('全部无到期时间时退化为剩余量降序', () => {
+    const text = formatPackageTooltip([
+      pkg({ name: 'A', remaining: 1 }),
+      pkg({ name: 'B', remaining: 500 }),
+      pkg({ name: 'C', remaining: 50 }),
+    ], { format: v => String(v), now: NOW })!
+    expect(text.split('\n').map(l => l[0])).toEqual(['B', 'C', 'A'])
+  })
+
+  /**
+   * ⚠️ 过滤与排序都按**渲染时刻**现算：同一份数据在不同 `now` 下结果不同。
+   * （宿主长期开着，时间只向前流 —— 一个 1 秒后到期的包，下一秒就该消失。）
+   */
+  it('过滤与排序随时间推进而改变', () => {
+    const packages = [
+      pkg({ name: '30秒后到期', remaining: 100, deductionEndTime: NOW + 30_000 }),
+      pkg({ name: '长期包', remaining: 200, deductionEndTime: NOW + 300 * DAY }),
+    ]
+    const before = formatPackageTooltip(packages, { format: v => String(v), now: NOW })!
+    expect(before.split('\n')[0]).toContain('30秒后到期')
+    // 40 秒后：那个包已过期，应当消失
+    const after = formatPackageTooltip(packages, { format: v => String(v), now: NOW + 40_000 })!
+    expect(after).not.toContain('30秒后到期')
+    expect(after).toContain('长期包')
   })
 
   /**
    * ⚠️ 真实场景：实测 CodeBuddy 中国版一个账号有 **105 个资源包**。
-   * 不截断的话 tooltip 会长到无法阅读，所以按剩余量降序取前 N 个，
-   * 其余汇总成一行并给出**合计剩余**（不丢总量信息）。
+   * 不截断的话 tooltip 会长到无法阅读，所以取前 N 个，其余汇总成一行并给出
+   * **合计剩余**（不丢总量信息）。
+   * ⚠️ 截断发生在**排序之后** —— 被截掉的是"最晚到期"的那批，
+   * 用户最该关心的"快过期了"永远在最上面。
    */
-  it('包数超过 maxRows 时截断并汇总剩余合计', () => {
+  it('包数超过 maxRows 时截断并汇总剩余合计（截掉的是最晚到期的）', () => {
     const many = Array.from({ length: 20 }, (_, i) => pkg({
       name: `包${i}`,
-      remaining: i + 1,      // 1..20
+      remaining: 100,
       total: 100,
-      deductionEndTime: NOW + 30 * DAY,
+      // 包0 最快到期（1 天），包19 最晚（20 天）
+      deductionEndTime: NOW + (i + 1) * DAY,
     }))
     const text = formatPackageTooltip(many, { format: v => String(v), now: NOW, maxRows: 12 })!
     const lines = text.split('\n')
     expect(lines).toHaveLength(13)
-    // 剩余量降序：最大的排第一，被截掉的是最小的
-    expect(lines[0]).toContain('包19')
-    expect(lines[11]).toContain('包8')
-    // 被截掉的是 remaining 1..7 与 8 ⇒ 合计 1+2+…+8 = 36
-    expect(lines[12]).toBe('…另有 8 个包，合计剩余 36')
+    // 到期升序：包0 在最上，包11 是第 12 个（最后一个显示的）
+    expect(lines[0]).toContain('包0')
+    expect(lines[11]).toContain('包11')
+    // 被截掉的是包12..包19（8 个），各 100 ⇒ 合计 800
+    expect(lines[12]).toBe('…另有 8 个包，合计剩余 800')
   })
 
-  it('汇总行不计入失效包（那部分扣不到）', () => {
+  /**
+   * ⚠️ 过滤发生在**截断之前**：不可用的包不占 `maxRows` 名额，
+   * 也不会被算进「另有 N 个包」。
+   */
+  it('不可用的包既不显示、也不占 maxRows 名额、也不计入汇总', () => {
     const many = [
-      ...Array.from({ length: 12 }, (_, i) => pkg({ name: `有效${i}`, remaining: 100 })),
-      pkg({ name: '失效1', remaining: 50, active: false }),
-      pkg({ name: '有效13', remaining: 50 }),
+      ...Array.from({ length: 12 }, (_, i) => pkg({
+        name: `有效${i}`, remaining: 100, deductionEndTime: NOW + (i + 1) * DAY,
+      })),
+      // 这三个都不可用 —— 若不过滤，它们会挤掉「有效13」并把汇总数字搞错
+      pkg({ name: '失效', remaining: 50, active: false, deductionEndTime: NOW + 100 * DAY }),
+      pkg({ name: '用完', remaining: 0, deductionEndTime: NOW + 100 * DAY }),
+      pkg({ name: '过期', remaining: 50, deductionEndTime: NOW - DAY }),
+      pkg({ name: '有效13', remaining: 50, deductionEndTime: NOW + 101 * DAY }),
     ]
     const text = formatPackageTooltip(many, { format: v => String(v), now: NOW, maxRows: 12 })!
-    expect(text.split('\n').at(-1)).toBe('…另有 2 个包，合计剩余 50')
+    const lines = text.split('\n')
+    // 可用包共 13 个 ⇒ 显示 12 个 + 汇总 1 个
+    expect(lines).toHaveLength(13)
+    expect(text).not.toContain('失效')
+    expect(text).not.toContain('用完')
+    expect(text).not.toContain('过期')
+    // 被截掉的只有「有效13」一个
+    expect(lines[12]).toBe('…另有 1 个包，合计剩余 50')
   })
 
   it('空或非数组返回 null（调用方据此不挂 title）', () => {
@@ -428,6 +580,38 @@ describe('supportsCreditPackageList 的门控', () => {
     for (const p of ['codearts', 'cline', 'raccoon', '', undefined]) {
       expect(supportsCreditPackageList(p as never), String(p)).toBe(false)
     }
+  })
+})
+
+/**
+ * ⚠️ **排序必须对所有 provider 生效**（用户 2026-09-29 要求）：
+ * 「有资源包列表显示的provider都要做这个」。
+ *
+ * 保证方式是「只有**一个**排序实现」—— `formatPackageTooltip` 内部按到期升序排，
+ * 而前端所有 provider 共用同一个 `packageTooltip` 计算点。若有人给某个 provider
+ * 另写排序（或把排序挪到调用点），本用例会变红。
+ */
+describe('包列表排序的覆盖面（源码级）', () => {
+  const here = dirname(fileURLToPath(import.meta.url))
+  const hubSource = readFileSync(resolve(here, '../../plugin-src/client/jet-hub.js'), 'utf8')
+  const expirySource = readFileSync(resolve(here, '../../plugin-src/client/credit-expiry.js'), 'utf8')
+
+  it('排序只在 formatPackageTooltip 内部实现一次', () => {
+    // 排序键用 packageExpiryMs（与显示同一个判据来源）
+    const tooltipBody = expirySource.slice(expirySource.indexOf('export function formatPackageTooltip'))
+    expect(tooltipBody).toContain('packageExpiryMs')
+    // 未知到期沉底（不能按 0 处理，否则跑到最上面）
+    expect(tooltipBody).toMatch(/=== null \? Infinity/)
+  })
+
+  it('前端只有一处调 formatPackageTooltip，且不按 provider 分支', () => {
+    const calls = hubSource.match(/formatPackageTooltip\(/g) ?? []
+    // 一处 import 处不会带括号调用，故调用点应为 1
+    expect(calls).toHaveLength(1)
+    // 调用点不得出现 provider 判断（那意味着某家走了别的排序）
+    const callIndex = hubSource.indexOf('formatPackageTooltip(')
+    const around = hubSource.slice(Math.max(0, callIndex - 400), callIndex + 200)
+    expect(around).not.toMatch(/provider ===/)
   })
 })
 
