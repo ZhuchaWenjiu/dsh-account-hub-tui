@@ -19,7 +19,7 @@ import {
 } from '@deepseek-ai/dsh-llm'
 import { AccountPool, providerCatalogVisible } from './account-pool.js'
 import { settingsNamespaceFor } from './settings-compat.js'
-import { isRateLimited, parseRateLimitError } from './llm-adapter.js'
+import { RATE_LIMIT_FALLBACK_MS, isRateLimited, parseRateLimitError } from './llm-adapter.js'
 import { ToolCallId } from '@deepseek-ai/dsh-llm'
 import type { GenerateOptions, LlmModelInfo, LlmProviderInfo, LlmResolvedModelInfo, StreamChunk } from '@deepseek-ai/dsh-llm'
 import {
@@ -1463,7 +1463,10 @@ export class BuddyAdapter extends LlmAdapter {
       // 其余可用账号。每个失败账号都会被记录，只有真正试完全部候选才报
       // "所有账号均受限"——避免只试一个就下结论（那会让 UI 显示的限流
       // 状态与实际判定不一致）。
-      if (this.options.accountPool && isRateLimited(errorText)) {
+      // ⚠️ 必须把 `response.status` 一并传入：服务端可能返回**空体**的 429，
+      // 而只按正文判定时对空体恒为 false → 整段换号逻辑被跳过，本可自愈的限流
+      // 被直接抛给用户（表现为「池里明明还有可用账号，插件却报错且不换号」）。
+      if (this.options.accountPool && isRateLimited(errorText, response.status)) {
         const tried = new Set<string>()
         if (currentAccountId) tried.add(currentAccountId)
 
@@ -1483,17 +1486,33 @@ export class BuddyAdapter extends LlmAdapter {
         let sawContentRejection = false
         let contentRejectionStatus = 0
         let contentRejectionBody = ''
+        /**
+         * 已经写过限流标记的账号：避免同一个账号被重复记账（换号途中可能取回它）。
+         * 标记是「账号 × 模型」的快照，写两次没有意义，日志也会重复。
+         */
+        const rateLimitMarked = new Set<string>()
 
         for (;;) {
-          // 记录当前账号在该模型上的限流重置时间（UI 据此展示限流标记）。
+          // 先给**当前**账号记限流标记（UI 据「限额重置」徽章展示；它也是
+          // 「重测 / 重置」两条人工解禁路径的唯一依据）。
           //
-          // 注意 `errorText` 在换号后可能是 11140（非限流）响应体，此时
-          // `parseRateLimitError` 返回 `null`：只跳过记录即可，**不能**据此
-          // break（那正是上面「换号提前中断」缺陷的另一半成因）。
-          const parsed = parseRateLimitError(errorText, options.model)
-          if (parsed !== null && currentAccountId) {
+          // ⚠️ 判据从「解析出重置时间」改为 `isRateLimited(errorText, response.status)`：
+          // 空体 429 根本没有 `msg` 可解析（`parseRateLimitError` 给兜底时长，
+          // 不需要在这里区分），而**只要判为限流就必须留下标记** —— 否则用户
+          // 既看不到限流徽章、也无法手动解禁。真实缺陷复现：空体 429 时旧写法
+          // 连标记都不写（`recorded` 为空），而换号却发生了。
+          //
+          // ⚠️ `parseRateLimitError` 仍然优先：它能把**服务端声明的**真实重置
+          // 时刻抠出来（有就绝不用兜底的 1 小时）。换号后 `errorText` 可能是
+          // 11140 等非限流体 —— 那种情况下面①的分支会先 continue，走不到这里。
+          if (currentAccountId !== '' && isRateLimited(errorText, response.status)
+            && !rateLimitMarked.has(currentAccountId)) {
+            rateLimitMarked.add(currentAccountId)
+            const parsed = parseRateLimitError(errorText, options.model, response.status)
             await this.options.accountPool.updateModelRateLimit(
-              currentAccountId, parsed.modelId, parsed.resetTimeMs,
+              currentAccountId,
+              parsed?.modelId ?? options.model,
+              parsed?.resetTimeMs ?? Date.now() + RATE_LIMIT_FALLBACK_MS,
             )
           }
           // 取下一个未尝试过的可用账号（同样按本产品 id 过滤，否则 WorkBuddy
@@ -1516,7 +1535,7 @@ export class BuddyAdapter extends LlmAdapter {
           }
           errorText = await response.text().catch(() => '')
           // ① 安全策略拦截（11140）：按账号生效，继续换号（与认证路径同语义）。
-          //    判据必须**先于**下面「非限流即抛」，否则会退回「只试一个账号」。
+          //    判据必须**先于**下面的「非限流即抛」，否则会退回「只试一个账号」。
           if (isContentRejection(errorText)) {
             sawContentRejection = true
             contentRejectionStatus = response.status
@@ -1538,7 +1557,9 @@ export class BuddyAdapter extends LlmAdapter {
           // ② 认证类失败：该账号凭据不可用，与路径 A 一致继续换号。
           if (response.status === 401 || response.status === 403) continue
           // ③ 其余非限流错误：请求本身有问题，换号无益，按原错误分类抛出。
-          if (!isRateLimited(errorText)) {
+          //    ⚠️ 同样必须传状态码：否则空体 429 会被当成「非限流」而在换号
+          //    途中**中断**，池里其余可用账号一个都试不到。
+          if (!isRateLimited(errorText, response.status)) {
             // 新账号失败但不是限流：按原错误分类抛出，不要再吞成"均受限"
             throw new LlmError(`${this.product.id}: ${errorDetail(errorText)}`, httpErrorCode(response.status, errorText), { status: response.status })
           }

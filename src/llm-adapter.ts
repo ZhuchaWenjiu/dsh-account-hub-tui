@@ -1036,8 +1036,18 @@ export class CodeArtsAdapter extends LlmAdapter {
         // （外层 for(;;) 会在拿到新凭据后重新签名发请求）。用 tried 集合
         // 保证每个账号只尝试一次，试完才判定"全部受限"——避免只试一个
         // 就下结论，导致 UI 限流状态与实际判定不一致。
-        if (this.options.accountPool && isRateLimited(errorText)) {
-          const parsed = parseRateLimitError(errorText, options.model)
+        //
+        // ⚠️ 必须把 `response.status` 一并传入：服务端可能返回**空体**的 429，
+        // 而只按正文判定时对空体恒为 false → 整段换号逻辑被跳过，本可自愈的
+        // 限流被直接抛给用户（见 `isRateLimited` 的说明）。
+        if (this.options.accountPool && isRateLimited(errorText, response.status)) {
+          // ⚠️ 状态码必须传到 `parseRateLimitError` —— **与上面外层判据同源**。
+          // 空体 429 时 `isRateLimited` 因状态码判真而放行进来，但只按正文解析的
+          // `parseRateLimitError` 返回 `null`，下面的 `if (parsed)` 会把**整块**
+          // （写限流标记 + 换号 + `continue`）一起跳过：既不换号、也不落标记，
+          // 最终按原错误抛出 —— 「空体 429 在 CodeArts 上依旧不自愈」。
+          // 这正是本补丁要修的缺陷，本处是第三条（也是最后一条）调用点。
+          const parsed = parseRateLimitError(errorText, options.model, response.status)
           if (parsed) {
             if (currentAccountId) {
               await this.options.accountPool.updateModelRateLimit(
@@ -1865,8 +1875,30 @@ function hasRateLimitBusinessCode(body: string): boolean {
   }
 }
 
-/** 判断错误文本是否为频率限制错误 */
-export function isRateLimited(body: string): boolean {
+/**
+ * 判断错误文本是否为频率限制错误。
+ *
+ * @param body - 响应体（可能为空串）
+ * @param status - HTTP 状态码（可选，但**手里有 Response 就必须传**）。为 `429`
+ *   时无条件判为限流，即使响应体为空、不含任何可识别文案。
+ *
+ * ⚠️ **`status` 判据是真实缺陷的修复，不是可选便利**：本函数原先只接收响应体，
+ * 而服务端（网关 / CDN / 限流中间件）完全可能返回**空体**的 429 —— 此时
+ * `hasRateLimitBusinessCode` 与 `RATE_LIMIT_PATTERN` **双双不命中**，函数返回
+ * `false`，于是适配器里整段「记录重置时间 + 切换账号」逻辑被**整体跳过**，
+ * 把一个本可自愈的限流直接抛给用户（表现为「账号池里明明还有可用账号，插件却
+ * 报错且不换号」）。
+ *
+ * 判据顺序刻意是「状态码优先」：429 是 HTTP 语义上**唯一**的限流信号，无需也不应
+ * 再去猜文案；下面的文案 / 业务码兜底只服务于「状态码不是 429、但正文表达了限流」
+ * 的场景（业务码 6004、SSE 流内错误、网关包装过的 200/400）。
+ *
+ * ⚠️ 反向的约束同样重要：**非 429 绝不能因为「有状态码」就判为限流** ——
+ * 404「模型不存在」这类换号无益的错误若被识别成限流，会被吞成「所有账号均受限」，
+ * 用户既看不到真实原因、插件还会白试一遍全池账号。
+ */
+export function isRateLimited(body: string, status?: number): boolean {
+  if (status === 429) return true
   return hasRateLimitBusinessCode(body) || RATE_LIMIT_PATTERN.test(body)
 }
 
@@ -1881,11 +1913,38 @@ export function isRateLimited(body: string): boolean {
  */
 const RESET_TIME_PATTERN = /(?:将在|reset at)\s+([\d-]+\s+[\d:]+)\s+(UTC[+-]\d+(?::\d+)?)/i
 
-/** 从限流错误中提取重置时间 */
+/**
+ * 限流文案里解析不出重置时刻时的**兜底时长**（1 小时）。
+ *
+ * 为什么需要兜底而不是「解析不到就不记标记」：网关 / CDN 返回的 429 常常既没有
+ * 重置时间、甚至**没有响应体**，而标记是 UI「限额重置」徽章与「重测 / 重置」
+ * 两条人工解禁路径的**唯一**依据 —— 静默跳过记录会让用户既看不到限流、也无从操作。
+ *
+ * ⚠️ 1 小时是**快照式**兜底（标记可被重测刷新），与 `BUDDY_POLICY_BLOCK_COOLDOWN_MS`
+ * 的 30 分钟**语义不同**（那是「安全策略拦截」的本地冷却，报文里根本没有时间字段），
+ * 也与 Qoder「按自然日 24:00」不同（那是按日的额度结算）。三者不要合并成一个常量。
+ *
+ * 导出是给 `buddy-adapter` 用的：它需要在**没拿到可解析体**时也能写出标记，
+ * 且必须与这里 `parseRateLimitError` 的兜底**同值**，否则两处口径会漂。
+ */
+export const RATE_LIMIT_FALLBACK_MS = 3_600_000
+
+/**
+ * 从限流错误中提取重置时间；体里没有时间时返回 {@link RATE_LIMIT_FALLBACK_MS} 兜底。
+ *
+ * @param status - HTTP 状态码（可选）。为 `429` 时即使**体为空、或无任何可识别文案**
+ *   也按兜底时长返回一条，避免调用方「识别出限流却没有标记可写」（见
+ *   {@link RATE_LIMIT_FALLBACK_MS} 的说明）。
+ */
 export function parseRateLimitError(
   body: string,
   currentModel: string,
+  status?: number,
 ): { modelId: string; resetTimeMs: number } | null {
+  const fallback = (): { modelId: string; resetTimeMs: number } => ({
+    modelId: currentModel,
+    resetTimeMs: Date.now() + RATE_LIMIT_FALLBACK_MS,
+  })
   try {
     const data = JSON.parse(body) as Record<string, unknown>
     const msg = typeof data.msg === 'string' ? data.msg : ''
@@ -1898,12 +1957,12 @@ export function parseRateLimitError(
       }
     }
     // 标准 OpenAI 429 格式，或带业务码但文案无法解析出时间
-    if (isRateLimited(body)) {
-      // fallback: 1小时后重试
-      return { modelId: currentModel, resetTimeMs: Date.now() + 3_600_000 }
+    if (isRateLimited(body, status)) {
+      return fallback()
     }
     return null
   } catch {
-    return null
+    // 非 JSON（空体、纯文本、CDN 的 HTML 错误页）：只剩状态码可判。
+    return status === 429 ? fallback() : null
   }
 }

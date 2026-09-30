@@ -1702,6 +1702,67 @@ describe('BuddyAdapter 账号池限流切换', () => {
     expect(pool.recorded.every((r) => r.resetAtMs > Date.now())).toBe(true)
   })
 
+  /**
+   * 回归：**空体 429** 必须同样触发换号，并写入限流标记。
+   *
+   * ## 真实缺陷（用户报障）
+   *
+   * 「账号池里明明还有可用账号，插件却直接报错、也不换号」——本可自愈的限流变成
+   * 硬失败。
+   *
+   * 根因：`isRateLimited` 原先只接收响应体（判据是业务码 6004 或中英文限流文案），
+   * 而服务端（网关 / CDN / 限流中间件）完全可能返回**空体**的 429 —— 两个判据双双
+   * 不命中 → 返回 false → `if (accountPool && isRateLimited(errorText))` 这整块被
+   * 跳过，既不切账号、也不写 `modelRateLimits`。
+   *
+   * ⚠️ 本用例的响应体刻意是**空串**：换任何含限流措辞的正文，缺陷就不会暴露
+   * （那正是上面那些 6004 用例覆盖不到它的原因）。
+   *
+   * ⚠️ 空体 429 的另一个必然后果是「没有重置时间可解析」（`parseRateLimitError`
+   * 拿不到 `msg`），所以标记必须走**兜底时长**而不是静默跳过 —— 否则 UI 上不会
+   * 出现任何限流标记，「重测 / 重置」两条人工解禁路径也就无从操作
+   * （与 `lobsterai-adapter` 对纯文本 429 的兜底同一口径）。
+   */
+  it('空体 429 也触发换号，并写入限流标记（状态码兜底，不只认正文）', async () => {
+    const pool = makePool(
+      { id: 'acct-1', token: 'AT1' },
+      [{ id: 'acct-2', token: 'AT2' }],
+    )
+    const sentTokens: string[] = []
+    const adapter = new BuddyAdapter({
+      credentialRef: CREDENTIAL_REF,
+      resolveCredential: async () => makeCredential({ access_token: 'AT1' }),
+      refresh: async () => {},
+      accountPool: pool as never,
+      fetchImpl: async (_url, init) => {
+        const auth = (init?.headers as Headers | undefined)?.get('Authorization') ?? ''
+        const token = auth.replace('Bearer ', '')
+        sentTokens.push(token)
+        // AT1 返回**空体 429**（无线索可判），AT2 成功 —— 必须换到 AT2。
+        if (token === 'AT2') {
+          return sseResponse('data: {"choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n')
+        }
+        return new Response('', { status: 429 })
+      },
+    })
+
+    const chunks = await collectChunks(adapter, {
+      model: DEFAULT_MODEL,
+      messages: [{ role: 'user', content: 'hi' }] as never,
+      signal: new AbortController().signal,
+    } as never)
+
+    // 关键断言 1：换号确实发生了。修复前这里只有 ['AT1']，随后直接抛原始 429。
+    expect(sentTokens).toEqual(['AT1', 'AT2'])
+    // 关键断言 2：最终拿到内容，而不是把 429 抛给用户。
+    expect(chunks.some((c) => c.type === 'text-delta' && c.text === 'ok')).toBe(true)
+    // 关键断言 3：失败账号被写入限流标记（空体无时间可解析 → 用兜底时长），
+    // 否则 UI 既不显示限流、用户也无法用「重测 / 重置」人工解禁。
+    expect(pool.recorded.map((r) => r.accountId)).toEqual(['acct-1'])
+    expect(pool.recorded[0]!.modelId).toBe(DEFAULT_MODEL)
+    expect(pool.recorded[0]!.resetAtMs).toBeGreaterThan(Date.now())
+  })
+
   it('全部账号限流后才报错，且错误码为不可重试的 QUOTA_EXCEEDED', async () => {
     const pool = makePool({ id: 'acct-1', token: 'AT1' }, [{ id: 'acct-2', token: 'AT2' }])
     const adapter = new BuddyAdapter({
