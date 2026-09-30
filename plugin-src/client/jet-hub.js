@@ -29,6 +29,11 @@ import {
   filterModels,
   isFilterActive,
 } from './model-filter.js';
+import {
+  groupBulkStateFor,
+  groupExpanded,
+  groupModelsForDisplay,
+} from './model-groups.js';
 import { decryptBackup, encryptBackup, isEncryptedBackup } from './backup-crypto.js';
 
 export const JET_HUB_RPC_CHANNEL = '/jet-hub';
@@ -773,6 +778,16 @@ function ModelListPanel({ provider, rpcCall, onClose }) {
    */
   const [query, setQuery] = React.useState('');
   const [statusFilter, setStatusFilter] = React.useState('all');
+  /**
+   * 各分组的**显式折叠选择**（`组 key → 是否展开`）。
+   *
+   * ⚠️ 只存「用户点过的组」：没点过的组走 `groupExpanded` 的默认策略
+   * （按量计费折叠、其余展开；有筛选时一律展开）。**不要把默认值烘焙进 state**
+   * ——那样「清空筛选后该恢复默认」就做不到了。
+   */
+  const [groupToggles, setGroupToggles] = React.useState({});
+  /** 正在提交「本组全开/全关」的组 key（null = 没有）。 */
+  const [groupBusy, setGroupBusy] = React.useState(null);
   const mounted = React.useRef(true);
 
   const load = React.useCallback(async () => {
@@ -844,6 +859,63 @@ function ModelListPanel({ provider, rpcCall, onClose }) {
   const filtered = filterModels(all, { query, status: statusFilter });
   /** 是否有生效中的筛选。决定是否渲染「清空筛选」按钮。 */
   const filtering = isFilterActive({ query, status: statusFilter });
+
+  /**
+   * 按「计费/来源」分组后的列表（组内已应用搜索与状态筛选）。
+   *
+   * ⚠️ `filtered`（上面的平铺结果）与 `groups` **同源**（都由 `filterModels`
+   * 算出）：前者用于计数行与「无命中」空态，后者用于渲染 —— 不会出现
+   * 「计数说 3 条、界面只渲染 1 条」。
+   */
+  const groups = groupModelsForDisplay(all, { query, status: statusFilter });
+
+  /** 某组此刻是否展开（用户点过以用户为准；有筛选时一律展开）。 */
+  const isGroupExpanded = (group) => groupExpanded(group, {
+    filterActive: filtering,
+    toggled: groupToggles[group.key],
+  });
+
+  /** 点组头：把「当前展开态的反面」写成显式选择（此后由用户说了算）。 */
+  const toggleGroup = (group) => {
+    const next = !isGroupExpanded(group);
+    setGroupToggles(prev => ({ ...prev, [group.key]: next }));
+  };
+
+  /**
+   * 「本组全开 / 本组全关」。
+   *
+   * ⚠️ 走 `model.setDisabledMany`（**按子集**），**不能**复用
+   * `model.setAllDisabled` —— 后者打开方向会清空整张黑名单，把用户特意关着的
+   * 其它分组一起打开，那正是分组开关要避免的事。
+   *
+   * 关闭方向先二次确认（与顶部「关闭全部」同约定：一次误点会关掉一整组）；
+   * 打开是恢复性操作，不弹确认（弹窗只会碍事）。
+   */
+  const setGroupDisabled = async (group, disabled) => {
+    const ids = group.models.map(model => model.id);
+    if (disabled && !confirm(
+      `确认关闭「${group.label}」的 ${ids.length} 个模型？关闭后它们不再出现在对话框的模型选择里。`,
+    )) {
+      return;
+    }
+    setGroupBusy(group.key);
+    setToggleError(null);
+    try {
+      await rpcCall('model.setDisabledMany', { provider, modelIds: ids, disabled });
+      if (!mounted.current) return;
+      // 就地更新（不等重新拉取）：端点返回的是权威黑名单，但列表里还有展示名等
+      // 字段，只能按 id 就地翻 `disabled`（与顶部批量开关同款做法）。
+      const changed = new Set(ids);
+      setModels(prev => (prev || []).map(m => (changed.has(m.id) ? { ...m, disabled } : m)));
+    } catch (caught) {
+      console.error('[jet-hub] group toggle failed:', caught);
+      if (!mounted.current) return;
+      // 与其它开关一致：失败只提示、保留列表，绝不把整张表换成错误页。
+      setToggleError(caught?.message || `本组批量${disabled ? '关闭' : '打开'}模型失败`);
+    } finally {
+      if (mounted.current) setGroupBusy(null);
+    }
+  };
 
   /** 清空搜索与筛选。 */
   const resetFilters = () => {
@@ -993,16 +1065,52 @@ function ModelListPanel({ provider, rpcCall, onClose }) {
                     React.createElement('button', { className: 'dim-jh-btn', onClick: resetFilters }, '清空筛选')))
               : React.createElement('div', { className: 'dim-jh-modalBody' },
                   React.createElement('div', { className: 'dim-jh-modelList' },
-                    // 直接渲染全部筛选结果（**无渲染上限**）：改动前 478 条就是
-                    // 一次性全渲染、工作正常。
-                    filtered.map(model => React.createElement(ModelToggle, {
-                      key: model.id,
-                      model,
-                      // 批量提交期间一并禁用单条开关：黑名单是整体写入，
-                      // 并发提交必然互相覆盖（后写的会丢掉先写的改动）。
-                      busy: busyIds.has(model.id) || bulkBusy,
-                      onToggle: (id, disabled) => void toggleModel(id, disabled),
-                    }))))));
+                    // **按计费/来源分组**渲染（订阅 / 免费 / Cline Cloud / 按量计费）。
+                    // 组内仍是全部筛选结果（**无渲染上限**）：改动前 478 条就是
+                    // 一次性全渲染、工作正常，加「显示更多」属于功能收缩。
+                    groups.map(group => {
+                      const expanded = isGroupExpanded(group);
+                      const groupBulk = groupBulkStateFor(group, bulkBusy || groupBusy !== null);
+                      return React.createElement('div', {
+                        key: group.key,
+                        className: 'dim-jh-modelGroup',
+                      },
+                        React.createElement('div', { className: 'dim-jh-modelGroupHead' },
+                          React.createElement('button', {
+                            className: 'dim-jh-modelGroupToggle',
+                            'aria-expanded': expanded ? 'true' : 'false',
+                            title: group.hint,
+                            onClick: () => toggleGroup(group),
+                          }, `${expanded ? '▾' : '▸'} ${group.label}`),
+                          React.createElement('span', { className: 'dim-jh-modelGroupCount' },
+                            group.counts.disabled > 0
+                              ? `${group.counts.shown} 个 · 已关闭 ${group.counts.disabled}`
+                              : `${group.counts.shown} 个`),
+                          React.createElement('button', {
+                            className: 'dim-jh-btn dim-jh-modelGroupBtn',
+                            title: `打开「${group.label}」的全部模型（不影响其它分组）`,
+                            disabled: groupBulk.openAllDisabled,
+                            onClick: () => void setGroupDisabled(group, false),
+                          }, '全开'),
+                          React.createElement('button', {
+                            className: 'dim-jh-btn dim-jh-modelGroupBtn',
+                            title: `关闭「${group.label}」的全部模型（不影响其它分组）`,
+                            disabled: groupBulk.closeAllDisabled,
+                            onClick: () => void setGroupDisabled(group, true),
+                          }, '全关')),
+                        expanded
+                          ? React.createElement('div', { className: 'dim-jh-modelGroupBody' },
+                              group.models.map(model => React.createElement(ModelToggle, {
+                                key: model.id,
+                                model,
+                                // 批量提交期间一并禁用单条开关：黑名单是整体写入，
+                                // 并发提交必然互相覆盖（后写的会丢掉先写的改动）。
+                                // 分组批量也算「批量」，故一并计入。
+                                busy: busyIds.has(model.id) || bulkBusy || groupBusy !== null,
+                                onToggle: (id, disabled) => void toggleModel(id, disabled),
+                              })))
+                          : null);
+                    })))));
 
   // 与登录弹窗（.dim-jh-loginOverlay）同款做法：直接渲染在组件树内，靠
   // position: fixed 覆盖全屏。**刻意不用 createPortal** —— 客户端模块表由

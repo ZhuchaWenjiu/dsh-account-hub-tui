@@ -384,10 +384,13 @@ export class ClineAdapter extends LlmAdapter {
    * 之前一定会先走 `ctx.llm.listModels()`（那会 await 加载完成），
    * 故实际使用中不会读到空目录。
    */
-  listAllModels(): readonly { id: string; name: string }[] {
+  listAllModels(): readonly { id: string; name: string; isFree: boolean }[] {
     const source = this.remoteModels ?? this.fallbackCatalog()
     if (this.remoteModels === undefined) void this.ensureRemoteModels()
-    return source.map((model) => ({ id: model.id, name: clineDisplayName(model) }))
+    // ⚠️ 必须带上 `isFree`：Jet Hub 的模型列表要按「计费/来源」分组
+    // （订阅 / 免费 / Cloud / 按量计费），而**免费集合是远端动态下发的**
+    // （见 `cline-models.ts` 的并集规则）—— 让客户端按前缀猜会漂移。
+    return source.map((model) => ({ id: model.id, name: clineDisplayName(model), isFree: model.isFree }))
   }
 
   async listModels(_provider: string): Promise<readonly LlmModelInfo[]> {

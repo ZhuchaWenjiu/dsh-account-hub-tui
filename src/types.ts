@@ -623,6 +623,14 @@ export interface RpcModelListEntry {
   name: string
   /** true = 已关闭（不出现在对话框的模型选择里）。 */
   disabled: boolean
+  /**
+   * 是否为**免费额度模型**（适配器按远端 `free` 集合判定的权威标记）。
+   *
+   * ⚠️ **缺失 = 该适配器没报**（不是「确认收费」）：Jet Hub 的模型列表按
+   * 「计费/来源」分组时，缺失项**保守归入「按量计费」**，但字段本身保持
+   * 「未知」语义 —— 不编造 `false`（与全仓「未知不编造」的约定一致）。
+   */
+  isFree?: boolean
 }
 
 /** RPC: 列出某 provider 的模型响应 */
@@ -664,6 +672,27 @@ export interface RpcModelSetAllDisabledRequest {
 /** RPC: 批量打开/关闭响应（回传写入后的完整黑名单，与单条端点同结构） */
 export type RpcModelSetAllDisabledResponse = RpcModelSetDisabledResponse
 
+/**
+ * RPC: 批量打开/关闭**指定的一批**模型（Jet Hub 模型列表里「按分组」的
+ * 本组全开 / 本组全关）。
+ *
+ * 与 {@link RpcModelSetAllDisabledRequest} 的区别是**范围**：那个是「该 provider
+ * 的全部模型」（且打开方向刻意顺带清掉已下线模型的历史死键），本端点只动传进来
+ * 的 id —— **分组开关必须用本端点**，否则一次「本组全开」会把用户特意关着的
+ * 其它组一起打开。
+ *
+ * ⚠️ `modelIds` **不接受空数组**：空组不该出现在界面上（前端按钮也按
+ * `bulkButtonState` 禁用），服务端再拒一次，避免一次无意义的写入与广播。
+ * ⚠️ `disabled` 同样**没有默认值**（与单条/全量端点同约定）。
+ */
+export interface RpcModelSetDisabledManyRequest {
+  provider: string
+  modelIds: string[]
+  disabled: boolean
+}
+
+/** RPC: 分组批量开关响应（回传写入后的完整黑名单，与其它两个开关端点同结构） */
+export type RpcModelSetDisabledManyResponse = RpcModelSetDisabledResponse
 /** 存储在 CODEARTS_ACCESS_TOKEN 下的归一化临时凭据。 */
 export interface CodeArtsCredential {
   access_key_id: string

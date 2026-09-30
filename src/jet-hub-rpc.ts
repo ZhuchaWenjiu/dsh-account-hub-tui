@@ -153,6 +153,8 @@ import type {
   RpcModelSetDisabledResponse,
   RpcModelSetAllDisabledRequest,
   RpcModelSetAllDisabledResponse,
+  RpcModelSetDisabledManyRequest,
+  RpcModelSetDisabledManyResponse,
 } from './types.js'
 
 /** Jet Hub RPC API 路径 */
@@ -681,7 +683,7 @@ export function registerJetHubRpc(
  * 只声明用到的方法（结构化类型），避免让本模块依赖五个具体适配器类。
  */
 export interface ModelCatalogSource {
-  listAllModels(): readonly { id: string; name: string }[]
+  listAllModels(): readonly { id: string; name: string; isFree?: boolean }[]
 }
 
 /**
@@ -2604,7 +2606,7 @@ function registerJetHubEndpoints(
         // 对话框模型选择器读的仍是过滤后的 `listModels`，可见性行为完全不变。
         const catalogSource = modelAdapters?.[req.provider]
         const all = catalogSource?.listAllModels()
-        let catalog: Array<{ id: string; name: string }>
+        let catalog: Array<{ id: string; name: string; isFree?: boolean }>
         if (all !== undefined) {
           catalog = [...all]
           // 全量目录里若仍有黑名单命中却缺失者，一并补上（保底，正常不会发生）。
@@ -2627,6 +2629,10 @@ function registerJetHubEndpoints(
             id: model.id,
             name: model.name,
             disabled: disabledMap[model.id] === true,
+            // ⚠️ 免费标记**照原样透传，缺失就不写**（不编造 `false`）：Jet Hub 的
+            // 模型列表按「计费/来源」分组，把「适配器没报」当成「按量计费」是
+            // 保守归组，但字段本身仍保持「未知」语义（与全仓约定一致）。
+            ...model.isFree === undefined ? {} : { isFree: model.isFree },
           })),
         }
         return { ok: true, value }
@@ -2651,6 +2657,49 @@ function registerJetHubEndpoints(
         // 必须广播：否则开关只写进磁盘、界面一直显示旧目录（成因见该函数注释）。
         broadcastCatalogChanged(ctx)
         const value: RpcModelSetDisabledResponse = {
+          provider: req.provider,
+          disabledModels: pool.listDisabledModels(req.provider),
+        }
+        return { ok: true, value }
+      }
+
+      /**
+       * 批量打开/关闭**指定的一批**模型（Jet Hub 模型列表里「按分组」的
+       * 本组全开 / 本组全关）。
+       *
+       * ⚠️ **不能复用 `model.setAllDisabled`**：那个的范围是「该 provider 的
+       * 全部模型」，且打开方向会清空整张黑名单（含用户特意关着的其它组）。
+       * 分组开关只动本组的 id，故服务端需要一个「按子集清除」的路径
+       * （`AccountPool.clearModelsDisabled`）。
+       *
+       * 与另外两个开关端点同约定：`disabled` 不做默认值猜测、只落盘一次、
+       * 只广播一次（逐条调用会写 N 次文档、广播 N 次）。
+       */
+      case 'model.setDisabledMany': {
+        const req = payload as RpcModelSetDisabledManyRequest
+        if (
+          typeof req.provider !== 'string' || req.provider.length === 0
+          || !Array.isArray(req.modelIds)
+          || typeof req.disabled !== 'boolean'
+        ) {
+          return {
+            ok: false,
+            error: { code: 'bad-request', message: 'provider、modelIds（数组）与 disabled（布尔）必填' },
+          }
+        }
+        // 去重 + 剔除非字符串/空串：前端按组传 id，重复项或脏值只会白写一次文档。
+        const ids = [...new Set(req.modelIds.filter((id): id is string => typeof id === 'string' && id.length > 0))]
+        if (ids.length === 0) {
+          return { ok: false, error: { code: 'bad-request', message: 'modelIds 不能为空' } }
+        }
+        if (req.disabled) await pool.setModelsDisabled(req.provider, ids)
+        else await pool.clearModelsDisabled(req.provider, ids)
+        ctx.logger.info(
+          `[jet-hub] ${req.disabled ? '关闭' : '打开'} ${req.provider} 的 ${ids.length} 个模型（按分组）`,
+        )
+        // 与其它开关端点一致：必须广播，否则界面一直显示旧目录。
+        broadcastCatalogChanged(ctx)
+        const value: RpcModelSetDisabledManyResponse = {
           provider: req.provider,
           disabledModels: pool.listDisabledModels(req.provider),
         }

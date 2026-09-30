@@ -221,6 +221,42 @@ export class AccountPool {
   }
 
   /**
+   * 批量**打开**一批模型（Jet Hub 模型列表里**按分组**的「本组全开」）。
+   *
+   * ## 与 {@link clearDisabledModels} 的区别是**范围**（勿混）
+   *
+   * 后者清空该 provider 的**全部**键，并刻意顺带清掉「已下线模型」的历史死键；
+   * 本方法**只删传入的 id**。分组开关必须用本方法 —— 用「清空」会把用户特意
+   * 关着的其它组一起打开（那正是分组开关要避免的事）。
+   *
+   * ⚠️ **无实际变更不落盘**：传进来的 id 若本来就不在黑名单里（例如该组已经
+   * 全开），删不掉任何键，此时不该产生一次文档重写与目录广播 ——
+   * 与 {@link setModelsDisabled} 的「空列表不落盘」是同一条精神。
+   */
+  async clearModelsDisabled(provider: string, modelIds: readonly string[]): Promise<void> {
+    if (modelIds.length === 0) return
+    // 同 setModelsDisabled：写路径必须自己保证已载入，否则会拿未载入的空表
+    // 去判「有没有变更」，进而漏掉磁盘上真实存在的关闭项。
+    this.ensureLoaded()
+    const perProvider = this.modelCache[provider]
+    if (perProvider === undefined) return
+    const nextPerProvider = { ...perProvider }
+    let changed = false
+    for (const id of modelIds) {
+      if (nextPerProvider[id] === true) {
+        delete nextPerProvider[id]
+        changed = true
+      }
+    }
+    if (!changed) return
+    const next: ModelDisableMap = { ...this.modelCache }
+    // 与 setModelDisabled 同约定：该 provider 一个关闭项都不剩时删掉整个键，
+    // 配置文件不随开关操作膨胀。
+    if (Object.keys(nextPerProvider).length === 0) delete next[provider]
+    else next[provider] = nextPerProvider
+    await this.writeModels(next)
+  }
+  /**
    * 清空某 provider 的全部关闭项（Jet Hub 模型列表的「打开全部」）。
    *
    * ⚠️ **刻意不看模型目录**：直接删掉该 provider 在黑名单里的**全部**键，

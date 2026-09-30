@@ -1441,6 +1441,157 @@ describe('model.list / model.setDisabled 端点', () => {
       expect(emitted).toEqual([])
     })
   })
+
+  /**
+   * 分组批量端点 `model.setDisabledMany`（Jet Hub 模型列表按「计费/来源」分组后的
+   * 「本组全开 / 本组全关」，用户 2026-10-01 要求）。
+   *
+   * ⚠️ **与 `model.setAllDisabled` 的区别就是本组用例的判据**：那个的范围是
+   * 「该 provider 的全部模型」，且**打开方向会清空整张黑名单**。若分组开关
+   * 图省事复用它会怎样？——「打开『订阅额度』这一组」会把用户特意关着的
+   * 「按量计费」那 400 多条**一起打开**。所以这里逐条锁住「只动传入的 id」。
+   */
+  describe('model.setDisabledMany（按分组批量开关）', () => {
+    it('disabled:true 只关闭传入的那批（其它已关闭项与已打开项都不受影响）', async () => {
+      const { call, storedValue } = registerEndpoints({
+        models: MODELS,
+        disabledModels: { buddy: { hy3: true } },
+      })
+
+      const result = await call('model.setDisabledMany', {
+        provider: 'buddy',
+        modelIds: ['glm-5.2'],
+        disabled: true,
+      })
+
+      expect(result.ok).toBe(true)
+      // hy3 本来就关着（保持），glm-5.2 新关，deepseek-v4-flash 仍然开着
+      expect(storedValue().disabledModels).toEqual({ buddy: { hy3: true, 'glm-5.2': true } })
+    })
+
+    /**
+     * ⚠️ **这条是本端点的存在理由**：打开方向必须**只**删传入的 id。
+     *
+     * 若实现里误用 `clearDisabledModels`（清空整个 provider），这里会断成 `{}`
+     * —— 用户「只打开订阅额度那一组」会连带打开按量计费的全部模型。
+     */
+    it('disabled:false 只打开传入的那批，**不清空整张黑名单**', async () => {
+      const { call, storedValue } = registerEndpoints({
+        models: MODELS,
+        disabledModels: { buddy: { hy3: true, 'glm-5.2': true, 'deepseek-v4-flash': true } },
+      })
+
+      const result = await call('model.setDisabledMany', {
+        provider: 'buddy',
+        modelIds: ['hy3', 'glm-5.2'],
+        disabled: false,
+      })
+
+      expect(result.ok).toBe(true)
+      // 只有 hy3/glm-5.2 被打开；deepseek-v4-flash 保持关闭
+      expect(storedValue().disabledModels).toEqual({ buddy: { 'deepseek-v4-flash': true } })
+    })
+
+    it('某个 provider 的关闭项被清空时删掉整个键（配置不膨胀）', async () => {
+      const { call, storedValue } = registerEndpoints({
+        models: MODELS,
+        disabledModels: { buddy: { hy3: true }, workbuddy: { 'gpt-5.4': true } },
+      })
+
+      await call('model.setDisabledMany', { provider: 'buddy', modelIds: ['hy3'], disabled: false })
+
+      // buddy 整个键被删掉，workbuddy 不受影响
+      expect(storedValue().disabledModels).toEqual({ workbuddy: { 'gpt-5.4': true } })
+    })
+
+    it('黑名单按 provider 隔离（关 buddy 不动 workbuddy）', async () => {
+      const { call, storedValue } = registerEndpoints({
+        models: MODELS,
+        disabledModels: { workbuddy: { 'gpt-5.4': true } },
+      })
+
+      await call('model.setDisabledMany', { provider: 'buddy', modelIds: ['hy3'], disabled: true })
+
+      expect(storedValue().disabledModels).toEqual({
+        workbuddy: { 'gpt-5.4': true },
+        buddy: { hy3: true },
+      })
+    })
+
+    /** 批量**只广播一次**：分组里可能有 460 条，逐条调用会打 460 次目录刷新。 */
+    it('只广播一次 llm/adapters-updated', async () => {
+      const { call, emitted } = registerEndpoints({ models: MODELS })
+
+      await call('model.setDisabledMany', {
+        provider: 'buddy',
+        modelIds: ['hy3', 'glm-5.2'],
+        disabled: true,
+      })
+
+      expect(emitted).toEqual(['llm/adapters-updated'])
+    })
+
+    it('返回写入后的完整黑名单（与其它两个开关端点同结构）', async () => {
+      const { call } = registerEndpoints({ models: MODELS })
+
+      const result = await call('model.setDisabledMany', {
+        provider: 'buddy',
+        modelIds: ['hy3'],
+        disabled: true,
+      })
+
+      expect(result.value).toEqual({ provider: 'buddy', disabledModels: { hy3: true } })
+    })
+
+    /** ⚠️ 空数组直接拒：空组不该出现在界面上（前端按钮也已禁用）。 */
+    it('modelIds 为空数组 → bad-request，不落盘也不广播', async () => {
+      const { call, storedValue, emitted } = registerEndpoints({ models: MODELS })
+
+      const result = await call('model.setDisabledMany', {
+        provider: 'buddy',
+        modelIds: [],
+        disabled: true,
+      })
+
+      expect(result.ok).toBe(false)
+      expect(result.error?.message).toContain('modelIds')
+      expect(storedValue().disabledModels).toBeUndefined()
+      expect(emitted).toEqual([])
+    })
+
+    it('modelIds 全是脏值（空串 / 非字符串）→ 同样拒（去重剔净后为空）', async () => {
+      const { call, emitted } = registerEndpoints({ models: MODELS })
+
+      const result = await call('model.setDisabledMany', {
+        provider: 'buddy',
+        modelIds: ['', 42, null],
+        disabled: true,
+      })
+
+      expect(result.ok).toBe(false)
+      expect(emitted).toEqual([])
+    })
+
+    /** ⚠️ `disabled` 不做默认值猜测（与单条/全量端点同约定）。 */
+    it('disabled 非布尔 → bad-request（不猜默认值）', async () => {
+      const { call, storedValue, emitted } = registerEndpoints({ models: MODELS })
+
+      const result = await call('model.setDisabledMany', { provider: 'buddy', modelIds: ['hy3'] })
+
+      expect(result.ok).toBe(false)
+      expect(result.error?.message).toContain('disabled')
+      expect(storedValue().disabledModels).toBeUndefined()
+      expect(emitted).toEqual([])
+    })
+
+    it('provider 非字符串或空串 → bad-request', async () => {
+      const { call, emitted } = registerEndpoints({ models: MODELS })
+
+      expect((await call('model.setDisabledMany', { modelIds: ['hy3'], disabled: true })).ok).toBe(false)
+      expect((await call('model.setDisabledMany', { provider: '', modelIds: ['hy3'], disabled: true })).ok).toBe(false)
+      expect(emitted).toEqual([])
+    })
+  })
 })
 
 /**

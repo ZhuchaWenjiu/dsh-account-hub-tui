@@ -3026,6 +3026,78 @@ cline-pass 部分模型为什么不全**，例如当前这个模型就看不到�
 `free`/`recommended`/`clinePass` ⇒ 这批模型拿不到 `name`/`description`
 （只能靠 `/models` 的裸 id 出现）。改动会影响模型列表内容，故未顺手做。
 
+### ⚠️ 模型列表的**「计费/来源」分组**（用户要求，2026-10-01）
+
+用户问「模型列表能够分组显示吗」→ 选定口径 **B：按计费/来源分 4 组**（而不是
+按 67 个命名空间），并要求**每组一个「全开 / 全关」**。实测目录规模 **488 条**
+（`openai` 104 / `qwen` 54 / `google` 41 / `anthropic` 29 …），平铺确实没法看。
+
+**只有 Jet Hub 的「显示列表」能分组**；⚠️ **对话框里的模型选择器不能** ——
+那是 harness 自己的 UI（`dsh-client-ui-model-selection`），它只按 **provider**
+分组，`cline` 在里面必然是一个大组；我们能影响的只有每个模型的 id/name。
+
+#### 分组口径（`plugin-src/client/model-groups.js`，纯函数）
+
+| 组 | 判据 | 实测规模 |
+|---|---|---|
+| 订阅额度 | `cline-pass/*` | 18 |
+| 免费额度 | **目录下发的 `isFree === true`** | 7（5 `cline-free/*` + 2 `stealth/*`） |
+| Cline Cloud | `cline-cloud/*` | 有则显示；**空组不渲染** |
+| 按量计费 | 其余全部（走账户余额结算） | 460+ |
+
+⚠️⚠️ **免费必须用 `isFree`，不能在前端按前缀猜**：免费集合是远端
+`recommended-models` 的 `free` 数组 + `:free` 后缀 + `cline-free/` 前缀的
+**并集**（见 `cline-models.ts`），而 **`stealth/pixel-canary` /
+`stealth/space-bunny-alpha` 在 `free` 数组里却不在 `cline-free/` 命名空间下**
+—— 按前缀判会把这两条**免费模型错归进「按量计费」**，用户以为要花钱而不敢用。
+⚠️ `isFree` **缺失**（老/外部适配器不报）时保守归入「按量计费」：那是兜底桶，
+「没说免费」比「谎称免费」安全（与全仓「未知不编造」一致）。
+
+#### 展开策略（`groupExpanded`）
+
+优先级：**用户点过 > 有筛选 > 默认**。默认**「按量计费」折叠、其余展开**
+（前者是兜底大桶、多数是关的，默认展开等于把列表撑到没法用）；**有搜索/筛选时
+一律展开**（否则搜到的结果藏在折叠组里，看起来像「没搜到」）。
+⚠️ **不要把默认值烘焙进 state**：只存「用户点过的组」，否则「清空筛选后恢复
+默认」就做不到了。
+
+#### ⚠️ 新增端点 `model.setDisabledMany`（按子集），**不能**复用 `setAllDisabled`
+
+分组的「本组全开/全关」必须只动本组的 id。若图省事复用
+`model.setAllDisabled`：**它的打开方向是「清空整张黑名单」** ⇒
+「只打开订阅额度这一组」会把用户特意关着的**按量计费 460 多条一起打开**。
+
+- 池新增 `AccountPool.clearModelsDisabled(provider, modelIds)`：**只删传入的 id**
+  （与 `clearDisabledModels` 的「清空全部、并顺带清掉已下线死键」是**两个语义**，
+  别混）；**无实际变更不落盘**（该组本就全开时不该产生一次文档重写 + 目录广播）。
+- 端点：校验 `provider` / `modelIds` 数组 / `disabled` 布尔（**不猜默认值**，
+  与另两个开关端点同约定），**去重 + 剔脏值后为空则拒**，只落盘一次、只广播一次。
+- 反向验证：把打开方向改回 `clearDisabledModels` → 用例红
+  （`expected {} to deeply equal { Object (buddy) }`，即「其它组的关闭项被一起清掉了」）。
+
+#### `model.list` 新增 `isFree`（缺失不编造）
+
+`ModelCatalogSource.listAllModels()` 的返回类型扩展为
+`{ id, name, isFree?: boolean }`，`ClineAdapter` 填上（它来自目录合并的
+`isFree`，与模型选择器里的「· 免费」标签**同源**）。RPC 层**照原样透传、缺失
+就不写这个字段** —— 不编造 `false`（类型上是 `isFree?: boolean`）。
+
+#### ⚠️⚠️ 验证盲区：客户端改动**单测全绿也不代表 bundle 能构建**
+
+`plugin-src/client/*.js` 的改动在本仓库**只被两种方式验证**：纯函数单测 + 把
+`jet-hub.js` 当**文本**读的源码级断言。二者都**不做语法解析** ⇒
+**必须另跑 `pnpm build:client`（或 `build:all`）**。
+本次真踩到：分组渲染用**块体箭头函数**（`group => { ... return ... }`），收尾括号
+比原来的**表达式体**少一层，我多打了一个 `)` —— 3809 条单测全绿、esbuild 报
+`Expected ";" but found ")"`。**改完客户端一律跑一次构建**。
+
+回归用例 `tests/unit/model-groups.spec.ts`（21 条：归组 / 并集不丢模型 /
+组内筛选与计数 / 展开策略 / 组内批量可用性 + 4 条源码级接线断言），
+端点用例在 `tests/unit/jet-hub-rpc.spec.ts` 的 `model.setDisabledMany` 段（10 条）。
+⚠️ 同时更新了 `model-filter.spec.ts` 里锁**旧平铺渲染**的那条断言
+（`filtered.map(...)` → `group.models.map(...)`）—— 与以往同型：**旧断言可能锁死
+被有意改掉的实现**。
+
 ### ⚠️ 额度窗口与请求记录**共享同一个翻页索引**（用户要求）
 
 「订阅额度」弹窗改为：**一次只显示一个账号**，用左右箭头 `‹ ›` 翻页；
