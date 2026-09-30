@@ -73,6 +73,26 @@ vi.mock('../../src/qoder-adapter.js', () => {
   return { QoderAdapter: MockQoderAdapter }
 })
 
+vi.mock('../../src/zcode-adapter.js', () => {
+  /**
+   * ZCode 的桩。
+   *
+   * 与 Qoder 同理：真实推理链路要跑内嵌的 captcha 与（首次请求时的）浏览器，
+   * 单测里跑不通，故判据取「构造了哪个适配器 + 带了哪份产品配置」。
+   */
+  class MockZcodeAdapter {
+    static readonly instances: Array<{ product?: { id: string } }> = []
+    constructor(options: { product?: { id: string } }) {
+      MockZcodeAdapter.instances.push(options)
+    }
+    // eslint-disable-next-line require-yield
+    async *stream(): AsyncGenerator<never> {
+      throw new LlmError('频率限制', 'RATE_LIMIT')
+    }
+  }
+  return { ZcodeAdapter: MockZcodeAdapter }
+})
+
 /**
  * `CodeArtsAdapter` 换成桩，但保留 `isRateLimited` 等**真实导出**。
  *
@@ -141,6 +161,14 @@ async function qoderInstances(): Promise<Array<{ product?: { id: string; encrypt
     QoderAdapter: { instances: Array<{ product?: { id: string; encryptedInferBase: string } }> }
   }
   return mod.QoderAdapter.instances
+}
+
+/** 取 ZCode 桩的构造记录。 */
+async function zcodeInstances(): Promise<Array<{ product?: { id: string } }>> {
+  const mod = await import('../../src/zcode-adapter.js') as unknown as {
+    ZcodeAdapter: { instances: Array<{ product?: { id: string } }> }
+  }
+  return mod.ZcodeAdapter.instances
 }
 
 /**
@@ -332,8 +360,21 @@ describe('account-probe 适配器选择 · TRAE 不得落入 CodeArts 分支', (
  * ⚠️ 这三个 provider 的查表函数**本来就存在**（`qoderProductById` 一份覆盖
  * 国际版与 CN、`clineProductById`），只是没被接上 —— 与 trae「压根没有查表
  * 函数、只能按 provider id 特判」不同，所以修复只需接线，不需要新增数据。
+ *
+ * ## ⚠️ 同型第 4 次：**zcode**（本次一并补上）
+ *
+ * 补 qoder / qodercn / cline 时**又漏了 zcode**，而它与 Qoder 完全同款：
+ * `src/zcode-adapter.ts` 的 `switchAccountOnQuota()` 也调
+ * `pool.updateModelRateLimit(..., nextUtc8DayStartMs())`（UTC+8 当日 24:00 标记）。
+ *
+ * 当时没被发现的原因值得记住：**那个写入点是在本分支建立之后才进 master 的**，
+ * 而本节此前没有 zcode 的对应用例 ⇒ 这个漏项在 CI 上是**静默通过**的
+ * （合并到 master 后全量单测仍然全绿）。
+ *
+ * ⇒ 故本节覆盖到 zcode；`src/account-probe.ts` 里同时写下了机械核对方式
+ * （`grep -n 'updateModelRateLimit(' src/*.ts`），避免第五次。
  */
-describe('account-probe 适配器选择 · qoder / qodercn / cline 不得落入 CodeArts 分支', () => {
+describe('account-probe 适配器选择 · qoder / qodercn / cline / zcode 不得落入 CodeArts 分支', () => {
   beforeEach(async () => {
     ;(await adapterInstances()).length = 0
     ;(await streamOptions()).length = 0
@@ -341,6 +382,7 @@ describe('account-probe 适配器选择 · qoder / qodercn / cline 不得落入 
     ;(await traeStreamOptions()).length = 0
     ;(await codeartsInstances()).length = 0
     ;(await qoderInstances()).length = 0
+    ;(await zcodeInstances()).length = 0
   })
 
   afterEach(() => {
@@ -411,6 +453,41 @@ describe('account-probe 适配器选择 · qoder / qodercn / cline 不得落入 
 
     expect(await codeartsInstances()).toHaveLength(0)
     expect(await qoderInstances()).toHaveLength(0)
+  })
+
+  /**
+   * zcode 这条与 qoder 同款（都写 `modelRateLimits`、都落过 else）。
+   *
+   * 断言面比 qoder 窄：zcode 只有一个产品（`ZCODE` 常量），不存在「两站配置
+   * 接反」的风险，故只需断言「构造的是 ZcodeAdapter、带的是 zcode 产品配置」，
+   * 以及**没有**构造 CodeArtsAdapter（否则就是用华为云签名发 zcode 凭据）。
+   */
+  it('zcode 账号走 ZcodeAdapter 而非 CodeArtsAdapter', async () => {
+    const calls = stubFetch()
+    const { retestAccount } = await import('../../src/account-probe.js')
+    const id = 'zcode-1'
+    const result = await retestAccount(makePool([makeEntry({
+      id,
+      provider: 'zcode',
+      credentialRef: 'ZCODE_ACCOUNT_TEST',
+      /**
+       * ⚠️ 必须带上限流标记：`retestAccount` 的探测目标是
+       * `Object.keys(entry.modelRateLimits)`，没有标记时它**根本不会构造适配器**
+       * —— 那样这条用例会变成**假绿**（既抓不到缺陷，也守不住修复）。
+       */
+      modelRateLimits: { 'GLM-5.3-Flash': Date.now() + 3_600_000 },
+    })]), id)
+
+    expect(result.tested).toBe(1)
+    expect(result.stillLimited).toHaveLength(1)
+
+    const zcode = await zcodeInstances()
+    expect(zcode).toHaveLength(1)
+    expect(zcode[0]?.product?.id).toBe('zcode')
+    // 核心断言：**没有**构造 CodeArtsAdapter（否则就是用华为云签名发 zcode 请求）。
+    expect(await codeartsInstances()).toHaveLength(0)
+    // 桩适配器在构造后立刻抛错，故不该有任何真实请求发出。
+    expect(calls).toHaveLength(0)
   })
 
   it('codearts 账号仍然走 CodeArtsAdapter（else 分支没有被改坏）', async () => {
