@@ -137,6 +137,59 @@ describe('buddy getAccount', () => {
     }
     await expect(getAccount(STATE, token, { fetcher, pollIntervalMs: 0, timeoutMs: 5 })).rejects.toThrow('超时')
   })
+
+  /**
+   * 回归（同型第三处）：`token.domain` 为**空串**时 X-Domain 必须回退到产品域名。
+   *
+   * `token` 由 `parseTokenData` → `readStringField` 产出，该函数在字段缺失/类型
+   * 不符时返回**空串**（不是 `undefined`），故裸用 `token.domain` 会让 X-Domain
+   * 以空值发出 —— 与 `buddy-adapter.ts`（chat 头）和 `buddy.ts`
+   * （`credentialRequestHeaders`）是同一形态。前两处已由 PR!19 修复，这里是
+   * 同一条链路上剩下的第三处（登录轮询的 `login/account`）。
+   *
+   * ⚠️ 兜底值取 `product.apiDomain` 而非常量 `API_DOMAIN`：本请求的 URL 是
+   * `${product.endpoint}${LOGIN_ACCOUNT_PATH}`，X-Domain 必须与产品端点一致。
+   */
+  it('token.domain 为空串时 X-Domain 回退到产品域名', async () => {
+    const fetcher = routeFetch([{
+      when: () => true,
+      respond: () => new Response(JSON.stringify({
+        code: 0, data: { uid: 'u1', nickname: 'n', enterpriseId: '', type: 'personal' },
+      }), { status: 200 }),
+    }])
+    const token = {
+      accessToken: 'AT', refreshToken: 'RT', expiresAt: '', refreshExpiresAt: '', tokenType: 'Bearer', scope: '', domain: '',
+    }
+    await getAccount(STATE, token, { fetcher, pollIntervalMs: 0, product: WORKBUDDY })
+    const [, init] = (fetcher as unknown as { mock: { calls: Array<[string, RequestInit]> } }).mock.calls[0]
+    expect((init.headers as Record<string, string>)['X-Domain']).toBe('www.workbuddy.ai')
+  })
+
+  /**
+   * 锁死「**非空时不被产品覆盖**」这条既有语义。
+   *
+   * 这里是登录流程：`token.domain` 是服务端**本次刚下发**的权威值，不是跨产品
+   * 迁移后过期的历史快照 —— 故它与 `buddy-adapter.ts` 那处「产品优先」方向
+   * 不同。差异只在「兜底值取谁」，判据一致（空串必回退）。
+   *
+   * ⚠️ 若将来决定把本处也改成「产品优先」，必须**同时**改本条用例，并在改动
+   * 说明里讲清为什么登录阶段的即时值不再权威 —— 否则这条用例会挡住无意的
+   * 语义漂移（那正是 PR!19 要修的那类缺陷）。
+   */
+  it('token.domain 非空时仍以服务端下发值为准（不被产品覆盖）', async () => {
+    const fetcher = routeFetch([{
+      when: () => true,
+      respond: () => new Response(JSON.stringify({
+        code: 0, data: { uid: 'u1', nickname: 'n', enterpriseId: '', type: 'personal' },
+      }), { status: 200 }),
+    }])
+    const token = {
+      accessToken: 'AT', refreshToken: 'RT', expiresAt: '', refreshExpiresAt: '', tokenType: 'Bearer', scope: '', domain: 'copilot.tencent.com',
+    }
+    await getAccount(STATE, token, { fetcher, pollIntervalMs: 0, product: WORKBUDDY })
+    const [, init] = (fetcher as unknown as { mock: { calls: Array<[string, RequestInit]> } }).mock.calls[0]
+    expect((init.headers as Record<string, string>)['X-Domain']).toBe('copilot.tencent.com')
+  })
 })
 
 describe('buddy refreshToken', () => {

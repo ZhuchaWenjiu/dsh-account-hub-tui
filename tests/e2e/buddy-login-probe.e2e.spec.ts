@@ -131,7 +131,9 @@ suite('CodeBuddy 登录流程原始响应探针', () => {
 
     // ── 4. login/account ──
     const accountUrl = `${API_ENDPOINT}${LOGIN_ACCOUNT_PATH}?state=${encodeURIComponent(state)}`
-    const tokenDomain = String(tokenData?.domain ?? API_DOMAIN)
+    // ⚠️ `||` 而非 `??`：探针若用 `??`，token 未下发 domain（空串）时会打印
+    // 「X-Domain 为空」却看不出原因 —— 正是 PR!19 要暴露的那种假阴性。
+    const tokenDomain = String(tokenData?.domain || API_DOMAIN)
     const accountRes = await fetch(accountUrl, {
       method: 'GET',
       headers: {
