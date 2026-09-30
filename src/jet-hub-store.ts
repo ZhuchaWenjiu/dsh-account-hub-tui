@@ -244,12 +244,18 @@ class MemoryStore implements JetHubStore {
  * 账号凭据一律存 `{PREFIX}_ACCOUNT_{UUID_SHORT}`（本插件的既有约定），故可据
  * ref 名反推 provider。**表与正则都由本表派生** —— 这是刻意的：
  *
- * ⚠️ 表与正则分家会漂移出「加了 provider 却漏改正则」这类缺陷。真实缺陷：
- * 本表原先只有 **6 项**（注释也写着「六个 provider」），而插件实际有 **11 个**
+ * ⚠️ 表与正则分家会漂移出「加了 provider 却漏改正则」这类缺陷。真实缺陷（**同型两次**）：
+ *
+ * ① 本表原先只有 **6 项**（注释也写着「六个 provider」），而插件实际有 **11 个**
  * —— `qodercn` / `cline` / `loomy` / `raccoon` / `zcode` 五个 provider 的账号在
  * `state.json`（Jet Hub 状态文档）缺失时（重装 / 迁移 / profile 重建）
  * **无法从 `.credentials.yaml` 的 `refs:` 恢复**，用户侧表现为「重装 / 迁移后
  * 这几个面板的账号凭空消失，只能重新登录」。凭据本体一直完好，只是索引建不出来。
+ *
+ * ② **2026-10-02 同型复发**：上游合并第 12 个 provider `minimax` 时**又漏加了本表**
+ * —— `tests/unit/jet-hub-store.spec.ts` 的派生用例当场变红（期望 12 项、实得 11 项），
+ * 但那条用例没在合并前跑到。⇒ 教训：**合并任何「新增 provider」的分支前先跑它**；
+ * 靠人眼维护本表已经漏过两次。
  *
  * ⚠️ **必须与 `src/jet-hub-rpc.ts` 的 `account.create` 生成的 ref 前缀一致**
  * （那里是 `${provider.toUpperCase()}_ACCOUNT_${suffix}`）。**新增 provider 时
@@ -258,9 +264,12 @@ class MemoryStore implements JetHubStore {
  * ⚠️ 单凭据回退 ref（如 `CODEARTS_ACCESS_TOKEN` / `ZCODE_CREDENTIAL`）不含
  * `_ACCOUNT_`，故不会被本表误吞 —— 这里只需登记账号 ref 前缀。
  *
+ * ⚠️ 本表的顺序与客户端 `plugin-src/client/jet-hub.js` 的 `PROVIDERS` **保持一致** ——
+ * 派生用例不校验顺序（恢复顺序由 refs 文件决定），但两者对齐后便于逐项核对。
+ *
  * 依据 `src/product.ts` 与各 `*-product.ts` 的 `id` 字段：
  * `codearts` / `buddy` / `workbuddy` / `lobsterai` / `qoder` / `qodercn`
- * / `trae` / `cline` / `loomy` / `raccoon` / `zcode`。
+ * / `trae` / `cline` / `loomy` / `raccoon` / `minimax` / `zcode`。
  */
 const REF_PREFIX_TO_PROVIDER: ReadonlyArray<readonly [string, string]> = [
   ['CODEARTS', 'codearts'],
@@ -273,6 +282,8 @@ const REF_PREFIX_TO_PROVIDER: ReadonlyArray<readonly [string, string]> = [
   ['CLINE', 'cline'],
   ['LOOMY', 'loomy'],
   ['RACCOON', 'raccoon'],
+  // ⚠️ 第 12 个 provider（上游 2026-10-02 合并）—— 曾漏加，见上方注释 ②。
+  ['MINIMAX', 'minimax'],
   ['ZCODE', 'zcode'],
 ]
 
