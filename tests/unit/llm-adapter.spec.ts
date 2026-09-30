@@ -136,6 +136,66 @@ describe('CodeArtsAdapter', () => {
     expect(typeof call.stream).toBe('function')
   })
 
+  // 回归（2026-09-29）：CodeArts 此前**从不声明** `reasoning`，故模型选择器里
+  // 没有思考档位可选。实测该网关唯一真正生效的思考控制是顶层 `thinking.type`：
+  //   - `{type:'disabled'}` → `reasoning_tokens` 3/3 全为 0、正文仍正确；
+  //   - `{type:'enabled'}` 与不传等价（服务端默认就开着）。
+  // 而 `reasoning_effort`（low/high/none/minimal）与嵌套 `reasoning.effort`
+  // **都被接受但完全无效果**（落在基线噪声内，`none` 也照常思考）。
+  // 故只声明「开启 / 关闭」两档，**不得**臆造 low/high/max 强度阶梯。
+  it('resolveModel declares the thinking on/off switch for every model', async () => {
+    const adapter = makeAdapter()
+    for (const model of ['GLM-5.2', 'glm-5.3-flash', 'deepseek-v4-flash', 'deepseek-v4.1-flash', 'openpangu-2.0-pro']) {
+      const resolved = await adapter.resolveModel('codearts', model)
+      expect({ model, efforts: resolved.reasoning?.efforts.map(e => e.id) }).toEqual({
+        model, efforts: ['on', 'off'],
+      })
+      // 展示名必须是中文（DSH 直接渲染 name，不本地化）。
+      expect(resolved.reasoning?.efforts.map(e => e.name)).toEqual(['开启', '关闭'])
+      // ⚠️ defaultEffort 必须落在 efforts 内，否则 DSH 会抛
+      // UNSUPPORTED_REASONING_EFFORT（dsh-llm 的 resolveCallWithInfo 校验）。
+      expect(resolved.reasoning?.defaultEffort).toBe('on')
+      expect(resolved.reasoning!.efforts.some(e => e.id === resolved.reasoning!.defaultEffort)).toBe(true)
+    }
+  })
+
+  it('maps the "off" effort onto top-level thinking.type=disabled, and sends nothing for "on"', async () => {
+    // ⚠️ 必须断言「开启档不发该字段」：`enabled` 与服务端默认等价，发了只是噪声；
+    // 更重要的是不能把它写成 raccoon 那种 `extra_body.thinking` 嵌套方言
+    // （两者是不同网关的方言，混用会静默无效）。
+    const seen: Array<Record<string, unknown>> = []
+    const fetchImpl = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+      seen.push(JSON.parse(String(init?.body ?? '{}')) as Record<string, unknown>)
+      return new Response(
+        'data: {"choices":[{"delta":{"content":"ok"}}]}\n\ndata: [DONE]\n\n',
+        { status: 200, headers: { 'content-type': 'text/event-stream' } },
+      )
+    })
+    const adapter = makeAdapter({ fetchImpl })
+    const run = async (reasoningEffort?: string) => {
+      const opts = {
+        provider: 'codearts',
+        model: 'deepseek-v4-flash',
+        messages: [],
+        ...reasoningEffort === undefined ? {} : { reasoningEffort },
+        signal: new AbortController().signal,
+      } as never
+      for await (const _ of adapter.stream(opts)) { /* drain */ }
+      return seen.at(-1)!
+    }
+
+    const off = await run('off')
+    expect(off.thinking).toEqual({ type: 'disabled' })
+    // 顶层字段，不是嵌套方言。
+    expect(off.extra_body).toBeUndefined()
+
+    const on = await run('on')
+    expect(on.thinking).toBeUndefined()
+
+    const unset = await run(undefined)
+    expect(unset.thinking).toBeUndefined()
+  })
+
   it('streams text deltas from an OpenAI-compatible SSE response', async () => {
     const fetchImpl = vi.fn(async () => new Response(
       'data: {"choices":[{"delta":{"content":"hi"}}]}\n\n'

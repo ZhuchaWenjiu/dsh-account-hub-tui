@@ -5,7 +5,7 @@ import {
   isQuotaExceededError, LlmAdapter, LlmError, QUOTA_EXCEEDED_CODE,
 } from '@deepseek-ai/dsh-llm'
 import type { GenerateOptions, LlmModelInfo, LlmProviderInfo, LlmResolvedModelInfo, StreamChunk } from '@deepseek-ai/dsh-llm'
-import { ToolCallId } from '@deepseek-ai/dsh-llm'
+import { ReasoningEffortId, ToolCallId } from '@deepseek-ai/dsh-llm'
 import { AccountPool, providerCatalogVisible } from './account-pool.js'
 import { settingsNamespaceFor } from './settings-compat.js'
 import { isCodeArtsBenefitModel } from './models.js'
@@ -831,6 +831,18 @@ export class CodeArtsAdapter extends LlmAdapter {
     const contextWindow = CONTEXT_WINDOWS.get(model)
     const resolved: LlmResolvedModelInfo = { provider, id: model, name }
     if (contextWindow !== undefined) resolved.context = { contextWindow }
+    // 思考开关（实测，2026-09-29）：本网关**唯一**真正生效的思考控制是
+    // 顶层 `thinking.type`。`reasoning_effort`（含 low/high/none/minimal）与
+    // 嵌套 `reasoning.effort` 都被服务端接受但**完全无效果**（判据为服务端
+    // 上报的 reasoning_tokens，落在基线噪声内；`none` 也照常思考）。
+    // 故这里只声明「开启 / 关闭」两档，**不**臆造 low/high/max 强度阶梯。
+    resolved.reasoning = {
+      efforts: [
+        { id: ReasoningEffortId('on'), name: '开启' },
+        { id: ReasoningEffortId('off'), name: '关闭' },
+      ],
+      defaultEffort: ReasoningEffortId('on'),
+    }
     return resolved
   }
 
@@ -914,6 +926,12 @@ export class CodeArtsAdapter extends LlmAdapter {
       // 让服务端返回加密 reasoning 内容与摘要。
       include: ['reasoning.encrypted_content'],
       reasoning_summary: 'auto',
+      // 思考开关（实测，2026-09-29）：档位「关闭」翻成本网关真正认的字段。
+      // ⚠️ 是**顶层** `thinking`，不是 raccoon 那种 `extra_body.thinking` 方言
+      // （两者是不同网关的方言，混用会静默无效）。
+      // 实测判据：`disabled` → reasoning_tokens 3/3 全为 0、正文仍正确；
+      // `enabled` 与不传等价（服务端默认就开着），故「开启」档**不发**该字段。
+      ...options.reasoningEffort === 'off' ? { thinking: { type: 'disabled' } } : {},
       // 对齐 CodeArts Agent IDE 请求体（deveco-code 内核日志实证）：
       // tool_stream=true 让后端将超大工具调用参数（如大文件 file_write）
       // 分段流式传输，避免单次 SSE 事件过大导致连接被掐断
