@@ -48,6 +48,12 @@ describe('OpenAI gateway request conversion', () => {
     expect(normalizeReasoningEffort('none', info)).toBe('off')
     expect(normalizeReasoningEffort('off', info)).toBe('off')
   })
+  it('maps CodeArts generic levels even when legacy runtime omits reasoning metadata', () => {
+    expect(normalizeReasoningEffort('high', undefined, 'codearts', 'deepseek-v4-flash')).toBe('on')
+    expect(normalizeReasoningEffort('max', undefined, 'codearts', 'deepseek-v4-flash')).toBe('on')
+    expect(normalizeReasoningEffort('none', undefined, 'codearts', 'deepseek-v4-flash')).toBe('off')
+  })
+
   it('rejects forced function tool choice in the first version', () => {
     expect(() => toGenerateOptions({
       model: 'qoder/qfmodel',

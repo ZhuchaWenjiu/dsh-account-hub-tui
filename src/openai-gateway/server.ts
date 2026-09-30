@@ -123,7 +123,7 @@ export function createOpenAiGateway(options: OpenAiGatewayOptions): OpenAiGatewa
       const body = await readJson(request, controller.signal)
       const route = parseModelRoute(body.model)
       const modelInfo = await options.llm.resolveModelInfo(route.provider, route.model, controller.signal)
-      const reasoningEffort = normalizeReasoningEffort(body.reasoning_effort, modelInfo)
+      const reasoningEffort = normalizeReasoningEffort(body.reasoning_effort, modelInfo, route.provider, route.model)
       const generate = toGenerateOptions(body, controller.signal, reasoningEffort)
       const stream = options.llm.stream(generate)
       if (body.stream === true) {

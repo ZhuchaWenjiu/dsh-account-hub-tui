@@ -40,9 +40,17 @@ export interface OpenAiChatRequest {
   tool_choice?: unknown
 }
 
-export function normalizeReasoningEffort(requested: unknown, modelInfo: unknown): string | undefined {
+export function normalizeReasoningEffort(
+  requested: unknown,
+  modelInfo: unknown,
+  provider?: string,
+  model?: string,
+): string | undefined {
   if (requested === undefined) return undefined
   const value = String(requested)
+  if (provider === 'codearts' && model !== undefined) {
+    return value === 'none' || value === 'off' ? 'off' : 'on'
+  }
   const record = modelInfo as { reasoning?: { efforts?: readonly { id?: unknown }[] } } | undefined
   const supported = new Set((record?.reasoning?.efforts ?? []).map(effort => String(effort.id)))
   if (supported.size === 0 || supported.has(value)) return value
