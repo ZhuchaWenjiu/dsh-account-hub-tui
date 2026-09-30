@@ -46,6 +46,10 @@ import { httpErrorCode, collectImages } from './openai-compat.js'
 import { MINIMAX, MINIMAX_INFER_PATH, type MinimaxProduct } from './minimax-product.js'
 import { minimaxInferHeaders } from './minimax.js'
 import {
+  registerAdapterIdempotent,
+  registerConfigurableProvidersIdempotent,
+} from './llm-register-compat.js'
+import {
   buildMinimaxMessagesPayload,
   consumeMinimaxSse,
   type MinimaxInlineImage,
@@ -430,7 +434,7 @@ export function registerMinimaxLlm(
   options: MinimaxAdapterOptions,
 ): MinimaxAdapter {
   const product = options.product ?? MINIMAX
-  ctx.llm.registerConfigurableProviders([
+  registerConfigurableProvidersIdempotent(ctx.llm, [
     {
       provider: product.id,
       displayName: product.displayName,
@@ -439,6 +443,6 @@ export function registerMinimaxLlm(
     },
   ])
   const adapter = new MinimaxAdapter(options)
-  ctx.llm.registerAdapter([product.id], adapter)
+  registerAdapterIdempotent(ctx.llm, [product.id], adapter)
   return adapter
 }

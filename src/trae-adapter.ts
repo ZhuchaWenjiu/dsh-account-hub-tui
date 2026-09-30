@@ -48,6 +48,10 @@ import { TRAE, type TraeFallbackModel, type TraeProduct } from './trae-product.j
 import { classifyTraeError, recordsTraeRateLimit, shouldRotateTraeAccount } from './trae-errors.js'
 import { normalizeHarnessMessages } from './message-shape.js'
 import { createBlankReasoningSuppressor, createReasoningLoopDetector, hasUsableToolName, isProseTruncatedByStopString, isReasoningLoopGuardEnabled, isTruncatedArguments, normalizeToolArguments, readWithIdleTimeout, reasoningLoopFailure, resolveEmptyResponseReason, resolveToolPairing, splitThinkTaggedContent, stripBareThinkCloseTagIfEnabled, stripCourseLeakFromHistoryContent, stripCourseLeakIfEnabled } from './sse.js'
+import {
+  registerAdapterIdempotent,
+  registerConfigurableProvidersIdempotent,
+} from './llm-register-compat.js'
 
 /** 本适配器注册的 provider 路由名。 */
 export const PROVIDER = 'trae'
@@ -1814,7 +1818,7 @@ function trimTraeHistory(
  */
 export function registerTraeLlm(ctx: Context, options: TraeAdapterOptions): TraeAdapter {
   const product = options.product ?? TRAE
-  ctx.llm.registerConfigurableProviders([
+  registerConfigurableProvidersIdempotent(ctx.llm, [
     {
       provider: product.id,
       displayName: product.displayName,
@@ -1824,7 +1828,7 @@ export function registerTraeLlm(ctx: Context, options: TraeAdapterOptions): Trae
     },
   ])
   const adapter = new TraeAdapter(options)
-  ctx.llm.registerAdapter([product.id], adapter)
+  registerAdapterIdempotent(ctx.llm, [product.id], adapter)
   // 返回实例：Jet Hub 的「显示列表」需要它的 `listAllModels()`（不受用户黑名单
   // 影响的全量目录，带最终展示名/倍率）。DSH 的 `ctx.llm` 不透传自定义方法，
   // 故必须由调用方持有引用。

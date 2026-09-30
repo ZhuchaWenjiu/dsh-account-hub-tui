@@ -35,6 +35,10 @@ import { unwrapQoderEnvelopeStream } from './qoder-envelope.js'
 import { QODER, type QoderFallbackModel, type QoderModelPromotion, type QoderProduct } from './qoder-product.js'
 import { projectRequestImage, type ImageRequestTarget } from './image-budget.js'
 import {
+  registerAdapterIdempotent,
+  registerConfigurableProvidersIdempotent,
+} from './llm-register-compat.js'
+import {
   collectImages,
   consumeOpenAiSse,
   contentToText,
@@ -1127,7 +1131,7 @@ export function qoderDisplayName(model: QoderFallbackModel, now: Date = new Date
  */
 export function registerQoderLlm(ctx: Context, options: QoderAdapterOptions): QoderAdapter {
   const product = options.product ?? QODER
-  ctx.llm.registerConfigurableProviders([
+  registerConfigurableProvidersIdempotent(ctx.llm, [
     {
       provider: product.id,
       displayName: product.displayName,
@@ -1136,7 +1140,7 @@ export function registerQoderLlm(ctx: Context, options: QoderAdapterOptions): Qo
     },
   ])
   const adapter = new QoderAdapter(options)
-  ctx.llm.registerAdapter([product.id], adapter)
+  registerAdapterIdempotent(ctx.llm, [product.id], adapter)
   // 返回实例：Jet Hub「显示列表」需要 `listAllModels()`（不受黑名单影响、
   // 带最终展示名/倍率）。`ctx.llm` 不透传自定义方法，须由调用方持有引用。
   return adapter

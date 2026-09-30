@@ -54,6 +54,10 @@ import {
 } from './lobsterai-errors.js'
 import { normalizeHarnessMessages } from './message-shape.js'
 import { createBlankReasoningSuppressor, createReasoningLoopDetector, hasUsableToolName, isProseTruncatedByStopString, isReasoningLoopGuardEnabled, isTruncatedArguments, normalizeToolArguments, readWithIdleTimeout, reasoningLoopFailure, resolveEmptyResponseReason, resolveToolPairing, splitThinkTaggedContent, stripBareThinkCloseTagIfEnabled, stripCourseLeakFromHistoryContent, stripCourseLeakIfEnabled } from './sse.js'
+import {
+  registerAdapterIdempotent,
+  registerConfigurableProvidersIdempotent,
+} from './llm-register-compat.js'
 
 /** 本适配器注册的 provider 路由名（历史常量，等价于 `LOBSTERAI.id`）。 */
 export const PROVIDER = 'lobsterai'
@@ -1703,7 +1707,7 @@ function displayNameFor(model: LobsteraiRemoteModel): string {
  */
 export function registerLobsteraiLlm(ctx: Context, options: LobsteraiAdapterOptions): LobsteraiAdapter {
   const product = options.product ?? LOBSTERAI
-  ctx.llm.registerConfigurableProviders([
+  registerConfigurableProvidersIdempotent(ctx.llm, [
     {
       provider: product.id,
       displayName: product.displayName,
@@ -1712,7 +1716,7 @@ export function registerLobsteraiLlm(ctx: Context, options: LobsteraiAdapterOpti
     },
   ])
   const adapter = new LobsteraiAdapter(options)
-  ctx.llm.registerAdapter([product.id], adapter)
+  registerAdapterIdempotent(ctx.llm, [product.id], adapter)
   // 返回实例：Jet Hub「显示列表」需要 `listAllModels()`（不受黑名单影响、
   // 带最终展示名/倍率）。`ctx.llm` 不透传自定义方法，须由调用方持有引用。
   return adapter
