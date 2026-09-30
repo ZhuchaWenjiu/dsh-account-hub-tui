@@ -11,8 +11,20 @@ import {
 import { CLINE } from '../../src/cline-product.js'
 import { mergeClineModels, type ClineModel } from '../../src/cline-models.js'
 import type { ClineCredential } from '../../src/cline.js'
+import {
+  readClineRequestHistory,
+  resetClineRequestHistory,
+} from '../../src/cline-request-log.js'
 
 const here = dirname(fileURLToPath(import.meta.url))
+
+/**
+ * 账号池里的账号 id。
+ *
+ * ⚠️ 它与 {@link cred} 里的 `account_id`（`usr-…`）是**两个 id 空间** ——
+ * 「请求记录中数据空白」这个真实缺陷的根因就是两者被混用。
+ */
+const POOL_ACCOUNT_ID = 'cline-bb211a53'
 
 /** 实测凭据形态（access_token 自带 workos: 前缀）。 */
 const cred: ClineCredential = {
@@ -602,6 +614,57 @@ describe('Cline 接线（源码级回归）', () => {
     expect(source.match(/yield\* this\.consumeWithLog\(/g)).toHaveLength(2)
     // 不得有绕过记录的消费出口（记录失败不反噬推理，但漏记会丢数据）
     expect(source).not.toMatch(/yield\* this\.consume\(/)
+  })
+
+  /**
+   * ⚠️⚠️ **真实缺陷**（用户报障「请求记录中数据空白，没有记录下来」）：
+   * 请求记录的「账号」必须是**账号池 id**（`cline-bb211a53`），
+   * **不是**凭据里的 `account_id`（`usr-…`）。
+   *
+   * 面板用 `cline.quota` 下发的**池 id** 去过滤记录（`cline.requestLog` 的
+   * `accountId`），而成功路径原先记的是 `credential.account_id` ——
+   * 两个 id 空间不一致 ⇒ `readClineRequestHistory({ accountId })` 恒返回空
+   * ⇒ **表格永远空白**（换号路径记的却是池 id，两条路径口径还不一致，
+   * 属同一缺陷的两半）。
+   *
+   * ⚠️ **反向验证**：把适配器改回 `credential.account_id ?? …` → 本用例变红。
+   */
+  it('请求记录归属「账号池 id」（不是凭据里的 usr- 用户 id）', async () => {
+    resetClineRequestHistory()
+    const adapter = makeAdapter({
+      currentAccountId: () => POOL_ACCOUNT_ID,
+      fetchImpl: (async () => sseResponse([
+        JSON.stringify({ choices: [{ delta: { content: 'hi' } }] }),
+        JSON.stringify({ choices: [{ delta: {}, finish_reason: 'stop' }] }),
+      ])) as unknown as typeof fetch,
+    })
+    await collect(adapter)
+
+    const rows = readClineRequestHistory()
+    expect(rows).toHaveLength(1)
+    expect(rows[0]!.accountId).toBe(POOL_ACCOUNT_ID)
+    // 关键：**不能**是凭据里的 `usr-…` —— 那正是空白的原因
+    expect(rows[0]!.accountId).not.toBe(cred.account_id)
+    // 面板用的过滤条件（池 id）必须能查到这一行，且用 usr-… 查不到
+    expect(readClineRequestHistory({ accountId: POOL_ACCOUNT_ID })).toHaveLength(1)
+    expect(readClineRequestHistory({ accountId: cred.account_id! })).toHaveLength(0)
+  })
+
+  /**
+   * 没有池账号（回退到单凭据 `CLINE_ACCESS_TOKEN` 模式）时仍要记一行，
+   * 只是退回凭据里的 `account_id` —— 那种模式下 `cline.quota` 同样没有账号
+   * 可翻页，记录查不到但至少不丢数据、也不会张冠李戴。
+   */
+  it('无池账号时退回记凭据的 account_id（单凭据模式不丢记录）', async () => {
+    resetClineRequestHistory()
+    const adapter = makeAdapter({
+      fetchImpl: (async () => sseResponse([
+        JSON.stringify({ choices: [{ delta: { content: 'hi' } }] }),
+        JSON.stringify({ choices: [{ delta: {}, finish_reason: 'stop' }] }),
+      ])) as unknown as typeof fetch,
+    })
+    await collect(adapter)
+    expect(readClineRequestHistory()[0]!.accountId).toBe(cred.account_id)
   })
 
   it('能力矩阵登记 cline 为「有余额、无签到、有订阅额度」', () => {

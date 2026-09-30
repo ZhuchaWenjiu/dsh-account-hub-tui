@@ -2863,6 +2863,39 @@ Cline 面板的账号管理区有一个**订阅额度**按钮（只在 Cline 出
     （record 内部全部 try/catch + 钳制 + 截断）。
 - 存储：**进程内存，100 条，重启即丢**（刻意，与参考一致；高频写不适合持久化）。
 
+### ⚠️⚠️ 请求记录的「账号」必须用**账号池 id**，不能用凭据里的 `account_id`（真实缺陷，2026-09-30）
+
+**用户报障**：「请求记录中数据空白，没有记录下来」。
+
+**根因是两个 id 空间被混用** —— 字段名叫 `accountId` 的有**两套值**：
+
+| 位置 | 值 | 形如 |
+|---|---|---|
+| 面板的过滤条件 `cline.requestLog.accountId` | **账号池 id**（取自 `cline.quota` 的 `accounts[].accountId`，即 `account.id`） | `cline-bb211a53` |
+| 适配器原先在**成功路径**记的 | 凭据里的 `account_id`（Cline 的**用户 id**） | `usr-01M3BCV4FY…` |
+
+两者不相等 ⇒ `readClineRequestHistory({ accountId })` 恒返回空 ⇒ 表格**永远空白**。
+（换号路径当时记的却是池 id —— 同一缺陷的两半，两条出口口径不一致。）
+
+**修法**：`ClineAdapterOptions` 新增 `currentAccountId?: () => string | undefined`，
+由 `src/index.ts` 在 `resolveCredential` 里记录**实际选中的池账号**
+（`activeClineAccountId`，与 `activeQoderAccountId` 同因、同写法）；
+适配器在 stream() 开头用它做**局部变量**的起点（只在首次取值，
+换号后自行跟进），两个出口都用「池 id 优先、无池账号才退回 `usr-…`」。
+
+⚠️ **反向验证已做**（本仓库要求）：把正常路径改回 `credential.account_id ?? …`
+→ `cline-adapter.spec.ts` 的「请求记录归属『账号池 id』」**变红**，报错为
+`expected 'usr-01M3BCV4FYCGJKAWD3MJG3DBQM' to be 'cline-bb211a53'`；还原后全绿。
+
+⚠️ **做这次反向验证时连踩两个工具坑**（都会让验证**假绿**，务必避开）：
+1. **同一表达式在文件里出现两次**（换号路径 + 正常路径，文本完全相同）——
+   用字符串 `replace` 命中的是**第一处（换号路径）**，而用例走的是正常路径，
+   于是「回退了却仍全绿」。必须按**上下文/最后一次出现**定位。
+2. **本仓库源文件是 CRLF**：脚本里写 `\n` 的**多行**锚点永远匹配不上
+   （单行锚点没事，所以第一次只替换成功的假象更难发现）。按行处理即可。
+   ⚠️ 另：**Windows 下别用内联 `node -e`**，PowerShell 会吃掉
+   `\``/`$`/引号（本次两次静默跑错），写成 `.mjs` 文件再跑。
+
 ### ⚠️ 额度窗口与请求记录**共享同一个翻页索引**（用户要求）
 
 「订阅额度」弹窗改为：**一次只显示一个账号**，用左右箭头 `‹ ›` 翻页；

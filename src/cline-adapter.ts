@@ -156,6 +156,18 @@ export interface ClineAdapterOptions {
   /** 多账号池（用于限流时切换账号与模型黑名单）。 */
   accountPool?: AccountPool
   /**
+   * 「本次实际使用的是哪个**账号池账号**」（池 id，如 `cline-bb211a53`）。
+   *
+   * ⚠️ **请求记录的「账号」列必须用池 id，不能用凭据里的 `account_id`**：
+   * 面板拿 `cline.quota` 下发的**池 id** 去过滤记录，两个 id 空间不一致时
+   * 过滤恒为空 → 表格**永远空白**（真实缺陷，用户报障「请求记录中数据空白」）。
+   *
+   * ⚠️ 回调**只用于首次确定起点**（与 `QoderAdapterOptions.currentAccountId` 同因）：
+   * 它返回「池当前会给出的那个账号」，适配器内部换号后**不会跟着变**，
+   * 故换号后必须用局部变量跟进。
+   */
+  currentAccountId?: () => string | undefined
+  /**
    * 读取图片附件的原始字节（内联为 data URL 用）。
    *
    * 由调用方桥接 `ctx.attachments.readImage(ref)`；未提供时收到图片会报
@@ -486,7 +498,11 @@ export class ClineAdapter extends LlmAdapter {
     // ⚠️ **403 必须先排除「地域限制」**：它与凭据无关，续期在这里永远无用，
     // 且最终会被归成 AUTH（UI 显示「API 密钥无效」），真实原因彻底丢失。
     // 命中时直接抛出带真实原因的错误（见 isClineRegionForbidden）。
-    let currentAccountId = ''
+    // ⚠️ 用**账号池 id** 起步，**不是**凭据里的 `account_id`（`usr-…`）：
+    // 面板用 `cline.quota` 下发的池 id 过滤请求记录，用错 id 空间会让表格
+    // **永远空白**（真实缺陷，用户报障「请求记录中数据空白」）。
+    // ⚠️ 回调只用于**首次**确定起点，换号后由下面的局部变量跟进（与 Qoder 同因）。
+    let currentAccountId = this.options.currentAccountId?.() ?? ''
     let response = await this.send(credential, body, options)
     if (!response.ok && (response.status === 401 || response.status === 403)) {
       const forbiddenText = await response.text().catch(() => '')
@@ -560,7 +576,11 @@ export class ClineAdapter extends LlmAdapter {
     // 5. 消费 SSE 流(并记录请求流水,见 consumeWithLog)
     yield* this.consumeWithLog(response, options, {
       model: options.model,
-      accountId: credential.account_id ?? currentAccountId,
+      // ⚠️ **池 id 优先**：面板按 `cline.quota` 的池 id 过滤记录，用凭据里的
+      // `usr-…` 会让过滤恒空（表格永远空白）。只有**没有池账号**（回退到单凭据
+      // ref 的模式）时才退回 `usr-…` —— 那种模式下 `cline.quota` 同样没有账号
+      // 可翻页，记录查不到但至少不会张冠李戴。
+      accountId: currentAccountId.length > 0 ? currentAccountId : (credential.account_id ?? ''),
       startedAt,
     })
   }
