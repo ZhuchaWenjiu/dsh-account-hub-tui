@@ -36,6 +36,37 @@ deepseek-harness 插件：执行 CodeArts（华为云）登录流程，默认走
 是否出现在对话框的模型选择里（黑名单制，默认全部显示）——
 见 [模型列表开关](#模型列表开关黑名单)。
 
+## 本机 OpenAI Chat Completions 网关
+
+插件启动后会在 `127.0.0.1:8326` 提供标准 OpenAI Chat Completions 接口，供 Pi、Continue、Cline、OpenCode 或其他兼容客户端使用。网关复用 Jet Hub 已登录账号和现有 provider 适配器，不把上游凭据复制到客户端。
+
+接口：
+
+```text
+GET  http://127.0.0.1:8326/v1/models
+POST http://127.0.0.1:8326/v1/chat/completions
+```
+
+鉴权使用：
+
+```text
+Authorization: Bearer <网关 API Key>
+```
+
+优先从 `DSH_OPENAI_GATEWAY_API_KEY` 读取；未设置时，插件首次启动会在 DSH home 的 `openai-gateway/api-key` 生成并持久化随机密钥，重启后保持不变。端口可通过 `DSH_OPENAI_GATEWAY_PORT` 修改；端口被占用时不会随机切换。
+
+模型 ID 使用 `provider/model` 形式，例如：
+
+```text
+codearts/GLM-5.3
+qoder/qfmodel
+qodercn/qfmodel
+zcode/GLM-5.3-Flash
+```
+
+第一期支持流式/非流式文本、reasoning、工具调用、工具结果、用量和请求取消。图片暂不静默丢弃：当前网关无法把外部 OpenAI 图片引用安全转换为 DSH 附件时，会明确返回不支持错误。
+
+
 ## 安装
 
 该包尚未发布到 npm registry。提供两种安装方式：**git 仓库安装**（推荐，自动拉取

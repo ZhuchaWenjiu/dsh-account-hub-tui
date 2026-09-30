@@ -31,6 +31,7 @@ import { hasLegacyNamespaceRegistration, settingsOf, suppressAutoSettingsPage } 
 import type { ImageRequestTarget } from './image-budget.js'
 import { buildRaccoonNickname, registerJetHubRpc } from './jet-hub-rpc.js'
 import { CODEBUDDY, WORKBUDDY, type BuddyProduct } from './product.js'
+import { mountOpenAiGateway } from './openai-gateway/index.js'
 import { buddyExpiringWindowDays } from './buddy-balance-rank.js'
 import { BuddyBalanceSelector, pickBuddyAccount } from './buddy-balance-selector.js'
 import { LOBSTERAI } from './lobsterai-product.js'
@@ -1475,5 +1476,6 @@ const zcodeAdapter = registerZcodeLlm(ctx, {
   }
 
   registerJetHubRpc(ctx, pool, service, buddy, workbuddy, lobsterai, qoder, qoderCn, trae, cline, loomy, raccoon, minimax, zcode, modelAdapters)
+  mountOpenAiGateway(ctx)
   ctx.provide('accountPool', pool)
 }
