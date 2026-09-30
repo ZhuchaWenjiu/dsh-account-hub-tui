@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import { ReasoningEffortId } from '@deepseek-ai/dsh-llm'
-import { parseModelRoute, toGenerateOptions, OpenAiGatewayError } from '../../src/openai-gateway/messages.js'
+import { parseModelRoute, toGenerateOptions, OpenAiGatewayError, normalizeReasoningEffort } from '../../src/openai-gateway/messages.js'
 
 describe('OpenAI gateway request conversion', () => {
   it('parses a namespaced model route', () => {
@@ -41,6 +41,13 @@ describe('OpenAI gateway request conversion', () => {
     expect(options.messages[3].content).toContainEqual(expect.objectContaining({ type: 'tool-result', toolCallId: 'call-1' }))
   })
 
+  it('maps generic reasoning levels to the provider declared on/off levels', () => {
+    const info = { reasoning: { efforts: [{ id: 'on' }, { id: 'off' }] } }
+    expect(normalizeReasoningEffort('max', info)).toBe('on')
+    expect(normalizeReasoningEffort('high', info)).toBe('on')
+    expect(normalizeReasoningEffort('none', info)).toBe('off')
+    expect(normalizeReasoningEffort('off', info)).toBe('off')
+  })
   it('rejects forced function tool choice in the first version', () => {
     expect(() => toGenerateOptions({
       model: 'qoder/qfmodel',

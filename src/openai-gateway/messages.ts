@@ -40,6 +40,22 @@ export interface OpenAiChatRequest {
   tool_choice?: unknown
 }
 
+export function normalizeReasoningEffort(requested: unknown, modelInfo: unknown): string | undefined {
+  if (requested === undefined) return undefined
+  const value = String(requested)
+  const record = modelInfo as { reasoning?: { efforts?: readonly { id?: unknown }[] } } | undefined
+  const supported = new Set((record?.reasoning?.efforts ?? []).map(effort => String(effort.id)))
+  if (supported.size === 0 || supported.has(value)) return value
+  if ((value === 'none' || value === 'off') && supported.has('off')) return 'off'
+  if (value !== 'none' && value !== 'off' && supported.has('on')) return 'on'
+  throw new OpenAiGatewayError(
+    `reasoning effort ${JSON.stringify(value)} is not supported by the selected DSH model`,
+    400,
+    'unsupported_parameter',
+    'unsupported_reasoning_effort',
+  )
+}
+
 function textFromContent(content: unknown): string {
   if (typeof content === 'string') return content
   if (content === null || content === undefined) return ''
@@ -151,7 +167,7 @@ function tokenValue(value: unknown, name: string): number | undefined {
   return value
 }
 
-export function toGenerateOptions(body: OpenAiChatRequest, signal: AbortSignal): GenerateOptions {
+export function toGenerateOptions(body: OpenAiChatRequest, signal: AbortSignal, reasoningEffortOverride?: string): GenerateOptions {
   const { provider, model } = parseModelRoute(body.model)
   if (!Array.isArray(body.messages) || body.messages.length === 0) {
     throw new OpenAiGatewayError('messages must be a non-empty array')
@@ -175,6 +191,7 @@ export function toGenerateOptions(body: OpenAiChatRequest, signal: AbortSignal):
   if (body.tool_choice === 'none' && tools !== undefined && tools.length > 0) {
     throw new OpenAiGatewayError('tool_choice none with tools cannot be represented by DSH', 400, 'unsupported_parameter', 'unsupported_parameter')
   }
+  const reasoningEffort = reasoningEffortOverride ?? (body.reasoning_effort === undefined ? undefined : String(body.reasoning_effort))
   return {
     provider,
     model,
@@ -183,7 +200,7 @@ export function toGenerateOptions(body: OpenAiChatRequest, signal: AbortSignal):
     ...maxTokens === undefined ? {} : { maxTokens },
     ...temperature === undefined ? {} : { temperature },
     ...stop === undefined ? {} : { stop },
-    ...body.reasoning_effort === undefined ? {} : { reasoningEffort: ReasoningEffortId(String(body.reasoning_effort)) },
+    ...reasoningEffort === undefined ? {} : { reasoningEffort: ReasoningEffortId(reasoningEffort) },
     signal,
   }
 }

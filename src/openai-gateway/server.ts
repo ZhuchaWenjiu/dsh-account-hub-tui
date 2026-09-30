@@ -5,7 +5,7 @@ import type { Context } from '@deepseek-ai/cordis'
 import type { GenerateOptions, LlmModelInfo, StreamChunk } from '@deepseek-ai/dsh-llm'
 import { loadOrCreateApiKey } from './auth.js'
 import { resolveGatewayConfig, type OpenAiGatewayConfig } from './config.js'
-import { toGenerateOptions, OpenAiGatewayError, parseModelRoute, type OpenAiChatRequest } from './messages.js'
+import { toGenerateOptions, OpenAiGatewayError, parseModelRoute, normalizeReasoningEffort, type OpenAiChatRequest } from './messages.js'
 import { toOpenAiModels } from './models.js'
 import { collectOpenAiCompletion, failureToOpenAiError, toOpenAiSse } from './stream.js'
 
@@ -122,8 +122,9 @@ export function createOpenAiGateway(options: OpenAiGatewayOptions): OpenAiGatewa
     try {
       const body = await readJson(request, controller.signal)
       const route = parseModelRoute(body.model)
-      await options.llm.resolveModelInfo(route.provider, route.model, controller.signal)
-      const generate = toGenerateOptions(body, controller.signal)
+      const modelInfo = await options.llm.resolveModelInfo(route.provider, route.model, controller.signal)
+      const reasoningEffort = normalizeReasoningEffort(body.reasoning_effort, modelInfo)
+      const generate = toGenerateOptions(body, controller.signal, reasoningEffort)
       const stream = options.llm.stream(generate)
       if (body.stream === true) {
         response.writeHead(200, {
