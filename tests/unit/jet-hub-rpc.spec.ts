@@ -1843,6 +1843,10 @@ describe('provider.status / provider.setEnabled 端点', () => {
       // 「无冲突」（改动分散在不同段落），但 `qoderCn` 插入后这里的占位整体错位
       // 一位 → `modelAdapters` 落到 `raccoon` 上 → 上面那三条用例再次假失败。
       // **合并新增 provider 后必须重跑本组用例，不能只看 git 是否报冲突。**
+      // ⚠️ **第六次**（2026-10-01，为提交独立 PR 而把本分支重建到最新上游）：
+      // 上游此后又加了 `minimax` 与 `zcode` ⇒ 这里少两个占位、`modelAdapters`
+      // 落到 `zcode` 上，本组 3 条用例**再次**以完全相同的形态失败。
+      // 判据永远是同一条：`provider.status` 的 `total` 恒为 0 ⇒ 先数占位。
       ctx as never, pool,
       {} as never, // codearts
       {} as never, // buddy
@@ -1854,6 +1858,8 @@ describe('provider.status / provider.setEnabled 端点', () => {
       {} as never, // cline
       {} as never, // loomy
       {} as never, // raccoon
+      {} as never, // minimax
+      {} as never, // zcode
       (adapter !== undefined ? { buddy: adapter } : undefined) as never,
     )
     if (handler === undefined) throw new Error('endpoint handler was not registered')
