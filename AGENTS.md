@@ -5294,24 +5294,38 @@ pnpm test:e2e:minimax-chat   # ⚠️ 发推理（真实适配器；默认 M2.7�
 可能轮换 `refresh_token`，若我们刷一次却不写回客户端文件，用户的客户端登录态
 就会被弄坏。实测过期 token 打只读端点返回 **HTTP 401 `invalid access token`**。
 
-### 10. ⚠️ `registerJetHubRpc` 的位置参数陷阱（**第 4 次复发**）
+### 10. ⚠️ `registerJetHubRpc` 的位置参数陷阱（**第 5 次复发**）
 
-`registerJetHubRpc` 是长**位置**参数列表（11 个 auth + `modelAdapters`）。
+`registerJetHubRpc` 是长**位置**参数列表（**12 个 auth** + `modelAdapters`，
+顺序：`codearts, buddy, workbuddy, lobsterai, qoder, qoderCn, trae, cline,
+loomy, raccoon, minimax, zcode`）。
 新增 provider 时**必须**在 `tests/unit/jet-hub-rpc.spec.ts` 的调用点补占位，
 否则 `modelAdapters` 会**错位**落到最后一个 auth 形参上。
 
-**已复发四次**：加 Loomy、加 Raccoon、加 QoderCN、**加 MiniMax**（本次）。
-测试注释里逐字预言过这个坑。本次症状：`jet-hub-rpc.spec.ts` 的
-「关闭的模型仍显示带倍率的展示名」**确定性失败**，而
-`git diff` 显示**没碰** `model.list` 相关代码。
+**已复发五次**：加 Loomy、加 Raccoon、加 QoderCN、加 MiniMax、**加 ZCode
+（2026-09-30 合并上游时一次插了两个 provider，第 5 次）**。
+测试注释里逐字预言过这个坑。
 
-⚠️ **排查教训（值得复用）**：一条看起来「与本次改动无关」的失败，
-**不要**先假设是抖动 —— 用 `git stash push -u` 回到基线跑同一文件：
-基线 3/3 通过、恢复后必失败 ⇒ **确证是自己引入的**。
+⚠️⚠️ **第 5 次的关键差别：这是「合并」引发的，`git` 全程不报冲突。**
+上游把 `minimax` / `zcode` 插在 `raccoon` 之后，`jet-hub-rpc.spec.ts` 的
+`provider.status` 那处调用点没跟上 → `modelAdapters` 落到 `minimax` 形参上、
+真正的位置收到 `undefined` → 实现退化成套黑名单的 `ctx.llm.listModels()`。
+症状与第 4 次**同型但报错位置不同**：三条用例断言
+`{ total, disabled }` 时实际拿到 **`{ total: 0, disabled: 0 }`**
+（不是渲染问题，是**目录读不到**）。
+⇒ **合并任何新增 provider 的上游改动后，必须重跑 `jet-hub-rpc.spec.ts` 的
+`provider.status` 组，不能以「git 没报冲突」判定合并没有语义问题。**
+排查脚本可离线复查全部调用点的实参对齐（剥注释后逐个数形参，
+本机实践：Windows 下别用内联 `node -e`，PowerShell 会吃掉引号/反引号，
+写成 `.mjs` 文件再跑）。
 
 ⚠️ **另一个格式陷阱**：`registerJetHubRpc` 的**调用**必须保持**单行**
-（`... raccoon, minimax, modelAdapters)`）。拆成多行（哪怕只加尾随逗号）
+（`... raccoon, minimax, zcode, modelAdapters)`）。拆成多行（哪怕只加尾随逗号）
 会让 `qoder-wiring.spec.ts` / `raccoon-wiring.spec.ts` 的正则失配而失败。
+
+⚠️ **根治方向**（尚未做）：把它改成**具名参数对象**（`{ auth: {...}, modelAdapters }`）。
+已复发五次说明「靠注释提醒补占位」不足以防住 —— 但那是独立重构，
+需要同时改 `src/index.ts` 与全部测试调用点，不要顺手做。
 
 ## ⚠️ ZCode（智谱）provider：「卡住 + 停止按钮无效」的两个根因（真实缺陷，2026-09-29）
 
