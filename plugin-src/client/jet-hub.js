@@ -1019,120 +1019,241 @@ function ModelListPanel({ provider, rpcCall, onClose }) {
  * （例如将来的 `daily`）时，面板立刻就能显示出新窗口，不必等插件发版 ——
  * 这与后端「窗口按网关原序透传、不映射到固定形状」是同一个设计。
  */
-const QUOTA_WINDOW_LABELS = Object.freeze({
-  five_hour: '5 小时',
-  weekly: '本周',
-  monthly: '本月',
-});
+/**
+ * 已知额度窗口及其**固定顺序**（与参考实现 `dsh-cline-pass` 同款）。
+ *
+ * ⚠️ 已知窗口按此顺序排在前，网关下发的**未知窗口追加在后** ——
+ * 纯按网关原序会让新窗口插到中间，同一账号两次读数的排列可能不同。
+ */
+const QUOTA_WINDOWS = Object.freeze([
+  ['five_hour', '5 小时'],
+  ['weekly', '本周'],
+  ['monthly', '本月'],
+]);
 
-/** 额度窗口类型的中文标签（未识别时回落到原值）。 */
+/** 额度窗口类型 → 中文标签（未识别时原样返回，不丢弃也不归入「其它」）。 */
 function quotaWindowLabel(type) {
-  return QUOTA_WINDOW_LABELS[type] || type;
+  const known = QUOTA_WINDOWS.find(([id]) => id === type);
+  return known === undefined ? type : known[1];
 }
 
 /**
- * 格式化额度窗口的重置时刻。
- *
- * ⚠️ **入参是 ISO 字符串**（网关口径，见 `src/cline-quota.ts`），
- * **不能**喂给 `formatTime` —— 那个函数按毫秒数运算，传字符串会得到
- * `NaN` 比较、从而一律显示「已过期」，把一个 6 小时后重置的窗口
- * 说成已重置。两者刻意分开成两个函数。
+ * 窗口排序：**已知窗口按固定顺序在前，未知窗口追加在后**（参考实现同款）。
+ * 这样网关新增窗口（如 `daily`）时面板立刻多一行，不必为它发插件版本。
+ * @returns `[type, label, window]` 三元组数组。
  */
-function formatWindowReset(iso) {
-  if (!iso) return '';
-  const ms = Date.parse(iso);
-  // 解析不出来就原样显示：宁可让用户看到奇怪字符串，也不要显示一个
-  // 由错误换算得出的「合理」时间（那会把排查引向错误方向）。
-  if (!Number.isFinite(ms)) return iso;
-  const now = Date.now();
-  if (ms <= now) return '已重置';
-  const diff = ms - now;
-  if (diff < 3_600_000) return `${Math.round(diff / 60_000)} 分钟后重置`;
-  if (diff < 86_400_000) return `${Math.round(diff / 3_600_000)} 小时后重置`;
-  return `${new Date(ms).toLocaleString('zh-CN', {
-    month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit',
-  })} 重置`;
+function quotaWindowsOf(windows) {
+  const known = new Map(windows.map((win) => [String(win.type), win]));
+  const ordered = QUOTA_WINDOWS
+    .filter(([type]) => known.has(type))
+    .map(([type, label]) => [type, label, known.get(type)]);
+  const extra = windows
+    .filter((win) => !QUOTA_WINDOWS.some(([type]) => type === String(win.type)))
+    .map((win) => [String(win.type), String(win.type), win]);
+  return [...ordered, ...extra];
 }
 
 /**
- * 格式化请求记录的时间戳（ISO 字符串 → 本地「月/日 时:分」）。
+ * 额度重置的**粗粒度**倒计时（参考实现同款）：
+ * 「3 天 4 小时」/「4 小时 5 分钟」/「5 分钟」。
  *
- * ⚠️ 同样不能复用 `formatTime`（毫秒口径）。解析不出来时**原样显示**，
- * 理由与 {@link formatWindowReset} 相同。
+ * ⚠️ 粗粒度是刻意的：额度重置是一眼扫过去的信息，秒级精度只会让面板
+ * 无谓重渲染，对用户也没有意义。
+ * 已过期 / 缺失 / 不可解析一律返回**空串**（不显示「已过期」这类噪音）。
  */
-function formatLogTime(iso) {
-  if (!iso) return '—';
-  const ms = Date.parse(iso);
-  if (!Number.isFinite(ms)) return iso;
-  return new Date(ms).toLocaleString('zh-CN', {
-    month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit',
-  });
+function quotaCountdown(resetsAt) {
+  const at = Date.parse(String(resetsAt ?? ''));
+  if (!Number.isFinite(at)) return '';
+  const minutes = Math.round((at - Date.now()) / 60_000);
+  if (minutes <= 0) return '';
+  const days = Math.floor(minutes / 1440);
+  const hours = Math.floor((minutes % 1440) / 60);
+  const mins = minutes % 60;
+  if (days > 0) return `${days} 天 ${hours} 小时`;
+  if (hours > 0) return `${hours} 小时 ${mins} 分钟`;
+  return `${Math.max(1, mins)} 分钟`;
+}
+
+/** 「{倒计时}后重置」；没有可读倒计时时返回空串（那一行不渲染）。 */
+function quotaResetsIn(resetsAt) {
+  const left = quotaCountdown(resetsAt);
+  return left === '' ? '' : `${left}后重置`;
 }
 
 /**
- * 百分比显示：整数不带小数位，非整数保留一位。
+ * 额度百分比 → 色调（参考实现同款三档）：≥90 红 / ≥70 黄 / 其余绿。
  *
- * ⚠️ **不夹取到 100%**：网关若给 120（超额），显示 120% 才是用户最该看到的信息。
- * 进度条的**宽度**另行夹取（那只是绘制），两者不能混为一谈。
+ * ⚠️ 只给「值得反应」的两档染色，正常读数保持绿色 —— 全部染成品牌蓝会让
+ * 「用掉九成」和「用掉一成」看起来一样，额度条就失去了警示作用。
  */
-function formatQuotaPercent(value) {
-  if (!Number.isFinite(value)) return '—';
-  const rounded = Math.round(value * 10) / 10;
-  return `${Number.isInteger(rounded) ? rounded : rounded.toFixed(1)}%`;
-}
-
-/** 百分比的着色档位（只影响颜色，不影响显示的数值）。 */
 function quotaTone(percent) {
-  if (!Number.isFinite(percent)) return undefined;
-  if (percent >= 100) return 'danger';
-  if (percent >= 80) return 'warn';
-  return undefined;
-}
-
-/** token 数按千分位显示。 */
-function formatTokenCount(value) {
-  if (!Number.isFinite(value)) return '—';
-  return Math.round(value).toLocaleString('zh-CN');
-}
-
-/** 毫秒 → 「320ms」/「4.2s」（≤1s 用毫秒，否则一位小数的秒）。 */
-function formatMs(ms) {
-  if (!Number.isFinite(ms) || ms <= 0) return '—';
-  if (ms < 1000) return `${Math.round(ms)}ms`;
-  return `${(ms / 1000).toFixed(1)}s`;
+  if (!Number.isFinite(percent)) return 'ok';
+  if (percent >= 90) return 'error';
+  if (percent >= 70) return 'warn';
+  return 'ok';
 }
 
 /**
- * 延迟列：参考实现是**首块耗时与总延迟并列**（`time-to-first-chunk beside
- * total latency`）—— 首块解释「多久才出字」，总延迟解释「这一笔一共多久」，
- * 两个数回答的是不同的问题，缺一个都解释不了「感觉慢」。
+ * 百分比取值：**先夹取到 0–100**（参考实现同款）。
+ * 进度条宽度与百分比文案共用这一个值，两者口径必须一致。
  */
-function formatLatency(ttftMs, totalMs) {
-  const parts = [];
-  if (Number.isFinite(ttftMs) && ttftMs > 0) parts.push(`首块 ${formatMs(ttftMs)}`);
-  if (Number.isFinite(totalMs) && totalMs > 0) parts.push(`共 ${formatMs(totalMs)}`);
-  return parts.length > 0 ? parts.join(' · ') : '—';
+function quotaPercentValue(percent) {
+  const n = Number(percent ?? 0);
+  if (!Number.isFinite(n)) return 0;
+  return Math.max(0, Math.min(100, n));
+}
+
+/** 百分比文案：夹取后**四舍五入到整数**（参考实现同款）。 */
+function formatQuotaPercent(percent) {
+  return `${Math.round(quotaPercentValue(percent))}%`;
+}
+
+/**
+ * 时间戳 → 请求记录里的「时间」列（参考实现同款）。
+ *
+ * 今天只给时钟（`HH:MM:SS`），跨天补日期（`MM-DD HH:MM`）——
+ * 宿主是长生命周期进程，只给时钟会让「昨天的记录」看起来像刚发生的。
+ */
+function formatStamp(ts) {
+  const at = new Date(Number(ts ?? 0));
+  if (!Number.isFinite(at.getTime())) return '-';
+  const pad = (part) => String(part).padStart(2, '0');
+  const clock = `${pad(at.getHours())}:${pad(at.getMinutes())}:${pad(at.getSeconds())}`;
+  if (at.toDateString() === new Date().toDateString()) return clock;
+  return `${pad(at.getMonth() + 1)}-${pad(at.getDate())} ${clock.slice(0, 5)}`;
+}
+
+/**
+ * token 数的**有界**渲染（参考实现同款）：10 万以内给精确千分位，
+ * 再大改 `k` / `M` 一位小数 —— 保证四个数字加标记也不会把行撑高。
+ * 精确数字保留在单元格 tooltip 里（见 renderLog）。
+ */
+function formatTokenCount(value) {
+  const n = Math.max(0, Number(value ?? 0));
+  if (!Number.isFinite(n)) return '0';
+  if (n < 100_000) return n.toLocaleString('en-US');
+  if (n < 1_000_000) {
+    const k = (n / 1000).toFixed(1);
+    // 999,999 会四舍五入成「1000.0k」—— 那是下一个单位已经命名的值。
+    return Number(k) >= 1000 ? `${(n / 1_000_000).toFixed(1)}M` : `${k}k`;
+  }
+  return `${(n / 1_000_000).toFixed(1)}M`;
+}
+
+/**
+ * 毫秒 → 「320ms」/「4.2s」。
+ *
+ * ⚠️ 没发生过的时刻给 `—`（破折号），**不是 0 也不是 `-`** ——
+ * `0ms` 会被读成「瞬间完成」，与「没测到」是两回事；破折号是参考实现
+ * （`latency()` 的 `stamp`）对这个「未知」格的固定字形，换回半角 `-`
+ * 会让两处的缺口看起来不是同一件事。
+ */
+function formatMs(value) {
+  const n = Number(value ?? 0);
+  if (!Number.isFinite(n) || n <= 0) return '—';
+  return n >= 1000 ? `${(n / 1000).toFixed(1)}s` : `${Math.round(n)}ms`;
+}
+
+/**
+ * 一行请求的 token 构成（参考实现同款）：
+ * `↓输入 ↑输出 [⚡缓存] [🧠推理]`。
+ *
+ * ⚠️ **未收到 usage 帧时返回 `null`**，调用方据此显示 `—`：网关没发用量
+ * 与「这次调用花了 0 token」是两件事，混为一谈会误导（参考实现同约定）。
+ */
+function tokenParts(row) {
+  if (row?.usageReported !== true) return null;
+  const parts = [
+    { key: 'in', icon: '↓', value: Number(row.inputTokens ?? 0) },
+    { key: 'out', icon: '↑', value: Number(row.outputTokens ?? 0) },
+  ];
+  if (Number(row.cacheReadTokens ?? 0) > 0) {
+    parts.push({ key: 'cache', icon: '⚡', value: Number(row.cacheReadTokens) });
+  }
+  if (Number(row.reasoningTokens ?? 0) > 0) {
+    parts.push({ key: 'think', icon: '🧠', value: Number(row.reasoningTokens) });
+  }
+  return parts;
+}
+
+/** TOKEN 单元格：有界渲染；未收到 usage 帧显示 `—`。 */
+function tokenSummary(row) {
+  const parts = tokenParts(row);
+  if (parts === null) return '—';
+  return parts.map((part) => `${part.icon}${formatTokenCount(part.value)}`).join(' ');
+}
+
+/** TOKEN 单元格的 tooltip：**精确**数字（单元格里是缩写，只有这里保留个位）。
+ *
+ * ⚠️ 未收到 usage 帧时返回**空串**（参考实现同约定）——「未知」由提示行里的
+ * 「— 表示网关本次未返回用量」表达，不要在这一格里另编一句替代文案，
+ * 否则同一件事会出现两种说法（完整拼装见 `tokenTooltip`）。
+ */
+function tokenSummaryExact(row) {
+  const parts = tokenParts(row);
+  if (parts === null) return '';
+  return parts.map((part) => `${part.icon}${part.value.toLocaleString('en-US')}`).join(' ');
+}
+
+/** TOKEN 单元格 tooltip 的图例行（参考实现原文，逐字保留）。 */
+const TOKEN_LEGEND = '↓输入 ↑输出 ⚡缓存 🧠推理；— 表示网关本次未返回用量';
+
+/**
+ * TOKEN 单元格的完整 tooltip：精确数字 + 图例。
+ *
+ * ⚠️ 图例**必须带**：`—` 是个约定，不解释的话「网关没发用量」会被读成
+ * 「没花 token」。参考实现把它钉在 tooltip 第二行。
+ * 未收到 usage 时精确数字为空串，此时**不拼前导空行**（纯排版，不丢字段）。
+ */
+function tokenTooltip(row) {
+  const exact = tokenSummaryExact(row);
+  return exact === '' ? TOKEN_LEGEND : `${exact}\n${TOKEN_LEGEND}`;
+}
+
+/**
+ * 延迟三行（参考实现同款）：**首字 / 总耗时 / 输出速率**。
+ *
+ * ⚠️ 速率只按**流式时长**（总耗时 − 首字）算，**不把首字算进去** ——
+ * 否则「想得久、吐字快」的请求会被报成慢速（参考实现注释明确此坑：
+ * 拿总耗时当分母等于把模型的思考折进「速度」）。
+ */
+function latencyParts(row) {
+  const first = Number(row?.ttftMs ?? 0);
+  const total = Number(row?.totalMs ?? 0);
+  const out = row?.usageReported === true ? Number(row.outputTokens ?? 0) : 0;
+  const streaming = total - first;
+  const rate = first > 0 && out > 0 && streaming > 0
+    ? `${(out / (streaming / 1000)).toFixed(1)} t/s`
+    : '—';
+  return { first, total, rate };
+}
+
+/** 状态点：绿=成功、红=失败（参考实现同款；错误消息在 title 里）。 */
+function StatusDot({ ok, title }) {
+  return React.createElement('span', {
+    className: 'dim-jh-quotaDot',
+    'data-tone': ok ? 'ok' : 'error',
+    title,
+    'aria-label': title,
+  });
 }
 
 /**
  * 「订阅额度」面板：官方额度窗口 + 请求记录。
  *
- * ## 与「积分」的区别（面板文案要讲清，否则用户以为是同一个数）
+ * ## 三个读数**互不替代**（面板文案要讲清，否则用户以为是同一个数）
  *
- * | | 积分（现有） | 订阅额度（本面板） |
- * |---|---|---|
- * | 答什么 | 还剩多少钱 | 各时间窗用掉百分之几 |
- * | 端点 | `/users/{id}/balance` | `/users/me/plan/usage-limits` |
- * | 请求记录 | 无 | `/users/{id}/usages`（逐笔流水） |
+ * | | 积分（账号卡片） | 订阅额度 | 请求记录 |
+ * |---|---|---|---|
+ * | 答什么 | 还剩多少钱 | 各时间窗用掉百分之几 | 本插件发出的每笔请求 |
+ * | 来源 | `/users/{id}/balance` | `/users/me/plan/usage-limits` | 本地流水（`src/cline-request-log.ts`） |
  *
- * ## 两个接口的失败语义**不同**，渲染也必须不同
+ * ## 两个区域的失败语义不同，渲染也必须不同
  *
- * - **额度**（`cline.quota`）：逐账号返回 `ok`。某个账号失败只让**那一个**
- *   卡片显示原因，**其余账号照常显示** —— 多账号下这是最实用的降级。
- * - **请求记录**（`cline.requestLog`）：失败以 `ok:false` 的**载荷**回报
- *   （不是 RPC 级错误），所以这里判 `res.ok` 而不是只 catch 异常；
- *   失败时**保留已加载的行**，只把原因显示在下方 —— 翻页途中失败不该
- *   把用户已经看到的记录清空。
+ * - **额度**（`cline.quota`）：逐账号返回 `ok`。某个账号失败只让**那一张卡**
+ *   显示原因，其余账号照常显示 —— 多账号下这是最实用的降级。
+ * - **请求记录**（`cline.requestLog`）：失败以 RPC 错误抛出（本地流水不会
+ *   部分失败），故 catch 后显示原因并保留空表。
  */
 function ClineQuotaPanel({ rpcCall, onClose }) {
   const mounted = React.useRef(true);
@@ -1231,77 +1352,81 @@ function ClineQuotaPanel({ rpcCall, onClose }) {
     const entry = viewAccount;
     if (entry === undefined) return null;
     // 账号翻页器:⚠️ **一次只看一个账号**(参考实现同款,多账号下全铺开会让
-    // 额度卡与记录表都变得极长);单账号时不渲染箭头(无处可去)。
-    const pager = React.createElement('div', { className: 'dim-jh-quotaPager' },
-      quota.length > 1
-        ? React.createElement('button', {
-            className: 'dim-jh-btn dim-jh-quotaArrow',
+    // 额度卡与记录表都变得极长)。
+    // ⚠️ 单账号时**整个名字行都不渲染**(参考实现同款):箭头无处可去,
+    // 而账号名在单账号下也不构成任何区分信息,留着只是占一行高度。
+    const pager = quota.length > 1
+      ? React.createElement('div', { className: 'dim-jh-quotaPager' },
+          React.createElement('button', {
+            className: 'dim-jh-quotaArrow',
             title: '上一个账号',
             'aria-label': '上一个账号',
             onClick: () => stepView(-1),
-          }, '‹')
-        : null,
-      React.createElement('strong', { className: 'dim-jh-quotaAccountName' },
-        entry.nickname || entry.accountId),
-      quota.length > 1
-        ? React.createElement('span', { className: 'dim-jh-quotaIndex' },
-            `${viewIndex + 1} / ${quota.length}`)
-        : null,
-      quota.length > 1
-        ? React.createElement('button', {
-            className: 'dim-jh-btn dim-jh-quotaArrow',
+          }, '‹'),
+          React.createElement('div', { className: 'dim-jh-quotaAccountName' },
+            React.createElement('span', {
+              className: 'dim-jh-quotaAccountLabel',
+              title: entry.nickname || entry.accountId,
+            }, entry.nickname || entry.accountId),
+            React.createElement('span', { className: 'dim-jh-quotaIndex' },
+              `第 ${viewIndex + 1} / ${quota.length} 个`)),
+          React.createElement('button', {
+            className: 'dim-jh-quotaArrow',
             title: '下一个账号',
             'aria-label': '下一个账号',
             onClick: () => stepView(1),
-          }, '›')
-        : null);
-    return React.createElement('div', null,
-      pager,
-      // ⚠️ 「查询失败」与「没有额度窗口」分开渲染：前者是错误（显示原因），
-      // 后者是事实（该账号没有这一层计量）。合并成一句会让用户以为额度没了。
-      entry.ok
-        ? (entry.windows.length === 0
-            ? React.createElement('p', { className: 'dim-jh-quotaNoWindow' }, '该账号没有额度窗口')
-            : React.createElement('ul', { className: 'dim-jh-quotaWindows' },
-                entry.windows.map((win, index) => {
-                  const tone = quotaTone(win.percentUsed);
-                  const clamped = Number.isFinite(win.percentUsed)
-                    ? Math.min(100, Math.max(0, win.percentUsed))
-                    : 0;
-                  return React.createElement('li', {
-                    // key 用「类型 + 下标」：网关万一重复下发同一类型，
-                    // 只用 type 会触发 React 的重复 key 警告（参考实现在
-                    // 这里踩过一次，见其 `399bbe1` 提交的措辞）。
-                    key: `${win.type}-${index}`,
-                    className: 'dim-jh-quotaWindow',
+          }, '›'))
+      : null;
+    // 窗口顺序:**已知窗口按固定顺序在前,网关新增的未知窗口追加在后**。
+    const windows = quotaWindowsOf(entry.windows);
+    // ⚠️ 「查询失败」与「没有额度窗口」分开渲染:前者是错误(显示原因),
+    // 后者是事实(该账号没有这一层计量)。合并成一句会让用户以为额度没了。
+    const body = entry.ok
+      ? (windows.length === 0
+          ? React.createElement('div', { className: 'dim-jh-quotaMuted' }, '官方未返回额度窗口。')
+          : React.createElement('div', { className: 'dim-jh-quotaWindows' },
+              windows.map(([type, label, win]) => {
+                const percent = quotaPercentValue(win.percentUsed);
+                const tone = quotaTone(percent);
+                const resetsIn = quotaResetsIn(win.resetsAt);
+                return React.createElement('div', {
+                  key: `${type}`,
+                  className: 'dim-jh-quotaWindow',
+                },
+                  React.createElement('div', { className: 'dim-jh-quotaWindowHead' },
+                    React.createElement('span', { className: 'dim-jh-quotaWindowName' }, label),
+                    // ⚠️ 18px 大字 + 夹取后取整(参考实现同款):百分比是这张卡
+                    // 唯一要读的数,值得占最大的字级。
+                    React.createElement('span', {
+                      className: 'dim-jh-quotaWindowPercent',
+                      'data-tone': tone,
+                    }, formatQuotaPercent(percent))),
+                  React.createElement('div', {
+                    className: 'dim-jh-quotaBar',
+                    role: 'progressbar',
+                    'aria-label': `${label} 已用`,
+                    'aria-valuenow': percent,
+                    'aria-valuemin': 0,
+                    'aria-valuemax': 100,
                   },
-                    React.createElement('div', { className: 'dim-jh-quotaWindowHead' },
-                      React.createElement('span', { className: 'dim-jh-quotaWindowName' },
-                        quotaWindowLabel(win.type)),
-                      React.createElement('span', {
-                        className: 'dim-jh-quotaWindowPercent',
-                        'data-tone': tone,
-                      }, formatQuotaPercent(win.percentUsed))),
                     React.createElement('div', {
-                      className: 'dim-jh-quotaBar',
-                      role: 'progressbar',
-                      'aria-label': `${quotaWindowLabel(win.type)} 已用`,
-                      'aria-valuenow': Number.isFinite(win.percentUsed) ? win.percentUsed : 0,
-                      'aria-valuemin': 0,
-                      'aria-valuemax': 100,
-                    },
-                      React.createElement('div', {
-                        className: 'dim-jh-quotaBarFill',
-                        'data-tone': tone,
-                        style: { width: `${clamped}%` },
-                      })),
-                    win.resetsAt
-                      ? React.createElement('span', { className: 'dim-jh-quotaReset' },
-                          formatWindowReset(win.resetsAt))
-                      : null);
-                })))
-        : React.createElement('p', { className: 'dim-jh-quotaAccountError' },
-            entry.error || '额度查询失败'));
+                      className: 'dim-jh-quotaBarFill',
+                      'data-tone': tone,
+                      style: { width: `${percent}%` },
+                    })),
+                  resetsIn === ''
+                    ? null
+                    : React.createElement('div', { className: 'dim-jh-quotaReset' }, resetsIn));
+              })))
+      : React.createElement('div', { className: 'dim-jh-quotaMuted' },
+          `暂时读不到官方额度。${entry.error ? ` ${entry.error}` : ''}`);
+    return React.createElement('div', {
+      // ⚠️ 按账号 id 作 key → 切账号时**重新挂载**该块(参考实现同款):
+      // 否则进度条的 width 过渡会在两个账号的读数之间播放,
+      // 看起来像"这个账号的额度在涨",而那只是动画。
+      key: entry.accountId,
+      className: 'dim-jh-quotaGroup',
+    }, pager, body);
   };
 
   const renderLog = () => {
@@ -1312,80 +1437,131 @@ function ClineQuotaPanel({ rpcCall, onClose }) {
       'h3', { className: 'dim-jh-quotaSectionTitle' }, '请求记录');
     const hint = React.createElement(
       'p', { className: 'dim-jh-quotaLogHint' },
-      '是本插件发出的请求流水(进程内存,重启后清空),不是官方账单 —— '
+      '是本插件发出的请求流水（进程内存，重启后清空），不是官方账单 —— '
       + '官方渠道的消费在 Cline 自己的用量页里。');
+    // 5 列:状态点 | 时间 | 模型/上游 | TOKEN | 延迟(参考实现同款)。
     const tableHead = React.createElement(
       'thead', null,
       React.createElement('tr', null,
-        React.createElement('th', null, '时间'),
+        React.createElement('th', { className: 'dim-jh-quotaDotCol' }, ''),
+        React.createElement('th', { className: 'dim-jh-quotaWhenCol' }, '时间'),
         React.createElement('th', null, '模型 / 上游'),
-        React.createElement('th', { className: 'dim-jh-quotaNumCol' }, 'TOKEN'),
-        React.createElement('th', { className: 'dim-jh-quotaNumCol' }, '延迟')));
+        React.createElement('th', null, 'TOKEN'),
+        React.createElement('th', null, '延迟')));
+    // 列宽提示(参考实现用 colgroup 同一写法):状态点 16px、时间 82px,
+    // 其余自适应。表格是 `table-layout: auto`,故这是**提示**而非硬约束 ——
+    // 与参考实现一致:内容更宽时列仍可自己长出来(不自造横向滚动)。
+    const colGroup = React.createElement(
+      'colgroup', null,
+      React.createElement('col', { className: 'dim-jh-quotaDotCol' }),
+      React.createElement('col', { className: 'dim-jh-quotaWhenCol' }),
+      React.createElement('col', null),
+      React.createElement('col', { className: 'dim-jh-quotaTokensCol' }),
+      React.createElement('col', { className: 'dim-jh-quotaLoadCol' }));
     const tableBody = React.createElement(
       'tbody', null,
       rows.flatMap((row, index) => {
         const key = `${row.ts}-${index}`;
+        const failed = row.error !== undefined;
+        const figures = latencyParts(row);
+        // ⚠️ 模型名去掉 `cline-pass/` 前缀(参考实现同款):这段前缀在**每一行**
+        // 都一样,是常量,却占掉模型名最需要的宽度;上游另有一格用 tag 表示。
+        const label = String(row.model ?? '').replace(/^cline-pass\//, '');
         const cells = [
-          React.createElement(
-            'td', { className: 'dim-jh-quotaWhen' }, formatLogTime(row.ts)),
-          React.createElement(
-            'td', null,
-            React.createElement(
-              'span', { className: 'dim-jh-quotaModel' }, row.model || '—'),
+          React.createElement('td', null, React.createElement(StatusDot, {
+            ok: !failed,
+            title: failed ? String(row.error) : '成功',
+          })),
+          React.createElement('td', { className: 'dim-jh-quotaWhen' }, formatStamp(row.ts)),
+          React.createElement('td', null,
+            React.createElement('span', {
+              className: 'dim-jh-quotaModel',
+              title: String(row.model ?? ''),
+            }, label || '—'),
             // 上游与模型是两个维度:同模型可能由不同通道服务,拼一列会让
             // 「同名不同上游」的行无法区分。
-            row.upstream
-              ? React.createElement(
-                  'span', { className: 'dim-jh-quotaModelType' }, row.upstream)
-              : null),
-          React.createElement(
-            'td', { className: 'dim-jh-quotaNumCol' },
-            // ⚠️ 输入/输出**分开**展示:合计会在「缓存命中/思考」上失真
-            // (openai-compat 的 inputTokens 已剔除缓存命中部分)。
-            React.createElement(
-              'span', { className: 'dim-jh-quotaTokens' },
-              `${formatTokenCount(row.inputTokens)} + ${formatTokenCount(row.outputTokens)}`),
-            // 思考 token:它是「首块慢」的主要解释(网关不流式输出思考,
-            // 思考量只在 usage 帧里),与普通 token 分开显示才看得到它去哪了。
-            typeof row.reasoningTokens === 'number' && row.reasoningTokens > 0
-              ? React.createElement(
-                  'span', { className: 'dim-jh-quotaTokenDetail' },
-                  `含思考 ${formatTokenCount(row.reasoningTokens)}`)
-              : null),
-          React.createElement(
-            'td', { className: 'dim-jh-quotaNumCol' },
-            formatLatency(row.ttftMs, row.totalMs)),
+            React.createElement('span', { className: 'dim-jh-quotaMeta' },
+              React.createElement('span', { className: 'dim-jh-quotaTag' },
+                row.upstream || '—'))),
+          React.createElement('td', {
+            className: 'dim-jh-quotaTokens',
+            // ⚠️ tooltip = **精确**数字 + 图例:单元格里超过 10 万会缩写成 k/M,
+            // tooltip 是唯一保留个位的地方;`—` 的含义也只在图例里解释
+            // (参考实现同款)。
+            title: tokenTooltip(row),
+          }, tokenSummary(row)),
+          React.createElement('td', { className: 'dim-jh-quotaLoad' },
+            React.createElement('span', { className: 'dim-jh-quotaLoadRow' },
+              React.createElement('span', { className: 'dim-jh-quotaLoadKey' }, '首字'),
+              React.createElement('span', null, formatMs(figures.first))),
+            React.createElement('span', { className: 'dim-jh-quotaLoadRow' },
+              React.createElement('span', { className: 'dim-jh-quotaLoadKey' }, '总耗时'),
+              React.createElement('span', null, formatMs(figures.total))),
+            React.createElement('span', { className: 'dim-jh-quotaLoadRow' },
+              React.createElement('span', { className: 'dim-jh-quotaLoadKey' }, '输出速率'),
+              React.createElement('span', null, figures.rate))),
         ];
-        const rowEl = React.createElement(
-          'tr', { key, 'data-error': row.error === undefined ? undefined : 'error' }, ...cells);
-        // ⚠️ 失败行:错误消息**随行**显示(参考实现同款,错误行 colSpan
-        // 横跨数据列) —— 收进 tooltip 用户永远看不到。
-        if (row.error !== undefined) {
+        const rowEl = React.createElement('tr', {
+          key,
+          'data-error': failed ? 'error' : undefined,
+          // 整行 restate 一遍事实(含 token 与速率):截图或复制时信息不丢
+          // (参考实现同款)。⚠️ 这里用**有界**的 tokenSummary(不是精确值),
+          // 与参考实现一致:精确个位只出现在 TOKEN 单元格的 tooltip 里。
+          title: [
+            String(row.model ?? ''),
+            `${row.upstream || '—'} · ${tokenSummary(row)}`,
+            `首字 ${formatMs(figures.first)} · 总耗时 ${formatMs(figures.total)} · 输出速率 ${figures.rate}`,
+            // 推理强度:有值时才有这一行(参考实现同款)。
+            row.effort ? `推理强度 ${row.effort}` : '',
+            failed ? String(row.error) : '',
+          ].filter((line) => line !== '').join('\n'),
+        }, ...cells);
+        // ⚠️ 失败行:错误消息**随行**显示。两个前置空单元格让消息**从模型列起**
+        // 横跨三列(模型/TOKEN/延迟),与参考实现同构 —— 收进 tooltip 用户永远看不到。
+        if (failed) {
           return [
             rowEl,
-            React.createElement(
-              'tr', { key: `${key}-err`, 'data-error': 'error' },
-              React.createElement(
-                'td', { colSpan: cells.length, className: 'dim-jh-quotaError' },
-                `失败：${row.error}`)),
+            React.createElement('tr', { key: `${key}-err`, 'data-error': 'error' },
+              React.createElement('td', null, ''),
+              React.createElement('td', null, ''),
+              React.createElement('td', {
+                className: 'dim-jh-quotaError',
+                colSpan: 3,
+                title: String(row.error),
+              }, String(row.error))),
           ];
         }
         return [rowEl];
       }));
     const table = React.createElement(
-      'table', { className: 'dim-jh-quotaTable' }, tableHead, tableBody);
+      'table', { className: 'dim-jh-quotaTable' }, colGroup, tableHead, tableBody);
     const wrap = React.createElement(
       'div', { className: 'dim-jh-quotaTableWrap' }, table);
     const empty = React.createElement(
       'div', { className: 'dim-jh-empty' },
       logError === ''
-        ? '暂无请求记录(面板打开后新发起的请求才会出现在这里)'
+        ? '暂无记录。（面板打开后新发起的请求才会出现在这里）'
         : logError);
     const body = logPhase === 'loading'
       ? React.createElement('div', { className: 'dim-jh-empty' }, '正在读取请求记录…')
       : rows.length === 0 ? empty : wrap;
     return React.createElement(
       'div', { className: 'dim-jh-quotaLog' }, head, hint, body);
+  };
+
+  /**
+   * 弹窗副标题：谁的身份。
+   *
+   * 参考实现的额度卡标题会带上「这是谁的额度」（多账号 = `· {n} 个账号`，
+   * 单账号 = `· 账号 {名}`）。jet-hub 的账号名行在**单账号时刻意不渲染**
+   * （见 renderQuota：箭头无处可去），故这份身份信息挂到副标题上，
+   * 既不重复占一行，也不会在单账号下丢失「这是谁的额度」。
+   */
+  const quotaSubtitle = () => {
+    if (quota.length > 1) return `Cline · ${quota.length} 个账号`;
+    const only = quota[0];
+    if (only === undefined) return 'Cline';
+    return `Cline · 账号 ${only.nickname || only.accountId}`;
   };
 
   // 与登录弹窗、模型列表同款：直接渲染在组件树内，靠 position: fixed 覆盖全屏。
@@ -1403,7 +1579,7 @@ function ClineQuotaPanel({ rpcCall, onClose }) {
       React.createElement('div', { className: 'dim-jh-modalHead' },
         React.createElement('div', { className: 'dim-jh-modalTitle' },
           React.createElement('strong', null, '订阅额度'),
-          React.createElement('span', { className: 'dim-jh-modalSubtitle' }, 'Cline')),
+          React.createElement('span', { className: 'dim-jh-modalSubtitle' }, quotaSubtitle())),
         React.createElement('div', { className: 'dim-jh-modelPanelActions' },
           React.createElement('button', {
             className: 'dim-jh-btn',

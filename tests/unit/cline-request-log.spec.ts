@@ -17,6 +17,7 @@ function seed(entries: Array<Parameters<typeof recordClineRequest>[0]>): void {
 const OK_A = {
   model: 'cline-pass/deepseek-v4.1-flash',
   accountId: 'acc-1',
+  usageReported: true,
   inputTokens: 100,
   outputTokens: 25,
   ttftMs: 320,
@@ -48,6 +49,43 @@ describe('recordClineRequest / readClineRequestHistory', () => {
     expect(readClineRequestHistory()[0]!.reasoningTokens).toBe(89)
     seed([OK_A])
     expect(readClineRequestHistory()[0]!.reasoningTokens).toBeUndefined()
+  })
+
+  it('cacheReadTokens 为 0/缺失时省略(与 reasoningTokens 同口径)', () => {
+    seed([{ ...OK_A, cacheReadTokens: 1_200 }])
+    expect(readClineRequestHistory()[0]!.cacheReadTokens).toBe(1200)
+    seed([{ ...OK_A, cacheReadTokens: 0 }])
+    expect(readClineRequestHistory()[0]!.cacheReadTokens).toBeUndefined()
+    seed([OK_A])
+    expect(readClineRequestHistory()[0]!.cacheReadTokens).toBeUndefined()
+  })
+
+  /**
+   * ⚠️ 展示层据 `usageReported` 决定 TOKEN 列显示 `—` 还是数字：
+   * 只有**严格 true** 才算「收到过 usage 帧」，任何垃圾值都必须落到 false
+   * （否则「网关没发用量」会被显示成 0，读起来像「没花 token」）。
+   */
+  it('usageReported 只认严格 true(垃圾值一律当「没收到 usage」)', () => {
+    const truthy = [1, 'true', 'yes', {}, []] as unknown[]
+    for (const value of truthy) {
+      seed([{ ...OK_A, usageReported: value as boolean }])
+      expect(readClineRequestHistory()[0]!.usageReported, String(value)).toBe(false)
+    }
+    seed([{ ...OK_A, usageReported: true }])
+    expect(readClineRequestHistory()[0]!.usageReported).toBe(true)
+  })
+
+  /**
+   * ⚠️ `effort` 的空串是**有意义的缺省**（= 本次没指定档位），
+   * 展示层据此整行不渲染；截断则防止一条超长档位名把表格撑宽。
+   */
+  it('effort 缺省为空串、有值则截断到 32 字', () => {
+    seed([OK_A])
+    expect(readClineRequestHistory()[0]!.effort).toBe('')
+    seed([{ ...OK_A, effort: 'high' }])
+    expect(readClineRequestHistory()[0]!.effort).toBe('high')
+    seed([{ ...OK_A, effort: 'x'.repeat(200) }])
+    expect(readClineRequestHistory()[0]!.effort).toHaveLength(32)
   })
 
   it('按 accountId 过滤(面板用同一个翻页索引切记录)', () => {

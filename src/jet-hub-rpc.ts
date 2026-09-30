@@ -2536,9 +2536,16 @@ function registerJetHubEndpoints(
               ts: row.ts,
               model: row.model,
               upstream: clineUpstreamOf(row.model),
+              // ⚠️ 必须透传「是否收到 usage」：表格据此把未知显示成 `—`,
+              // 而不是 0（0 会被读成「瞬间完成、没花 token」）。
+              usageReported: row.usageReported,
               inputTokens: row.inputTokens,
               outputTokens: row.outputTokens,
+              ...row.cacheReadTokens !== undefined ? { cacheReadTokens: row.cacheReadTokens } : {},
               ...row.reasoningTokens !== undefined ? { reasoningTokens: row.reasoningTokens } : {},
+              // 推理强度：空串也照传（展示层据「空串 ⇒ 不渲染那一行」判断，
+              // 若在这里省略字段，前端就得同时处理 undefined 与 '' 两种缺省）。
+              effort: row.effort,
               ttftMs: row.ttftMs,
               totalMs: row.totalMs,
               ...row.error !== undefined ? { error: row.error } : {},

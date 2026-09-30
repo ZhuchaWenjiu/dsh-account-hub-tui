@@ -463,12 +463,28 @@ export interface RpcClineRequestLogRow {
   model: string
   /** 模型族/上游（模型 id 的 `/` 前缀，如 `cline-pass`）。 */
   upstream: string
+  /**
+   * 是否收到过 usage 帧。
+   *
+   * ⚠️ 与「token 为 0」不是一回事：网关没发 usage 时（abort / 上游提前断开）
+   * 必须显示 `—`，给 0 会被读成「瞬间完成、没花 token」（参考实现同约定）。
+   */
+  usageReported: boolean
   /** 输入 token（未命中缓存的部分）。 */
   inputTokens: number
   /** 输出 token。 */
   outputTokens: number
-  /** 思考 token（缺失时省略 —— 上游不给就没有）。 */
+  /** 缓存命中的输入 token（表格的 ⚡ 那一项；缺失时省略）。 */
+  cacheReadTokens?: number
+  /** 思考 token（表格的 🧠 那一项；缺失时省略）。 */
   reasoningTokens?: number
+  /**
+   * 本次请求的**推理强度**（DSH 注入的 `options.reasoningEffort`）。
+   *
+   * ⚠️ 空串 = 本次没指定，展示层据此**整行不渲染**（参考实现同约定）；
+   * 不要改成 `'auto'` —— 那会被读成「确实选了自动这一档」。
+   */
+  effort: string
   /** 首个内容块耗时（毫秒）—— 解释「为什么等了这么久才出字」。 */
   ttftMs: number
   /** 全程耗时（毫秒）。 */

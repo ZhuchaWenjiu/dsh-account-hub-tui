@@ -248,59 +248,77 @@ const STYLES = `
 
 /* ── Cline「订阅额度」弹窗（官方额度窗口 + 请求记录）── */
 /* 账号翻页器:⚠️ **一次只看一个账号**(参考实现同款,多账号全铺开会让
-   额度卡与记录表都极长);额度窗口与请求记录**共享同一个索引**。 */
-.dim-jh-quotaPager { display: flex; align-items: center; gap: 10px; margin: 4px 0 12px; }
-.dim-jh-quotaArrow { flex: none; min-width: 30px; padding: 3px 8px; font-size: 14px; line-height: 18px; }
-.dim-jh-quotaAccountName { flex: 1 1 auto; min-width: 0; overflow: hidden; font-size: 13px; font-weight: 600; color: var(--dsw-alias-label-primary, #1f2329); text-overflow: ellipsis; white-space: nowrap; }
-.dim-jh-quotaIndex { flex: none; font-size: 11px; font-variant-numeric: tabular-nums; color: var(--dsw-alias-label-tertiary, #8f959e); }
-/* 当前账号查询失败的原因:必须允许换行 —— 网关文案较长,nowrap 会把它撑出弹窗。 */
-.dim-jh-quotaAccountError { margin: 0; font-size: 12px; line-height: 17px; color: #d93025; word-break: break-word; }
-.dim-jh-quotaNoWindow { margin: 0; font-size: 12px; color: var(--dsw-alias-label-tertiary, #8f959e); }
-.dim-jh-quotaWindows { display: flex; flex-direction: column; gap: 10px; margin: 0; padding: 0; list-style: none; }
-.dim-jh-quotaWindow { display: flex; flex-direction: column; gap: 4px; }
+   额度卡与记录表都极长);额度窗口与请求记录**共享同一个索引**。
+   ⚠️ 单账号时整行都不渲染(见 renderQuota)——箭头无处可去。 */
+.dim-jh-quotaGroup { display: flex; flex-direction: column; gap: 12px; }
+.dim-jh-quotaPager { display: flex; align-items: center; gap: 8px; }
+/* 24×24 方形按钮(参考实现 .cp-usage-nav):箭头是导航控件,不是文字按钮。 */
+.dim-jh-quotaArrow { box-sizing: border-box; width: 24px; height: 24px; flex: none; padding: 0; border: 0.5px solid var(--dsw-alias-border-l2, #d0d3d9); border-radius: 6px; background: transparent; color: var(--dsw-alias-label-primary, #1f2329); font-size: 13px; line-height: 1; cursor: pointer; }
+.dim-jh-quotaArrow:hover { border-color: var(--dsw-alias-brand-primary, #1677ff); }
+.dim-jh-quotaAccountName { display: flex; align-items: center; gap: 8px; flex: 1 1 auto; min-width: 0; }
+.dim-jh-quotaAccountLabel { overflow: hidden; font-size: 13px; font-weight: 600; color: var(--dsw-alias-label-primary, #1f2329); text-overflow: ellipsis; white-space: nowrap; }
+.dim-jh-quotaIndex { flex: none; font-size: 12px; font-variant-numeric: tabular-nums; color: var(--dsw-alias-label-tertiary, #8f959e); }
+/* 读数区:**多窗口并排卡片**(grid,参考实现同款)。
+   ⚠️ auto-fit + 最小 170px:窄面板自动换列,不会把卡片压成一条。 */
+.dim-jh-quotaWindows { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 10px; }
+.dim-jh-quotaWindow { display: flex; flex-direction: column; gap: 8px; padding: 10px 12px; border: 0.5px solid var(--dsw-alias-border-l2, #d0d3d9); border-radius: 8px; }
 .dim-jh-quotaWindowHead { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; }
-.dim-jh-quotaWindowName { font-size: 12px; color: var(--dsw-alias-label-secondary, #555); }
-.dim-jh-quotaWindowPercent { font-size: 13px; font-weight: 600; font-variant-numeric: tabular-nums; color: var(--dsw-alias-label-primary, #1f2329); }
-.dim-jh-quotaWindowPercent[data-tone="warn"] { color: #d9822b; }
-.dim-jh-quotaWindowPercent[data-tone="danger"] { color: #d93025; }
-/* 进度条：宽度由内联 style 给（已夹取到 0–100 仅用于绘制）。
-   ⚠️ 数值本身**不夹取** —— 超额时显示 120%，那才是有用信息。 */
-.dim-jh-quotaBar { height: 6px; overflow: hidden; border-radius: 999px; background: var(--dsw-alias-bg-layer-2, #f4f5f7); }
-.dim-jh-quotaBarFill { height: 100%; border-radius: 999px; background: #1677ff; transition: width .2s ease; }
-.dim-jh-quotaBarFill[data-tone="warn"] { background: #d9822b; }
-.dim-jh-quotaBarFill[data-tone="danger"] { background: #d93025; }
-.dim-jh-quotaReset { font-size: 11px; color: var(--dsw-alias-label-tertiary, #8f959e); }
-/* 请求记录区：与额度区用上边框分开 */
+.dim-jh-quotaWindowName { font-size: 12px; font-weight: 600; color: var(--dsw-alias-label-secondary, #555); }
+/* 百分比是这张卡唯一要读的数 —— 18px 大字(参考实现同款) */
+.dim-jh-quotaWindowPercent { font-size: 18px; font-weight: 600; font-variant-numeric: tabular-nums; color: var(--dsw-alias-label-primary, #1f2329); }
+.dim-jh-quotaWindowPercent[data-tone="warn"] { color: var(--dsw-alias-state-warn-primary, #d9822b); }
+.dim-jh-quotaWindowPercent[data-tone="error"] { color: var(--dsw-alias-state-error-primary, #d93025); }
+/* 进度条:宽度用的就是**夹取后**的百分比(与文案同一个值)。
+   ⚠️ 正常档是**绿色**(参考实现 usageColor):全染品牌蓝会让「用掉九成」
+   与「用掉一成」看起来一样,额度条就失去警示作用。 */
+.dim-jh-quotaBar { height: 6px; overflow: hidden; border-radius: 999px; background: var(--dsw-alias-border-l2, #d0d3d9); }
+.dim-jh-quotaBarFill { height: 100%; border-radius: 999px; background: var(--dsw-alias-state-success-primary, #2ea043); transition: width .3s; }
+.dim-jh-quotaBarFill[data-tone="warn"] { background: var(--dsw-alias-state-warn-primary, #d9822b); }
+.dim-jh-quotaBarFill[data-tone="error"] { background: var(--dsw-alias-state-error-primary, #d93025); }
+.dim-jh-quotaReset { font-size: 12px; color: var(--dsw-alias-label-tertiary, #8f959e); }
+/* 不可用 / 无窗口的静默文案(参考实现 .cp-muted) */
+.dim-jh-quotaMuted { font-size: 12px; line-height: 17px; color: var(--dsw-alias-label-tertiary, #8f959e); word-break: break-word; }
+
+/* 请求记录区:与额度区用上边框分开 */
 .dim-jh-quotaLog { margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--dsw-alias-border-default, #e5e5e5); }
 .dim-jh-quotaSectionTitle { margin: 0 0 4px; font-size: 13px; font-weight: 600; color: var(--dsw-alias-label-primary, #1f2329); }
 /* 说明「记录是本地流水」的提示:让用户知道重启会清空,而不是丢数据。 */
 .dim-jh-quotaLogHint { margin: 0 0 8px; font-size: 11px; line-height: 16px; color: var(--dsw-alias-label-tertiary, #8f959e); }
-/* token 用量:输入 + 输出分开展示 —— 合计会在「缓存命中/思考」上失真
-   (openai-compat 的 inputTokens 已剔除缓存命中部分);思考 token 另起一行。 */
-.dim-jh-quotaTokens { display: block; font-variant-numeric: tabular-nums; white-space: nowrap; }
-.dim-jh-quotaTokenDetail { display: block; font-size: 11px; color: var(--dsw-alias-label-tertiary, #8f959e); white-space: nowrap; }
-/* 失败行:错误消息**随行**展示(colSpan 横跨数据列),整行用危险色区分
-   —— 收进 tooltip 用户永远看不到。 */
-.dim-jh-quotaTable tr[data-error="true"] td { color: #d93025; }
-.dim-jh-quotaError { font-size: 11.5px; line-height: 17px; word-break: break-word; }
-/* 表格容器：窄面板下横向滚动，而不是把列压到不可读。
-   ⚠️ 溢出必须落在**这个容器**上；让表格自己溢出会把弹窗整体撑宽。 */
-.dim-jh-quotaTableWrap { overflow-x: auto; margin-bottom: 10px; }
-.dim-jh-quotaTable { width: 100%; border-collapse: collapse; font-size: 12px; }
-.dim-jh-quotaTable th, .dim-jh-quotaTable td { padding: 6px 8px; text-align: left; vertical-align: top; border-bottom: 1px solid var(--dsw-alias-border-l2, #eee); }
-.dim-jh-quotaTable th { font-weight: 600; color: var(--dsw-alias-label-secondary, #555); white-space: nowrap; }
-/* 数字列右对齐:⚠️ 必须用**复合选择器** —— 单独 .dim-jh-quotaNumCol 的优先级
-   是 (0,1,0),压不过 .dim-jh-quotaTable th/td 的 (0,1,1),text-align:right 会
-   **静默失效**:表头左对齐、数据右对齐,列就错位。参考实现的 README 里
-   「429 错误行撑宽请求记录表格」正是同一个选择器强度问题,解法也是复合选择器。 */
-.dim-jh-quotaTable td.dim-jh-quotaNumCol, .dim-jh-quotaTable th.dim-jh-quotaNumCol { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
-/* 时间列定宽:参考实现实测 82px 可完整显示「MM-DD HH:mm」不被截断;
-   同样用复合选择器,避免被 .dim-jh-quotaTable th 的声明压过。 */
-.dim-jh-quotaTable td.dim-jh-quotaWhen { width: 82px; white-space: nowrap; color: var(--dsw-alias-label-secondary, #555); }
-.dim-jh-quotaModel { display: block; overflow: hidden; color: var(--dsw-alias-label-primary, #1f2329); word-break: break-word; }
-/* 上游/模型族另起一行:它与模型名是两个维度,拼在一起会让
-   「同名不同上游」的行无法区分。 */
-.dim-jh-quotaModelType { display: block; font-size: 11px; color: var(--dsw-alias-label-tertiary, #8f959e); word-break: break-word; }
+/* 表格容器:⚠️ 自带纵向滚动 + 表头 sticky(参考实现 .cp-history 的 280px):
+   长列表在弹窗内滚,表头始终可见。 */
+.dim-jh-quotaTableWrap { max-height: 280px; overflow: auto; padding: 0 4px 2px; }
+.dim-jh-quotaTable { width: 100%; border-collapse: collapse; table-layout: auto; font-size: 12px; }
+/* ⚠️ td 默认 overflow:hidden:TOKEN / 延迟 / 错误列必须各自改成 normal+visible,
+   否则它们继承的截断会把内容吃掉(参考实现踩过同一个坑)。 */
+.dim-jh-quotaTable th, .dim-jh-quotaTable td { padding: 6px 0; border-bottom: 0.5px solid var(--dsw-alias-border-l2, #eee); font-size: 12px; vertical-align: middle; text-align: center; overflow: hidden; }
+.dim-jh-quotaTable th { position: sticky; top: 0; z-index: 1; background: var(--dsw-alias-bg-layer-1, #fff); font-weight: 400; font-size: 11px; color: var(--dsw-alias-label-tertiary, #8f959e); white-space: nowrap; }
+.dim-jh-quotaTable tbody tr:hover td { background: var(--dsw-alias-bg-layer-2, #f4f5f7); }
+/* 列宽:状态点 16px、时间 82px(参考实现实测值,防时间戳被截断)。
+   ⚠️ 用复合选择器:单独一个类的优先级压不过 .dim-jh-quotaTable td 的 (0,1,1)。 */
+.dim-jh-quotaTable .dim-jh-quotaDotCol { width: 16px; }
+.dim-jh-quotaTable .dim-jh-quotaWhenCol, .dim-jh-quotaTable .dim-jh-quotaWhen { width: 82px; }
+.dim-jh-quotaTable td.dim-jh-quotaWhen { color: var(--dsw-alias-label-tertiary, #8f959e); font-variant-numeric: tabular-nums; }
+/* 状态点:绿=成功、红=失败(参考实现同款;错误消息在 title 里)。 */
+.dim-jh-quotaDot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--dsw-alias-state-success-primary, #2ea043); }
+.dim-jh-quotaDot[data-tone="error"] { background: var(--dsw-alias-state-error-primary, #d93025); }
+/* 模型列:等宽字 + 省略号(模型 id 是最该被扫到的标识);上游做成 tag。 */
+.dim-jh-quotaModel { display: block; max-width: 100%; overflow: hidden; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; color: var(--dsw-alias-label-primary, #1f2329); text-overflow: ellipsis; white-space: nowrap; }
+.dim-jh-quotaMeta { display: flex; align-items: center; justify-content: center; gap: 6px; min-width: 0; overflow: hidden; margin-top: 2px; }
+.dim-jh-quotaTag { padding: 1px 6px; border-radius: 5px; background: var(--dsw-alias-bg-layer-2, #f4f5f7); font-size: 11px; color: var(--dsw-alias-label-tertiary, #8f959e); white-space: nowrap; }
+/* TOKEN 列:⚠️ 必须**允许折行**(参考实现同款)—— nowrap 会让
+   「↓12.3k ↑4.5k ⚡1.2k 🧠89」把表格撑出横向滚动。 */
+.dim-jh-quotaTable td.dim-jh-quotaTokens { font-size: 11.5px; font-variant-numeric: tabular-nums; color: var(--dsw-alias-label-secondary, #555); white-space: normal; overflow: visible; }
+/* 延迟列:三行(首字 / 总耗时 / 输出速率),标签左、数值右(参考实现同款)。 */
+.dim-jh-quotaTable td.dim-jh-quotaLoad { font-variant-numeric: tabular-nums; white-space: normal; overflow: visible; }
+.dim-jh-quotaLoadRow { display: flex; justify-content: space-between; gap: 5px; max-width: 112px; margin: 0 auto; font-size: 11.5px; line-height: 1.5; }
+.dim-jh-quotaLoadRow > span { white-space: nowrap; }
+.dim-jh-quotaLoadRow > span:first-child { flex: none; }
+.dim-jh-quotaLoadRow > span:last-child { min-width: 0; overflow: hidden; text-align: right; text-overflow: ellipsis; }
+.dim-jh-quotaLoadKey { color: var(--dsw-alias-label-tertiary, #8f959e); }
+/* 失败行:错误消息随行横跨数据列。⚠️ 必须允许折行 —— 错误文案(429 / 11140)
+   很长,继承 td 的 nowrap + hidden 会把表格撑出横向滚动(参考实现的原坑)。 */
+.dim-jh-quotaTable tr[data-error="true"] td { color: var(--dsw-alias-state-error-primary, #d93025); }
+.dim-jh-quotaTable td.dim-jh-quotaError { font-size: 11.5px; line-height: 1.5; white-space: normal; overflow: visible; text-overflow: clip; word-break: break-word; }
 `
 
 let injected = false

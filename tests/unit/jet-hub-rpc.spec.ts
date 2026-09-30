@@ -1959,9 +1959,12 @@ describe('cline.quota / cline.requestLog 端点', () => {
       seedOne({
         model: 'cline-pass/deepseek-v4.1-flash',
         accountId: 'acc-1',
+        usageReported: true,
         inputTokens: 100,
         outputTokens: 25,
+        cacheReadTokens: 400,
         reasoningTokens: 89,
+        effort: 'high',
         ttftMs: 320,
         totalMs: 4200,
       })
@@ -1969,7 +1972,19 @@ describe('cline.quota / cline.requestLog 端点', () => {
       const result = await call('cline.requestLog', { provider: 'cline', accountId: 'acc-1' })
       expect(result.ok).toBe(true)
       const value = result.value as {
-        rows: Array<{ ts: number; model: string; upstream: string; inputTokens: number; outputTokens: number; reasoningTokens?: number; ttftMs: number; totalMs: number }>
+        rows: Array<{
+          ts: number
+          model: string
+          upstream: string
+          usageReported: boolean
+          inputTokens: number
+          outputTokens: number
+          cacheReadTokens?: number
+          reasoningTokens?: number
+          effort: string
+          ttftMs: number
+          totalMs: number
+        }>
       }
       expect(value.rows).toHaveLength(1)
       expect(value.rows[0]).toEqual({
@@ -1977,12 +1992,39 @@ describe('cline.quota / cline.requestLog 端点', () => {
         model: 'cline-pass/deepseek-v4.1-flash',
         // 上游取模型 id 的「/ 前缀」—— 模型与上游是两个维度
         upstream: 'cline-pass',
+        // ⚠️ 必须透传：表格据此把「网关没发 usage」显示成 `—`（不是 0）
+        usageReported: true,
         inputTokens: 100,
         outputTokens: 25,
+        // 缓存命中：有值才出现（表格的 ⚡ 那一项）
+        cacheReadTokens: 400,
         reasoningTokens: 89,
+        // 推理强度：**空串也照传**（前端据「空串 ⇒ 不渲染那一行」判断）
+        effort: 'high',
         ttftMs: 320,
         totalMs: 4200,
       })
+    })
+
+    /** ⚠️ 未收到 usage 帧时 token 全为 0，但 `usageReported:false` 必须透传。 */
+    it('未收到 usage 帧时 usageReported:false 透传（0 不等于未知）', async () => {
+      seedOne({
+        model: 'cline-pass/deepseek-v4.1-flash',
+        accountId: 'acc-1',
+        usageReported: false,
+        inputTokens: 0,
+        outputTokens: 0,
+        effort: '',
+        ttftMs: 320,
+        totalMs: 4200,
+      })
+      const { call } = setup()
+      const result = await call('cline.requestLog', { provider: 'cline', accountId: 'acc-1' })
+      const row = (result.value as { rows: Array<Record<string, unknown>> }).rows[0]!
+      expect(row.usageReported).toBe(false)
+      expect(row.effort).toBe('')
+      expect('cacheReadTokens' in row).toBe(false)
+      expect('reasoningTokens' in row).toBe(false)
     })
 
     it('按 accountId 过滤:别的账号的记录不混进来', async () => {

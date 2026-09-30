@@ -598,10 +598,17 @@ export class ClineAdapter extends LlmAdapter {
     let ttftMs = 0
     /**
      * usage 帧，**在它经过时捕获**：网关把它放在内容之后的最后一帧，
-     * 流结束才记账的前提是「这块真的被读到了」—— 若调用方中途 abort，
-     * usage 帧可能永远没被消费到，此时如实记 0 而不是编一个值。
+     * 流结束才记账的前提是「这块真的被读到了」—— 若调用方中途 abort、
+     * 或上游提前断开，usage 帧可能永远没被消费到。此时**如实标为「未收到」**
+     * （`usageReported: false`），由展示层显示 `—` 而不是 `0`
+     * —— 0 会被读成「瞬间完成、没花 token」（参考实现同约定）。
      */
-    let usage: { inputTokens: number; outputTokens: number; reasoningTokens?: number } | undefined
+    let usage: {
+      inputTokens: number
+      outputTokens: number
+      cacheReadTokens?: number
+      reasoningTokens?: number
+    } | undefined
     try {
       for await (const chunk of this.consume(response, options)) {
         if (ttftMs === 0) ttftMs = Date.now() - meta.startedAt
@@ -609,6 +616,10 @@ export class ClineAdapter extends LlmAdapter {
           usage = {
             inputTokens: Number(chunk.usage.inputTokens ?? 0) || 0,
             outputTokens: Number(chunk.usage.outputTokens ?? 0) || 0,
+            // 缓存命中/思考量：有值才带（表格的 ⚡ / 🧠 两项据此出现）。
+            ...(typeof chunk.usage.cacheReadTokens === 'number' && chunk.usage.cacheReadTokens > 0
+              ? { cacheReadTokens: chunk.usage.cacheReadTokens }
+              : {}),
             ...(typeof chunk.usage.reasoningTokens === 'number' && chunk.usage.reasoningTokens > 0
               ? { reasoningTokens: chunk.usage.reasoningTokens }
               : {}),
@@ -620,9 +631,13 @@ export class ClineAdapter extends LlmAdapter {
       recordClineRequest({
         model: meta.model,
         accountId: meta.accountId,
+        usageReported: usage !== undefined,
         inputTokens: usage?.inputTokens ?? 0,
         outputTokens: usage?.outputTokens ?? 0,
+        ...(usage?.cacheReadTokens !== undefined ? { cacheReadTokens: usage.cacheReadTokens } : {}),
         ...(usage?.reasoningTokens !== undefined ? { reasoningTokens: usage.reasoningTokens } : {}),
+        // 推理强度：**DSH 注入的原值**（未指定时空串 ⇒ 记录里少一行 tooltip）。
+        effort: options.reasoningEffort ?? '',
         ttftMs,
         totalMs: Date.now() - meta.startedAt,
         error: error instanceof Error ? error.message : String(error),
@@ -632,13 +647,13 @@ export class ClineAdapter extends LlmAdapter {
     recordClineRequest({
       model: meta.model,
       accountId: meta.accountId,
-      ...(usage === undefined
-        ? { inputTokens: 0, outputTokens: 0 }
-        : {
-            inputTokens: usage.inputTokens,
-            outputTokens: usage.outputTokens,
-            ...(usage.reasoningTokens !== undefined ? { reasoningTokens: usage.reasoningTokens } : {}),
-          }),
+      usageReported: usage !== undefined,
+      inputTokens: usage?.inputTokens ?? 0,
+      outputTokens: usage?.outputTokens ?? 0,
+      ...(usage?.cacheReadTokens !== undefined ? { cacheReadTokens: usage.cacheReadTokens } : {}),
+      ...(usage?.reasoningTokens !== undefined ? { reasoningTokens: usage.reasoningTokens } : {}),
+      // 推理强度：**DSH 注入的原值**（未指定时空串 ⇒ 记录里少一行 tooltip）。
+      effort: options.reasoningEffort ?? '',
       ttftMs,
       totalMs: Date.now() - meta.startedAt,
     })

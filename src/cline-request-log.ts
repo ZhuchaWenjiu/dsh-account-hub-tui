@@ -37,12 +37,31 @@ export interface ClineRequestEntry {
   model: string
   /** 发请求用的**账号**（账号池里的 `id`；换号后是**最终服务的那笔**）。 */
   accountId: string
+  /**
+   * 是否**收到过 usage 帧**。
+   *
+   * ⚠️ 与「token 为 0」**不是一回事**：网关没发 usage 时（调用方 abort、
+   * 上游提前断开）表格必须显示 `—`（未知），而不是 `0` ——
+   * 给 0 会被读成「瞬间完成、没花 token」。参考实现同约定
+   * （其 `usageReported !== true` 时 tokenSummary 返回 `—`）。
+   */
+  usageReported: boolean
   /** 输入 token（未命中缓存的部分）。 */
   inputTokens: number
   /** 输出 token。 */
   outputTokens: number
+  /** 缓存命中的输入 token（缺失时省略；有值时表格显示 ⚡ 那一项）。 */
+  cacheReadTokens?: number
   /** 思考 token（上游不流式输出，只在 usage 里出现；缺失时省略）。 */
   reasoningTokens?: number
+  /**
+   * 本次请求的**推理强度**（DSH 注入的 `options.reasoningEffort`）。
+   *
+   * ⚠️ **空串表示「本次没指定」** —— 展示层据此整行不渲染（参考实现同约定：
+   * `entry.effort === ''` 时 tooltip 少一行）。不要写成 `'auto'`：
+   * 那会被读成「确实选了自动这一档」，与「没传这个字段」是两回事。
+   */
+  effort: string
   /** 首个内容块耗时（毫秒）—— 解释「为什么等了这么久才出字」的关键数字。 */
   ttftMs: number
   /** 全程耗时（毫秒）。 */
@@ -67,11 +86,21 @@ export function recordClineRequest(entry: Omit<ClineRequestEntry, 'ts'>): void {
       ts: Date.now(),
       model: String(entry.model ?? '').slice(0, 120),
       accountId: String(entry.accountId ?? '').slice(0, 64),
+      // ⚠️ 必须显式判 `=== true`：缺失/垃圾值一律当「没收到 usage」，
+      // 由展示层显示 `—` 而不是 0（见接口注释）。
+      usageReported: entry.usageReported === true,
       inputTokens: Math.max(0, Math.trunc(Number(entry.inputTokens ?? 0))) || 0,
       outputTokens: Math.max(0, Math.trunc(Number(entry.outputTokens ?? 0))) || 0,
+      ...(Number(entry.cacheReadTokens ?? 0) > 0
+        ? { cacheReadTokens: Math.trunc(Number(entry.cacheReadTokens)) }
+        : {}),
       ...(Number(entry.reasoningTokens ?? 0) > 0
         ? { reasoningTokens: Math.trunc(Number(entry.reasoningTokens)) }
         : {}),
+      // ⚠️ 与 token 字段不同，这里**始终写字符串**（缺省空串）：展示层的判据
+      // 是「空串 ⇒ 不渲染那一行」，若此处省略字段，判据就得同时处理
+      // undefined 与 ''，两处口径容易分叉（参考实现同取 `''` 兜底）。
+      effort: String(entry.effort ?? '').slice(0, 32),
       ttftMs: Math.max(0, Math.trunc(Number(entry.ttftMs ?? 0))) || 0,
       totalMs: Math.max(0, Math.trunc(Number(entry.totalMs ?? 0))) || 0,
       ...(typeof entry.error === 'string' && entry.error.length > 0
