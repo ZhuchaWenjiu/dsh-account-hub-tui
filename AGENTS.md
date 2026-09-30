@@ -759,6 +759,11 @@ allowBuilds 判定，不换 commit 会得到假的"成功"）：
   `esbuild`（`plugin-src/client/build.mjs`）打包到 `lib/client/jet-hub.js`。
   两者都产出到已 gitignore 的 `lib/`，`prepare` 执行 `pnpm build:all` 保证
   git 安装时两侧产物齐全。
+  ⚠️ **`tsc` 不清理「源文件已删除」的产物**：改名/删文件后 `lib/` 会留着旧的
+  `.js` / `.d.ts` / `.map`（2026-10-01 把 `cline-modalities.ts` 换成
+  `cline-models-dev.ts` 时实测到，`lib/cline-modalities.*` 四个文件仍在，
+  并随文件拷贝式安装一起进了 profile）。**删改源文件后手动清一次 `lib/`**
+  （或整目录重建），否则残留模块虽无人 import 却会一直跟着发布。
 - **测试**：Vitest（单元测试 + E2E 端到端测试）
   - `pnpm test` — 单元测试（快速，无网络，全部 mock）
   - `pnpm test:e2e:*` — 端到端测试，按 provider 分列（如 `test:e2e:codearts`、`test:e2e:buddy`、`test:e2e:workbuddy-claim`）；**均有闸门，默认全部跳过**，详见 `tests/e2e/README.md`
