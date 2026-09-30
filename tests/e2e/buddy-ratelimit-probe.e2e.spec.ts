@@ -137,7 +137,8 @@ async function directProbe(credential: BuddyCredential, model: string): Promise<
     method: 'POST',
     headers: {
       Authorization: `Bearer ${credential.access_token}`,
-      'X-Domain': credential.domain ?? 'www.codebuddy.cn',
+      // ⚠️ `||` 而非 `??`（空串不是 undefined —— 见 PR!19 的同型缺陷）。
+      'X-Domain': credential.domain || 'www.codebuddy.cn',
       'X-Product': 'SaaS',
       'X-Product-Code': 'codebuddy',
       'User-Agent': 'CodeBuddyIDE/1.106.1',

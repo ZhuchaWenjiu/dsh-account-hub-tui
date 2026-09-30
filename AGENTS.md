@@ -4352,6 +4352,26 @@ const claim = deps.claim ?? (claimDailyCheckin as unknown as NonNullable<…>)
 
 `checkinHeaders`（`src/credits.ts`）用 `product.apiDomain` 构造 `X-Domain`，**不优先用 `credential.domain`**。凭据里的 domain 是登录时的快照，跨产品迁移后会留下旧值（早期 workbuddy 指向中国版），跟着它走会让请求的 baseURL 与身份标识自相矛盾。
 
+⚠️ **一律用 `||` 而非 `??`**：domain 经 `readStringField`（`src/buddy.ts`）读取，
+字段缺失/类型不符时它返回的是**空串而不是 `undefined`**，`??` 对空串不生效 →
+`X-Domain` 以**空值**发出（服务端视作身份缺失，且日志里看不出原因）。
+这是 PR!19 定位的共同根因（2026-09-30）。
+
+**四处发 `X-Domain`，判据一致（空串必回退），但「兜底值取谁」按语境分工**：
+
+| 位置 | 表达式 | 为什么 |
+|---|---|---|
+| `src/credits.ts` `checkinHeaders` | `product.apiDomain \|\| credential.domain \|\| ''` | 凭据 domain 是登录时快照 → **产品优先** |
+| `src/buddy-adapter.ts` `send()`（chat 头） | `this.product.apiDomain \|\| credential.domain \|\| ''` | 同上：baseURL 取 `product.endpoint`，两者必须一致 |
+| `src/buddy.ts` `credentialRequestHeaders` | `credential.domain \|\| API_DOMAIN` | **凭据级**基础头，调用方 `buddy-oauth.ts`（`refreshToken` / `fetchModels`）随后按产品覆盖 domain 与 UA，此处只需把空串兜回默认域 |
+| `src/buddy-oauth.ts` `getAccount`（登录轮询） | `token.domain \|\| product.apiDomain` | 登录流程中该值是服务端**本次刚下发**的权威值（非历史快照）→ 非空时**不被产品覆盖**，只兜空串 |
+
+⚠️ 四处**不是同一判据的四种写法，而是两种语境**（「凭据是历史快照」→ 产品优先；
+「登录即时值权威」→ 服务端优先）。改其中任何一处前，先确认它属于哪种语境。
+⚠️ 反向验证：把某处的 `||` 改回 `??`（`getAccount` 处改回裸 `token.domain`），
+`tests/unit/buddy.spec.ts` / `buddy-adapter.spec.ts` / `buddy-oauth.spec.ts` 里
+对应那条「空串」用例立刻变红 —— 故那些用例不是同义反复。
+
 LobsterAI **不适用本条**（它根本不发 `X-Domain`）；其对应约束是「`apiBase` 与 `portalBase` 都是编译期常量，不从凭据推断」。
 
 ## ⚠️ Loomy（讯飞）provider：五个不能凭直觉改的点

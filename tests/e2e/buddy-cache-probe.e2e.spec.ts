@@ -148,7 +148,9 @@ async function probe(
   headers.set('Authorization', `Bearer ${credential.access_token}`)
   headers.set('Accept', 'text/event-stream')
   headers.set('Content-Type', 'application/json')
-  headers.set(HTTP_HEADER_DOMAIN, credential.domain ?? API_DOMAIN)
+  // ⚠️ `||` 而非 `??`：凭据的 domain 经 `readStringField` 读取，字段缺失时是
+  // **空串**（不是 undefined），`??` 会让 X-Domain 以空值发出（PR!19 修的形态）。
+  headers.set(HTTP_HEADER_DOMAIN, credential.domain || API_DOMAIN)
   headers.set(HTTP_HEADER_PRODUCT, BUDDY_DEPLOYMENT_TYPE)
   headers.set(HTTP_HEADER_PRODUCT_CODE, BUDDY_PRODUCT_CODE)
   headers.set('User-Agent', BUDDY_USER_AGENT)
