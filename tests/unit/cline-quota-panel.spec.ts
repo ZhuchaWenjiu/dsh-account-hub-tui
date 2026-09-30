@@ -253,16 +253,19 @@ describe('Cline 订阅额度：客户端接线', () => {
 
   /**
    * 延迟列**三行**：首字 / 总耗时 / 输出速率（参考实现同款）。
-   * ⚠️ 速率只按**流式时长**（总耗时 − 首字）算 —— 拿总耗时当分母等于把模型的
-   * 思考折进「速度」，会把「想得久、吐字快」的请求报成慢速。
+   *
+   * ⚠️ 速率的分母**不含首字之前那段**（`总耗时 − 首字`），否则「想得久、
+   * 吐字快」的请求会被报成慢速 —— 但**分子分母必须同一阶段**，
+   * 故分母实际取的是「首个**正文**块」而非「首个任意块」（见下面那条用例：
+   * 首块常常是思考增量）。这两条约束合起来才是正确口径。
    */
-  it('延迟列三行(首字/总耗时/输出速率)，速率按流式时长', () => {
+  it('延迟列三行(首字/总耗时/输出速率)', () => {
     expect(client).toMatch(/'首字'/)
     expect(client).toMatch(/'总耗时'/)
     expect(client).toMatch(/'输出速率'/)
     expect(client).toMatch(/function latencyParts\(row\)/)
-    expect(client).toMatch(/const streaming = total - first/)
-    expect(client).toMatch(/out \/ \(streaming \/ 1000\)/)
+    // 分母起点是「首个正文块」，不是「首个任意块」也不是 0
+    expect(client).toMatch(/const firstContent = Number\(row\?\.ttfcMs \?\? 0\)/)
   })
 
   /**
@@ -271,7 +274,8 @@ describe('Cline 订阅额度：客户端接线', () => {
    */
   it('未知耗时用破折号 — （不是 0，也不是半角 -）', () => {
     expect(client).toMatch(/function formatMs\(value\) \{[\s\S]{0,140}?return '—'/)
-    expect(client).toMatch(/const rate = first > 0 && out > 0 && streaming > 0[\s\S]{0,120}?: '—'/)
+    // 速率不可测时（没有正文块 / 窗口过短）同样是破折号，**不报假数字**
+    expect(client).toMatch(/const rate = firstContent > 0 && contentTokens > 0 && window >= MIN_RATE_WINDOW_MS[\s\S]{0,140}?: '—'/)
     // 不允许退回半角
     expect(client).not.toMatch(/function formatMs\(value\) \{[\s\S]{0,140}?return '-';/)
   })
@@ -348,5 +352,26 @@ describe('Cline 订阅额度：客户端接线', () => {
    */
   it('弹窗内容在 .dim-jh-modalBody 滚动区里（不直接铺在 .dim-jh-modal）', () => {
     expect(client).toMatch(/dim-jh-modalBody'[\s\S]{0,80}?renderQuota\(\),[\s\S]{0,40}?renderLog\(\)\)/)
+  })
+
+  /**
+   * ⚠️⚠️ **真实缺陷**（用户报障 2026-09-30）：「输出速率 11814.8 t/s」。
+   *
+   * 速率原先写成 `outputTokens ÷ (总耗时 − 首字)` —— **分子分母跨阶段**：
+   * `outputTokens` 含思考 token（本仓库已实测 `reasoning_tokens` 计入
+   * `completion_tokens`），而思考产生于首字**之前**。思考越多、正文越短，
+   * 虚高越离谱（实测 11814.8 t/s，物理上不可能）。
+   *
+   * 正确口径：分子 = `outputTokens − reasoningTokens`（正文 token），
+   * 分母 = `总耗时 − 首个正文块耗时`（正文阶段）；窗口过短时显示 `—`。
+   * ⚠️ 退回旧写法会让本用例变红（那条 `not.toMatch` 就是防回退的）。
+   */
+  it('输出速率按「正文阶段」算（分子扣思考、分母用首个正文块）', () => {
+    expect(client).toMatch(/const MIN_RATE_WINDOW_MS = 250/)
+    expect(client).toMatch(/const contentTokens = Math\.max\(0, out - thinking\)/)
+    expect(client).toMatch(/const window = total - firstContent/)
+    expect(client).toMatch(/window >= MIN_RATE_WINDOW_MS/)
+    // 不得退回「outputTokens ÷ 首字之后」那种跨阶段写法
+    expect(client).not.toMatch(/out \/ \(streaming \/ 1000\)/)
   })
 })

@@ -62,8 +62,36 @@ export interface ClineRequestEntry {
    * 那会被读成「确实选了自动这一档」，与「没传这个字段」是两回事。
    */
   effort: string
+  /**
+   * **真正服务这笔请求的上游渠道**（网关下发的路由元数据，如 `alibaba`）。
+   *
+   * ⚠️ 与「模型命名空间」（`cline-pass` / `cline-free`）**不是一回事** ——
+   * 后者是订阅通道，甚至可能是厂商名（`deepseek/…`）。原先展示层取的是后者，
+   * 用户报障「上游显示的不正确」；真实来源见 `src/cline-routing.ts`。
+   *
+   * ⚠️ **空串 = 网关本次没报路由**，展示层据此回落到模型命名空间。
+   * 不要写成 `'auto'` 之类的代称：那会把「没读到」冒充成一个具体读数。
+   */
+  upstream: string
   /** 首个内容块耗时（毫秒）—— 解释「为什么等了这么久才出字」的关键数字。 */
   ttftMs: number
+  /**
+   * **首个「正文」块**耗时（毫秒；0 = 本次没有任何正文/工具调用块）。
+   *
+   * ⚠️ 与 {@link ttftMs} 是**两个不同时刻**：`ttftMs` 是「收到的第一块」
+   * （可能是思考增量），`ttfcMs` 是「第一块**正文**」。
+   *
+   * 为什么要分开（真实缺陷，用户报障 2026-09-30「输出速率 11814.8 t/s」）：
+   * 「输出速率」必须让**分子与分母描述同一段时间**。`outputTokens`
+   * **含思考 token**（本仓库已实测：`reasoning_tokens` 计入
+   * `completion_tokens`），而思考是在 `ttftMs` 之前产生的 —— 拿
+   * `outputTokens ÷ (totalMs − ttftMs)` 会把不在那段窗口里的 token 算进去，
+   * 速率被无限放大（实测见 11814.8 t/s，物理上不可能）。
+   *
+   * ⇒ 速率的正确口径是**正文阶段**：分子 = `outputTokens − reasoningTokens`，
+   * 分母 = `totalMs − ttfcMs`。
+   */
+  ttfcMs: number
   /** 全程耗时（毫秒）。 */
   totalMs: number
   /** 失败原因；**成功时为 undefined**。 */
@@ -101,7 +129,13 @@ export function recordClineRequest(entry: Omit<ClineRequestEntry, 'ts'>): void {
       // 是「空串 ⇒ 不渲染那一行」，若此处省略字段，判据就得同时处理
       // undefined 与 ''，两处口径容易分叉（参考实现同取 `''` 兜底）。
       effort: String(entry.effort ?? '').slice(0, 32),
+      // 上游渠道：与 `effort` 同口径**始终写字符串**（缺省空串 = 网关没报），
+      // 展示层据「空串 ⇒ 回落到模型命名空间」判断，避免两处口径分叉。
+      upstream: String(entry.upstream ?? '').slice(0, 64),
       ttftMs: Math.max(0, Math.trunc(Number(entry.ttftMs ?? 0))) || 0,
+      // 首个**正文**块耗时（0 = 没有正文块）。⚠️ 必须单独存：速率的分子分母
+      // 都要落在正文阶段（见接口上 `ttfcMs` 的注释）。
+      ttfcMs: Math.max(0, Math.trunc(Number(entry.ttfcMs ?? 0))) || 0,
       totalMs: Math.max(0, Math.trunc(Number(entry.totalMs ?? 0))) || 0,
       ...(typeof entry.error === 'string' && entry.error.length > 0
         ? { error: entry.error.slice(0, 200) }

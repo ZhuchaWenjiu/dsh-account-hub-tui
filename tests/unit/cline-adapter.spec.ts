@@ -54,6 +54,9 @@ function makeAdapter(overrides: Partial<ConstructorParameters<typeof ClineAdapte
     refresh: async () => {},
     product: CLINE,
     loadModels: async () => ({ models: MODELS, warnings: [] }),
+    // ⚠️ 模态表也必须注入：默认加载器会去拉 models.dev（真实网络）。
+    // 空表 = 「没读到」，各用例按需覆盖。
+    loadModalities: async () => new Map<string, boolean>(),
     ...overrides,
   })
 }
@@ -64,6 +67,25 @@ function sseResponse(frames: string[]): Response {
     status: 200,
     headers: { 'Content-Type': 'text/event-stream' },
   })
+}
+
+/**
+ * **逐帧延迟**下发的 SSE —— 用来把 `ttft`（首块）与 `ttfc`（首个正文块）
+ * 在时间上分开。`sseResponse` 一次性给完，两者会落在同一毫秒上，测不出区别。
+ */
+function slowSseResponse(frames: Array<{ delayMs: number; payload: string }>): Response {
+  const encoder = new TextEncoder()
+  const stream = new ReadableStream({
+    async start(controller) {
+      for (const frame of frames) {
+        await new Promise((resolve) => setTimeout(resolve, frame.delayMs))
+        controller.enqueue(encoder.encode(`data: ${frame.payload}\n\n`))
+      }
+      controller.enqueue(encoder.encode('data: [DONE]\n\n'))
+      controller.close()
+    },
+  })
+  return new Response(stream, { status: 200, headers: { 'Content-Type': 'text/event-stream' } })
 }
 
 /** 收集一次 stream 的全部 chunk。 */
@@ -665,6 +687,141 @@ describe('Cline 接线（源码级回归）', () => {
     })
     await collect(adapter)
     expect(readClineRequestHistory()[0]!.accountId).toBe(cred.account_id)
+  })
+
+  /**
+   * ⚠️⚠️ **真实缺陷**（用户报障 2026-09-30）：「这个插件中支持图片的模型
+   * 发送不了图片」。
+   *
+   * 根因：图片能力原先**只看本地兜底表**（全表只有 5 条 `cline-free/*`），
+   * 于是 `cline-pass/*` 一律被播报成纯文本 ⇒ DSH 根本不把图片送进来。
+   * 修复后补上 models.dev 这一级（见 `src/cline-modalities.ts`）。
+   *
+   * ⚠️ **反向验证**：注释掉 `inputModalitiesFor` 里 `remoteModalities` 那一行
+   * → 本用例变红（抛 `不支持图片输入`）。
+   */
+  it('图片能力取自 models.dev：cline-pass/* 也能发图（不再被误判纯文本）', async () => {
+    const bodies: string[] = []
+    const adapter = makeAdapter({
+      loadModalities: async () => new Map([['cline-pass/deepseek-v4.1-flash', true]]),
+      readImage: async () => ({ data: new Uint8Array([1, 2, 3]), mediaType: 'image/png' }),
+      fetchImpl: (async (_url: string, init: RequestInit) => {
+        bodies.push(String(init.body))
+        return sseResponse([
+          JSON.stringify({ choices: [{ delta: { content: 'ok' } }] }),
+          JSON.stringify({ choices: [{ delta: {}, finish_reason: 'stop' }] }),
+        ])
+      }) as unknown as typeof fetch,
+    })
+
+    await collect(adapter, {
+      model: 'cline-pass/deepseek-v4.1-flash',
+      messages: [{
+        role: 'user',
+        content: [
+          { type: 'text', text: '看看这张图' },
+          { type: 'image', attachment: { attachmentId: 'att-1' } },
+        ],
+      }],
+    })
+
+    expect(bodies).toHaveLength(1)
+    // 图片真的被内联成 data URL 发出去了
+    expect(bodies[0]).toContain('"image_url"')
+    expect(bodies[0]).toContain('data:image/png;base64,')
+    expect(bodies[0]).not.toContain('[image unavailable]')
+  })
+
+  /** 模态表说「不支持」时照旧拒绝（不能为了修缺陷就无条件放行）。 */
+  it('模态表明确不支持时仍拒绝图片（保守方向未失守）', async () => {
+    const adapter = makeAdapter({
+      loadModalities: async () => new Map([['cline-pass/glm-5.3', false]]),
+      readImage: async () => ({ data: new Uint8Array([1]), mediaType: 'image/png' }),
+      fetchImpl: (async () => sseResponse([])) as unknown as typeof fetch,
+    })
+    await expect(collect(adapter, {
+      model: 'cline-pass/glm-5.3',
+      messages: [{ role: 'user', content: [{ type: 'image', attachment: { attachmentId: 'a' } }] }],
+    })).rejects.toThrow(/不支持图片输入/)
+  })
+
+  /**
+   * ⚠️ **真实缺陷**（用户报障 2026-09-30）：「上游显示的不正确」。
+   *
+   * 「上游」原先取模型 id 的 `/` 前缀（`cline-pass`），那是**订阅通道**、
+   * 甚至可能是厂商名，不是 serving channel。修复后取网关下发的路由元数据
+   * （`provider_metadata.gateway.routing.finalProvider`，参考实现同源）。
+   */
+  it('请求记录记下网关报的真实上游渠道（而不是模型前缀）', async () => {
+    resetClineRequestHistory()
+    const adapter = makeAdapter({
+      fetchImpl: (async () => sseResponse([
+        JSON.stringify({ choices: [{ delta: { content: 'hi' } }] }),
+        // 路由元数据出现在「携带它的那一帧」上（planner 管线）
+        JSON.stringify({ provider_metadata: { gateway: { routing: { finalProvider: 'alibaba' } } } }),
+        JSON.stringify({ choices: [{ delta: {}, finish_reason: 'stop' }] }),
+      ])) as unknown as typeof fetch,
+    })
+    await collect(adapter, { model: 'cline-pass/deepseek-v4.1-flash' })
+
+    const row = readClineRequestHistory()[0]!
+    expect(row.upstream).toBe('alibaba')
+    // 关键：**不能**是模型命名空间
+    expect(row.upstream).not.toBe('cline-pass')
+  })
+
+  /** 网关没报路由时留空串 —— 由 RPC 侧回落到模型命名空间，**不在适配器里编造**。 */
+  it('网关未报路由时 upstream 留空串（不编造渠道名）', async () => {
+    resetClineRequestHistory()
+    const adapter = makeAdapter({
+      fetchImpl: (async () => sseResponse([
+        JSON.stringify({ choices: [{ delta: { content: 'hi' } }] }),
+        JSON.stringify({ choices: [{ delta: {}, finish_reason: 'stop' }] }),
+      ])) as unknown as typeof fetch,
+    })
+    await collect(adapter, { model: 'cline-pass/deepseek-v4.1-flash' })
+    expect(readClineRequestHistory()[0]!.upstream).toBe('')
+  })
+
+  /**
+   * ⚠️⚠️ **真实缺陷**（用户报障 2026-09-30）：「输出速率 11814.8 t/s」。
+   *
+   * 速率必须让**分子分母落在同一段时间**：`outputTokens` 含思考 token
+   * （本仓库已实测 `reasoning_tokens` 计入 `completion_tokens`），而思考
+   * 产生于首字之前 ⇒ 适配器必须**单独**记「首个**正文**块耗时」。
+   *
+   * ⚠️ **反向验证**：把 `ttfcMs` 的赋值改成与 `ttftMs` 相同（即任何块都算）
+   * → 本用例的 `ttfcMs > ttftMs` 断言变红。
+   */
+  it('分开记录「首块」与「首个正文块」（思考块不算正文）', async () => {
+    resetClineRequestHistory()
+    const adapter = makeAdapter({
+      fetchImpl: (async () => slowSseResponse([
+        { delayMs: 40, payload: JSON.stringify({ choices: [{ delta: { reasoning: '想一会儿…' } }] }) },
+        { delayMs: 60, payload: JSON.stringify({ choices: [{ delta: { content: '答' } }] }) },
+        { delayMs: 10, payload: JSON.stringify({ choices: [{ delta: {}, finish_reason: 'stop' }] }) },
+      ])) as unknown as typeof fetch,
+    })
+    await collect(adapter, { model: 'cline-pass/deepseek-v4.1-flash' })
+
+    const row = readClineRequestHistory()[0]!
+    expect(row.ttftMs).toBeGreaterThan(0)
+    expect(row.ttfcMs).toBeGreaterThan(0)
+    // 关键：正文块**晚于**首块（首块是思考增量）—— 这条断言就是本次修复的判据
+    expect(row.ttfcMs).toBeGreaterThan(row.ttftMs)
+  })
+
+  /** 只有思考、没有正文时 `ttfcMs` 为 0 ⇒ 展示层把速率显示成 `—` 而不是编一个值。 */
+  it('纯思考响应没有正文块：ttfcMs 为 0', async () => {
+    resetClineRequestHistory()
+    const adapter = makeAdapter({
+      fetchImpl: (async () => sseResponse([
+        JSON.stringify({ choices: [{ delta: { reasoning: '只想不说' } }] }),
+        JSON.stringify({ choices: [{ delta: {}, finish_reason: 'stop' }] }),
+      ])) as unknown as typeof fetch,
+    })
+    await collect(adapter, { model: 'cline-pass/deepseek-v4.1-flash' })
+    expect(readClineRequestHistory()[0]!.ttfcMs).toBe(0)
   })
 
   it('能力矩阵登记 cline 为「有余额、无签到、有订阅额度」', () => {

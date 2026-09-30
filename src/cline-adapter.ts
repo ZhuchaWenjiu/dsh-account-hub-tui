@@ -47,6 +47,8 @@ import {
   type ClineProduct,
 } from './cline-product.js'
 import { projectRequestImage, type ImageRequestTarget } from './image-budget.js'
+import { makeClineModalitiesLoader } from './cline-modalities.js'
+import { parseClineRouting } from './cline-routing.js'
 import { recordClineRequest } from './cline-request-log.js'
 import {
   registerAdapterIdempotent,
@@ -198,6 +200,13 @@ export interface ClineAdapterOptions {
    * 默认走 `loadClineModels`（两次远端请求）。注入后单测可完全离线。
    */
   loadModels?: (options: { credential?: ClineCredential }) => Promise<{ models: ClineModel[]; warnings: string[] }>
+  /**
+   * 输入模态（图片能力）加载器覆盖（测试用）。
+   *
+   * 默认走 `makeClineModalitiesLoader`（拉 models.dev，带 TTL 缓存）。
+   * ⚠️ 注入后单测可完全离线 —— 与 `loadModels` 同款理由。
+   */
+  loadModalities?: () => Promise<Map<string, boolean>>
 }
 
 /**
@@ -212,11 +221,25 @@ export class ClineAdapter extends LlmAdapter {
   private remoteModels: ClineModel[] | undefined
   /** 正在进行中的目录加载（避免并发重复请求）。 */
   private loading: Promise<void> | undefined
+  /**
+   * 输入模态表（`模型 id → 是否接受图片`），来自 models.dev（见
+   * {@link makeClineModalitiesLoader}）。
+   *
+   * ⚠️ `undefined` = **还没读到**（不是「都不支持」）：只有它明确为 `false`
+   * 才是否定结论，未命中一律退回本地兜底表。这条区分是整个模块的要点 ——
+   * 把「没读到」当「不支持」正是本次修复的那个缺陷。
+   */
+  private remoteModalities: Map<string, boolean> | undefined
+  /** 正在进行中的模态表加载（并发去重）。 */
+  private modalitiesLoading: Promise<void> | undefined
+  /** 模态表加载器。 */
+  private readonly loadModalities: () => Promise<Map<string, boolean>>
 
   constructor(private readonly options: ClineAdapterOptions) {
     super()
     this.product = options.product ?? CLINE
     this.fetchImpl = options.fetchImpl ?? fetch
+    this.loadModalities = options.loadModalities ?? makeClineModalitiesLoader({ fetcher: this.fetchImpl })
   }
 
   /**
@@ -235,13 +258,24 @@ export class ClineAdapter extends LlmAdapter {
   /**
    * 模型接受的输入模态。
    *
-   * 按**模型**判定（内嵌目录的 `capabilities` 含 `images`），不是按 provider
-   * 一刀切。未声明时**保守报 text**：宁可少报能力（用户改用文本描述），
-   * 也不要报一个服务端不认的模态（请求会失败）。
+   * 两级判据（**顺序不能颠倒**）：
+   * 1. **本地兜底表/内嵌目录**（`remoteModels` 里的 `supportsImage`，含
+   *    `product.fallbackModels` 的策展条目）—— 它是从官方客户端内嵌目录
+   *    提取的，比社区目录权威；显式 `false` 也照样赢。
+   * 2. **models.dev 模态表**（`remoteModalities`）—— 补前者覆盖不到的模型。
+   *
+   * ⚠️ **这是「支持图片的模型发不了图」的修复点**：修复前只看第 1 级，而它
+   * 全表只有 5 条 `cline-free/*` 条目 ⇒ `cline-pass/*` 等**全部**被播报成
+   * 纯文本 ⇒ DSH 根本不把图片送进来。详见 `src/cline-modalities.ts`。
+   *
+   * ⚠️ 两级都**没有结论**时保守报 `text`（宁可少报能力，也不要报一个服务端
+   * 不认的模态）—— 注意这与「明确读到不支持」是两回事，但外部行为一致。
    */
   private inputModalitiesFor(model: string): readonly ('text' | 'image')[] {
     const entry = this.remoteModels?.find((candidate) => candidate.id === model)
-    return entry?.supportsImage === true ? ['text', 'image'] : ['text']
+    if (entry?.supportsImage === true) return ['text', 'image']
+    if (this.remoteModalities?.get(model) === true) return ['text', 'image']
+    return ['text']
   }
 
   /**
@@ -290,6 +324,32 @@ export class ClineAdapter extends LlmAdapter {
     await this.loading
   }
 
+  /**
+   * 懒加载输入模态表（models.dev），并发去重。
+   *
+   * ⚠️ **失败只记日志、不抛**：拿不到就保持 `undefined`（退回本地兜底表），
+   * 下一次调用会重试（`TtlCache` 不缓存失败）。图片能力是**播报**信息，
+   * 不能因为一次目录抖动就让整个会话不可用。
+   */
+  private async ensureModalities(): Promise<void> {
+    if (this.remoteModalities !== undefined) return
+    if (this.modalitiesLoading !== undefined) {
+      await this.modalitiesLoading
+      return
+    }
+    this.modalitiesLoading = (async () => {
+      try {
+        this.remoteModalities = await this.loadModalities()
+      } catch (error) {
+        // eslint-disable-next-line no-console
+        console.warn(`[cline] 输入模态目录拉取失败（图片能力退回本地兜底表）：${error instanceof Error ? error.message : String(error)}`)
+      } finally {
+        this.modalitiesLoading = undefined
+      }
+    })()
+    await this.modalitiesLoading
+  }
+
   /** 兜底目录（远端不可用时的静态表，含 5 个免费模型）。 */
   private fallbackCatalog(): ClineModel[] {
     return this.product.fallbackModels.map((model) => ({
@@ -334,6 +394,9 @@ export class ClineAdapter extends LlmAdapter {
     // 必须 await：冷缓存时目录尚未落地就返回，模型选择器会短暂显示错误的
     // 模型集合（Jet Hub 的模型开关也据此渲染）。
     await this.ensureRemoteModels()
+    // 图片能力要在**播报目录**时就正确：DSH 的选择器与 composer 都读这里的
+    // `inputModalities`（读错就等于「支持图片的模型发不了图」）。
+    await this.ensureModalities()
     const source = this.remoteModels ?? this.fallbackCatalog()
     // 用户在 Jet Hub 关闭的模型（黑名单制：不在表里即默认打开）。
     // 只影响此处对外播报的模型目录，不改变 resolveModel/stream 的路由能力
@@ -355,6 +418,9 @@ export class ClineAdapter extends LlmAdapter {
 
   async resolveModel(provider: string, model: string, _signal?: AbortSignal): Promise<LlmResolvedModelInfo> {
     await this.ensureRemoteModels()
+    // 同 `listModels`：`resolveModel` 的 `inputModalities` 决定 DSH 是否把图片
+    // 送进来，故播报前必须让模态表就位。
+    await this.ensureModalities()
     const source = this.remoteModels ?? this.fallbackCatalog()
     const entry = source.find((candidate) => candidate.id === model)
     const resolved: LlmResolvedModelInfo = {
@@ -414,6 +480,10 @@ export class ClineAdapter extends LlmAdapter {
     }
     let imageUrls: Map<string, string> | undefined
     if (imageRefs.size > 0) {
+      // ⚠️ 判定能力之前先把模态表读进来（`resolveModel` 通常已 await 过，
+      // 这里命中缓存、不发请求）；`stream()` 也可能被直接调用而没有前置
+      // `resolveModel`，缺了这一步会把支持图片的模型误判成纯文本。
+      await this.ensureModalities()
       if (!this.inputModalitiesFor(options.model).includes('image')) {
         throw new LlmError(
           `cline: 模型 "${options.model}" 不支持图片输入`,
@@ -617,6 +687,16 @@ export class ClineAdapter extends LlmAdapter {
     /** 首个内容块耗时；0 表示还没有任何块到达。 */
     let ttftMs = 0
     /**
+     * 首个**正文**块耗时；0 = 本次没有任何正文（纯思考/纯 usage 的响应）。
+     *
+     * ⚠️ 与 `ttftMs` 是**两个时刻**：Cline 会流式下发思考增量
+     * （`delta.reasoning`），故「第一块」常常是思考块。展示层的「输出速率」
+     * 必须让分子分母落在**正文阶段**（`outputTokens − reasoningTokens`
+     * ÷ `totalMs − ttfcMs`），否则速率被无限放大 —— 用户报障的
+     * `11814.8 t/s` 正是这样来的（见 `src/cline-request-log.ts` 的 `ttfcMs`）。
+     */
+    let ttfcMs = 0
+    /**
      * usage 帧，**在它经过时捕获**：网关把它放在内容之后的最后一帧，
      * 流结束才记账的前提是「这块真的被读到了」—— 若调用方中途 abort、
      * 或上游提前断开，usage 帧可能永远没被消费到。此时**如实标为「未收到」**
@@ -629,9 +709,28 @@ export class ClineAdapter extends LlmAdapter {
       cacheReadTokens?: number
       reasoningTokens?: number
     } | undefined
+    /**
+     * 网关报告的**真实上游渠道**（`alibaba` / `baseten` / `GMICloud` …）。
+     *
+     * ⚠️ 逐帧观测、**最后一次非空为准**（参考实现注释：路由元数据出现在
+     * 「携带它的那一帧」上）。读不到时留空串，展示层回落到模型命名空间
+     * —— 「记录成模型前缀」正是用户报障的「上游显示不正确」，见
+     * `src/cline-routing.ts`。
+     */
+    let upstream = ''
+    const observeFrame = (frame: Record<string, unknown>): void => {
+      const found = parseClineRouting(frame)
+      if (found.length > 0) upstream = found
+    }
     try {
-      for await (const chunk of this.consume(response, options)) {
+      for await (const chunk of this.consume(response, options, observeFrame)) {
         if (ttftMs === 0) ttftMs = Date.now() - meta.startedAt
+        // 正文块（文本 / 工具调用）才算「正文阶段」的起点：Cline 会先流式下发
+        // 思考增量（`delta.reasoning`），把思考块当成正文会让速率的分子分母
+        // 落在不同时间段（用户报障 11814.8 t/s 的根因）。
+        if (ttfcMs === 0 && (chunk.type === 'text-delta' || chunk.type === 'tool-call-delta')) {
+          ttfcMs = Date.now() - meta.startedAt
+        }
         if (chunk.type === 'usage' && typeof chunk.usage === 'object' && chunk.usage !== null) {
           usage = {
             inputTokens: Number(chunk.usage.inputTokens ?? 0) || 0,
@@ -658,7 +757,9 @@ export class ClineAdapter extends LlmAdapter {
         ...(usage?.reasoningTokens !== undefined ? { reasoningTokens: usage.reasoningTokens } : {}),
         // 推理强度：**DSH 注入的原值**（未指定时空串 ⇒ 记录里少一行 tooltip）。
         effort: options.reasoningEffort ?? '',
+        upstream,
         ttftMs,
+        ttfcMs,
         totalMs: Date.now() - meta.startedAt,
         error: error instanceof Error ? error.message : String(error),
       })
@@ -674,18 +775,26 @@ export class ClineAdapter extends LlmAdapter {
       ...(usage?.reasoningTokens !== undefined ? { reasoningTokens: usage.reasoningTokens } : {}),
       // 推理强度：**DSH 注入的原值**（未指定时空串 ⇒ 记录里少一行 tooltip）。
       effort: options.reasoningEffort ?? '',
+      upstream,
       ttftMs,
+      ttfcMs,
       totalMs: Date.now() - meta.startedAt,
     })
   }
 
   /** 消费 OpenAI 兼容 SSE（共享实现）。 */
-  private consume(response: Response, options: GenerateOptions): AsyncIterable<StreamChunk> {
+  private consume(
+    response: Response,
+    options: GenerateOptions,
+    onFrame?: (data: Record<string, unknown>) => void,
+  ): AsyncIterable<StreamChunk> {
     return consumeOpenAiSse(response, { ...options.signal === undefined ? {} : { signal: options.signal } }, {
       label: 'cline',
       firstTokenTimeoutMs: resolveFirstTokenTimeoutMs(),
       chunkTimeoutMs: resolveChunkTimeoutMs(),
       ...options.maxTokens === undefined ? {} : { maxTokens: options.maxTokens },
+      // 旁路观测网关路由元数据（真正服务这笔请求的上游渠道）。
+      ...onFrame === undefined ? {} : { onFrame },
     })
   }
 

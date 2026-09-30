@@ -2535,7 +2535,11 @@ function registerJetHubEndpoints(
             rows: readClineRequestHistory({ accountId: req.accountId, limit: req.limit }).map((row) => ({
               ts: row.ts,
               model: row.model,
-              upstream: clineUpstreamOf(row.model),
+              // ⚠️ **优先用网关报的真实上游渠道**（`alibaba` 等，见
+              // `src/cline-routing.ts`）；它没报时才回落到模型命名空间
+              // （`cline-pass` / `cline-free`）—— 后者是**订阅通道**
+              // （甚至可能是厂商名），不是 serving channel，用户报障点正在于此。
+              upstream: row.upstream.length > 0 ? row.upstream : clineUpstreamOf(row.model),
               // ⚠️ 必须透传「是否收到 usage」：表格据此把未知显示成 `—`,
               // 而不是 0（0 会被读成「瞬间完成、没花 token」）。
               usageReported: row.usageReported,
@@ -2547,6 +2551,10 @@ function registerJetHubEndpoints(
               // 若在这里省略字段，前端就得同时处理 undefined 与 '' 两种缺省）。
               effort: row.effort,
               ttftMs: row.ttftMs,
+              // ⚠️ 首个**正文**块耗时必须透传：展示层的「输出速率」拿它当分母
+              // 起点（分子是正文 token 数）。缺了它速率会虚高到物理不可能的值
+              // —— 用户报障的 `11814.8 t/s` 就是分子分母跨阶段的产物。
+              ttfcMs: row.ttfcMs,
               totalMs: row.totalMs,
               ...row.error !== undefined ? { error: row.error } : {},
             })),

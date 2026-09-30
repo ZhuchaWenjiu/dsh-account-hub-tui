@@ -375,6 +375,17 @@ export interface ConsumeOpenAiSseOptions {
    * 文案会退化成「额度没有占满，可以直接继续」而不给具体数值。
    */
   maxTokens?: number
+  /**
+   * 每解析成功一帧就回调一次（**旁路观测**，不得影响流本身）。
+   *
+   * Cline 用它取网关下发的路由元数据（真正服务这笔请求的上游渠道），
+   * 见 `src/cline-routing.ts`。做成回调查而不是把字段塞进 `StreamChunk`：
+   * 那是**展示用的旁路信息**，不该污染 DSH 的 chunk 契约（也不该被
+   * 其它复用本消费器的 provider 无意中看到）。
+   *
+   * ⚠️ 回调**抛错会被吞掉**：观测失败绝不能把一次正常推理打死。
+   */
+  onFrame?: (data: Record<string, unknown>) => void
 }
 
 /**
@@ -597,6 +608,14 @@ export async function* consumeOpenAiSse(
           data = JSON.parse(payload)
         } catch {
           continue
+        }
+        // 旁路观测（如 Cline 的网关路由元数据）：失败绝不影响这次推理。
+        if (config.onFrame !== undefined) {
+          try {
+            config.onFrame(data)
+          } catch {
+            // 观测是尽力而为，吞掉异常（见选项注释）。
+          }
         }
         if (data.error !== undefined) {
           throw new LlmError(`${label}: ${data.error.message ?? 'unknown error'}`, 'SERVER')

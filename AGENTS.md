@@ -2896,6 +2896,91 @@ Cline 面板的账号管理区有一个**订阅额度**按钮（只在 Cline 出
    ⚠️ 另：**Windows 下别用内联 `node -e`**，PowerShell 会吃掉
    `\``/`$`/引号（本次两次静默跑错），写成 `.mjs` 文件再跑。
 
+### ⚠️⚠️ 请求记录的三处**展示语义**缺陷（2026-09-30 用户复核，一次报三个）
+
+用户报障原文：「**上游显示的不正确**」「支持图片的模型**发送不了图片**」
+「请求记录中：输出速率 `11814.8 t/s` 这个是不是也有问题」。
+三者**根因各不相同**，但都属于「字段取错了口径」，逐个记下：
+
+#### ① 「上游」列取的是**模型命名空间**，不是 serving channel
+
+- 原实现：`clineUpstreamOf(model)` = 模型 id 的 `/` 前缀（`cline-pass` /
+  `cline-free`），**甚至是厂商名**（`deepseek/deepseek-v4.1-flash` → `deepseek`）。
+  那是「订阅通道/厂商」，不是「谁服务了这笔请求」。
+- 参考实现同一列显示的是 **`alibaba` / `baseten`** 这类真实渠道，取自网关
+  下发的路由元数据（其 `parseRouting()`）。
+- **落点**（三种实测形态，`src/cline-routing.ts`）：
+
+  | 形态 | 路径 |
+  |---|---|
+  | planner | `choices[0].message.provider_metadata.gateway.routing.finalProvider` |
+  | planner（**流式帧**） | 顶层 `provider_metadata.gateway.routing.finalProvider` |
+  | direct | 顶层 `provider`（如 `GMICloud`，原样保留） |
+
+  ⚠️ **大小写两种拼写都要认**：本仓库另一处实测（Gemini-400 段）记的是
+  **camelCase** `providerMetadata`，参考样例是 snake_case；只认一种会在另一种
+  形态下静默读不到。
+  ⚠️ 参考注释：*"in a stream it appears on whichever frame carries it, so every
+  frame is inspected and the last non-null reading wins"* ⇒ **逐帧**观测、
+  最后一次非空为准。
+- **实现**：`consumeOpenAiSse` 新增**可选旁路** `onFrame`（回调抛错被吞掉 ——
+  观测绝不能打死一次正常推理）；适配器在 `consumeWithLog` 里累积，写进
+  `ClineRequestEntry.upstream`。**空串 = 网关没报**，RPC 侧才回落到模型命名空间。
+- 反向验证：停掉逐帧观测 → 用例红（`expected '' to be 'alibaba'`）。
+
+#### ② 图片能力只查本地兜底表 ⇒ `cline-pass/*` 全被误报「纯文本」
+
+- 原实现：`inputModalitiesFor()` 只看 `product.fallbackModels[].supportsImage`
+  —— **全表只有 5 条、且全是 `cline-free/*`**；而远端两个目录端点
+  **都不下发能力字段**（实测 `recommended-models` 只有
+  `{id,name,description,tags}`，`/models` 只有裸 id）。
+  ⇒ DSH 按适配器播报的 `inputModalities` 决定要不要把图片投影成占位符，
+  于是**图片根本送不进适配器** —— 用户看到的就是「支持图片的模型发不了图」。
+- **权威来源：`https://models.dev/api.json` 的 `cline-pass` provider 块**
+  （实测 18 条，逐模型带 `modalities.input`）：
+  `cline-pass/deepseek-v4.1-flash` → `["text","image"]`、
+  `cline-pass/minimax-m3` → `["text","image","video"]`、
+  `cline-pass/glm-5.3` → `["text"]`。参考实现用的**正是同一来源**
+  （其 `MODELS_DEV_URL`，注释说明它专为覆盖「发布晚于本版本、不在自带表里」
+  的模型 —— 同型缺陷）。
+- **口径**（`src/cline-modalities.ts`）：只认 `image`（夹取掉 audio/video/pdf
+  —— DSH 词表只有 text/image）；**本地兜底表优先级更高**（官方内嵌目录策展）；
+  **失败向上抛、不缓存**（`TtlCache` 只在成功时写入 ⇒ 下次可重试），适配器侧
+  吞掉并保持「未知」。TTL **6 小时**（发布节奏的数据，不必每次会话都拉）。
+- ⚠️ **「没读到」≠「不支持」**：`remoteModalities === undefined` 表示还没读到，
+  只有明确未命中/`false` 才是否定结论 —— 把前者当后者正是本次缺陷的形态。
+- 反向验证：停用 models.dev 那一级 → 用例红
+  （`cline: 模型 "cline-pass/deepseek-v4.1-flash" 不支持图片输入`）。
+
+#### ③ 「输出速率」的**分子与分母跨阶段** ⇒ 11814.8 t/s
+
+- 原实现（与参考实现同式）：`outputTokens ÷ (totalMs − ttftMs)`。
+- ⚠️ 本仓库已实测：**`reasoning_tokens` 计入 `completion_tokens`**
+  （见本文件多处，如 `reasoningTokens == outputTokens == 128000`），
+  而思考产生于 `ttftMs`（首个**任意**块）**之前** ⇒ **分子含不在该窗口里
+  产生的 token**，速率被无限放大。实测 `11814.8 t/s` ≙ 约 `142 token ÷ 12ms`：
+  响应整段几乎一次性到达时 `首字 ≈ 总耗时`，窗口退化成十几毫秒，任何 token
+  数除下来都物理不可能。
+- **修法：让分子分母落在同一阶段（正文阶段）**
+  - 新增记录字段 **`ttfcMs`**（首个**正文**块耗时；文本/工具调用才算，
+    思考块不算；0 = 本次没有正文块）；
+  - 速率 = `(outputTokens − reasoningTokens) ÷ (totalMs − ttfcMs)`；
+  - 窗口 **< 250ms**（`MIN_RATE_WINDOW_MS`）视为**不可测** → 显示 `—`
+    （宁可显示不可测，也不报一个看起来精确的假数字）。
+- ⚠️ 「首字」那一行**不变**（仍是首个任意块）—— 那是用户真实等待的时刻；
+  变的只是速率的分子分母要对齐到正文阶段。
+- 反向验证：把 `ttfcMs` 退回「任意块」→ 用例红
+  （`expected 53 to be greater than 53`，两者落在同一毫秒）。
+- ⚠️ 两个旧断言锁的正是**修复前**的写法（`const streaming = total - first`
+  与 `out / (streaming / 1000)`），已随之改写 —— 与「账号池 id」那次同型：
+  **旧断言可能锁死缺陷本身**，改口径时必须一并改。
+
+⚠️ **另记一处未修的小缺口**（不属本次报障，留给后续）：
+`recommended-models` 实测还有第 4 个数组 **`clineCloud`**（3 条，如
+`cline-cloud/glm-5.3`），而 `parseClineRecommendedModels` 只读
+`free`/`recommended`/`clinePass` ⇒ 这批模型拿不到 `name`/`description`
+（只能靠 `/models` 的裸 id 出现）。改动会影响模型列表内容，故未顺手做。
+
 ### ⚠️ 额度窗口与请求记录**共享同一个翻页索引**（用户要求）
 
 「订阅额度」弹窗改为：**一次只显示一个账号**，用左右箭头 `‹ ›` 翻页；

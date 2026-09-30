@@ -1211,19 +1211,44 @@ function tokenTooltip(row) {
 }
 
 /**
+ * 速率可测的**最小时长**（毫秒）。
+ *
+ * ⚠️ 窗口过短时**不报速率**：响应整段几乎一次性到达时
+ * （`首个正文块 ≈ 总耗时`，只剩十几毫秒），任何 token 数除下来都会得到
+ * 物理上不可能的值 —— 用户实测见到 `11814.8 t/s`（≈142 token ÷ 12ms）。
+ * 宁可显示 `—`（不可测），也不要报一个看起来精确的假数字。
+ */
+const MIN_RATE_WINDOW_MS = 250;
+
+/**
  * 延迟三行（参考实现同款）：**首字 / 总耗时 / 输出速率**。
  *
- * ⚠️ 速率只按**流式时长**（总耗时 − 首字）算，**不把首字算进去** ——
- * 否则「想得久、吐字快」的请求会被报成慢速（参考实现注释明确此坑：
- * 拿总耗时当分母等于把模型的思考折进「速度」）。
+ * ⚠️ 速率的分母**不含首字之前那段**（`总耗时 − 首字`），否则「想得久、
+ * 吐字快」的请求会被报成慢速（参考实现注释明确此坑）。
+ *
+ * ⚠️⚠️ 但**分子分母必须落在同一阶段**（真实缺陷，用户报障
+ * 「输出速率 11814.8 t/s」）：`outputTokens` **含思考 token**
+ * （本仓库已实测 `reasoning_tokens` 计入 `completion_tokens`），
+ * 而思考是在首字**之前**产生的；首字之后那段时间里真正产出的只有**正文**。
+ * 故：
+ * - 分子 = `outputTokens − reasoningTokens`（正文 token）
+ * - 分母 = `总耗时 − 首个正文块耗时`（正文阶段）
+ *
+ * 换回 `outputTokens ÷ (总耗时 − 首字)` 会让速率虚高到物理不可能的值
+ * （思考越多、正文越短，虚高越离谱）。
  */
 function latencyParts(row) {
   const first = Number(row?.ttftMs ?? 0);
   const total = Number(row?.totalMs ?? 0);
-  const out = row?.usageReported === true ? Number(row.outputTokens ?? 0) : 0;
-  const streaming = total - first;
-  const rate = first > 0 && out > 0 && streaming > 0
-    ? `${(out / (streaming / 1000)).toFixed(1)} t/s`
+  const usageReported = row?.usageReported === true;
+  const out = usageReported ? Number(row.outputTokens ?? 0) : 0;
+  const thinking = usageReported ? Math.max(0, Number(row.reasoningTokens ?? 0)) : 0;
+  // 首个**正文**块耗时（0 = 本次没有正文块 ⇒ 速率不可测）。
+  const firstContent = Number(row?.ttfcMs ?? 0);
+  const contentTokens = Math.max(0, out - thinking);
+  const window = total - firstContent;
+  const rate = firstContent > 0 && contentTokens > 0 && window >= MIN_RATE_WINDOW_MS
+    ? `${(contentTokens / (window / 1000)).toFixed(1)} t/s`
     : '—';
   return { first, total, rate };
 }

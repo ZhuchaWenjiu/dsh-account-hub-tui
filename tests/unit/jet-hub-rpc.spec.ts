@@ -1966,6 +1966,8 @@ describe('cline.quota / cline.requestLog 端点', () => {
         reasoningTokens: 89,
         effort: 'high',
         ttftMs: 320,
+        // 首个**正文**块耗时：速率的分子分母都要落在正文阶段，必须透传
+        ttfcMs: 1800,
         totalMs: 4200,
       })
       const { call } = setup()
@@ -1983,6 +1985,7 @@ describe('cline.quota / cline.requestLog 端点', () => {
           reasoningTokens?: number
           effort: string
           ttftMs: number
+          ttfcMs: number
           totalMs: number
         }>
       }
@@ -1990,7 +1993,7 @@ describe('cline.quota / cline.requestLog 端点', () => {
       expect(value.rows[0]).toEqual({
         ts: expect.any(Number),
         model: 'cline-pass/deepseek-v4.1-flash',
-        // 上游取模型 id 的「/ 前缀」—— 模型与上游是两个维度
+        // 网关没报路由时回落到模型 id 的「/ 前缀」（两个维度，见 RPC 侧注释）
         upstream: 'cline-pass',
         // ⚠️ 必须透传：表格据此把「网关没发 usage」显示成 `—`（不是 0）
         usageReported: true,
@@ -2002,8 +2005,47 @@ describe('cline.quota / cline.requestLog 端点', () => {
         // 推理强度：**空串也照传**（前端据「空串 ⇒ 不渲染那一行」判断）
         effort: 'high',
         ttftMs: 320,
+        ttfcMs: 1800,
         totalMs: 4200,
       })
+    })
+
+    /**
+     * ⚠️ 用户报障「上游显示的不正确」：**网关报的真实渠道优先**，
+     * 它没报时才回落到模型命名空间（`cline-pass` 那类订阅通道名）。
+     */
+    it('upstream 优先用网关报的渠道；未报时回落到模型命名空间', async () => {
+      seedOne({
+        model: 'cline-pass/deepseek-v4.1-flash',
+        accountId: 'acc-1',
+        usageReported: true,
+        inputTokens: 1,
+        outputTokens: 1,
+        effort: '',
+        upstream: 'alibaba',
+        ttftMs: 320,
+        totalMs: 4200,
+      })
+      const { call } = setup()
+      const withRoute = (await call('cline.requestLog', { provider: 'cline', accountId: 'acc-1' }))
+        .value as { rows: Array<{ upstream: string }> }
+      expect(withRoute.rows[0]!.upstream).toBe('alibaba')
+
+      // 网关没报路由（空串）⇒ 回落成模型命名空间，而不是编造渠道名
+      seedOne({
+        model: 'cline-pass/deepseek-v4.1-flash',
+        accountId: 'acc-1',
+        usageReported: true,
+        inputTokens: 1,
+        outputTokens: 1,
+        effort: '',
+        upstream: '',
+        ttftMs: 320,
+        totalMs: 4200,
+      })
+      const noRoute = (await call('cline.requestLog', { provider: 'cline', accountId: 'acc-1' }))
+        .value as { rows: Array<{ upstream: string }> }
+      expect(noRoute.rows[0]!.upstream).toBe('cline-pass')
     })
 
     /** ⚠️ 未收到 usage 帧时 token 全为 0，但 `usageReported:false` 必须透传。 */

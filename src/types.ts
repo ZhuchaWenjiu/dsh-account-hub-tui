@@ -461,7 +461,13 @@ export interface RpcClineRequestLogRow {
   ts: number
   /** 模型 id（wire 上的 `model`）。 */
   model: string
-  /** 模型族/上游（模型 id 的 `/` 前缀，如 `cline-pass`）。 */
+  /**
+   * 真正服务这笔请求的**上游渠道**（网关下发的路由元数据，如 `alibaba`）。
+   *
+   * ⚠️ 与「模型命名空间」（`cline-pass` / `cline-free`）**不是一回事**：
+   * 后者是订阅通道，甚至可能是厂商名（`deepseek/…`）。网关本次没报路由时
+   * 这里回落到命名空间 —— 取值顺序见 `src/cline-routing.ts` 与 RPC 侧注释。
+   */
   upstream: string
   /**
    * 是否收到过 usage 帧。
@@ -487,6 +493,15 @@ export interface RpcClineRequestLogRow {
   effort: string
   /** 首个内容块耗时（毫秒）—— 解释「为什么等了这么久才出字」。 */
   ttftMs: number
+  /**
+   * 首个**正文**块耗时（毫秒；0 = 本次没有任何正文/工具调用块）。
+   *
+   * ⚠️ 「输出速率」必须让分子分母落在**正文阶段**：分子 =
+   * `outputTokens − reasoningTokens`（思考 token 计入 `completion_tokens`，
+   * 且产生于 `ttftMs` 之前），分母 = `totalMs − ttfcMs`。缺这个字段，
+   * 速率会把思考 token 除进正文窗口 → 虚高到物理不可能的值（用户报障）。
+   */
+  ttfcMs: number
   /** 全程耗时（毫秒）。 */
   totalMs: number
   /** 失败原因；成功行省略。 */

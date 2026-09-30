@@ -88,6 +88,34 @@ describe('recordClineRequest / readClineRequestHistory', () => {
     expect(readClineRequestHistory()[0]!.effort).toHaveLength(32)
   })
 
+  /**
+   * ⚠️ `upstream` 的空串是**有意义的缺省**（= 网关本次没报路由），
+   * 展示层据此回落到模型命名空间；截断防止异常长的渠道名撑宽表格。
+   */
+  it('upstream 缺省为空串、有值则截断到 64 字', () => {
+    seed([OK_A])
+    expect(readClineRequestHistory()[0]!.upstream).toBe('')
+    seed([{ ...OK_A, upstream: 'alibaba' }])
+    expect(readClineRequestHistory()[0]!.upstream).toBe('alibaba')
+    seed([{ ...OK_A, upstream: 'x'.repeat(200) }])
+    expect(readClineRequestHistory()[0]!.upstream).toHaveLength(64)
+  })
+
+  /**
+   * ⚠️ `ttfcMs` 是「首个**正文**块」耗时，与 `ttftMs`（首个任意块，可能是
+   * 思考增量）**必须分开存**：展示层的输出速率 = 正文 token ÷
+   * (`totalMs − ttfcMs`)，缺了它分子分母会跨阶段（用户报障 11814.8 t/s）。
+   */
+  it('ttfcMs 缺省为 0（= 没有正文块）、有值则保留', () => {
+    seed([OK_A])
+    expect(readClineRequestHistory()[0]!.ttfcMs).toBe(0)
+    seed([{ ...OK_A, ttftMs: 320, ttfcMs: 1800 }])
+    expect(readClineRequestHistory()[0]!.ttfcMs).toBe(1800)
+    // 负数/垃圾值钳到 0（与 ttftMs 同口径）
+    seed([{ ...OK_A, ttfcMs: -5 }])
+    expect(readClineRequestHistory()[0]!.ttfcMs).toBe(0)
+  })
+
   it('按 accountId 过滤(面板用同一个翻页索引切记录)', () => {
     seed([
       { ...OK_A, accountId: 'acc-1' },
