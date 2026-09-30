@@ -43,22 +43,60 @@ deepseek-harness 插件：执行 CodeArts（华为云）登录流程，默认走
 
 ### 方式一：从 git 仓库安装（推荐）
 
-先在 profile 的 `pnpm-workspace.yaml` 中放行该包的 build 脚本
-（路径形如 `~/.dsh/profiles/<name>/pnpm-workspace.yaml`）：
+`add` 以 `git+https` 方式安装，pnpm 会运行本包的 `prepare` 脚本自动构建 `lib/`，
+无需手动 `pnpm build`。
 
-```yaml
-allowBuilds:
-  dsh-codearts-auth@git+https://gitee.com/iJetLi/deepseek-harness-codearts.git: true
-```
+⚠️ pnpm 10 起会拦截依赖的构建脚本，必须先在 profile 的 `pnpm-workspace.yaml`
+（路径形如 `~/.dsh/profiles/<name>/pnpm-workspace.yaml`）里放行；而**放行键的写法
+在 pnpm 10 与 pnpm 11 之间互不兼容**，写错就装不上（两种报错见本节末）。
 
-再用 `dsh plugin add` 从 gitee 拉取并安装：
+**1. 先跑一次安装**（这一次必然失败，为的是让 pnpm 打印它期望的键）：
 
 ```sh
 dsh plugin --profile <name> add "https://gitee.com/iJetLi/deepseek-harness-codearts.git"
 ```
 
-`add` 以 `git+https` 方式安装，pnpm 会运行 `prepare` 脚本自动构建 `lib/`，无需
-手动 `pnpm build`。每次升级时重新 `add` 即可拉取最新版本并重建。
+**2. 按第 1 步的报错选一种写法，写进 profile 的 `pnpm-workspace.yaml`。**
+
+报 **`ERR_PNPM_INVALID_VERSION_UNION`** 的（**pnpm 10.x**）—— 只认**纯包名**键：
+
+```yaml
+allowBuilds:
+  dsh-codearts-auth: true
+```
+
+报 **`ERR_PNPM_GIT_DEP_PREPARE_NOT_ALLOWED`** 的（**pnpm 11.x**，如本机实测的
+一版 DSH Desktop 内置 pnpm 11.7.0）—— git 托管包**不认**纯包名键，必须用第 1 步
+pnpm 打印的**完整键（含 `#<commit>`）**：
+
+```yaml
+allowBuilds:
+  dsh-codearts-auth@git+https://gitee.com/iJetLi/deepseek-harness-codearts.git#<第 1 步打印的 commit>: true
+```
+
+**两代通用（省事，但放宽了权限）**：
+
+```yaml
+dangerouslyAllowAllBuilds: true
+```
+
+它会放行该 profile 里**所有**依赖的构建脚本（不止本插件）。
+
+**3. 重跑第 1 步的命令**：这次会拉取、构建并安装成功。之后每次升级重新 `add` 即可。
+
+⚠️ **不要**写 `dsh-codearts-auth@git+https://gitee.com/…`（不带 `#<commit>`）——
+这个"看起来最自然"的键在两代 pnpm 上都不工作：
+
+- **pnpm 10.x**：解析该键即抛 `ERR_PNPM_INVALID_VERSION_UNION`（"Use exact versions
+  only."），安装当场失败 —— issue IKJCOC 报的就是它；
+- **pnpm 11.x**：不报错，但该键缺 commit，**永远匹配不上**真实依赖，表现为反复
+  `ERR_PNPM_GIT_DEP_PREPARE_NOT_ALLOWED`。
+
+⚠️ pnpm 11.x 的精确键里带 commit，因此**升级（重新 `add` 拉到新 commit）后该键
+失效**，按新报错里的键替换即可；用 `dangerouslyAllowAllBuilds` 则不必改。
+
+> 实测矩阵、判据与本仓库自身 `pnpm-workspace.yaml` 为什么不能出现同类键，
+> 见 `AGENTS.md` 的「安装（git 插件）的 allowBuilds 键在 pnpm 10 / 11 语义互不兼容」。
 
 ### 方式二：从源码目录安装（本地开发）
 
