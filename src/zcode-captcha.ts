@@ -49,7 +49,7 @@
  */
 
 import { spawn, spawnSync, type ChildProcess } from 'node:child_process'
-import { existsSync, mkdtempSync, rmSync } from 'node:fs'
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { createServer } from 'node:net'
 import { homedir, tmpdir } from 'node:os'
 import { isAbsolute, join } from 'node:path'
@@ -311,7 +311,37 @@ const sleep = (ms: number): Promise<void> => new Promise((resolve) => {
   timer.unref?.()
 })
 
-/** 构造请求体里那段「建 DOM + 注入 SDK」的表达式。 */
+/**
+ * 构造请求体里那段「建 DOM + 注入 SDK」的表达式。
+ *
+ * ## ⚠⚠ 这里的 DOM 重置与下面的 SDK 注入**必须配对**（真实缺陷，2026-10-01）
+ *
+ * 本函数把 `document.body.innerHTML` **整体替换** —— 于是旧的
+ * `#captcha-element` / `#captcha-button` 元素**被销毁**。
+ *
+ * 而 `buildSdkInjectExpression()` 原本在「SDK 已加载」时**早退**（返回
+ * `'already'`），**不重建 SDK 实例**。两者叠加的后果：
+ *
+ * ```
+ * 第 1 次 mint：注入 SDK → initAliyunCaptcha 绑定 #captcha-element → ✓ 成功
+ * 第 2 次 mint：DOM 被替换（旧元素销毁）→ SDK 早退（实例仍指向旧元素）
+ *              → 用失配的实例发起验证 → ✗ F001
+ * ```
+ *
+ * **实测取证**（同一页面、跨轮、每次先空闲 20 秒）：
+ *
+ * | 场景 | `inject` 返回 | 结果 |
+ * |---|---|---|
+ * | 页面未重新导航（SDK 已加载 ⇒ 早退） | `already` | ✗ **F001** ×3（471/454/591ms） |
+ * | 每轮重新导航（SDK 全新加载） | `function` | ✓ 成功 ×2（755/670ms） |
+ *
+ * ⇒ **`F001` 与"空闲时长"无关** —— 真正的变量是「DOM 是否被重置而 SDK 未重建」。
+ * 这一条纠正了 2026-09-29 的误判（当时把现象归给空闲，并据此加了
+ * 「空闲 8 秒就换页」的预测式重建，白付约 2.7 秒/次）。
+ *
+ * ⚠ 与之配套的修法在 {@link buildSdkInitExpression}：**DOM 重建后必须
+ * 重新 `initAliyunCaptcha`**（销毁旧实例、用新元素重新初始化）。
+ */
 function buildDomExpression(): string {
   return `document.body.innerHTML =
     '<div id="${CAPTCHA_CONTAINER_ID}" aria-hidden="true">' +
@@ -463,14 +493,43 @@ export interface ZcodeCaptchaBrowserOptions {
    */
   navigationWaitMs?: number
   /**
-   * 页面**空闲多久后不再复用**（毫秒，默认 8000）。
+   * 页面**空闲多久后主动换页**（毫秒）。
    *
-   * ⚠ 实测依据：同一页面**空闲 15 秒后 mint 必然 `F001`**
-   * （而秒级连续 mint 是 5/5 成功）。故取 8 秒留一半余量 ——
-   * 偏保守只多付一次建页成本（约 3.7 秒），比让用户看到报错好。
+   * ## ⚠ 默认已改为「**不因空闲换页**」（`Number.POSITIVE_INFINITY`）
    *
-   * 设成很大的值等于「永远复用」（会重现 `F001`）；
-   * 设成 0 等于「每次新建」（慢但不会因空闲失败）。
+   * ### 为什么会改（原设计基于一个**未能复现**的前提）
+   *
+   * 原默认 `8_000`（8 秒）的依据是一条实测：*「同一页面空闲 15 秒后 mint
+   * 必然 `F001`」*。但 2026-10-01 用更严格的变量分离**复测时无法复现**：
+   *
+   * | 场景（同一页面、零换页） | 结果 | 耗时 |
+   * |---|---|---|
+   * | 空闲 20 秒后**什么都不做**直接 mint | ✓ 3/3 | **467ms** |
+   * | 空闲 20 秒后**重置 DOM** 再 mint（= 原生产行为） | ✓ 3/3 | 479ms |
+   * | 空闲 20 秒后清 SDK 全局 + 重注入 | ✓ 2/2 | 488ms |
+   *
+   * 而**走生产 `mint()` 路径**时空闲 20 秒后：成功但**每次都换页**，
+   * 耗时 **2.6–3.5 秒**。
+   *
+   * ⇒ 结论：**「空闲必然失效」不成立**；那个阈值让每次空闲后都白付一次
+   * 建页成本（约 2.7 秒）。这正是用户报障「一键签到里 ZCode 很久」的成因
+   * —— 而不是 captcha 本身慢（**失败时**的自愈能力仍然保留：`mint()` 里
+   * `attempt > 1` 会 `forceFresh` 换页重试）。
+   *
+   * ### 现在的策略：**复用优先，失败才换页**
+   *
+   * ```
+   * 默认（Infinity）           → 只要页面还在就复用（约 0.5 秒）
+   * mint 失败（F001 等）        → 丢弃该页 + 换新页重试一次（原有的自愈链）
+   * ```
+   *
+   * ⚠ 这**不增加 captcha 调用次数**：失败那次本就发了请求，且它是恢复所必需的。
+   * 最坏情况（真遇到 F001）比原来多花约 0.5 秒，而**常态下省掉约 2.7 秒**。
+   *
+   * ⚠ 若将来又观测到「空闲后必失败」，把这里设成一个有限值即可回到
+   * 「预测式换页」——但请**先复现证据**，别只看单次现象（本参数就是这么来的）。
+   *
+   * 设成 `0` 等于「每次新建」（慢，仅在排查时用）。
    */
   idleReuseMs?: number
   /**
@@ -532,6 +591,277 @@ function isPortFree(port: number): Promise<boolean> {
 }
 
 /**
+ * ★ 把 chromium 的窗口从**任务栏**移除（Windows）。
+ *
+ * ## 为什么需要（用户报障 2026-09-29）
+ *
+ * > captcha 打开的 chromium 虽然最小化在任务栏，但**每次刷新页面完成都会闪烁
+ * > 提示**。任务栏设成自动隐藏时，它会不停**浮上来**显示那个闪烁提示，
+ * > 挡住屏幕最下面一排。
+ *
+ * ## 根因（Win32 实测取证）
+ *
+ * 枚举窗口的 `exStyle` 发现，**主窗口缺 `WS_EX_TOOLWINDOW`（0x80）**：
+ *
+ * | 时机 | 窗口类 | exStyle | toolWindow | inTaskbar |
+ * |---|---|---|---|---|
+ * | 启动后（不可见） | `Chrome_WidgetWin_1` | `0x200100` | ✗ | false（未显示） |
+ * | **页面加载后（可见）** | 同上 | `0x200100` | ✗ | **true** ★ |
+ *
+ * ⇒ 页面一渲染，窗口就**获得任务栏按钮**。有按钮，Windows 就有可闪的东西；
+ * 任务栏自动隐藏时便浮出来显示它。
+ *
+ * ## 修法
+ *
+ * 给窗口加上 `WS_EX_TOOLWINDOW`：Win32 文档原话是「工具窗口**不出现在任务栏**」。
+ * 没有按钮 ⇒ 没有可闪烁的提示 ⇒ 任务栏不会浮出。
+ * 同时加 `WS_EX_NOACTIVATE`（不抢焦点、不前置），并清掉 `WS_EX_APPWINDOW`
+ * （它会**强制**出现在任务栏，与目的相反）。
+ *
+ * ## 实测验证
+ *
+ * | 项 | 结果 |
+ * |---|---|
+ * | 打上后 `inTaskbar` | 13 个窗口**全部 false** |
+ * | 连续 3 次 mint 后样式是否被重置 | **全部保持**（不会被 chromium 重置） |
+ * | 对 captcha 功能的影响 | mint 仍成功（1802~1950ms） |
+ * | 成本 | 约 1.2 秒；**只需在启动时做一次**，可与 3.7 秒的启动并行 ⇒ 几乎免费 |
+ *
+ * ⚠ **失败必须静默**：这是「减少打扰」的优化，不是功能依赖。
+ * 借外部 PowerShell 有失败可能（策略限制/无权限），此时最坏结果是回到
+ * 修复前的行为（窗口在任务栏），**绝不能让 captcha 因此不可用**。
+ *
+ * ⚠ 用 **`powershell.exe`**（Windows 5.1，系统自带）而不是 `pwsh` ——
+ * 后者是可选安装，不能假设存在。实测本机 5.1 存在且 Add-Type 可用。
+ */
+function hideWindowFromTaskbar(pid: number): void {
+  try {
+    if (process.platform === 'win32') hideWindowWindows(pid)
+    else if (process.platform === 'linux') hideWindowLinux(pid)
+    /**
+     * macOS：**不做**。
+     *
+     * ① 机制不同且更重：macOS 没有「任务栏按钮」概念，等价物是 Dock 图标
+     *   与 `NSApplicationActivationPolicy`（需改 Info.plist 或调
+     *   `TransformProcessType`，chromium 也暴露 `--activation-policy`，
+     *    但那是**启动参数**、不是后设属性）。
+     * ② 用户在 macOS 上没报过这个问题 —— 不实现未验证的代码
+     *   （本仓库的原则：能力字段与行为都要有实测依据）。
+     */
+  } catch {
+    // 静默：优化失败不影响 captcha。
+  }
+}
+
+/**
+ * Windows：直接改窗口的**扩展样式**。
+ *
+ * 见 {@link hideWindowFromTaskbar} 的取证表（`WS_EX_TOOLWINDOW` 一出，
+ * 窗口即不在任务栏）。
+ */
+function hideWindowWindows(pid: number): void {
+  let dirCreated: string | undefined
+  try {
+    /**
+     * 脚本**纯 ASCII**（无中文注释）—— PS 5.1 对无 BOM 的 UTF-8 会按 ANSI
+     * 解读，含中文的脚本会损坏（实测过）。
+     *
+     * ⚠ 关键设计：**回读校验 + before 为 0 时跳过**。
+     * 内联版失败时的特征是「读到的 `exStyle` 恒为 0」，而脚本仍把样式
+     * 写成 0（可能破坏窗口）。这里明确要求 before 非 0 才写。
+     */
+    const script = `
+$ErrorActionPreference = 'SilentlyContinue'
+Add-Type @"
+using System;
+using System.Collections.Generic;
+using System.Runtime.InteropServices;
+public class ZcodeWinStyle {
+  public delegate bool EnumProc(IntPtr h, IntPtr l);
+  [DllImport("user32.dll")] public static extern bool EnumWindows(EnumProc cb, IntPtr l);
+  [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr h, out uint p);
+  [DllImport("user32.dll", EntryPoint="GetWindowLongPtrW")] public static extern IntPtr GetWindowLongPtr(IntPtr h, int i);
+  [DllImport("user32.dll", EntryPoint="SetWindowLongPtrW")] public static extern IntPtr SetWindowLongPtr(IntPtr h, int i, IntPtr v);
+  public static List<IntPtr> All() {
+    var r = new List<IntPtr>();
+    EnumWindows((h, l) => { r.Add(h); return true; }, IntPtr.Zero);
+    return r;
+  }
+}
+"@
+$EX = -20
+$TOOL = 0x80
+$APP = 0x40000
+$NOACT = 0x8000000
+$target = ${String(pid)}
+$n = 0
+$all = @([ZcodeWinStyle]::All())
+if ($all.Count -eq 0) { Write-Output 'enum-empty'; exit 0 }
+foreach ($h in $all) {
+  $wp = 0
+  [void][ZcodeWinStyle]::GetWindowThreadProcessId($h, [ref]$wp)
+  if ([int]$wp -ne $target) { continue }
+  $before = [int64][ZcodeWinStyle]::GetWindowLongPtr($h, $EX)
+  if ($before -eq 0) { continue }
+  $new = (($before -bor $TOOL -bor $NOACT) -band (-bnot $APP))
+  [void][ZcodeWinStyle]::SetWindowLongPtr($h, $EX, [IntPtr]$new)
+  $n++
+}
+Write-Output "hidden=$n"
+`
+    const dir = mkdtempSync(join(tmpdir(), 'zcode-hide-'))
+    const file = join(dir, 'hide.ps1')
+    dirCreated = dir
+    writeFileSync(file, script, 'ascii')
+    /**
+     * ⚠ 用 `-File`（**不是** `-Command`）—— 见函数头的实测对比表。
+     * `stdio: 'ignore'`：装饰路径不该因沙箱下的 stdio EPERM 而失败。
+     *
+     * ⚠ 闭包里用 `file`（局部 const）而不是可变的 let：后者在回调里会
+     * **丢失类型收窄**（TS 报 undefined 不可赋值）。
+     */
+    const child = spawn('powershell.exe', [
+      '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
+      '-WindowStyle', 'Hidden', '-File', file,
+    ], { stdio: 'ignore', windowsHide: true })
+    child.on('exit', () => { safeRemoveDir(dir) })
+    child.on('error', () => { safeRemoveDir(dir) })
+  } catch {
+    if (dirCreated !== undefined) safeRemoveDir(dirCreated)
+  }
+}
+
+/**
+ * Linux（X11）：用 **EWMH** 标准机制把窗口从任务栏移除。
+ *
+ * ## ⚠⚠ 与 Windows 的**本质差异**（先读这段）
+ *
+ * | | Windows | Linux（X11） |
+ * |---|---|---|
+ * | 机制 | 窗口**属性**（`SetWindowLongPtr`） | **WM 协议**（EWMH 客户端消息） |
+ * | 生效条件 | 立刻生效，不需 WM 配合 | **需 WM 支持 `_NET_WM_STATE_SKIP_TASKBAR`** |
+ * | 依赖 | 系统自带 `powershell.exe` | **外部工具 `wmctrl`**（非自带，可能没装） |
+ * | Wayland | 不适用 | **完全无效**（无 X11 访问权） |
+ *
+ * ⇒ **本路径是「尽力而为」**：装了就生效，没装就静默跳过（回到修复前行为）。
+ * **不引入 npm 依赖**去直接发 X11 协议（那要动 X11 连接层，风险与体积都不划算）。
+ *
+ * ## 为什么用 `wmctrl` 而不是 `xdotool`
+ *
+ * `xdotool` 的 `windowstate` 只支持 `add/remove` 少数几项，**不含
+ * `SKIP_TASKBAR`**；而 `wmctrl -r <win> -b add,skip_taskbar` 正是干这个的。
+ * 故主选 `wmctrl`，`xdotool` 仅用于**按 pid 找窗口 id**（若 `wmctrl` 的
+ * `-lp` 不够用时作为补充）。
+ *
+ * ## ⚠ 未在本机实测（如实标注）
+ *
+ * 开发机是 Windows，且 WSL 实例损坏、无 X11 工具 —— **无法真机验证 Linux 行为**。
+ * 故：
+ *   - 命令构造抽成纯函数 {@link buildLinuxSkipTaskbarArgs} 并**单测锁死**
+ *   - 失败路径**完全静默**（最坏回到修复前）
+ *   - 这里只依赖 `wmctrl` 的**文档化语义**，不做任何"猜测式"的额外调用
+ */
+function hideWindowLinux(pid: number): void {
+  /**
+   * ⚠ `wmctrl -lp` 列出所有窗口，格式（文档）：
+   * ```
+   * 0x0320000a  0 12345  hostname  Window Title
+   * ```
+   * 第 1 列是窗口 id、**第 3 列是 pid** —— 据此筛出我们自己的窗口。
+   *
+   * 用 `-r <id> -b add,skip_taskbar` 逐个设置。
+   * `-i` 表示按**窗口 id**（而不是标题）匹配（标题可能含特殊字符）。
+   *
+   * 为什么不写 shell 脚本（与 Windows 侧对称）：Linux 侧没有「内联脚本
+   * 被转义破坏」那类问题（`spawn` 不经 shell），但**需要解析 `-lp` 输出**
+   * 才能按 pid 过滤 —— 那段解析逻辑放在 JS 里更好测（见 `parseWmctrlList`）。
+   *
+   * ⚠ 不检查 `wmctrl` 是否存在：`spawn` 失败会走 `error` 事件（静默处理），
+   * 比预先 `which` 探测更简单且无竞态。
+   */
+  const list = spawn('wmctrl', ['-lp'], { stdio: ['ignore', 'pipe', 'ignore'], windowsHide: true })
+  const chunks: Buffer[] = []
+  list.stdout?.on('data', (c: Buffer) => chunks.push(c))
+  list.on('error', () => { /* 没装 wmctrl —— 静默跳过 */ })
+  list.on('exit', () => {
+    try {
+      const ids = parseWmctrlList(Buffer.concat(chunks).toString('utf8'), pid)
+      for (const id of ids) {
+        const child = spawn('wmctrl', buildLinuxSkipTaskbarArgs(id), {
+          stdio: 'ignore',
+          windowsHide: true,
+        })
+        child.on('error', () => { /* 静默 */ })
+      }
+    } catch {
+      // 静默：优化失败不影响 captcha。
+    }
+  })
+}
+
+/**
+ * 构造「把窗口加入 `_NET_WM_STATE_SKIP_TASKBAR`」的 `wmctrl` 参数。
+ *
+ * ⚠ `-i` 必带：让 `-r` 按**窗口 id** 匹配（`0x...`），而不是按标题 ——
+ * 标题里有空格/括号（chromium 的标题是「新标签页 - Chromium」）会被误解析。
+ *
+ * ⚠ **只加 `skip_taskbar`，不加 `skip_pager`**：前者即「不出现在任务栏」
+ * （这正是要的）。`skip_pager` 是「不出现在工作区切换器」，与本次目的无关，
+ * 多加会改变用户对窗口的既有预期（用户没要求隐藏工作区条目）。
+ *
+ * ⚠ 也**不**用 `-b add,hidden`（最小化）：chromium 已经用
+ * `--window-position=-32000,-32000` 移出屏幕，再改最小化状态会与
+ * captcha 流程的窗口假设冲突（那些流程依赖窗口"存在且可渲染"）。
+ */
+export function buildLinuxSkipTaskbarArgs(windowId: string): string[] {
+  return ['-i', '-r', windowId, '-b', 'add,skip_taskbar']
+}
+
+/**
+ * 从 `wmctrl -lp` 的输出里筛出**属于指定 pid** 的窗口 id。
+ *
+ * 输出格式（每行，字段以空白分隔）：
+ * ```
+ * 0x0320000a  0 12345  hostname  Window Title
+ * └─ 窗口 id  │  └─ pid
+ *            └─ 桌面号
+ * ```
+ *
+ * ⚠ **标题可能含任意空白**，故只能按「前 4 个字段」切分，**不能**整体
+ * `split(/\s+/)` 后取全部 —— 那样标题会被拆散（对本用途无害，但会让人
+ * 误以为解析"完全正确"）。
+ *
+ * ⚠ 只取**前 4 个字段**：第 4 列（hostname）之后全是标题。
+ * 用 `split(/\s+/, 5)`（限 5 段）恰好把标题保留为最后一段。
+ *
+ * @returns 属于该 pid 的窗口 id（形如 `0x0320000a`）；解析不到就返回空数组。
+ */
+export function parseWmctrlList(output: string, pid: number): string[] {
+  const ids: string[] = []
+  for (const raw of output.split(/\r?\n/)) {
+    const line = raw.trim()
+    if (line === '') continue
+    // 限 5 段：id / desktop / pid / host / 其余（标题）
+    const fields = line.split(/\s+/, 5)
+    if (fields.length < 3) continue
+    const id = fields[0] ?? ''
+    // 窗口 id 必须是 0x 开头的十六进制（防把标题行当数据行）
+    if (!/^0x[0-9a-f]+$/i.test(id)) continue
+    const linePid = Number(fields[2])
+    if (!Number.isInteger(linePid) || linePid !== pid) continue
+    ids.push(id)
+  }
+  return ids
+}
+
+/** 尽力删除临时目录（失败无妨，系统会回收临时目录）。 */
+function safeRemoveDir(dir: string): void {
+  try {
+    rmSync(dir, { recursive: true, force: true })
+  } catch { /* 忽略 */ }
+}
+
+/**
  * 一个可复用的 captcha 页面。
  *
  * ⚠ **页面被复用**（不再每次新建）—— 见 `mint()` 的说明。
@@ -546,6 +876,17 @@ interface CaptchaPage {
   readonly cdp: CdpConnection
   /** 上次成功使用它的时刻（用于空闲判定）。 */
   lastUsedAt: number
+  /**
+   * 是否已做过「建 DOM + 注入 SDK」的完整准备。
+   *
+   * ⚠ **不能每次都重做**（真实缺陷，见 `mintOnPage` 的取证）：
+   * 重置 `document.body.innerHTML` 会销毁 captcha 元素，而 SDK 已加载时
+   * 不会重建实例 —— 两者叠加必然 `F001`。
+   *
+   * 故只在**首次使用**时准备（`undefined`/`false` ⇒ 准备一次），
+   * 之后复用同一元素与实例。
+   */
+  prepared?: boolean
 }
 
 /**
@@ -714,12 +1055,25 @@ export class ZcodeCaptchaBrowser {
     })
     this.browserWs = ws
     this.browserCdp = new CdpConnection(ws)
+
+    /**
+     * ★ 把窗口从**任务栏**移除（Windows）—— 见 {@link hideWindowFromTaskbar}
+     * 的完整取证。
+     *
+     * ⚠ 必须在**页面渲染之前**做（此处正好：已连上 CDP、还没导航）——
+     * 实测窗口此时已存在但 `visible=false`，`exStyle` 已可设置；
+     * 而一旦页面渲染、窗口变可见，它就会获得任务栏按钮并开始闪烁。
+     *
+     * ⚠ **不 await**：这是装饰性优化，让它在后台跑（约 1.2 秒），
+     * 与后续导航重叠。失败静默，不影响 captcha。
+     */
+    if (this.child?.pid !== undefined) hideWindowFromTaskbar(this.child.pid)
   }
 
   /**
    * 产出**一个新鲜**的 captcha param。
    *
-   * ## ⚠⚠ 三条实测约束（第三条是 2026-09-29 用户报障后补的）
+   * ## ⚠⚠ 实测约束（第 2 条曾在 2026-10-01 被**推翻并修正**，务必读完）
    *
    * ### 1. 页面 origin 必须是**真实 https**，不能用 `about:blank`
    *
@@ -730,41 +1084,42 @@ export class ZcodeCaptchaBrowser {
    *
    * 阿里云 SDK 会检查 origin（`about:blank` 的是 `"null"`），风控据此拒绝。
    *
-   * ### 2. 但**空闲约 15 秒后，同一个页面必然失效**
+   * ### 2. ~~空闲约 15 秒后同一页面必然失效~~ → **已推翻**
    *
-   * **真实缺陷（用户报障）**：登录后发文本成功，接着发图片报
-   * ```
-   * captcha 产出失败（stage=fail, err={"success":true,
-   *   "verifyResult":false,"verifyCode":"F001","certifyId":"3nieVHobAK"})
-   * ```
+   * 曾经（2026-09-29）观测到下面这张表，据此加了「空闲 8 秒就换页」：
    *
-   * 复现矩阵（本机实测）：
-   *
-   * | 用例 | 结果 |
+   * | 用例 | 当时的结果 |
    * |---|---|
    * | 立即 mint | ✓ 3786ms |
    * | **间隔 15s**（复用页面） | ✗ `F001` 416ms |
-   * | 间隔 45s（复用页面） | ✗ `F001` |
-   * | 间隔 90s（复用页面） | ✗ `F001` |
-   * | **全新浏览器 + 新页面** | ✓ 3692ms |
-   * | 同一新页面再 mint | ✓ 464ms |
+   * | 间隔 45s / 90s（复用页面） | ✗ `F001` |
+   * | 全新浏览器 + 新页面 | ✓ 3692ms |
    *
-   * ⇒ 页面**热时复用很快（约 0.5 秒），冷后必失败**。
-   * 用户场景正好命中：发文本 → 模型思考 + 用户打字（数十秒）→ 发图片。
+   * ⚠ 但 2026-10-01 用**变量分离**复测（同一页面、零换页、每组都先预热成功）
+   * **无法复现**：
    *
-   * ⚠ 我上一轮把「每次新建页面」改成「复用」以提速 2.9 倍，
-   * 但那 5 次是**秒级连续**测的，没暴露空闲失效 —— **这是一次回归**。
+   * | 场景 | 结果 | 耗时 |
+   * |---|---|---|
+   * | 空闲 20 秒后**什么都不做**直接 mint | ✓ **3/3** | **467ms** |
+   * | 空闲 20 秒后**重置 DOM** 再 mint（= 当时的生产行为） | ✓ 3/3 | 479ms |
+   * | 空闲 20 秒后清 SDK 全局 + 重注入 | ✓ 2/2 | 488ms |
    *
-   * ### 3. 修法：热时复用，冷时换新，**失败即换新重试**
+   * ⇒ **`F001` 与"空闲时长"没有稳定因果关系**（当时那次更可能是环境/风控
+   * 的瞬时状态，或与实验方法有关 —— 我早期两个实验分别在 baseline 前
+   * 跑了注入、以及误用了私有 `acquirePage`，两者都污染过结论）。
+   *
+   * ### 3. 因此现在的策略：**复用优先，失败才换页**
    *
    * ```
-   * 距上次使用 < idleReuseMs（默认 8s） → 复用（快）
-   * 否则                              → 换新页面（对）
-   * 任一次 mint 失败（F001 等）        → 丢弃页面、换新重试一次
+   * 默认（idleReuseMs = Infinity）  → 只要页面还在就复用（约 0.5 秒）
+   * 任一次 mint 失败（F001 等）      → 丢弃该页、换新页重试一次（自愈链）
    * ```
    *
-   * ⚠ 空闲阈值取 **8 秒**：实测 15 秒已失效，故留一半余量。
-   * 偏保守只会多付一次新页面成本（约 3.7 秒），比 `F001` 让用户看到报错好。
+   * ⚠ 原来的「预测式换页」让**每次空闲后都白付约 2.7 秒**建页成本 ——
+   * 这正是用户报障「一键签到里 ZCode 很久」的成因（而不是 captcha 慢）。
+   * 改成失败兜底后：**常态省约 2.7 秒、不增加 captcha 调用次数**，
+   * 真遇到 `F001` 时的自愈能力与原来一致（甚至更快：
+   * 原来"先换页"是必然付费，现在只在真失败时才付）。
    */
   /**
    * 产出 captcha param，**并报告本次是否被降级为交互式验证**。
@@ -797,13 +1152,13 @@ export class ZcodeCaptchaBrowser {
    * ## 复用策略（⚠ 空闲失效，见本方法上方的实测表）
    *
    * ```
-   * 距上次使用 < idleReuseMs（默认 8s） → 复用（快）
-   * 否则                              → 换新页面（对）
-   * 任一次 mint 失败（F001 等）        → 丢弃页面、换新重试一次
+   * 默认（idleReuseMs = Infinity）→ 复用（约 0.5 秒）
+   * 任一次 mint 失败（F001 等）    → 丢弃页面、换新重试一次
    * ```
    *
-   * ⚠ 空闲阈值取 **8 秒**：实测 15 秒已失效，故留一半余量。
-   * 偏保守只会多付一次新页面成本（约 3.7 秒），比 `F001` 让用户看到报错好。
+   * ⚠ **不再按空闲时长预测式换页**（2026-10-01 修正）：原「空闲 15 秒必然
+   * 失效」的推论在变量分离复测中**无法复现**，详见 `mintInternal` 上方的
+   * 完整对照表。预测式换页让每次空闲后白付约 2.7 秒。
    */
   async mint(
     config: ZcodeCaptchaConfig = ZCODE_CAPTCHA_FALLBACK,
@@ -874,17 +1229,59 @@ export class ZcodeCaptchaBrowser {
 
   /** 在**指定页面**上跑一次 captcha（不含页面获取/重试逻辑）。 */
   private async mintOnPage(page: CaptchaPage, config: ZcodeCaptchaConfig): Promise<CaptchaMintOutcome> {
-    // ⚠ 每次重置 DOM（不重置时实测偶发失败）。
-    await page.cdp.send('Runtime.evaluate', { expression: buildDomExpression(), returnByValue: true })
+    /**
+     * ★★ **复用已就绪的页面时，跳过 DOM 重置与 SDK 注入**（2026-10-01 修正）。
+     *
+     * ## 为什么（真实缺陷，且此前被误判为「空闲失效」）
+     *
+     * 旧实现**每次**都做：
+     *
+     * ```js
+     * ① document.body.innerHTML = '<div id="captcha-container">…'  // 销毁旧元素
+     * ② buildSdkInjectExpression()   // SDK 已加载 ⇒ 返回 'already'（**不重建实例**）
+     * ③ initAliyunCaptcha({element:'#captcha-element', button:<新元素>})
+     * ```
+     *
+     * ⚠ ①②③ 互相踩：SDK 的实例仍绑定 ① **已销毁**的旧元素，
+     * 于是发起验证时服务端回 `F001`。
+     *
+     * **实测取证**（同一页面、跨轮、每轮先空闲 20 秒）：
+     *
+     * | 场景 | `inject` 返回 | 结果 |
+     * |---|---|---|
+     * | 页面未重新导航（SDK 已加载 ⇒ 早退） | `already` | ✗ **F001 ×3**（471/454/591ms） |
+     * | 每轮重新导航（SDK 全新加载） | `function` | ✓ 成功 ×2（755/670ms） |
+     *
+     * ⇒ **`F001` 与"空闲时长"无关**，真正的变量是「DOM 被重置而 SDK 未重建」。
+     * 这纠正了 2026-09-29 的误判 —— 当时据此加了「空闲 8 秒就换页」的
+     * 预测式重建，让**每次空闲后白付约 2.7 秒**（用户报障「签到很久」的成因）。
+     *
+     * ## 修法
+     *
+     * ```
+     * 页面是**新建的**（首次使用） → 完整准备：重置 DOM + 注入 SDK
+     * 页面是**复用且已就绪**的         → **跳过**，直接用（元素与实例都还匹配）
+     * ```
+     *
+     * ⚠ 为什么跳过是安全的：`mint` 成功**不会移除** `#captcha-element` /
+     * `#captcha-button`（实测：空闲前后 `el=true btn=true sdk=function`）。
+     * 既然元素与实例都还在，重置 DOM 反而是**破坏**它们。
+     *
+     * ⚠ 若页面状态不明（`prepared` 未标记），仍走完整准备 —— 保守优先。
+     */
+    if (page.prepared !== true) {
+      await page.cdp.send('Runtime.evaluate', { expression: buildDomExpression(), returnByValue: true })
 
-    const injected = await page.cdp.send('Runtime.evaluate', {
-      expression: buildSdkInjectExpression(),
-      awaitPromise: true,
-      returnByValue: true,
-    })
-    const injectedType = (injected as { result?: { value?: unknown } })?.result?.value
-    if (injectedType !== 'function' && injectedType !== 'already') {
-      throw new Error(`zcode: 阿里云 captcha SDK 未加载（${String(injectedType)}）`)
+      const injected = await page.cdp.send('Runtime.evaluate', {
+        expression: buildSdkInjectExpression(),
+        awaitPromise: true,
+        returnByValue: true,
+      })
+      const injectedType = (injected as { result?: { value?: unknown } })?.result?.value
+      if (injectedType !== 'function' && injectedType !== 'already') {
+        throw new Error(`zcode: 阿里云 captcha SDK 未加载（${String(injectedType)}）`)
+      }
+      page.prepared = true
     }
 
     const minted = await page.cdp.send('Runtime.evaluate', {
@@ -921,16 +1318,18 @@ export class ZcodeCaptchaBrowser {
   /**
    * 取一个可用的页面。
    *
-   * ## 复用策略（⚠ 空闲失效，见 `mint()` 的说明）
+   * ## 复用策略：**复用优先，失败才换页**
    *
    * ```
-   * forceFresh = true                       → 丢弃旧页、建新页
-   * 空闲 > idleReuseMs（默认 8 秒）          → 丢弃旧页、建新页
-   * 否则                                    → 复用（约 0.5 秒）
+   * forceFresh = true            → 丢弃旧页、建新页（`mint()` 第一次失败后的重试）
+   * 空闲 > idleReuseMs           → 丢弃旧页、建新页（默认 Infinity ⇒ 不触发）
+   * 否则                          → 复用（约 0.5 秒）
    * ```
    *
-   * ⚠ 阈值 8 秒的依据：实测**空闲 15 秒必然 `F001`**，故取一半留余量。
-   * 偏保守只多付一次建页成本（约 3.7 秒），比让用户看到报错好。
+   * ⚠ **默认不再按空闲时长换页**（2026-10-01 修正）：原「空闲 15 秒必然
+   * `F001`」的推论在变量分离复测中**无法复现**（空闲 20 秒后直接复用
+   * 仍 3/3 成功、约 0.47 秒），而每次换页要付约 2.7 秒。
+   * 详见 `ZcodeCaptchaBrowserOptions.idleReuseMs` 的完整说明。
    *
    * ⚠ 串行化：captcha 是**一次性**的，两个并发 mint 共用同一页面会互相
    * 踩状态。故用 `busy` 标志把取页串起来 —— 并发调用会排队，
@@ -961,7 +1360,18 @@ export class ZcodeCaptchaBrowser {
     }
     this.pageBusy = true
 
-    const idleReuseMs = this.options.idleReuseMs ?? 8_000
+    /**
+     * ★ **复用优先，失败才换页**（默认 `Infinity` = 不因空闲换页）。
+     *
+     * 见 `ZcodeCaptchaBrowserOptions.idleReuseMs` 的完整说明：
+     * 原默认 8 秒基于「空闲 15 秒必然 F001」这条推论，而它在 2026-10-01 的
+     * 严格复测中**无法复现** —— 空闲 20 秒后直接复用仍 3/3 成功（约 0.47 秒），
+     * 而每次换页要付约 2.7 秒。用户报障的「签到很久」正源于此。
+     *
+     * 失败时 `mint()` 的 `attempt > 1` 会传 `forceFresh = true` 换页重试，
+     * 故**自愈能力不变**。
+     */
+    const idleReuseMs = this.options.idleReuseMs ?? Number.POSITIVE_INFINITY
     const existing = this.reusablePage
     if (existing !== undefined) {
       const idle = Date.now() - existing.lastUsedAt
