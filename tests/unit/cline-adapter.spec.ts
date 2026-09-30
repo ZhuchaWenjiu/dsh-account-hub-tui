@@ -750,28 +750,62 @@ describe('Cline 接线（源码级回归）', () => {
   })
 
   /**
-   * ⚠️ **真实缺陷**（用户报障 2026-09-30）：「上游显示的不正确」。
+   * ⚠️⚠️ **真实缺陷**（用户两次报障：「上游显示的不正确」/「上游显示的还是错误的」）。
    *
    * 「上游」原先取模型 id 的 `/` 前缀（`cline-pass`），那是**订阅通道**、
    * 甚至可能是厂商名，不是 serving channel。修复后取网关下发的路由元数据
    * （`provider_metadata.gateway.routing.finalProvider`，参考实现同源）。
+   *
+   * ⚠️ **本用例的 fixture 必须用实测的真实形状**：第一版把路由写成**帧顶层**，
+   * 而真实流式响应挂在 **`choices[0].delta`** 上 —— 于是用例绿、功能坏，
+   * 用户第二次报障才暴露。**这就是「fixture 写错等于没有测试」的活例**：
+   * 凡外部载荷的层级，只能照实测写（探针 `probe-cline-routing-live.mjs`）。
    */
   it('请求记录记下网关报的真实上游渠道（而不是模型前缀）', async () => {
     resetClineRequestHistory()
     const adapter = makeAdapter({
       fetchImpl: (async () => sseResponse([
         JSON.stringify({ choices: [{ delta: { content: 'hi' } }] }),
-        // 路由元数据出现在「携带它的那一帧」上（planner 管线）
-        JSON.stringify({ provider_metadata: { gateway: { routing: { finalProvider: 'alibaba' } } } }),
+        // 实测量到的位置：`choices[0].delta.provider_metadata.gateway.routing.finalProvider`
+        // （modelAttempts 是真实帧里同时存在的嵌套字段，防止解析器误取嵌套 provider）
+        JSON.stringify({
+          choices: [{
+            index: 0,
+            delta: {
+              provider_metadata: {
+                gateway: {
+                  routing: {
+                    finalProvider: 'deepseek',
+                    modelAttempts: [{ providerAttempts: [{ provider: 'deepseek' }] }],
+                  },
+                },
+              },
+            },
+          }],
+        }),
         JSON.stringify({ choices: [{ delta: {}, finish_reason: 'stop' }] }),
       ])) as unknown as typeof fetch,
     })
     await collect(adapter, { model: 'cline-pass/deepseek-v4.1-flash' })
 
     const row = readClineRequestHistory()[0]!
-    expect(row.upstream).toBe('alibaba')
+    expect(row.upstream).toBe('deepseek')
     // 关键：**不能**是模型命名空间
     expect(row.upstream).not.toBe('cline-pass')
+  })
+
+  /** 另一种形态（帧顶层）保留兼容 —— 参考实现抓到过它，但**不是**主流式链路。 */
+  it('路由挂在帧顶层时同样读得到（兼容形态）', async () => {
+    resetClineRequestHistory()
+    const adapter = makeAdapter({
+      fetchImpl: (async () => sseResponse([
+        JSON.stringify({ choices: [{ delta: { content: 'hi' } }] }),
+        JSON.stringify({ provider_metadata: { gateway: { routing: { finalProvider: 'baseten' } } } }),
+        JSON.stringify({ choices: [{ delta: {}, finish_reason: 'stop' }] }),
+      ])) as unknown as typeof fetch,
+    })
+    await collect(adapter, { model: 'cline-pass/deepseek-v4.1-flash' })
+    expect(readClineRequestHistory()[0]!.upstream).toBe('baseten')
   })
 
   /** 网关没报路由时留空串 —— 由 RPC 侧回落到模型命名空间，**不在适配器里编造**。 */

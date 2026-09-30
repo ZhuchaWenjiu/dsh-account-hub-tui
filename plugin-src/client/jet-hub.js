@@ -1358,7 +1358,14 @@ function latencyParts(row) {
   const rate = firstContent > 0 && contentTokens > 0 && window >= MIN_RATE_WINDOW_MS
     ? `${(contentTokens / (window / 1000)).toFixed(1)} t/s`
     : '—';
-  return { first, total, rate };
+  // ⚠️ `—` 的**原因**必须能查到（用户第二次报障时就怀疑「速率还是错的」，而
+  // 实际上一种情形是**不可测**）：两种不可测各有各的说法，别合并成一句。
+  const rateTitle = rate !== '—'
+    ? `正文 ${contentTokens} token ÷ 正文阶段 ${(window / 1000).toFixed(2)}s（不含首字前的思考阶段）`
+    : firstContent === 0
+      ? '本次没有正文块（只输出思考，或流在正文之前结束）—— 速率不可测'
+      : `正文阶段只有 ${window}ms（不足 ${MIN_RATE_WINDOW_MS}ms）—— 响应几乎一次性到达，速率不可测`;
+  return { first, total, rate, rateTitle };
 }
 
 /** 状态点：绿=成功、红=失败（参考实现同款；错误消息在 title 里）。 */
@@ -1630,7 +1637,7 @@ function ClineQuotaPanel({ rpcCall, onClose }) {
             React.createElement('span', { className: 'dim-jh-quotaLoadRow' },
               React.createElement('span', { className: 'dim-jh-quotaLoadKey' }, '总耗时'),
               React.createElement('span', null, formatMs(figures.total))),
-            React.createElement('span', { className: 'dim-jh-quotaLoadRow' },
+            React.createElement('span', { className: 'dim-jh-quotaLoadRow', title: figures.rateTitle },
               React.createElement('span', { className: 'dim-jh-quotaLoadKey' }, '输出速率'),
               React.createElement('span', null, figures.rate))),
         ];

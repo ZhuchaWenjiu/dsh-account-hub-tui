@@ -2918,9 +2918,10 @@ Cline 面板的账号管理区有一个**订阅额度**按钮（只在 Cline 出
 
   | 形态 | 路径 |
   |---|---|
-  | planner | `choices[0].message.provider_metadata.gateway.routing.finalProvider` |
-  | planner（**流式帧**） | 顶层 `provider_metadata.gateway.routing.finalProvider` |
-  | direct | 顶层 `provider`（如 `GMICloud`，原样保留） |
+  | **流式（真实链路）** | `choices[0].delta.provider_metadata.gateway.routing.finalProvider` |
+  | 非流式 / planner | `choices[0].message.provider_metadata.gateway.routing.finalProvider` |
+  | 帧顶层 | `provider_metadata.gateway.routing.finalProvider` |
+  | direct | `delta.provider` / 顶层 `provider`（如 `GMICloud`，原样保留） |
 
   ⚠️ **大小写两种拼写都要认**：本仓库另一处实测（Gemini-400 段）记的是
   **camelCase** `providerMetadata`，参考样例是 snake_case；只认一种会在另一种
@@ -2931,7 +2932,43 @@ Cline 面板的账号管理区有一个**订阅额度**按钮（只在 Cline 出
 - **实现**：`consumeOpenAiSse` 新增**可选旁路** `onFrame`（回调抛错被吞掉 ——
   观测绝不能打死一次正常推理）；适配器在 `consumeWithLog` 里累积，写进
   `ClineRequestEntry.upstream`。**空串 = 网关没报**，RPC 侧才回落到模型命名空间。
-- 反向验证：停掉逐帧观测 → 用例红（`expected '' to be 'alibaba'`）。
+- 反向验证：停掉逐帧观测 → 用例红（`expected '' to be 'deepseek'`）。
+
+⚠️⚠️ **第一版读漏了 `delta` 这一层，整处修复在真实链路上完全没生效**
+（用户 2026-10-01 第二次报障：「**上游**和**请求速率**为什么显示的还是错误的」；
+进程核对过 —— 00:30 启动的进程**已含** 00:09 那次安装，不是「没加载」）。
+当时按「非流式挂 `message`、**流式挂帧顶层**」实现，而**实测的流式帧把它挂在
+`choices[0].delta` 上** ⇒ 每帧都读不到、`upstream` 恒为空串、展示层回落到
+`cline-pass`，用户看到的与修复前**一模一样**。
+
+**两条教训（都比这一处 bug 值钱）**：
+
+1. ⚠️ **外部载荷的确切层级只能实测，不能按参考实现的只言片语推断**。参考实现
+   只说了「出现在携带它的那一帧上」，**没有说挂在 `delta` 还是帧顶层**，我按
+   猜测填了帧顶层。一次性探针
+   （`scripts/probe-cline-routing-live.mjs`：用凭据库里的 token 发一次极小流式
+   请求，**逐帧打印命中的 JSON 路径**）当场就能定案 —— 这类「形状假设」必须
+   在写实现时就用探针钉死，或至少在注释里标成**未验证假设**。
+2. ⚠️⚠️ **fixture 写错等于没有测试**：适配器那条 `upstream` 用例当时用的是
+   **帧顶层**的 fixture（即我的猜测），于是**用例绿、功能坏**，直到用户第二次
+   报障才暴露。凡涉及外部响应形状的 fixture，必须照实测量到的报文写，
+   并把「实测来源 + 日期 + 探针名」写进注释（现已如此）。
+
+   ⚠️ 探针本身也踩了一个坑：仓库里的 `access_token` **已含 `workos:` 前缀**
+   （`buildClineCredential` 写入时就加了），再拼一次 ⇒ `Bearer workos:workos:…`
+   ⇒ **401**。第一版探针因此误判「两个账号的 token 都失效」。
+
+**顺带核清的 `finalProvider` 语义**：它既可能是**基础设施商**（参考实现抓到的
+`alibaba` / `baseten`），也可能是**模型厂商自己的 API** —— 本机实测
+`cline-pass/deepseek-v4.1-flash` → `finalProvider = "deepseek"`。两者都是
+「网关最终决定由谁服务」，故**原样展示**、不要试图归类。
+
+**同时给「输出速率」补了 `—` 的原因提示**（`latencyParts` 新增 `rateTitle`，
+挂在那一行的 `title` 上）：不可测有两种情形，各自给话 ——
+`本次没有正文块（只输出思考，或流在正文之前结束）` /
+`正文阶段只有 Nms（不足 250ms）—— 响应几乎一次性到达`。
+用户第二次报障时正是怀疑「速率还是错的」，而实际是**不可测**；
+一个横杠不解释，就会被读成「坏了」。
 
 #### ② 图片能力只查本地兜底表 + **`cline-pass` 目录不全**（同一处修复）
 

@@ -4,15 +4,67 @@ import { parseClineRouting } from '../../src/cline-routing.js'
 /**
  * 「上游渠道」解析的回归。
  *
- * ⚠️ 这些 fixture 的**形状取自参考实现**（`github.com/codeOct/dsh-cline-pass`
- * 的 `test/smoke.mjs`，其注释说明是照着真实网关响应写的）：
- * planner 管线走 `provider_metadata.gateway.routing.finalProvider`，
- * direct 管线走顶层 `provider`。
+ * ⚠️ fixture 的形状分两类来源，别混：
+ * - `choices[0].delta` 那条是**本机真实流式响应**（2026-10-01 实测，
+ *   `cline-pass/deepseek-v4.1-flash`，逐帧打印命中路径的探针见 AGENTS.md）；
+ * - `message` / 顶层 / `provider` 那几条取自参考实现的样例。
  *
  * 用户报障「上游显示的不正确」：原先展示层用的是**模型 id 的 `/` 前缀**
  * （`cline-pass` / `cline-free`，甚至是厂商名），不是 serving channel。
+ *
+ * ⚠️⚠️ **本文件存在的直接理由**：第一版实现只读 `message` 与**帧顶层**，
+ * 而实测的真实链路把它挂在 `choices[0].delta` 上 —— 修复因此**在真实链路上
+ * 完全没生效**（用户第二次报障「上游显示的还是错误的」）。故下面第一条用例
+ * 锁的就是这个位置，改动解析顺序时**不许把它挪到后面去**。
  */
 describe('parseClineRouting', () => {
+  /**
+   * ⚠️ **真实流式形状（本机实测）** —— 缺了这条，第一版的漏读就不会被发现。
+   *
+   * 实测原文（节选，只保留相关字段）：
+   * `{"choices":[{"index":0,"delta":{"provider_metadata":{"gateway":{"routing":
+   * {"finalProvider":"deepseek","modelAttempts":[{"providerAttempts":
+   * [{"provider":"deepseek"}]}]}}}}}]}`
+   */
+  it('流式（真实链路）：读 choices[0].delta 上的 provider_metadata', () => {
+    expect(parseClineRouting({
+      id: 'gen-1759250000-abc',
+      object: 'chat.completion.chunk',
+      model: 'deepseek/deepseek-v4.1-flash',
+      choices: [{
+        index: 0,
+        delta: {
+          provider_metadata: {
+            gateway: {
+              routing: {
+                finalProvider: 'deepseek',
+                modelAttempts: [{ providerAttempts: [{ provider: 'deepseek' }] }],
+              },
+            },
+          },
+        },
+      }],
+    })).toBe('deepseek')
+  })
+
+  /** ⚠️ 真实帧里 `provider` 也出现在嵌套的 `providerAttempts[]` 里，不能被误取。 */
+  it('流式：嵌套的 providerAttempts[].provider 不算「上游」（只认 routing.finalProvider）', () => {
+    expect(parseClineRouting({
+      choices: [{
+        index: 0,
+        delta: {
+          provider_metadata: {
+            gateway: {
+              routing: {
+                modelAttempts: [{ providerAttempts: [{ provider: 'deepseek' }] }],
+              },
+            },
+          },
+        },
+      }],
+    })).toBe('')
+  })
+
   it('planner 管线：读 message 上的 provider_metadata（参考实现同款样例）', () => {
     expect(parseClineRouting({
       choices: [{
@@ -32,7 +84,7 @@ describe('parseClineRouting', () => {
     })).toBe('alibaba')
   })
 
-  it('流式帧：读顶层 provider_metadata（路由出现在携带它的那一帧）', () => {
+  it('帧顶层：读 provider_metadata（参考实现抓到的另一种形态，保留兼容）', () => {
     expect(parseClineRouting({
       provider_metadata: { gateway: { routing: { finalProvider: 'baseten' } } },
     })).toBe('baseten')
@@ -40,6 +92,10 @@ describe('parseClineRouting', () => {
 
   it('direct 管线：读顶层 provider（保留原始大小写）', () => {
     expect(parseClineRouting({ provider: 'GMICloud', choices: [{ message: {} }] })).toBe('GMICloud')
+  })
+
+  it('direct 管线（流式）：读 delta.provider', () => {
+    expect(parseClineRouting({ choices: [{ delta: { provider: 'GMICloud' } }] })).toBe('GMICloud')
   })
 
   it('套了一层 data 信封也要认（参考实现的 unwrapEnvelope）', () => {
