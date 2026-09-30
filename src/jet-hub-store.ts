@@ -239,22 +239,55 @@ class MemoryStore implements JetHubStore {
 }
 
 /**
- * 旧凭据 ref → 账号条目的前缀表。
+ * provider id ↔ 凭据 ref 前缀的**单一真相源**。
  *
- * 六个 provider 的账号凭据一律存 `{PREFIX}_ACCOUNT_{UUID_SHORT}`（本插件的既有
- * 约定），故可据 ref 名反推 provider。
+ * 账号凭据一律存 `{PREFIX}_ACCOUNT_{UUID_SHORT}`（本插件的既有约定），故可据
+ * ref 名反推 provider。**表与正则都由本表派生** —— 这是刻意的：
+ *
+ * ⚠️ 表与正则分家会漂移出「加了 provider 却漏改正则」这类缺陷。真实缺陷：
+ * 本表原先只有 **6 项**（注释也写着「六个 provider」），而插件实际有 **11 个**
+ * —— `qodercn` / `cline` / `loomy` / `raccoon` / `zcode` 五个 provider 的账号在
+ * `state.json`（Jet Hub 状态文档）缺失时（重装 / 迁移 / profile 重建）
+ * **无法从 `.credentials.yaml` 的 `refs:` 恢复**，用户侧表现为「重装 / 迁移后
+ * 这几个面板的账号凭空消失，只能重新登录」。凭据本体一直完好，只是索引建不出来。
+ *
+ * ⚠️ **必须与 `src/jet-hub-rpc.ts` 的 `account.create` 生成的 ref 前缀一致**
+ * （那里是 `${provider.toUpperCase()}_ACCOUNT_${suffix}`）。**新增 provider 时
+ * 漏加本表 = 该 provider 的账号在状态文档丢失后静默消失**。
+ *
+ * ⚠️ 单凭据回退 ref（如 `CODEARTS_ACCESS_TOKEN` / `ZCODE_CREDENTIAL`）不含
+ * `_ACCOUNT_`，故不会被本表误吞 —— 这里只需登记账号 ref 前缀。
+ *
+ * 依据 `src/product.ts` 与各 `*-product.ts` 的 `id` 字段：
+ * `codearts` / `buddy` / `workbuddy` / `lobsterai` / `qoder` / `qodercn`
+ * / `trae` / `cline` / `loomy` / `raccoon` / `zcode`。
  */
-const PROVIDER_BY_REF_PREFIX: Record<string, string> = {
-  CODEARTS: 'codearts',
-  BUDDY: 'buddy',
-  WORKBUDDY: 'workbuddy',
-  LOBSTERAI: 'lobsterai',
-  QODER: 'qoder',
-  TRAE: 'trae',
-}
+const REF_PREFIX_TO_PROVIDER: ReadonlyArray<readonly [string, string]> = [
+  ['CODEARTS', 'codearts'],
+  ['BUDDY', 'buddy'],
+  ['WORKBUDDY', 'workbuddy'],
+  ['LOBSTERAI', 'lobsterai'],
+  ['QODER', 'qoder'],
+  ['QODERCN', 'qodercn'],
+  ['TRAE', 'trae'],
+  ['CLINE', 'cline'],
+  ['LOOMY', 'loomy'],
+  ['RACCOON', 'raccoon'],
+  ['ZCODE', 'zcode'],
+]
 
-/** 账号凭据 ref 形态：`{PREFIX}_ACCOUNT_{HEX}`。 */
-const ACCOUNT_REF_RE = /^(CODEARTS|BUDDY|WORKBUDDY|LOBSTERAI|QODER|TRAE)_ACCOUNT_([0-9A-Fa-f]{6,})$/
+/** 账号凭据 ref 形态：`{PREFIX}_ACCOUNT_{HEX}`（前缀由单一真相源派生）。 */
+const ACCOUNT_REF_RE = new RegExp(
+  // ⚠️ 按前缀长度**降序**排列：`QODERCN` 必须排在 `QODER` 之前。虽然正则的
+  // 回溯最终仍能让 `QODERCN_*` 匹配成功（所以顺序错了也**暂时**看不出问题），
+  // 但那时匹配结果就取决于引擎的尝试顺序而非规则 —— 一旦将来加入更多同前缀的
+  // provider（如 `QODERX`），就会变成静默错归属：账号挂到 `qoder` 面板，而它的
+  // 凭据是 CN 的，请求必然失败。故这里显式定序，而非依赖回溯。
+  `^(${REF_PREFIX_TO_PROVIDER
+    .map(([prefix]) => prefix)
+    .sort((a, b) => b.length - a.length)
+    .join('|')})_ACCOUNT_([0-9A-Fa-f]{6,})$`,
+)
 
 /**
  * 从 `.credentials.yaml` 的 `refs:` 段提取 ref 名（**只取键名，不读值**）。
@@ -284,9 +317,13 @@ function extractCredentialRefNames(text: string): string[] {
 function accountFromCredentialRef(ref: string): ProviderAccountEntry | undefined {
   const match = ACCOUNT_REF_RE.exec(ref)
   if (match === null) return undefined
-  const provider = PROVIDER_BY_REF_PREFIX[match[1] as string]
+  const prefix = match[1]
   const suffix = match[2]
-  if (provider === undefined || suffix === undefined) return undefined
+  if (prefix === undefined || suffix === undefined) return undefined
+  // 查表也走同一份真相源：正则捕获组只证明「前缀被登记过」，provider 仍由表给出，
+  // 避免这里再写一份「前缀 → provider」的映射。
+  const provider = REF_PREFIX_TO_PROVIDER.find(([candidate]) => candidate === prefix)?.[1]
+  if (provider === undefined) return undefined
   const id = `${provider}-${suffix.toLowerCase()}`
   return {
     id,

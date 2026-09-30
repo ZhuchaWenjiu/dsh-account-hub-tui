@@ -249,6 +249,102 @@ describe('文件后端（FileStore）', () => {
     expect(existsSync(join(dir, 'jet-hub', 'state.json'))).toBe(true)
   })
 
+  /**
+   * 回归：**全部 11 个 provider** 的账号 ref 都必须能恢复。
+   *
+   * 真实缺陷：恢复表原先只有 6 项（注释也写着「六个 provider」），而插件实际
+   * 有 11 个 —— `qodercn` / `cline` / `loomy` / `raccoon` / `zcode` 的账号在
+   * 状态文档缺失时**静默消失**（用户侧表现：「重装 / 迁移后这几个面板的账号
+   * 凭空不见，只能重新登录」）。凭据本体一直在 `.credentials.yaml` 里，
+   * 只是索引建不出来。
+   *
+   * ⚠️ 上一条用例只覆盖 `buddy` 与 `codearts`，正是这个覆盖缺口让缺陷溜过。
+   * 本用例按 `jet-hub-rpc.ts` 的 `account.create` 前缀规则
+   * （`${provider.toUpperCase()}_ACCOUNT_${suffix}`）逐个断言。
+   */
+  it('十一个 provider 的账号 ref 全部可恢复（新增 provider 必须同步登记）', () => {
+    const cases: Array<[string, string]> = [
+      ['CODEARTS_ACCOUNT_AAAAAA', 'codearts'],
+      ['BUDDY_ACCOUNT_BBBBBB', 'buddy'],
+      ['WORKBUDDY_ACCOUNT_CCCCCC', 'workbuddy'],
+      ['LOBSTERAI_ACCOUNT_DDDDDD', 'lobsterai'],
+      ['QODER_ACCOUNT_EEEEEE', 'qoder'],
+      ['QODERCN_ACCOUNT_FFFFFF', 'qodercn'],
+      ['TRAE_ACCOUNT_111111', 'trae'],
+      ['CLINE_ACCOUNT_222222', 'cline'],
+      ['LOOMY_ACCOUNT_333333', 'loomy'],
+      ['RACCOON_ACCOUNT_444444', 'raccoon'],
+      ['ZCODE_ACCOUNT_555555', 'zcode'],
+    ]
+    writeFileSync(
+      join(dir, '.credentials.yaml'),
+      ['version: 1', 'refs:', ...cases.map(([ref]) => `  ${ref}: '{}'`), 'records: {}'].join('\n'),
+      'utf-8',
+    )
+
+    const recovered = createJetHubStore(makeCtx(undefined)).load()?.accounts ?? []
+    expect(recovered.map(a => [a.credentialRef, a.provider])).toEqual(cases)
+  })
+
+  /**
+   * 回归（**根因级保险**）：恢复表必须覆盖客户端 `PROVIDERS` 的每一个 provider。
+   *
+   * 上一条用例的清单是**人手维护**的，所以「上游新增 provider 而本表没跟上」
+   * 这种缺陷它**测不出来** —— 上一版的十项清单正是如此漏掉了 zcode：合并上游
+   * 新增 ZCode 后全套单测仍然全绿，而 `ZCODE_ACCOUNT_*` 的账号在 `state.json`
+   * 缺失时会静默消失（凭据还在，只是索引建不出来，用户只能重新登录）。
+   *
+   * 故本用例从**客户端唯一的 provider 清单**（`plugin-src/client/jet-hub.js`
+   * 的 `PROVIDERS`）取 id —— 派生方式与 `credits-capabilities.spec.ts` 的
+   * 「能力矩阵覆盖 PROVIDERS 中的每一个 provider」**完全一致**，只保留一处
+   * 正则，避免两处漂移。上游再加 provider 而忘记同步本表时，这里会红。
+   */
+  it('恢复表覆盖客户端 PROVIDERS 的全部 provider（从真实清单派生）', () => {
+    // ⚠️ 用 `import.meta.url` 直接拼 URL（不引 `fileURLToPath` / `dirname`）：
+    // 本文件的 import 区最容易被上游改动，少一处依赖就少一处合并冲突面。
+    const source = readFileSync(new URL('../../plugin-src/client/jet-hub.js', import.meta.url), 'utf8')
+    const providerIds = [...source.matchAll(/\{\s*id:\s*'([a-z]+)',\s*label:/g)].map((m) => m[1]!)
+    // 防「正则该更新了却静默取到 0 项」这类假绿。
+    expect(providerIds.length).toBeGreaterThan(0)
+
+    const refs = providerIds.map(
+      (id, index) => `${id.toUpperCase()}_ACCOUNT_${(index + 1).toString(16).toUpperCase().padStart(6, '0')}`,
+    )
+    writeFileSync(
+      join(dir, '.credentials.yaml'),
+      ['refs:', ...refs.map((ref) => `  ${ref}: '{}'`), 'records: {}'].join('\n'),
+      'utf-8',
+    )
+
+    const recovered = createJetHubStore(makeCtx(undefined)).load()?.accounts ?? []
+    expect(recovered.map(a => [a.provider, a.credentialRef])).toEqual(
+      providerIds.map((id, index) => [id, refs[index]!]),
+    )
+  })
+
+  /**
+   * 回归：`QODERCN` 不能被 `QODER` 前缀抢先匹配。
+   *
+   * 恢复表与正则由同一份真相源派生，若把 `QODER` 排在 `QODERCN` 之前，
+   * `QODERCN_*` 会因正则回溯而**暂时**仍匹配成功 —— 但这取决于引擎的尝试
+   * 顺序，一旦将来加入更多同前缀 provider（如 `QODERX`）就会变成静默错归属：
+   * 账号被挂到 `qoder` 面板，而它的凭据是 CN 的，请求必然失败。
+   * 故按前缀长度**降序**拼接并在此锁死顺序带来的结果。
+   */
+  it('QODERCN 前缀不被 QODER 抢先匹配', () => {
+    writeFileSync(
+      join(dir, '.credentials.yaml'),
+      ['refs:', "  QODERCN_ACCOUNT_ABCDEF: '{}'", "  QODER_ACCOUNT_123ABC: '{}'"].join('\n'),
+      'utf-8',
+    )
+
+    const recovered = createJetHubStore(makeCtx(undefined)).load()?.accounts ?? []
+    expect(recovered.map(a => [a.credentialRef, a.provider, a.id])).toEqual([
+      ['QODERCN_ACCOUNT_ABCDEF', 'qodercn', 'qodercn-abcdef'],
+      ['QODER_ACCOUNT_123ABC', 'qoder', 'qoder-123abc'],
+    ])
+  })
+
   it('已有状态文档时不再从凭据恢复（尊重用户删号）', async () => {
     await createJetHubStore(makeCtx(undefined)).save({ accounts: [], disabledModels: {} })
     writeFileSync(
