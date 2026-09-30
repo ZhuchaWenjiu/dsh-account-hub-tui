@@ -54,9 +54,9 @@ function makeAdapter(overrides: Partial<ConstructorParameters<typeof ClineAdapte
     refresh: async () => {},
     product: CLINE,
     loadModels: async () => ({ models: MODELS, warnings: [] }),
-    // ⚠️ 模态表也必须注入：默认加载器会去拉 models.dev（真实网络）。
+    // ⚠️ models.dev 目录也必须注入：默认加载器会去拉真实网络。
     // 空表 = 「没读到」，各用例按需覆盖。
-    loadModalities: async () => new Map<string, boolean>(),
+    loadModelsDev: async () => new Map(),
     ...overrides,
   })
 }
@@ -703,7 +703,9 @@ describe('Cline 接线（源码级回归）', () => {
   it('图片能力取自 models.dev：cline-pass/* 也能发图（不再被误判纯文本）', async () => {
     const bodies: string[] = []
     const adapter = makeAdapter({
-      loadModalities: async () => new Map([['cline-pass/deepseek-v4.1-flash', true]]),
+      loadModelsDev: async () => new Map([
+        ['cline-pass/deepseek-v4.1-flash', { id: 'cline-pass/deepseek-v4.1-flash', supportsImage: true }],
+      ]),
       readImage: async () => ({ data: new Uint8Array([1, 2, 3]), mediaType: 'image/png' }),
       fetchImpl: (async (_url: string, init: RequestInit) => {
         bodies.push(String(init.body))
@@ -735,7 +737,9 @@ describe('Cline 接线（源码级回归）', () => {
   /** 模态表说「不支持」时照旧拒绝（不能为了修缺陷就无条件放行）。 */
   it('模态表明确不支持时仍拒绝图片（保守方向未失守）', async () => {
     const adapter = makeAdapter({
-      loadModalities: async () => new Map([['cline-pass/glm-5.3', false]]),
+      loadModelsDev: async () => new Map([
+        ['cline-pass/glm-5.3', { id: 'cline-pass/glm-5.3', supportsImage: false }],
+      ]),
       readImage: async () => ({ data: new Uint8Array([1]), mediaType: 'image/png' }),
       fetchImpl: (async () => sseResponse([])) as unknown as typeof fetch,
     })
@@ -822,6 +826,43 @@ describe('Cline 接线（源码级回归）', () => {
     })
     await collect(adapter, { model: 'cline-pass/deepseek-v4.1-flash' })
     expect(readClineRequestHistory()[0]!.ttfcMs).toBe(0)
+  })
+
+  /**
+   * ⚠️⚠️ **真实缺陷**（用户报障 2026-09-30）：「cline-pass 部分模型列表不全」。
+   *
+   * 实测对账：网关 `recommended-models` 的 `clinePass` **只下发 14 条**，
+   * 而 models.dev 的 `cline-pass` 块有 **18 条** —— 差的 4 条
+   * （`kimi-k2.6` / `glm-5.2` / `kimi-k2.7-code` / `deepseek-v4-flash`）
+   * 在本插件里**根本不存在**，用户既看不到也选不到。
+   * 另外网关给 `cline-pass/*` 的 `name` 就是 id 本身，列表里全是裸 id。
+   *
+   * ⚠️ **反向验证**：把 `ensureRemoteModels` 里的 `applyModelsDevCatalog(...)`
+   * 换回 `models` → 本用例「补进来的模型在目录里」断言变红。
+   */
+  it('models.dev 补全 cline-pass 目录（网关没下发的模型 + 可读名）', async () => {
+    const adapter = makeAdapter({
+      loadModelsDev: async () => new Map([
+        ['cline-pass/kimi-k2.7-code', {
+          id: 'cline-pass/kimi-k2.7-code', name: 'Kimi K2.7 Code', supportsImage: true,
+        }],
+        ['cline-pass/deepseek-v4.1-flash', {
+          id: 'cline-pass/deepseek-v4.1-flash', name: 'DeepSeek V4.1 Flash', supportsImage: true,
+        }],
+      ]),
+    })
+    const models = await adapter.listModels('cline')
+    const byId = new Map(models.map((m) => [m.id, m]))
+
+    // ① 网关目录里没有的模型被补进来（这是「列表不全」的修复点）
+    expect(byId.has('cline-pass/kimi-k2.7-code')).toBe(true)
+    // ② 名字是可读的，不是裸 id
+    expect(byId.get('cline-pass/kimi-k2.7-code')?.name).toBe('Kimi K2.7 Code')
+    expect(byId.get('cline-pass/deepseek-v4.1-flash')?.name).toBe('DeepSeek V4.1 Flash')
+    // ③ 图片能力随之播报 —— DSH 据此才会把图片送进适配器
+    expect(byId.get('cline-pass/kimi-k2.7-code')?.inputModalities).toEqual(['text', 'image'])
+    // ④ 本地兜底表的策展条目不受影响
+    expect(byId.get('cline-free/gemini-3.8-flash')?.inputModalities).toEqual(['text', 'image'])
   })
 
   it('能力矩阵登记 cline 为「有余额、无签到、有订阅额度」', () => {

@@ -2928,7 +2928,11 @@ Cline 面板的账号管理区有一个**订阅额度**按钮（只在 Cline 出
   `ClineRequestEntry.upstream`。**空串 = 网关没报**，RPC 侧才回落到模型命名空间。
 - 反向验证：停掉逐帧观测 → 用例红（`expected '' to be 'alibaba'`）。
 
-#### ② 图片能力只查本地兜底表 ⇒ `cline-pass/*` 全被误报「纯文本」
+#### ② 图片能力只查本地兜底表 + **`cline-pass` 目录不全**（同一处修复）
+
+用户后来又报了同一条链上的第二个症状：「**当前 cline 供应商的模型列表中关于
+cline-pass 部分模型为什么不全**，例如当前这个模型就看不到了」。两者同源：
+**models.dev 这份目录此前完全没被当作目录来源**。
 
 - 原实现：`inputModalitiesFor()` 只看 `product.fallbackModels[].supportsImage`
   —— **全表只有 5 条、且全是 `cline-free/*`**；而远端两个目录端点
@@ -2936,21 +2940,57 @@ Cline 面板的账号管理区有一个**订阅额度**按钮（只在 Cline 出
   `{id,name,description,tags}`，`/models` 只有裸 id）。
   ⇒ DSH 按适配器播报的 `inputModalities` 决定要不要把图片投影成占位符，
   于是**图片根本送不进适配器** —— 用户看到的就是「支持图片的模型发不了图」。
+- **目录也不全（实测对账，2026-09-30）**：
+
+  | 来源 | `cline-pass/*` 条数 |
+  |---|---|
+  | 网关 `recommended-models` 的 `clinePass` 数组 | **14** |
+  | models.dev 的 `cline-pass` provider 块 | **18** |
+
+  差的 4 条 —— `kimi-k2.6` / `glm-5.2` / `kimi-k2.7-code` / `deepseek-v4-flash`
+  —— 在本插件里**根本不存在**，用户既看不到也选不到。
+  另外网关给 `cline-pass/*` 的 `name` **就是 id 本身**
+  （`name === 'cline-pass/mimo-v2.6-flash'`），列表里全是裸 id 也让人无从辨认；
+  models.dev 给的是可读名（`DeepSeek V4.1 Flash`）。
 - **权威来源：`https://models.dev/api.json` 的 `cline-pass` provider 块**
-  （实测 18 条，逐模型带 `modalities.input`）：
+  （实测 18 条，逐条带 `modalities.input` 与 `limit`）：
   `cline-pass/deepseek-v4.1-flash` → `["text","image"]`、
   `cline-pass/minimax-m3` → `["text","image","video"]`、
   `cline-pass/glm-5.3` → `["text"]`。参考实现用的**正是同一来源**
-  （其 `MODELS_DEV_URL`，注释说明它专为覆盖「发布晚于本版本、不在自带表里」
-  的模型 —— 同型缺陷）。
-- **口径**（`src/cline-modalities.ts`）：只认 `image`（夹取掉 audio/video/pdf
-  —— DSH 词表只有 text/image）；**本地兜底表优先级更高**（官方内嵌目录策展）；
-  **失败向上抛、不缓存**（`TtlCache` 只在成功时写入 ⇒ 下次可重试），适配器侧
-  吞掉并保持「未知」。TTL **6 小时**（发布节奏的数据，不必每次会话都拉）。
-- ⚠️ **「没读到」≠「不支持」**：`remoteModalities === undefined` 表示还没读到，
-  只有明确未命中/`false` 才是否定结论 —— 把前者当后者正是本次缺陷的形态。
-- 反向验证：停用 models.dev 那一级 → 用例红
-  （`cline: 模型 "cline-pass/deepseek-v4.1-flash" 不支持图片输入`）。
+  （其 `MODELS_DEV_URL`；面板里「Rescan the official subscription list and
+  **adopt newly published models**」就是这一步 —— 注释原文：
+  *"Without it a model newer than this release resolves to the `text` fallback
+  and the harness refuses every image for it, silently."* 两处报障同型）。
+- **实现口径**（`src/cline-models-dev.ts`，替代原先只管模态的
+  `cline-modalities.ts`）：models.dev 是**目录的第三个来源**，
+  在 `ensureRemoteModels()` 里用 `applyModelsDevCatalog()` 并入：
+  1. **补缺**：目录里没有的 id **追加在该前缀最后一条之后**
+     （不能挂第一条后 —— 那会插到同族中间；更不能追加到列表末尾 ——
+     那里沉在 460 条远端 id 之后，等于没人看得到）；
+  2. **补名字**：仅当 `name === id`（网关把 id 当名字下发）时用可读名替换；
+  3. **补窗口**：`contextWindow` 缺失时才用 models.dev 的 `limit.context`；
+  4. ⚠️ **不取 `limit.output`**：那是要**真的写进请求体 `max_tokens`** 的值，
+     本仓库有过「据印象填大值 → vertex/google 400」的真实缺陷
+     （见本文件 Gemini-400 段），故只补展示名与窗口，不碰输出上限。
+  ⚠️ **一律不覆盖已有值**：策展的本地兜底表与网关数据优先于社区目录
+  （显式 `supportsImage: false` 也照样赢）。
+  ⚠️ **只认 `image`**（夹取掉 audio/video/pdf —— DSH 词表只有 text/image）。
+  ⚠️ **失败向上抛、不缓存**（`TtlCache` 只在成功时写入 ⇒ 下次可重试），
+  适配器侧吞掉并保持「这一层没有补充」。TTL **6 小时**（发布节奏的数据）。
+- ⚠️ **「没读到」≠「不支持」**：读不到时目录照常工作、图片能力退回本地兜底表；
+  把前者当后者正是本次缺陷的形态。
+- 反向验证：停用 `applyModelsDevCatalog` 那一行 → **两条**用例同时变红：
+  `图片能力取自 models.dev：cline-pass/* 也能发图`（报错
+  `cline: 模型 "cline-pass/deepseek-v4.1-flash" 不支持图片输入`）
+  与 `models.dev 补全 cline-pass 目录`。
+
+⚠️ **排障提示（本次顺带查明的第三种「看不到」）**：目录里有 14 条 `cline-pass`，
+但**用户的黑名单关掉了 10 条**（`~/.dsh/jet-hub/state.json` 的
+`disabledModels.cline`，实测 474 条 cline 模型被关），模型选择器里因此只剩
+4 条 —— 那是**用户自己的模型开关**，不是目录缺失。Jet Hub 的模型列表会渲染
+被关闭的模型（`listAllModels()` 就是为此存在），所以能在那里重新打开。
+**两种「看不到」的判据不同，别混**：黑名单造成的在 Jet Hub 里能看到（带开关）、
+目录缺失的在任何地方都没有。
 
 #### ③ 「输出速率」的**分子与分母跨阶段** ⇒ 11814.8 t/s
 

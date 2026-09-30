@@ -47,7 +47,7 @@ import {
   type ClineProduct,
 } from './cline-product.js'
 import { projectRequestImage, type ImageRequestTarget } from './image-budget.js'
-import { makeClineModalitiesLoader } from './cline-modalities.js'
+import { applyModelsDevCatalog, makeClineModelsDevLoader, type ClineModelsDevEntry } from './cline-models-dev.js'
 import { parseClineRouting } from './cline-routing.js'
 import { recordClineRequest } from './cline-request-log.js'
 import {
@@ -201,12 +201,13 @@ export interface ClineAdapterOptions {
    */
   loadModels?: (options: { credential?: ClineCredential }) => Promise<{ models: ClineModel[]; warnings: string[] }>
   /**
-   * 输入模态（图片能力）加载器覆盖（测试用）。
+   * models.dev 目录加载器覆盖（测试用）。
    *
-   * 默认走 `makeClineModalitiesLoader`（拉 models.dev，带 TTL 缓存）。
+   * 默认走 `makeClineModelsDevLoader`（拉 models.dev，带 TTL 缓存）。
+   * 它同时补**名字/上下文窗口/图片能力**，见 `src/cline-models-dev.ts`。
    * ⚠️ 注入后单测可完全离线 —— 与 `loadModels` 同款理由。
    */
-  loadModalities?: () => Promise<Map<string, boolean>>
+  loadModelsDev?: () => Promise<Map<string, ClineModelsDevEntry>>
 }
 
 /**
@@ -222,24 +223,23 @@ export class ClineAdapter extends LlmAdapter {
   /** 正在进行中的目录加载（避免并发重复请求）。 */
   private loading: Promise<void> | undefined
   /**
-   * 输入模态表（`模型 id → 是否接受图片`），来自 models.dev（见
-   * {@link makeClineModalitiesLoader}）。
+   * models.dev 目录（`模型 id → 条目`，含名字/窗口/图片能力）。
    *
-   * ⚠️ `undefined` = **还没读到**（不是「都不支持」）：只有它明确为 `false`
-   * 才是否定结论，未命中一律退回本地兜底表。这条区分是整个模块的要点 ——
-   * 把「没读到」当「不支持」正是本次修复的那个缺陷。
+   * ⚠️ `undefined` = **还没读到**（不是「空目录」）：读不到时目录照常工作，
+   * 只是少了它补的那几条。这条区分是整个模块的要点 ——
+   * 把「没读到」当「不支持」正是「支持图片的模型发不了图」那个缺陷的形态。
    */
-  private remoteModalities: Map<string, boolean> | undefined
-  /** 正在进行中的模态表加载（并发去重）。 */
-  private modalitiesLoading: Promise<void> | undefined
-  /** 模态表加载器。 */
-  private readonly loadModalities: () => Promise<Map<string, boolean>>
+  private modelsDev: Map<string, ClineModelsDevEntry> | undefined
+  /** 正在进行中的 models.dev 加载（并发去重）。 */
+  private modelsDevLoading: Promise<void> | undefined
+  /** models.dev 加载器。 */
+  private readonly loadModelsDev: () => Promise<Map<string, ClineModelsDevEntry>>
 
   constructor(private readonly options: ClineAdapterOptions) {
     super()
     this.product = options.product ?? CLINE
     this.fetchImpl = options.fetchImpl ?? fetch
-    this.loadModalities = options.loadModalities ?? makeClineModalitiesLoader({ fetcher: this.fetchImpl })
+    this.loadModelsDev = options.loadModelsDev ?? makeClineModelsDevLoader({ fetcher: this.fetchImpl })
   }
 
   /**
@@ -259,23 +259,22 @@ export class ClineAdapter extends LlmAdapter {
    * 模型接受的输入模态。
    *
    * 两级判据（**顺序不能颠倒**）：
-   * 1. **本地兜底表/内嵌目录**（`remoteModels` 里的 `supportsImage`，含
-   *    `product.fallbackModels` 的策展条目）—— 它是从官方客户端内嵌目录
-   *    提取的，比社区目录权威；显式 `false` 也照样赢。
-   * 2. **models.dev 模态表**（`remoteModalities`）—— 补前者覆盖不到的模型。
+   * 判据是**目录条目上的 `supportsImage`**，而它有两个来源（优先级即顺序）：
+   * 1. **本地兜底表/内嵌目录**（`product.fallbackModels` 的策展条目）——
+   *    从官方客户端内嵌目录提取的，比社区目录权威；显式 `false` 也照样赢。
+   * 2. **models.dev**（`src/cline-models-dev.ts` 补进目录）—— 补前者覆盖不到的
+   *    模型（`cline-pass/*` 等）。
    *
    * ⚠️ **这是「支持图片的模型发不了图」的修复点**：修复前只看第 1 级，而它
    * 全表只有 5 条 `cline-free/*` 条目 ⇒ `cline-pass/*` 等**全部**被播报成
-   * 纯文本 ⇒ DSH 根本不把图片送进来。详见 `src/cline-modalities.ts`。
+   * 纯文本 ⇒ DSH 根本不把图片送进来。详见 `src/cline-models-dev.ts`。
    *
-   * ⚠️ 两级都**没有结论**时保守报 `text`（宁可少报能力，也不要报一个服务端
-   * 不认的模态）—— 注意这与「明确读到不支持」是两回事，但外部行为一致。
+   * ⚠️ 没有结论时保守报 `text`（宁可少报能力，也不要报一个服务端不认的模态）
+   * —— 注意这与「明确读到不支持」是两回事，但外部行为一致。
    */
   private inputModalitiesFor(model: string): readonly ('text' | 'image')[] {
     const entry = this.remoteModels?.find((candidate) => candidate.id === model)
-    if (entry?.supportsImage === true) return ['text', 'image']
-    if (this.remoteModalities?.get(model) === true) return ['text', 'image']
-    return ['text']
+    return entry?.supportsImage === true ? ['text', 'image'] : ['text']
   }
 
   /**
@@ -306,7 +305,13 @@ export class ClineAdapter extends LlmAdapter {
         const { models, warnings } = await load({
           ...credential === undefined ? {} : { credential },
         })
-        if (models.length > 0) this.remoteModels = models
+        if (models.length > 0) {
+          // ⚠️ **models.dev 是目录的第三个来源**（补缺的模型 + 可读名 + 上下文
+          // 窗口 + 图片能力），必须在这里合并 —— 合并进目录后，
+          // `inputModalitiesFor` 只看目录条目就够了（见其注释）。
+          // 它失败不影响目录本身（只记日志）。
+          this.remoteModels = applyModelsDevCatalog(models, await this.ensureModelsDev())
+        }
         // 目录部分失败时留下日志：静默降级会让用户看到「少了模型」却无从排查
         // （两个端点独立容错，故这里只记 warning 不抛错）。
         for (const warning of warnings) {
@@ -325,29 +330,32 @@ export class ClineAdapter extends LlmAdapter {
   }
 
   /**
-   * 懒加载输入模态表（models.dev），并发去重。
+   * 懒加载 models.dev 目录，并发去重。
    *
-   * ⚠️ **失败只记日志、不抛**：拿不到就保持 `undefined`（退回本地兜底表），
-   * 下一次调用会重试（`TtlCache` 不缓存失败）。图片能力是**播报**信息，
-   * 不能因为一次目录抖动就让整个会话不可用。
+   * ⚠️ **失败只记日志、返回空表**：拿不到就相当于「这一层没有补充」，
+   * 目录与图片能力都退回本地兜底表；下一次调用会重试（`TtlCache` 不缓存失败）。
+   * 它是**补充**信息，不能因为一次抖动就让整个 provider 不可用。
+   *
+   * @returns 读到的条目；失败返回空 Map（调用方无需区分）。
    */
-  private async ensureModalities(): Promise<void> {
-    if (this.remoteModalities !== undefined) return
-    if (this.modalitiesLoading !== undefined) {
-      await this.modalitiesLoading
-      return
+  private async ensureModelsDev(): Promise<Map<string, ClineModelsDevEntry>> {
+    if (this.modelsDev !== undefined) return this.modelsDev
+    if (this.modelsDevLoading !== undefined) {
+      await this.modelsDevLoading
+      return this.modelsDev ?? new Map()
     }
-    this.modalitiesLoading = (async () => {
+    this.modelsDevLoading = (async () => {
       try {
-        this.remoteModalities = await this.loadModalities()
+        this.modelsDev = await this.loadModelsDev()
       } catch (error) {
         // eslint-disable-next-line no-console
-        console.warn(`[cline] 输入模态目录拉取失败（图片能力退回本地兜底表）：${error instanceof Error ? error.message : String(error)}`)
+        console.warn(`[cline] models.dev 目录拉取失败（缺的模型与图片能力退回本地兜底表）：${error instanceof Error ? error.message : String(error)}`)
       } finally {
-        this.modalitiesLoading = undefined
+        this.modelsDevLoading = undefined
       }
     })()
-    await this.modalitiesLoading
+    await this.modelsDevLoading
+    return this.modelsDev ?? new Map()
   }
 
   /** 兜底目录（远端不可用时的静态表，含 5 个免费模型）。 */
@@ -393,10 +401,9 @@ export class ClineAdapter extends LlmAdapter {
     if (!await providerCatalogVisible(this.options.accountPool, this.product.id)) return []
     // 必须 await：冷缓存时目录尚未落地就返回，模型选择器会短暂显示错误的
     // 模型集合（Jet Hub 的模型开关也据此渲染）。
+    // ⚠️ 目录里**已经**并入 models.dev（补缺的模型 / 可读名 / 图片能力），
+    // 故这里不需要再单独 await 一次模态表。
     await this.ensureRemoteModels()
-    // 图片能力要在**播报目录**时就正确：DSH 的选择器与 composer 都读这里的
-    // `inputModalities`（读错就等于「支持图片的模型发不了图」）。
-    await this.ensureModalities()
     const source = this.remoteModels ?? this.fallbackCatalog()
     // 用户在 Jet Hub 关闭的模型（黑名单制：不在表里即默认打开）。
     // 只影响此处对外播报的模型目录，不改变 resolveModel/stream 的路由能力
@@ -417,10 +424,9 @@ export class ClineAdapter extends LlmAdapter {
   }
 
   async resolveModel(provider: string, model: string, _signal?: AbortSignal): Promise<LlmResolvedModelInfo> {
+    // 目录里已并入 models.dev（名字 / 窗口 / 图片能力），故 `inputModalities`
+    // 与展示名在这一次 await 之后就都是最终值。
     await this.ensureRemoteModels()
-    // 同 `listModels`：`resolveModel` 的 `inputModalities` 决定 DSH 是否把图片
-    // 送进来，故播报前必须让模态表就位。
-    await this.ensureModalities()
     const source = this.remoteModels ?? this.fallbackCatalog()
     const entry = source.find((candidate) => candidate.id === model)
     const resolved: LlmResolvedModelInfo = {
@@ -480,10 +486,11 @@ export class ClineAdapter extends LlmAdapter {
     }
     let imageUrls: Map<string, string> | undefined
     if (imageRefs.size > 0) {
-      // ⚠️ 判定能力之前先把模态表读进来（`resolveModel` 通常已 await 过，
+      // ⚠️ 判定能力之前先把**目录**读进来（`resolveModel` 通常已 await 过，
       // 这里命中缓存、不发请求）；`stream()` 也可能被直接调用而没有前置
-      // `resolveModel`，缺了这一步会把支持图片的模型误判成纯文本。
-      await this.ensureModalities()
+      // `resolveModel`，缺了这一步会把支持图片的模型误判成纯文本
+      // —— 那正是「支持图片的模型发不了图」的形态。
+      await this.ensureRemoteModels()
       if (!this.inputModalitiesFor(options.model).includes('image')) {
         throw new LlmError(
           `cline: 模型 "${options.model}" 不支持图片输入`,
