@@ -44,6 +44,10 @@ import {
 } from './raccoon-product.js'
 import { projectRequestImage, type ImageRequestTarget } from './image-budget.js'
 import {
+  registerAdapterIdempotent,
+  registerConfigurableProvidersIdempotent,
+} from './llm-register-compat.js'
+import {
   collectImages,
   consumeOpenAiSse,
   errorDetail,
@@ -493,7 +497,7 @@ function resolveChunkTimeoutMs(): number {
  */
 export function registerRaccoonLlm(ctx: Context, options: RaccoonAdapterOptions): RaccoonAdapter {
   const product = options.product ?? RACCOON
-  ctx.llm.registerConfigurableProviders([
+  registerConfigurableProvidersIdempotent(ctx.llm, [
     {
       provider: product.id,
       displayName: product.displayName,
@@ -502,6 +506,6 @@ export function registerRaccoonLlm(ctx: Context, options: RaccoonAdapterOptions)
     },
   ])
   const adapter = new RaccoonAdapter(options)
-  ctx.llm.registerAdapter([product.id], adapter)
+  registerAdapterIdempotent(ctx.llm, [product.id], adapter)
   return adapter
 }

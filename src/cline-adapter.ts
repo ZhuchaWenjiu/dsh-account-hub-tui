@@ -48,6 +48,10 @@ import {
 } from './cline-product.js'
 import { projectRequestImage, type ImageRequestTarget } from './image-budget.js'
 import {
+  registerAdapterIdempotent,
+  registerConfigurableProvidersIdempotent,
+} from './llm-register-compat.js'
+import {
   collectImages,
   consumeOpenAiSse,
   errorDetail,
@@ -680,7 +684,7 @@ const CLINE_REGION_FORBIDDEN_MARKERS: readonly string[] = [
  */
 export function registerClineLlm(ctx: Context, options: ClineAdapterOptions): ClineAdapter {
   const product = options.product ?? CLINE
-  ctx.llm.registerConfigurableProviders([
+  registerConfigurableProvidersIdempotent(ctx.llm, [
     {
       provider: product.id,
       displayName: product.displayName,
@@ -689,7 +693,7 @@ export function registerClineLlm(ctx: Context, options: ClineAdapterOptions): Cl
     },
   ])
   const adapter = new ClineAdapter(options)
-  ctx.llm.registerAdapter([product.id], adapter)
+  registerAdapterIdempotent(ctx.llm, [product.id], adapter)
   // 返回实例：Jet Hub「显示列表」需要 `listAllModels()`（不受黑名单影响、
   // 带最终展示名）。`ctx.llm` 不透传自定义方法，须由调用方持有引用。
   return adapter

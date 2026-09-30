@@ -28,6 +28,7 @@ commit-msg.tmp
 
 ide-models.json
 scripts
+.minimax-forensics/
 
 # Qoder 私有签名体系的复现脚本（研究工具，仅本地保留）
 #
@@ -61,6 +62,17 @@ docs/qoder-encryption-notes.md
 # README / AGENTS.md 只保留行为契约（协议差异、坑点、能力矩阵），
 # 凭据值、解密口令、脚本清单一律放本文件。
 docs/loomy-protocol-notes.md
+
+# MiniMax Code 协议逆向与取证细节（内部文档，仅本地保留）
+#
+# 含：OAuth 设备码 + PKCE 的端点与常量、模型目录 / 签到 / 积分端点的实测记录、
+# `timezone_id` 必须走 query 的四种组合对照、asar 源码证据编号，以及
+# **未验证项清单**（端到端推理因账号余额不足未能实测）。
+#
+# ⚠️ 这是**知识库**而非运行时依赖：`src/` 不引用它。
+# README / AGENTS.md 只保留行为契约（协议差异、坑点、能力矩阵），
+# 重新采集数据的方法与证据细节一律放本文件。
+docs/minimax-protocol-notes.md
 
 # 本地 npm/pnpm 配置：不入库（issue !IKIRUB）
 #

@@ -126,6 +126,24 @@ export const CREDITS_CAPABILITIES = Object.freeze({
   //   `dailyCheckin` —— 后者会让用户以为每天都真的加了额度。
   //   ⚠️ 该端点**需要** `X-Client-Platform` 头（值见 RaccoonProduct.clientPlatform）。
   raccoon: Object.freeze({ balance: true, onboardingTasks: true }),
+  // MiniMax Code（中国版）：余额 + 每日签到**都有**（与 raccoon 不同）。
+  //
+  // 余额：`GET /minimax-cloud/api/v1/credit/details`（**只读**，实测返回
+  //   `{total_count, base_resp}`；⚠️ **空明细时 `details` 字段整个缺失**，
+  //   故解析必须容忍缺失 —— 见 `src/minimax-credits.ts` 的 `unwrapEnvelopeData`）。
+  //   ⚠️ 该端点是**平铺响应**（`total_count` 与 `base_resp` 同级、没有 `data` 键），
+  //   与签到端点的信封结构不同。
+  //
+  // 每日签到：`GET /minimax-cloud/api/v1/signin/status?timezone_id=<IANA>` +
+  //   `POST …/signin/claim?timezone_id=<IANA>`（body `{}`）。
+  //   ⚠️ **`timezone_id` 是 query 参数且必填** —— 实测放请求头会回
+  //   `1406010011 invalid timezone_id`，且**那也是 HTTP 200**（只看状态码会误判成功）。
+  //   ⚠️ **`points` 是总数，`bonus_points` 是其中的「额外」部分，不得相加**：
+  //   实测第 1 天 `points: 800` / `bonus_points: 400`，截图按钮即「签到得 800」
+  //   + 右上角「额外 400」角标。相加会虚高一倍（用户 2026-09-28 纠正）。
+  //   ⚠️ 幂等判据是响应体的 `claim_result`（`1`=真领取、`2`=已领过），
+  //   **不是 HTTP 状态码**（重复领取同样返回 200）。
+  minimax: Object.freeze({ balance: true, dailyCheckin: true }),
   /**
    * ZCode（智谱）：余额与每日领取**都有**。
    *

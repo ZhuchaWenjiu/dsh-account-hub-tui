@@ -24,7 +24,7 @@ function codeOnly(source: string): string {
 const indexSource = codeOnly(read('src/index.ts'))
 const rpcSource = codeOnly(read('src/jet-hub-rpc.ts'))
 
-/** 九个 auth 文件（`buddy-auth.ts` 一份实现同时服务 buddy 与 workbuddy）。 */
+/** 十个 auth 文件（`buddy-auth.ts` 一份实现同时服务 buddy 与 workbuddy）。 */
 const AUTH_FILES = [
   'src/service.ts',
   'src/buddy-auth.ts',
@@ -34,6 +34,12 @@ const AUTH_FILES = [
   'src/cline-auth.ts',
   'src/loomy-auth.ts',
   'src/raccoon-auth.ts',
+  // ⚠️ MiniMax 是第 9 个 auth 文件（buddy-auth 一份服务两个 provider）。
+  // 加它之前本清单**漏了 minimax** —— 于是「续期必须带 pool/accountId 且调
+  // `syncAccountExpiry`」这条契约对 minimax **不被强制**（Spec 盲区）。
+  // 该契约正是「账号卡片刷新按钮按下去没反应」那个缺陷的回归防线，
+  // 新增 provider 时必须同步加进来。
+  'src/minimax-auth.ts',
 ]
 
 /** 取出某个方法从签名到结束花括号的整段（CRLF 安全）。 */
@@ -78,6 +84,9 @@ describe('续期调度器：启动必须先跑一轮', () => {
     const expected = [
       'service', 'buddy', 'workbuddy', 'lobsterai', 'qoder',
       'qoderCn', 'trae', 'cline', 'loomy', 'raccoon',
+      // ⚠️ 新增 provider 必须同时加进 `src/index.ts` 的 refreshTargets
+      // **与本清单** —— 只加前者不会被这条用例发现（它会静默不续期）。
+      'minimax',
     ]
     for (const name of expected) {
       expect(
@@ -111,10 +120,19 @@ describe('按需续期必须回写账号池的有效期', () => {
     expect(signature, `${rel}: 签名缺 pool`).toContain('pool?: AccountPool')
     expect(signature, `${rel}: 签名缺 accountId`).toContain('accountId?: string')
     // Loomy 无续期端点，但仍要在探测成功后对账（见 LOOMY_EXPIRY_ACCESSORS）。
-    expect(signature, `${rel}: 未调用共享回写`).toMatch(/syncAccountExpiry\(/)
+    //
+    // ⚠️ **两种正确形态都接受**（补 minimax 时实测到该断言原先过窄）：
+    // ① 直接调 `syncAccountExpiry(...)`（raccoon 的写法）；
+    // ② 走包装 `refreshAccountWithReconcile(...)` —— 它**内部**两处调用
+    //    `syncAccountExpiry`（见 `src/expiry-sync.ts`），是更规范的用法
+    //    （自带回写失败不反噬、有效期内仍对账等既有不变量）。
+    // 只认 ① 会把 ② 判为「未调用共享回写」—— 那是**假阴性**。
+    expect(signature, `${rel}: 未调用共享回写`).toMatch(
+      /syncAccountExpiry\(|refreshAccountWithReconcile\(/,
+    )
   })
 
-  it('八个 auth 都改用共享的有效期回写，不再各写一份', () => {
+  it('九个 auth 都改用共享的有效期回写，不再各写一份', () => {
     // 本缺陷的形态正是「raccoon 接好了、其余七个各漏一环」，
     // 故这里锁的是「每个文件都真的引了 `src/expiry-sync.ts`」。
     for (const rel of AUTH_FILES) {

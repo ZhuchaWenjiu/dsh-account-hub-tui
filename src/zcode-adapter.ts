@@ -70,6 +70,10 @@ import {
 } from './zcode-captcha.js'
 import { GateAbortedError, ModelGate } from './model-gate.js'
 import { nextUtc8DayStartMs } from './model-queue.js'
+import {
+  registerAdapterIdempotent,
+  registerConfigurableProvidersIdempotent,
+} from './llm-register-compat.js'
 
 /** 本适配器注册的 provider 路由名（等价于 `ZCODE.id`）。 */
 export const PROVIDER = 'zcode'
@@ -1331,7 +1335,7 @@ export function httpErrorCodeForZcode(status: number, body: string): string {
  */
 export function registerZcodeLlm(ctx: Context, options: ZcodeAdapterOptions): ZcodeAdapter {
   const product = options.product ?? ZCODE
-  ctx.llm.registerConfigurableProviders([
+  registerConfigurableProvidersIdempotent(ctx.llm, [
     {
       provider: product.id,
       displayName: product.displayName,
@@ -1340,6 +1344,6 @@ export function registerZcodeLlm(ctx: Context, options: ZcodeAdapterOptions): Zc
     },
   ])
   const adapter = new ZcodeAdapter(options)
-  ctx.llm.registerAdapter([product.id], adapter)
+  registerAdapterIdempotent(ctx.llm, [product.id], adapter)
   return adapter
 }

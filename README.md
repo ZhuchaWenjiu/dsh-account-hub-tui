@@ -6,7 +6,8 @@ deepseek-harness 插件：执行 CodeArts（华为云）登录流程，默认走
 为显式回退（`flow: 'ticket'`）。插件还注册一个 `codearts` LLM provider 路由，使该
 凭证可直接用于 CodeArts 后端模型调用。
 
-此外插件内置另外五个 provider 路由：
+此外插件内置另外十个 provider 路由（完整清单见 [LLM provider](#llm-provider)）；
+其中带积分能力的几个：
 
 - **buddy（腾讯 CodeBuddy）** — 见 [buddy provider](#buddy-provider)；
   另支持「一键领取积分」（每日签到）与「**锁定永久积分**」。
@@ -21,12 +22,17 @@ deepseek-harness 插件：执行 CodeArts（华为云）登录流程，默认走
   **唯一用短信验证码登录**、**唯一不能自动续期**的 provider；
   支持积分余额（两个池）、每日额度签到、**新手任务一键领取 10000 积分**，
   以及「**锁定永久积分**」（CodeBuddy / WorkBuddy 也有同名按钮，但判据不同）。
+- **minimax（MiniMax Code 中国版）** — 见
+  [MiniMax Code provider](#minimax-code-provider中国版)；
+  **首个 Anthropic Messages 协议族**的 provider；
+  支持积分余额与每日签到，**推理已启用**（Anthropic Messages，
+  4 个模型实测通过；⚠️ 图片输入未实现）。
 
 `codearts` 面板同样支持**积分账户检测、积分余额与「一键领取积分」**
 （华为云「每日签到得积分」活动，走 `SDK-HMAC-SHA256` 签名）——
 见 [CodeArts 积分](#codearts-积分华为云每日签到得积分)。
 
-八个 provider 的 Jet Hub 面板都提供「**显示列表**」按钮，可逐个开关模型以控制其
+十一个 provider 的 Jet Hub 面板都提供「**显示列表**」按钮，可逐个开关模型以控制其
 是否出现在对话框的模型选择里（黑名单制，默认全部显示）——
 见 [模型列表开关](#模型列表开关黑名单)。
 
@@ -123,8 +129,9 @@ Tokens 福利）。
 [TRAE provider](#trae-provider字节跳动-trae)）、`cline`（见
 [Cline provider](#cline-provider)）、`loomy`（见
 [Loomy provider](#loomy-provider讯飞办公助手)）、`raccoon`（见
-[Raccoon Work provider](#raccoon-work-provider商汤小浣熊)）与 `zcode`（见
-[ZCode provider](#zcode-provider智谱-zai-免费额度)）。十一个互不覆盖，可同时使用。
+[Raccoon Work provider](#raccoon-work-provider商汤小浣熊)）、`minimax`（见
+[MiniMax Code provider](#minimax-code-provider中国版)）与 `zcode`（见
+[ZCode provider](#zcode-provider智谱-zai-免费额度)）。十二者互不覆盖，可同时使用。
 
 ## 凭证
 
@@ -1816,6 +1823,241 @@ pnpm test:e2e:raccoon-tools  # ⚠️ 发推理：验证 **tools 被端点接受
 ⚠️ **`raccoon-tools` 的判据是「响应里有结构化 `tool_calls`」**，
 不是「模型在正文里说它想调用工具」—— 后者正是 Qoder / TRAE 踩过的缺陷形态
 （插件没把 `tools` 发出去，模型只能用正文 XML 臆造，harness 认不出 → 任务终止）。
+
+---
+
+## MiniMax Code provider（中国版）
+
+`minimax` 是本插件第 **10** 个 provider，也是**首个 Anthropic Messages 协议族**
+的 provider（其余九个都是 OpenAI 兼容族或各自的自定义协议）。生产环境：
+`https://agent.minimax.cn`。
+
+### 登录：OAuth 设备码 + PKCE
+
+与 Qoder 同型（**不起本地监听端口**），但协议族不同：
+
+- `client_id = mcode-public`、`scope = agent.default`、`audience = agent-backend`
+- 设备码端点拿到 `user_code` 后，`verification_uri` 是 `/oauth-authorize`
+- **两步式**：`account.create` **先**返回 `loginUrl`（含 `user_code`），
+  后台轮询换 token —— 不能阻塞等授权完成，否则 `window.open` 的手势窗口早已过期、
+  弹窗必被拦截（与其余九个 provider 一致，见上文「+ 新建账号」小节）。
+
+⚠️ **`pending` 是 HTTP 200，不是 OAuth 标准的 400。** 服务端用
+**HTTP 200 + `status: "pending"`** 表达「用户还没完成授权」。只看 HTTP 状态码
+会把「还在等你点授权」误判成「拿到 token 了」—— 实测表现为
+`令牌响应缺少 access_token`。故轮询里**两种形态都要认**：
+`200 + status`（本产品）与「非 200 + `error=authorization_pending`」（OAuth 标准）。
+
+### 模型目录（远端 4 个）
+
+⚠️ **目录必须走远端** `GET /mavis/api/v1/models?region=cn&buildEnv=prod`。
+客户端 `config.js` 的**内置表只有 3 个**（`MiniMax-M3` / `MiniMax-M2.7-highspeed`
+/ `MiniMax-M2.7`）—— **照抄内置表会漏掉 `MiniMax-M3.1-Flash-Preview`**，
+而它正是客户端界面上被选中的那个。
+
+| 模型 id | 展示名 | 上下文窗口 | 思考档位 | 图片 |
+|---|---|---|---|---|
+| `MiniMax-M3.1-Flash-Preview` | `M3.1-Flash-Preview` | **1,000,000** | `default`/`low`/`medium`/`high`/`xhigh`/`max`（默认 `default`） | ✅ |
+| `MiniMax-M3` | `M3` | **1,000,000** | 无 | ✅ |
+| `MiniMax-M2.7-highspeed` | `M2.7-highspeed` | **200,000** | 无 | ❌ |
+| `MiniMax-M2.7` | `M2.7` | **200,000** | 无 | ❌ |
+
+⚠️ **只有 `MiniMax-M3.1-Flash-Preview` 有思考档位** —— 其余三个远端条目
+**没有 `effort_options` 字段**（不是我们漏解析）。这与 Qoder 的 `qmodel`
+「只有关闭思考」是同一类事实：**远端没给就是没有，不要补猜测的默认值**。
+档位展示名直接用**远端原文**（`name === id`），不做本地化。
+
+⚠️ **窗口口径是「档位表最大档」**，不是目录里的 `max_input_tokens`。
+
+### 推理（**已启用**，2026-09-29 端到端实测通过）
+
+走 **Anthropic Messages** 协议：
+
+```
+POST {apiHost}/mavis/api/v1/llm/v1/messages      # body 带 stream: true
+```
+
+⚠️ **只带 `Authorization` + `Content-Type` + `Accept: text/event-stream`**
+即被接受 —— **不需要 `anthropic-version` 头**（实测；不照抄 Anthropic 官方文档
+加未经验证的头）。
+
+实测四个模型全部 HTTP 200，文本 / 思考 / 工具调用均正常：
+
+| 测试项 | 结果 |
+|---|---|
+| `M2.7` | 文本「收到」，思考 230 字符，`finish=stop` |
+| `M3.1-Flash-Preview` | 文本「收到」，`finish=stop` |
+| 工具调用（M2.7） | 结构化 `tool-call` 块 `get_weather({"city":"北京"})`，`finish=tool-calls` |
+
+#### ⚠️⚠️ 思考档位：**M3.1 必须 adaptive，传 `disabled` 是硬 400**
+
+实测服务端响应（这是本项目第一条**来自服务端本身**的 M3.1 约束证据）：
+
+```
+POST /mavis/api/v1/llm/v1/messages
+{model:"MiniMax-M3.1-Flash-Preview", thinking:{type:"disabled"}, ...}
+→ HTTP 400
+{"type":"error","error":{"type":"invalid_request_error",
+ "message":"invalid params, model \"MiniMax-M3.1-Flash-Preview\" requires
+  adaptive thinking; thinking.type=\"disabled\" (including
+  reasoning.effort=none) is not allowed (2013)"}}
+```
+
+⇒ 实现里 `MiniMax-M3.1*` **一律发** `thinking: {type:'adaptive'}`，
+档位走 `output_config.effort`（照客户端 `requestPatch`）。
+
+⚠️ **但不要推广成「所有 Anthropic 请求都必须 adaptive」**：
+`M3` / `M2.7` / `M2.7-highspeed` 实测**不传 `thinking` 即 200**，
+且服务端**默认就会思考**（M2.7 实测 `thinking_tokens: 250`）。
+故实现里**只有 M3.1 前缀**发 adaptive —— 见
+`MINIMAX_ADAPTIVE_ONLY_PREFIX`。
+
+⚠️ 客户端取证里那个 `forceAdaptiveThinking: true` 出现在
+`resolveModelThinkingProtocol` 的**通用 anthropic-messages 分支**，
+而该函数**只在有 effort 值时**才返回（无 effort 提前返回 `undefined`）——
+所以它**不是**「M3.1 专属」，也**不是**「所有请求都带」。
+两处事实（客户端行为 + 服务端约束）是**互补**的，不冲突。
+
+#### ⚠️ SSE 帧形状（实测）
+
+`message_start`（含 `usage.input_tokens` / `cache_read_input_tokens`）→
+`ping`（忽略）→ `content_block_start`（`thinking` / `text` / `tool_use`）→
+`content_block_delta`（`thinking_delta` / `text_delta` / `signature_delta` /
+`input_json_delta`）→ `content_block_stop` → `message_delta`
+（`stop_reason` + `usage.output_tokens`）→ `message_stop`。
+
+- ⚠️ **`signature_delta` 必须忽略**：它是 thinking 块的签名，
+  当正文处理会往回答里注入一串十六进制。
+- ⚠️ **`thinking` 块映射为 `reasoning` 块**（DSH 的 `ReasoningBlock`），
+  否则思考内容污染正文。
+- ⚠️ **`thinking_tokens` 是 `output_tokens` 的「子集」**，映射到
+  `reasoningTokens`，**不累加**到 outputTokens。
+
+#### ⚠️ 工具调用：`tool_use` / `tool_result`（Anthropic 形状）
+
+- assistant 的 `tool-call` → `tool_use`（`id` / `name` / **`input` 是对象**）；
+- **Anthropic 没有 `role:'tool'`** —— 工具结果必须是 **user 消息**里的
+  `tool_result` 块（`tool_use_id`）。
+- ⚠️ 参数是残缺 JSON 时退化为 `{}`，但**块必须保留** ——
+  丢了会让后续 `tool_result` 变孤儿块、服务端 400。
+- ⚠️ 历史里的 `reasoning` 块**不回传**：Anthropic 要求 thinking 块带签名，
+  而我们不持久化签名，回传无签名 thinking 会被拒。
+
+#### 验证命令
+
+```
+pnpm test:e2e:minimax-chat   # 双重闸门 DSH_MINIMAX_CHAT_E2E=1 且 ..._CONFIRM=yes
+                             # 默认测 M2.7；加 DSH_MINIMAX_CHAT_E2E_ALL=1 测全部
+```
+
+⚠️ 该探针走**真实适配器**（不是手搓 fetch），故协议/档位形态被改坏时会拦住。
+
+#### ⚠️ 未实现：图片
+
+`M3.1` / `M3` 的目录条目声明支持图片，但**带图请求未实测**，
+故序列化遇到 image 块**显式抛错**（不静默丢弃 —— 静默丢弃会让用户以为
+图片被模型看到了）。
+
+### 签到（每日领取）
+
+```
+GET  /minimax-cloud/api/v1/signin/status?timezone_id=<IANA>
+POST /minimax-cloud/api/v1/signin/claim?timezone_id=<IANA>   # body: {}
+```
+
+1. ⚠️ **`timezone_id` 是 query 参数且必填**。实测放到请求头会回
+   `1406010011 invalid timezone_id` —— 而且**那也是 HTTP 200**，
+   只看状态码会误判成成功。取值 `Intl.DateTimeFormat().resolvedOptions().timeZone`，
+   读不到回退 `'UTC'`。
+
+2. ⚠️⚠️ **`points` 是总数，`bonus_points` 是其中的「额外」部分，不得相加**
+   （用户 2026-09-28 亲自纠正）。实测第 1 天 `points: 800` / `bonus_points: 400`：
+   客户端按钮显示「签到得 **800**」、右上角另有「额外 400」角标。
+   故 `dailyCredit === points`（**800**），**不是** `points + bonus_points`（1200）。
+   相加会让展示金额**虚高一倍**。
+
+3. **7 天契约**：面板 `days` 数组必须是**恰好 7 条**，且 `is_today` **至多一条**
+   —— 不满足即判为非法响应（返回 `undefined`），不猜。
+
+4. **业务码在 `base_resp.status_code`**（不是 `code`），`0` 为成功。
+
+5. ⚠️ **幂等判据是响应体的 `claim_result`**（`1` = 真领取、`2` = 已领过），
+   **不是 HTTP 状态码** —— 重复领取同样返回 200。故 `claim_result` 缺失 /
+   `null` / 越界 / 字符串时一律判 `failed`，**不虚报成功**
+   （虚报会让用户以为 +了积分，实际 +0）。
+
+6. ⚠️ **今日已领的判据是 `is_today && status === 3`**，**不是**「没有 Claimable」
+   —— 后者会把「服务端没下发数据」误报成「今天已领」。
+
+### 积分余额
+
+`GET /minimax-cloud/api/v1/credit/details`
+
+- ⚠️ **该端点是平铺响应**（`details` / `total_count` 与 `base_resp` 同级、
+  **没有 `data` 键**），与签到端点的信封结构**不同**。实现用
+  `unwrapEnvelopeData` 兼容两种形状。
+- ⚠️ **空明细时 `details` 字段整个缺失** —— 解析必须容忍缺失。实测
+  `total_count: 0` 且无 `details`，那是**有效结果**（「真的为 0」），
+  与「查询失败」（`null`）是两回事。
+- ⚠️⚠️ **余额取 `details[].remaining_amount` 之和，`total_count` 是「记录条数」
+  不是余额**（2026-09-29 修复的真实缺陷）。
+
+  实测原始响应（领取 800 积分后）：
+  ```json
+  {"details":[{"remaining_amount":"800.00","consumed_amount":"0.00",
+               "granted_amount":"800.00","credit_type":2,
+               "granted_at_ms":1790645562328,"expire_at_ms":1793203200000}],
+   "total_count":1,"base_resp":{"status_code":0,"status_msg":"ok"}}
+  ```
+  真实余额是 **800**（`remaining_amount`），而 `total_count` 是 **1**。
+
+  ⚠️ **为什么初版没被发现**：余额为 0 时 `details` 缺失、`total_count` 也是 **0**
+  —— 「条数 0」与「余额 0」在数值上**偶然重合**，那条单测因此是**同义反复**。
+  领取积分后才分叉（条数 1 / 余额 800），用户界面会显示「1 积分」。
+
+  ⚠️ `remaining_amount` 实测是**字符串**（`"800.00"`），故解析必须同时接受
+  字符串与数字（上游改型不该让余额整块失效）；`Number('')` 是 0，
+  空串必须**先挡掉**，否则会被误读成「0 积分」。
+- ⚠️ **`expiredTotal` 仍为 0、`packages` 留空**：`details[]` 里没有区分
+  「本周期有效」的标志（`credit_type` 语义未实测），故**不凭猜测分类**。
+
+### 能力矩阵
+
+```js
+minimax: { balance: true, dailyCheckin: true }
+```
+
+余额与每日签到**都有**（与 raccoon 只有 `onboardingTasks` 不同）。
+
+### 反向验证
+
+四条，均为「注入变异 → 确认变红 → 逐字还原」（详见
+`.superpowers/sdd/progress.md` 的 Task 8 记录）：
+
+| 变异 | 变红条数 | 被守住的判据 |
+|---|---|---|
+| `MiniMax-M3` 加档位 + 无条件声明 `reasoning` | **4** | 「无 effortOptions 返回 undefined」「M2.7 系不声明 reasoning」 |
+| 删掉 `200 + status=pending` 轮询分支 | **2** | 「HTTP 200 + pending 必须继续轮询」 |
+| `dailyCredit = points + bonusPoints` | **1** | 「dailyCredit === 800（不是 1200）」 |
+| `timezone_id` 改放请求头 | **2** | 「timezone_id 必须在 query」（status + claim 两条） |
+
+### e2e 探针
+
+```
+pnpm test:e2e:minimax        # 只读：模型目录/签到状态/积分余额；**绝不领取**
+pnpm test:e2e:minimax-claim  # ⚠️ **真实领取**当日积分（消耗当天唯一一次机会）
+pnpm test:e2e:minimax-chat   # ⚠️ 发推理（真实适配器；默认测 M2.7，会消耗额度）
+```
+
+⚠️ 只读探针读的是 **MiniMax Code 客户端自己的登录态**
+（`~/.minimax/auth/prod/cn/mcode-public/auth.json`），**不是**本插件的凭据存储
+—— 该 provider 尚未在任何机器上完成过插件登录。
+
+⚠️ **token 过期时探针自动 skip 并打印指引，不代客户端续期**：MiniMax 的 refresh
+可能轮换 `refresh_token`，若我们刷一次却不写回客户端文件，用户的客户端登录态
+就会被弄坏（代价远大于「探针跑不起来」）。实测过期 token 打只读端点返回
+**HTTP 401 `invalid access token`**。
+
 
 ---
 

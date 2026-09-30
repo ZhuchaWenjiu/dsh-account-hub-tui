@@ -347,7 +347,8 @@ describe('ZCode 客户端接入（缺口 3 / 4 / 5）', () => {
     // 也确认没把既有的挤掉。
     expect(ids).toContain('codearts')
     expect(ids).toContain('raccoon')
-    expect(ids).toHaveLength(11)
+    // ⚠️ 2026-09-30 合并 master 后 minimax 也接入了 —— 11 → 12。
+    expect(ids).toHaveLength(12)
   })
 
   it('展示名与产品配置一致（避免两处漂移）', () => {
@@ -420,7 +421,8 @@ describe('ZCode RPC 分派（缺口 2：接线）', () => {
 
   it('index.ts 把 zcode 接进 registerJetHubRpc 与 modelAdapters', () => {
     const source = readFileSync(resolve(HERE, '../../src/index.ts'), 'utf8')
-    expect(source).toMatch(/registerJetHubRpc\(ctx, pool, service, .*raccoon, zcode, modelAdapters\)/)
+    // ⚠️ 2026-09-30 合并后 minimax 排在 zcode 之前 —— 用 .* 容忍中间插队者。
+    expect(source).toMatch(/registerJetHubRpc\(ctx, pool, service, .*raccoon,.*zcode, modelAdapters\)/)
     expect(source).toMatch(/zcode: zcodeAdapter/)
   })
 

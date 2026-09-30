@@ -136,6 +136,7 @@ function makeRpc() {
     {} as never, // cline
     {} as never, // loomy
     {} as never, // raccoon
+    {} as never, // minimax（2026-09-30 合并后新增，插在 zcode 前）
     zcode as never,
     undefined,
   )
@@ -357,6 +358,7 @@ describe('ZCode Jet Hub 登录接入', () => {
       ctx, pool,
       {} as never, {} as never, {} as never, {} as never, {} as never,
       {} as never, {} as never, {} as never, {} as never, {} as never,
+      {} as never, // minimax（合并后插在 zcode 前）
       zcode as never, undefined,
     )
     const h = handler()!
@@ -393,9 +395,10 @@ describe('ZCode Jet Hub 登录接入', () => {
     const call = /registerJetHubRpc\(([^)]*)\)/.exec(source)
     expect(call?.[1]).toBeDefined()
     const args = (call?.[1] ?? '').split(',').map((s) => s.trim())
-    // ctx, pool, 然后 11 个 provider，最后 modelAdapters。
-    expect(args.length).toBe(14)
-    expect(args[args.length - 3]).toBe('raccoon')
+    // ctx, pool, 然后 12 个 provider（合并后 minimax 排在 zcode 前），最后 modelAdapters。
+    expect(args.length).toBe(15)
+    expect(args[args.length - 4]).toBe('raccoon')
+    expect(args[args.length - 3]).toBe('minimax')
     expect(args[args.length - 2]).toBe('zcode')
     expect(args[args.length - 1]).toBe('modelAdapters')
   })

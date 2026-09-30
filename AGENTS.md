@@ -8,7 +8,7 @@
 
 ## 项目概述
 
-本项目是 DeepSeek Harness 的一个插件（`dsh-codearts-auth`），提供华为云 CodeArts 浏览器登录与凭据管理功能。插件还附带 `buddy`（腾讯 CodeBuddy 中国版）、`workbuddy`（腾讯 WorkBuddy **国际版** / WorkBuddy AI）、`lobsterai`（有道 **LobsterAI** / 龙虾）、`qoder`（阿里系 **Qoder**）、`qodercn`（**Qoder 中国版**，与 `qoder` 同协议族、共用同一份 WASM）、`trae`（字节跳动 **TRAE**）、`cline`（**Cline** 桌面端 / Cline API）、`loomy`（讯飞 **Loomy** 办公助手）与 `raccoon`（商汤 **Raccoon Work** / 小浣熊）九个 LLM provider 路由。
+本项目是 DeepSeek Harness 的一个插件（`dsh-codearts-auth`），提供华为云 CodeArts 浏览器登录与凭据管理功能。插件还附带 `buddy`（腾讯 CodeBuddy 中国版）、`workbuddy`（腾讯 WorkBuddy **国际版** / WorkBuddy AI）、`lobsterai`（有道 **LobsterAI** / 龙虾）、`qoder`（阿里系 **Qoder**）、`qodercn`（**Qoder 中国版**，与 `qoder` 同协议族、共用同一份 WASM）、`trae`（字节跳动 **TRAE**）、`cline`（**Cline** 桌面端 / Cline API）、`loomy`（讯飞 **Loomy** 办公助手）、`raccoon`（商汤 **Raccoon Work** / 小浣熊）与 `minimax`（**MiniMax Code 中国版**，首个 **Anthropic Messages** 协议族）十个 LLM provider 路由。
 
 `buddy` 与 `workbuddy` 同源：共用同一 CLI 内核与同一认证协议，差异全部收敛在 `src/product.ts` 的产品配置中。关键差异是 **`endpoint`**：中国版为 `copilot.tencent.com`，国际版为 `www.workbuddy.ai`，两者返回不同模型池，因此 endpoint 必须随产品切换、不可当作全局常量。此外 `platform` 分别为 `ide` 与 `workbuddy-ai`，国际版登录 URL 还追加 `version` / `loginSessionId`。
 
@@ -797,6 +797,29 @@ console.log('0.3.0-rc.1 must be false:', s.satisfies('0.3.0-rc.1', R, { includeP
 
 ## 工作方式
 
+### ⚠️ 子任务优先用 **inline** 执行，不要新开 subagent
+
+处理多任务计划（如 `docs/superpowers/plans/*.md` 的 Task 1..N）时，**新子任务直接在
+当前会话 inline 做**，不要为每个子任务再新开 subagent。用户 2026-09-29 明确要求。
+
+理由（本项目实测的代价）：
+- **同一工作区无法安全并行**：subagent 做「反向验证」时会在源码里注入**临时变异**
+  （未提交状态）。此时若另一个 subagent 跑全量测试，会看到 2~3 条**不属于它的**失败，
+  容易误判为自身缺陷；更糟的是若它执行 `git stash` / `git checkout -- .` /
+  `git restore` / `git add -A`，会**毁掉**前者的变异验证（丢未提交的变异体与还原基线）。
+- **subagent 会长时间空转**：本项目已有两次复审 subagent 跑到超时仍无产出
+  （Task 2 的复审者被 `interrupt_agent` 中止、Task 4 的复审者未输出即结束）。
+- **context 更可控**：inline 做时前面已建立的实测事实（协议细节、坑点、
+  既有范例行号）都在手边，不必每次重新交代，也不会因为表述遗漏而让子代理
+  重新踩已知的坑。
+
+若确实要用 subagent（例如任务之间**没有文件重叠**且**都不做变异验证**），必须：
+1. 预先告知它「工作区可能有他人未提交改动，**只 `git add` 自己的文件**」；
+2. **明令禁止** `git stash` / `git checkout -- .` / `git restore` / `git add -A`；
+3. 告诉它判断成败要用**自己的**测试文件，全量测试只作参考。
+
+### `ctx.xxxAuth` 服务统一接口
+
 本插件定义的所有 `ctx.xxxAuth` 服务（`codeartsAuth`、`buddyAuth`、`workbuddyAuth`、`lobsteraiAuth`、`qoderAuth`、`qoderCnAuth`、`traeAuth`、`clineAuth`）均遵循统一接口：
 
 - `login(options?)` — 执行浏览器登录流程
@@ -804,7 +827,7 @@ console.log('0.3.0-rc.1 must be false:', s.satisfies('0.3.0-rc.1', R, { includeP
 - `refreshAccountCredential(refName, pool?, accountId?)` — 按凭据 ref 续期**指定账号**（账号卡片「刷新」按钮）。⚠️ 后两个参数**必须传**：只有拿到池与账号 id，续期后的新 `expiresAt` 才能回写账号池（见下）
 - `refreshAll(pool)` — 批量续期全部账号（定时调度器）
 
-⚠️ **不注册任何斜杠命令**：九个 provider 的登录/状态/续期**全部**在 Jet Hub 设置页完成。
+⚠️ **不注册任何斜杠命令**：十个 provider 的登录/状态/续期**全部**在 Jet Hub 设置页完成。
 
 ⚠️ **CodeArts 只支持账号池，单凭据模式已移除**（用户要求）：
 
@@ -816,7 +839,7 @@ console.log('0.3.0-rc.1 must be false:', s.satisfies('0.3.0-rc.1', R, { includeP
   移除单凭据后会恒返回空列表。
 - `codearts-login` / `codearts-status` / `codearts-refresh` 三个命令**已删除**
   （注意代码里**从来没有** `codearts-logout` 命令，logout 只是服务方法）。
-- 九个 provider 的门控判据因此**完全一致**：都只看账号池，
+- 十个 provider 的门控判据因此**完全一致**：都只看账号池，
   `providerCatalogVisible` 的 `extraCredentialRefs` 参数已随之删除。
 - 老用户影响：若此前只用固定 ref 登录过，模型列表会变空，需在 Jet Hub 重新登录一次
   （用户已确认接受该行为，不做自动迁移）。
@@ -837,7 +860,7 @@ console.log('0.3.0-rc.1 must be false:', s.satisfies('0.3.0-rc.1', R, { includeP
 - `src/index.ts` 的 `accounts.some(a => a.refreshable && a.enabled)`
   → **所有账号都停用时续期定时器根本不启动**。
 
-用户重新启用后拿到的是死凭据，只能重新登录。九个 provider 的
+用户重新启用后拿到的是死凭据，只能重新登录。十个 provider 的
 `refreshAll`（`buddy-auth.ts` / `service.ts` / `lobsterai-auth.ts` / `qoder-auth.ts` / `trae-auth.ts`）与调度器
 **都必须保持只看 `refreshable`**。
 
@@ -873,7 +896,7 @@ console.log('0.3.0-rc.1 must be false:', s.satisfies('0.3.0-rc.1', R, { includeP
    lead-time 的目的是**减少**请求，不是增加。别「为统一」把它改成 1 小时。
 3. **回写账号池**：UI 读的**只**是池里的 `expiresAt`
    （`plugin-src/client/jet-hub.js` 的 `account.expiresAt <= Date.now()`）。
-   原先九个 provider 里只有 raccoon 回写，其余七个（含 `createPoolRefresh` ——
+   原先十个 provider 里只有 raccoon 回写，其余八个（含 `createPoolRefresh` ——
    CodeBuddy 系**发消息途中**按需续期的路径，触发频率远高于点按钮）
    只 `credentials.set` → 「数据源分叉」，功能完全正常但界面永远错。
    现统一走 `src/expiry-sync.ts` 的 `syncAccountExpiry` / `refreshAccountWithReconcile`。
@@ -2165,7 +2188,7 @@ groups: catalog.flatMap(...).filter(group => group.models.length > 0)
 | 判据是**凭据可解析** | 服务层的 `logout()` **只 unset 凭据、保留账号条目**（删条目是另一条路径 `removeAccount`）。若只看「有条目」，用户登出后模型仍然显示，门控形同虚设 |
 | **不看 `enabled`** | 停用只影响「自动选号」，与「是否已登录」无关。若过滤 `enabled`，把所有账号停用的用户会发现整个 provider 的模型凭空消失。与「续期只看 `refreshable`、不看 `enabled`」是同一条既有约定 |
 
-⚠️ **九个 provider 判据完全一致，没有例外**：早期 CodeArts 曾额外接受固定单凭据
+⚠️ **十个 provider 判据完全一致，没有例外**：早期 CodeArts 曾额外接受固定单凭据
 ref（`CODEARTS_ACCESS_TOKEN`），该模式**已移除**，`extraCredentialRefs` 参数一并
 删除。老用户若只用固定 ref 登录过，模型列表会变空 —— 需在 Jet Hub 重新登录一次
 （用户已确认接受，不做自动迁移）。
@@ -4906,6 +4929,302 @@ pnpm test:e2e:raccoon-tools  # ⚠️ 发推理：**tools 是否被接受**（�
 - `400 100006 captcha_verify_error` —— 滑块过期，需重新过验证。
 - `400 100002 params_invalid_error` —— 手机号格式或验证码错。
 - `400 100003 params_encryted_error` —— 手机号**未加密**或加密格式不对。
+
+---
+
+## ⚠️ MiniMax Code（中国版）provider：不能凭直觉改的点
+
+`minimax` 是**第 10 个、也是首个 `Anthropic Messages` 协议族**的 provider
+（其余九个都是 OpenAI 兼容族或各自的自定义协议）。生产环境
+`https://agent.minimax.cn`。实现是独立一套 `src/minimax*.ts`。
+
+### 1. ⚠️ `pending` 是 **HTTP 200**，不是 OAuth 标准的 400
+
+设备码轮询里，服务端用 **HTTP 200 + `status: "pending"`** 表达「用户还没完成授权」；
+而标准 OAuth 是「非 200 + `error=authorization_pending`」。**两种形态都要认**。
+
+⚠️ **只看 HTTP 状态码会把「还在等你点授权」误判成「拿到 token 了」** ——
+实测表现为 `令牌响应缺少 access_token`。这与 Qoder「404 表示尚未授权、
+必须继续轮询」是同类坑（**别把非标准形态当错误**）。
+
+### 2. ⚠️ 模型目录**必须走远端**，不能照抄客户端内置表
+
+客户端 `config.js` 的内置表**只有 3 个**（`MiniMax-M3` /
+`MiniMax-M2.7-highspeed` / `MiniMax-M2.7`），而远端
+`GET /mavis/api/v1/models?region=cn&buildEnv=prod` 有 **4 个** ——
+**照抄内置表会漏掉 `MiniMax-M3.1-Flash-Preview`**，而它正是客户端界面上
+被选中的那个（用户截图证据）。
+
+**判据**：目录走远端；远端失败时才回退兜底表（`minimaxFallbackEntries`）。
+
+### 3. ⚠️ 只有 `MiniMax-M3.1-Flash-Preview` 有思考档位
+
+其余三个远端条目**没有 `effort_options` 字段** —— 这是**远端事实，不是我们漏解析**。
+故 `resolveModel` 对它们**不声明 `reasoning`**（`minimaxReasoningInfo` 返回
+`undefined`）。与 Qoder 的 `qmodel`「只有关闭思考」是同一类事实：
+**远端没给就是没有，不要补猜测的默认值。**
+
+⚠️ 档位展示名直接用**远端原文**（`name === id`），不做本地化。
+⚠️ 窗口口径是**档位表最大档**（M3.1 / M3 → 1M；M2.7 系 → 200K），
+**不是**目录里的 `max_input_tokens`（Qoder 那条已证伪的口径，别再犯）。
+
+### 4. ⚠️ `timezone_id` 是 **query 参数**，且放错位置**也是 HTTP 200**
+
+签到端点：
+```
+GET  /minimax-cloud/api/v1/signin/status?timezone_id=<IANA>
+POST /minimax-cloud/api/v1/signin/claim?timezone_id=<IANA>   # body {}
+```
+⚠️ 放到**请求头**会回 `1406010011 invalid timezone_id` —— 而且**那也是 HTTP 200**。
+故「HTTP 200 = 成功」在这里**不成立**，必须查业务码
+（`base_resp.status_code`，**不是** `code`）。
+
+### 5. ⚠️ `points` 是**总数**，`bonus_points` **含在其中**，**不得相加**
+
+实测第 1 天 `points: 800` / `bonus_points: 400`：客户端按钮显示「签到得 **800**」、
+右上角另有「额外 400」角标 —— 即 `bonus_points` 是 `points` 的**子集**，
+不是额外加量。
+
+⇒ `dailyCredit === points`（**800**），**不是** `points + bonus_points`（1200）。
+相加会让展示金额**虚高一倍**（用户 2026-09-28 亲自纠正）。
+
+### 6. ⚠️ 幂等判据是 `claim_result`，**不是 HTTP 状态码**
+
+`claim_result`：`1` = 真领取、`2` = 已领过。**重复领取同样返回 200**。
+故 `claim_result` 缺失 / `null` / 越界 / 字符串时一律判 `failed`，
+**绝不虚报成功**（虚报会让用户以为 +了积分，实际 +0 ——
+与 TRAE「显示成功但 +0」是同一类报障）。
+
+⚠️ 另：**今日已领的判据是 `is_today && status === 3`**，**不是**「没有 Claimable」
+—— 后者会把「服务端没下发数据」误报成「今天已领」（Qoder 踩过同款）。
+
+### 7. ⚠️ 积分余额端点是**平铺响应**，且 `details` 会整个缺失
+
+`GET /minimax-cloud/api/v1/credit/details` 的 `total_count` 与 `base_resp` **同级、
+没有 `data` 键** —— 与签到端点的信封结构**不同**。实现用 `unwrapEnvelopeData`
+兼容两种形状（否则会撞上「缺 `data` 即判失败」的守卫，把**「余额为 0」
+报成「查询失败」**）。
+
+⚠️ **空明细时 `details` 字段整个缺失**；解析必须容忍。本机实测
+`total_count: 0` 且无 `details` —— 那是**有效结果**（「真的为 0」），
+与「查询失败」（`null`）是两回事，**不要合并**。
+
+### 7.1 ⚠️⚠️ 余额取 `details[].remaining_amount`，**`total_count` 是记录条数**（2026-09-29 修复的真实缺陷）
+
+初版写成 `total = total_count` —— **错的**。`total_count` 是 `details[]` 的
+**记录条数**，真实余额是各包 `remaining_amount` 之和。
+
+实测原始响应（本机领取 800 积分后，2026-09-29）：
+```json
+{"details":[{"remaining_amount":"800.00","consumed_amount":"0.00",
+             "granted_amount":"800.00","credit_type":2,
+             "granted_at_ms":1790645562328,"expire_at_ms":1793203200000}],
+ "total_count":1,"base_resp":{"status_code":0,"status_msg":"ok"}}
+```
+余额是 **800**，`total_count` 是 **1** —— 用户界面会显示「1 积分」。
+
+⚠️⚠️ **为什么初版与单测都没发现（这个坑的形态值得记住）**：
+账号余额为 0 时 `details` **整个缺失**、`total_count` 恰好也是 **0**
+—— 「条数 0」与「余额 0」在数值上**偶然重合**。于是
+「`total_count: 0` → `total: 0`」那条单测是**同义反复**，
+它**只能证明「0 还是 0」**，无法区分两个语义。
+⇒ **领取积分后才分叉**（条数 1 / 余额 800），缺陷才暴露。
+
+**教训具有普遍性**：当「错误的字段」与「正确的字段」在**已知样本上取值相同**时，
+任何断言都是同义反复。⇒ **必须构造让两者分叉的样本**
+（本例：一条 800 的记录 ⇒ 期望 800 而非 1）。这正是 Task 8「反向验证」要解决的
+问题，但反向验证**只能证明既有用例有判别力**，证明不了「用例覆盖了正确的语义」
+—— 后者需要**让错误实现产生不同数值**的样本。
+
+⚠️ **`remaining_amount` 是字符串**（`"800.00"`），而 `finiteNumber` 只认 number
+⇒ 必须用宽容解析（数字与字符串都接受，见 `looseAmount`）。
+⚠️ `Number('')` **是 0** ⇒ 空串必须**先挡掉**，否则「缺字段」会被误读成
+「0 积分」（与「不编造 0」的既有铁律冲突）。
+⚠️ `expiredTotal` 仍为 0、`packages` 留空：`details[]` 没有区分「本周期有效」的
+标志（`credit_type` 语义**未实测**），**不凭猜测分类**。
+
+### 8. 推理：**Anthropic Messages** 协议（已实测启用，2026-09-29）
+
+`POST {apiHost}/mavis/api/v1/llm/v1/messages`（`stream: true`）。
+实现分两块：`src/minimax-messages.ts`（请求体构造 + SSE 消费）与
+`src/minimax-adapter.ts` 的 `stream()`。
+
+⚠️ **不要复用 `openai-compat.ts`**：那是 OpenAI 形状，硬套会把
+`tools` / `tool_calls` / `input_json_delta` 全部翻译错。
+⚠️ 也**不做**「通用 Anthropic 层」抽象 —— 只有一个消费者，
+抽象是凭空多一层间接（Qoder 的教训是「同族第二个产品出现时再抽」）。
+
+#### 8.1 ⚠️⚠️ 思考档位：**两种能力**，M3.1 与 M3 完全不同
+
+远端 `thinking_config.mode` 有三种值（**不是**只看 `effort_options`）：
+
+| 模型 | mode | effort_options | 实测行为 | 我方声明 |
+|---|---|---|---|---|
+| M3.1-Flash-Preview | `forced_on` | ✅ `default/low/medium/high/xhigh/max` | 传 disabled ⇒ **硬 400** | 6 档（默认 `default`） |
+| **M3** | **`switchable`** | ❌ 无 | **不发 ⇒ 不思考**；adaptive ⇒ 2785+ 字符 | `on` + `none` |
+| M2.7 / M2.7-highspeed | `forced_on` | ❌ 无 | 传 disabled ⇒ **静默忽略** | 不声明 |
+
+**M3.1 必须 adaptive**（服务端原话，实测 HTTP 400）：
+```
+{"type":"error","error":{"type":"invalid_request_error",
+ "message":"invalid params, model \"MiniMax-M3.1-Flash-Preview\" requires
+  adaptive thinking; thinking.type=\"disabled\" (including
+  reasoning.effort=none) is not allowed (2013)"}}
+```
+
+⚠️⚠️ **M3 必须给「开启」档，不能只给「关闭」**（真实功能缺口，2026-09-29 修复）：
+实测 M3 **不发 `thinking` 时默认「不思考」**（两轮各 0 字符），
+而 `adaptive` 有 **2785 / 2797** 字符。初版只看了 `effort_options`（M3 没有）
+⇒ 声明成「无推理等级」⇒ 用户**既不能开也不能关**；
+我第二版只加 `none` ⇒ **只能关、无法开**（把模型强项藏起来了）。
+
+⇒ 取客户端**权威词汇**（`thinking.js` 的 `isMiniMaxM3ThinkingMode`：
+`value === 'on' || value === 'off'`）声明 **`['on','none']`**
+（`on`→`adaptive`、`none`→`disabled`；`off` 在 DSH 侧的惯用名是 `none`）。
+⚠️ **不设 `defaultEffort`**（M3 无 `default_effort`）⇒ 保持服务端默认（=不思考），
+**不擅自**设成 `on`（那会改变用户既有行为）。
+
+⚠️ **`forced_on` 的模型绝不追加开关**：M3.1 会硬 400、M2.7 被静默忽略
+—— 「给了选项却空转」比「不给」更糟（用户以为关掉了、实际没关）。
+
+⚠️ **展示名**：远端档位用原文（官方 IDE 就是 `default`/`low`/…），
+但 `on`/`none` 是**我们追加**的，给中文「开启思考」/「关闭思考」。
+
+⚠️ **档位真的生效**（实测同一难题）：M3.1 `low`=572 / `medium`=1181 /
+`max`=1297 字符 ⇒ **不是空转**。故断言必须比较**不同档位的思考量**，
+不能只断言「HTTP 200」。
+
+⚠️ **测档位要用需要推理的问题**：问「只回复两个字：收到」时
+adaptive 与 none **都是 0 思考字符**（模型根本不思考）⇒ 断言退化成同义反复
+（我第一版探针就这么假红过）。
+
+⚠️ **`readImage` / contextWindow 与用户 IDE 截图的对应**：
+IDE 的「上下文窗口 512K / 1M」是 **IDE 自己的**多档选择；
+DSH 的 `LlmModelContext` **只有单一 `contextWindow` 字段**，本身不支持多档
+⇒ 按用户 2026-09-29 的指示「不用档位直接用最大的」取 **1M**。
+⚠️ 用户「看不到档位」的**真实原因**是**插件未登录**（凭据里无 `MINIMAX_*`
+⇒ `providerCatalogVisible` 为假 ⇒ `listModels` 返回空 ⇒ DSH 隐藏整个 provider），
+**不是档位没实现**。排障时先查登录态。
+
+#### 8.2 ⚠️ 图片：**必须** Anthropic 形状（真机实测）
+
+```json
+{ "type":"image", "source":{"type":"base64","media_type":"image/png","data":"<裸base64>"} }
+```
+- ⚠️ OpenAI 的 `image_url` 被服务端**明确拒绝**：
+  `400 ... messages.0.content.0: unsupported content type 'image_url' (2013)`
+- ⚠️ `data` 是**裸 base64**（无 `data:` 前缀）
+- ⚠️ 实测：**1×1 的 PNG 会被拒**（`400 invalid params`，**无细节**）；
+  40×40 起正常。真实截图远大于此，不影响使用 ——
+  但**排障时别用 1×1 图**（会得到一个毫无线索的 400）
+- ⚠️ 可与 `thinking:{type:'adaptive'}` 共存、`text` 在 `image` 前后均可
+- 实测：M3.1 / M3 都能识图（自造纯红 PNG ⇒ 答「红色」）
+
+⚠️ **判据是「模型真的看到了图」，不是「HTTP 200」**（后者在静默丢图时也通过）。
+⚠️ **但不要断言精确颜色**：实测同一张纯色图 M3.1 答过「灰色和暗红色」、
+M3 答过「绿色」/「红色」—— 那是**模型自身识图质量**，与序列化无关；
+硬匹配会让探针随机假红。断言应取「**不是**拒答」+「含颜色词」。
+⚠️ **消息体的图读不到 ⇒ 抛错**（用户显式意图）；**工具结果里的图读不到 ⇒ 跳过**
+（工具结果本身仍有价值）—— 有意区别对待。
+⚠️ 声明不支持图片的模型收到图片 ⇒ **报错**，不能发出去让服务端 400。
+
+#### 8.3 SSE 帧形状与三个必须保留的细节
+
+`message_start` → `ping` → `content_block_start` → `content_block_delta` →
+`content_block_stop` → `message_delta` → `message_stop`。
+
+- ⚠️ **`signature_delta` 必须忽略**（thinking 块的签名）。当正文处理会往回答里
+  注入一串十六进制。
+- ⚠️ **`thinking` 块映射成 `reasoning` 块**，否则思考内容污染正文。
+- ⚠️ **`thinking_tokens` 是 `output_tokens` 的「子集」**（实测两者都可能是 64），
+  映射到 `reasoningTokens`，**不累加**到 outputTokens。
+- ⚠️ **错误走 `event: error`**（`{type:'error', error:{type,message}}`），
+  不是 OpenAI 的 `{error:{message}}` —— **必须抛错**，否则重演 Qoder
+  「干净地停止、无任何报错」。
+
+#### 8.3 ⚠️ 工具调用是 Anthropic 形状，**没有 `role:'tool'`**
+
+- assistant 的 `tool-call` → `tool_use`（**`input` 是对象**，不是 JSON 字符串）；
+- 工具结果 → **user 消息**里的 `tool_result` 块（`tool_use_id`）。
+- ⚠️ 参数是残缺 JSON 时退化 `{}`，但**块必须保留** —— 丢了会让后续
+  `tool_result` 变孤儿块、服务端 400。
+- ⚠️ 历史里的 `reasoning` 块**不回传**：Anthropic 要求 thinking 带签名，
+  我们不持久化签名 ⇒ 回传会被拒。丢弃思考历史是安全的。
+- ⚠️ **判据是「结构化 `tool-call` 块」**，不是「模型在正文里说它想调工具」
+  —— 后者正是 Qoder/TRAE 踩过的缺陷形态（插件没发 `tools`，
+  模型只能用正文 XML 臆造，harness 认不出 → 任务终止）。
+
+#### 8.4 ⚠️ 402 必须归 `QUOTA_EXCEEDED`，不能归 `SERVER`/`AUTH`
+
+余额不足是最常见的真实失败，归错会让用户看不到「去充值」这个**唯一有效动作**。
+
+#### 8.5 ⚠️ 未实现：图片（**显式抛错**，不静默丢弃）
+
+`M3.1` / `M3` 目录条目声明 `supportsImage`（用于 `inputModalities` 播报），
+但**带图请求未实测**，故序列化遇到 image 块**显式抛错**。
+静默丢弃会让用户以为图片被模型看到了。
+
+#### 8.6 ⚠️ 单测抓到的真实缺陷：截断流丢失最后一帧
+
+原 `consumeMinimaxSse` 只在 `while (!done)` 里按行处理，`split('\n')` 后
+`pop()` 的尾巴留在 `buffer` 等下一轮 —— 但**流结束时没有下一轮**，
+于是最后一条事件（正是携带 `stop_reason` 与 `usage` 的 `message_delta`）
+**永远被丢弃**。
+
+真实 SSE 大多以空行结尾，恰好掩盖了它；**截断的流**才暴露，且症状极隐蔽：
+`max_tokens` 被误报成 `stop`、`usage` 永远是 0 —— **不报错、不中断，只是数字错**。
+
+⇒ 修法：把行处理抽成嵌套生成器 `processLine`，收尾时先 `decoder.decode()`
+刷出残留多字节，再把 `buffer` 余量**按整行**走一遍同一套逻辑。
+⚠️ 同时**空行要重置 `eventName`**（它是 SSE 的事件终止符；提到循环外后
+不重置会让上一条事件的 `event:` 名残留到下一条 `data:` 上）。
+回归用例 4 条，反向验证过（去掉收尾冲刷 ⇒ 4 条变红）。
+
+### 9. 能力矩阵与 e2e
+
+```js
+minimax: { balance: true, dailyCheckin: true }
+```
+余额与每日签到**都有**（与 raccoon 只有 `onboardingTasks` 不同）。
+
+```
+pnpm test:e2e:minimax        # 只读：目录/签到状态/余额；**绝不领取**
+pnpm test:e2e:minimax-claim  # ⚠️ **真实领取**当日积分（消耗当天唯一一次机会）
+pnpm test:e2e:minimax-chat   # ⚠️ 发推理（真实适配器；默认 M2.7，会消耗额度）
+```
+
+⚠️ `minimax-chat` 的断言是「**取到非空文本 + finish 正确**」与
+「工具调用返回**结构化** `tool-call` 块」—— 不是「请求返回 200」。
+后者在「模型什么都没说」时也会通过（那正是要防的形态）。
+⚠️ 默认只测 **M2.7**（用户 2026-09-29 指定：每天有免费额度）；
+`DSH_MINIMAX_CHAT_E2E_ALL=1` 才测全部四个模型。
+
+⚠️ 只读/领取探针读的是 **MiniMax Code 客户端自己的登录态**
+（`~/.minimax/auth/prod/cn/mcode-public/auth.json`），**不是**本插件的凭据存储
+—— 该 provider 尚未在任何机器上完成过插件登录。
+
+⚠️ **token 过期时探针自动 skip，绝不代客户端续期**：MiniMax 的 refresh
+可能轮换 `refresh_token`，若我们刷一次却不写回客户端文件，用户的客户端登录态
+就会被弄坏。实测过期 token 打只读端点返回 **HTTP 401 `invalid access token`**。
+
+### 10. ⚠️ `registerJetHubRpc` 的位置参数陷阱（**第 4 次复发**）
+
+`registerJetHubRpc` 是长**位置**参数列表（11 个 auth + `modelAdapters`）。
+新增 provider 时**必须**在 `tests/unit/jet-hub-rpc.spec.ts` 的调用点补占位，
+否则 `modelAdapters` 会**错位**落到最后一个 auth 形参上。
+
+**已复发四次**：加 Loomy、加 Raccoon、加 QoderCN、**加 MiniMax**（本次）。
+测试注释里逐字预言过这个坑。本次症状：`jet-hub-rpc.spec.ts` 的
+「关闭的模型仍显示带倍率的展示名」**确定性失败**，而
+`git diff` 显示**没碰** `model.list` 相关代码。
+
+⚠️ **排查教训（值得复用）**：一条看起来「与本次改动无关」的失败，
+**不要**先假设是抖动 —— 用 `git stash push -u` 回到基线跑同一文件：
+基线 3/3 通过、恢复后必失败 ⇒ **确证是自己引入的**。
+
+⚠️ **另一个格式陷阱**：`registerJetHubRpc` 的**调用**必须保持**单行**
+（`... raccoon, minimax, modelAdapters)`）。拆成多行（哪怕只加尾随逗号）
+会让 `qoder-wiring.spec.ts` / `raccoon-wiring.spec.ts` 的正则失配而失败。
 
 ## ⚠️ ZCode（智谱）provider：「卡住 + 停止按钮无效」的两个根因（真实缺陷，2026-09-29）
 

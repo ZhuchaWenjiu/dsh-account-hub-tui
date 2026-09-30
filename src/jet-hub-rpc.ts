@@ -33,6 +33,15 @@ import { ZCODE } from './zcode-product.js'
 import type { ZcodeCredential } from './zcode.js'
 import type { RaccoonCredential } from './raccoon.js'
 import type { StartedRaccoonLoginFlow } from './raccoon-login-page.js'
+import { MINIMAX } from './minimax-product.js'
+import type { MinimaxAuth, StartedMinimaxLoginFlow } from './minimax-auth.js'
+import { isMinimaxRefreshable, minimaxCredentialExpiresAtMs } from './minimax.js'
+import type { MinimaxCredential } from './minimax.js'
+import {
+  claimMinimaxDailyCheckin,
+  fetchMinimaxCreditBalance,
+  fetchMinimaxSigninStatus,
+} from './minimax-credits.js'
 import { LOOMY_TASK_POINTS, LOOMY_TASK_TITLES } from './loomy-onboarding.js'
 import { LOBSTERAI } from './lobsterai-product.js'
 import { QODER, QODER_CN, type QoderProduct } from './qoder-product.js'
@@ -640,6 +649,8 @@ export function registerJetHubRpc(
   cline: ClineAuth,
   loomy: LoomyAuth,
   raccoon: RaccoonAuth,
+  /** MiniMax Code **中国版**实例（OAuth 设备码 + PKCE，与 Qoder 同型但协议不同）。 */
+  minimax: MinimaxAuth,
   zcode: ZcodeAuth,
   /**
    * provider → 适配器实例（可选）。
@@ -653,7 +664,7 @@ export function registerJetHubRpc(
   ctx.inject(['connection'], (connectionCtx) => {
     registerJetHubEndpoints(
       connectionCtx as Context, pool, codearts, buddy, workbuddy, lobsterai,
-      qoder, qoderCn, trae, cline, loomy, raccoon, zcode, modelAdapters,
+      qoder, qoderCn, trae, cline, loomy, raccoon, minimax, zcode, modelAdapters,
     )
   })
 }
@@ -712,6 +723,7 @@ function registerJetHubEndpoints(
   cline: ClineAuth,
   loomy: LoomyAuth,
   raccoon: RaccoonAuth,
+  minimax: MinimaxAuth,
   zcode: ZcodeAuth,
   modelAdapters?: Readonly<Record<string, ModelCatalogSource>>,
 ): void {
@@ -1165,6 +1177,60 @@ function registerJetHubEndpoints(
           })
 
           return { ok: true, value: { accountId: id, loginUrl: raccoonStarted.loginUrl } }
+        } else if (provider === MINIMAX.id) {
+          // MiniMax Code（中国版）走 **OAuth 设备码 + PKCE**（与 Qoder 同型：
+          // 不起本地监听端口，`startLogin` 立即返回指向 `agent.minimax.cn` 的
+          // `verification_uri_complete`，后台轮询换 token）。
+          //
+          // ⚠️ 绝不能在用户授权完成后才返回 loginUrl —— `window.open` 只在
+          //    用户手势窗口内有效，那时手势早已过期、弹窗必被拦截。
+          //
+          // ⚠️ 先登记**占位条目**（无凭据），使前端 `login.poll` 能立即看到该账号；
+          //    登录成功后再回填昵称与 `expiresAt`。失败则删除占位条目。
+          //    写法照 `RACCOON.id` 分支（那是已验证的形态）。
+          await pool.addAccount({
+            id,
+            provider: MINIMAX.id,
+            nickname: id,
+            enabled: true,
+            credentialRef: refName,
+            refreshable: false,
+            createdAt: Date.now(),
+          })
+
+          let minimaxStarted: StartedMinimaxLoginFlow
+          try {
+            minimaxStarted = await minimax.startLogin()
+          } catch (error) {
+            // 设备码申请失败：删掉占位条目，不留幽灵账号。
+            void pool.removeAccount(id).catch(() => {})
+            const reason = error instanceof Error ? error.message : String(error)
+            throw new Error(`无法启动 MiniMax 登录（设备码申请失败）：${reason}`)
+          }
+
+          minimaxStarted.result.then(async (credential) => {
+            const result = await minimax.persistLogin(credential, { refName })
+            await pool.updateAccount(id, {
+              // ⚠️ `persistLogin` 的 `accountId` 对真实凭据**恒为 `undefined`** ——
+              // MiniMax 的 `access_token` **不是 JWT**（`mmoat_` 前缀、60 字符、
+              // 0 个点），故 `decodeJwtSub` 恒不命中、`account_id` 不会被写入。
+              // 这是**预期行为**（账号 id 由本层生成），不是缺陷：此时退化为 `id`。
+              // 一旦上游改发 JWT，这里会自动用上服务端的 account_id。
+              nickname: result.accountId === undefined ? id : `MiniMax ${result.accountId.slice(0, 8)}`,
+              // ⚠️ **必须用 `minimaxCredentialExpiresAtMs`**（优先 `expires_at`，
+              // 它由 OAuth 响应的 `expires_in` 自算）—— 不能指望从 token 解 JWT，
+              // 那样会得到 `undefined`，UI 永远显示「未知」。
+              expiresAt: minimaxCredentialExpiresAtMs(credential),
+              // ⚠️ MiniMax **有** refresh 端点（与 Loomy 恒 false 不同）。
+              refreshable: isMinimaxRefreshable(credential),
+            })
+          }).catch((error: unknown) => {
+            ctx.logger.warn(`[jet-hub] background ${MINIMAX.id} login failed for ${id}: ${String(error)}`)
+            // 登录失败：移除占位条目，避免留下无凭据的幽灵账号
+            void pool.removeAccount(id).catch(() => {})
+          })
+
+          return { ok: true, value: { accountId: id, loginUrl: minimaxStarted.loginUrl } }
         } else if (provider === ZCODE.id) {
           /**
            * zcode 走**两步式**（与 codearts / qoder 等同型）：
@@ -1367,6 +1433,12 @@ function registerJetHubEndpoints(
               // 账号池，否则 UI 一直显示「已过期」（真实缺陷：JWT 已续到 15:09、
               // 账号池仍是 12:02，相差 3.1 小时，但功能完全正常）。
               await raccoon.refreshAccountCredential(entry.credentialRef, pool, entry.id)
+              break
+            case MINIMAX.id:
+              // MiniMax **有** refresh 端点（`/oauth2/token` 的 refresh_token 授权），
+              // 这里是真续期。⚠️ 必须传 pool + entry.id —— 续期后要把新的
+              // `expiresAt` 写回账号池，否则 UI 一直显示「已过期」。
+              await minimax.refreshAccountCredential(entry.credentialRef, pool, entry.id)
               break
             case ZCODE.id:
               /**
@@ -1789,6 +1861,24 @@ function registerJetHubEndpoints(
             } satisfies RpcCreditsStatusResponse,
           }
         }
+        if (req.provider === MINIMAX.id) {
+          // ⚠️ MiniMax **有**独立的签到状态端点（`/minimax-cloud/api/v1/signin/status`），
+          // 与 LobsterAI/TRAE/Cline 那几个「如实返回 null」的 provider 不同 ——
+          // 故走共享 helper 真查（`fetchMinimaxSigninStatus` 失败时返回 null，
+          // 由 helper 逐账号 try/catch 兜住，单账号失败不中断整体）。
+          //
+          // ⚠️ **判据是 `is_today && status===3`**（见 `minimaxPanelToCheckinStatus`），
+          // 不是「没有 Claimable」。`active` 恒 true（拿到响应即 true）。
+          const minimaxStatusAccounts = await pool.listAccounts(req.provider)
+          const value = await collectCreditsStatus<MinimaxCredential, undefined>(
+            minimaxStatusAccounts, undefined, {
+              resolve: (ref) => ctx.credentials.resolve(ref),
+              fetchStatus: (credential) => fetchMinimaxSigninStatus(credential),
+              warn: (msg) => ctx.logger?.warn?.(msg),
+            },
+          )
+          return { ok: true, value: { accounts: value } satisfies RpcCreditsStatusResponse }
+        }
         const product = productById(req.provider)
         if (product === undefined) {
           return { ok: false, error: { code: 'bad-request', message: `unsupported provider: ${req.provider}` } }
@@ -1940,6 +2030,23 @@ function registerJetHubEndpoints(
               message: 'Raccoon Work 不支持每日签到（每日积分由服务端自动发放；登录奖励请在「新手任务」中领取）',
             },
           }
+        }
+        if (req.provider === MINIMAX.id) {
+          // ⚠️ **必须开启状态预检**（`precheckStatus` 默认为 true，不要传 false）。
+          //
+          // 理由与 TRAE 那条同型（见上方 TRAE 分支的详细注释）：MiniMax 的
+          // `claimMinimaxDailyCheckin` 靠响应体的 `claim_result` 判幂等
+          //（`1`=真领取、`2`=已领过），这在 **HTTP 层**是可靠的；但状态预检是
+          // 第二道防线 —— 若某天服务端对已领账号也回 `claim_result: 1`，
+          // 预检能靠 `todayCheckedIn` 先挡住，避免把「今天已领」报成「+积分」。
+          // 反之传 false 会让已签到账号走到 claim 请求（多发一次 POST）。
+          const value = await collectClaimResults<MinimaxCredential, undefined>(accounts, undefined, {
+            resolve: (ref) => ctx.credentials.resolve(ref),
+            fetchStatus: (credential) => fetchMinimaxSigninStatus(credential),
+            claim: (credential) => claimMinimaxDailyCheckin(credential),
+            warn: (msg) => ctx.logger?.warn?.(msg),
+          })
+          return { ok: true, value: value satisfies RpcCreditsClaimAllResponse }
         }
         if (req.provider === ZCODE.id) {
           /**
@@ -2118,6 +2225,22 @@ function registerJetHubEndpoints(
               windowDays: buddyExpiringWindowDays(),
             } satisfies RpcCreditsBalancesResponse,
           }
+        }
+        if (req.provider === MINIMAX.id) {
+          // 余额来自 `GET /minimax-cloud/api/v1/credit/details`。
+          //
+          // ⚠️ **该端点是平铺响应**（`total_count` 与 `base_resp` 同级、**没有
+          // `data` 键**）—— 与签到端点不同。`fetchMinimaxCreditBalance` 内部已
+          // 用 `unwrapEnvelopeData` 兼容两种形状。
+          // ⚠️ 查不到时（null）由 helper 统一补「余额查询失败」文案，卡片显示
+          // 原因而非 0 —— 这与「余额为 0」是**两回事**，不能混为一谈
+          //（本机实测 `total_count: 0` 且 `details` 缺失正是「真的为 0」）。
+          const values = await collectCreditBalances<MinimaxCredential, undefined>(accounts, undefined, {
+            resolve: (ref) => ctx.credentials.resolve(ref),
+            fetchBalance: (credential) => fetchMinimaxCreditBalance(credential),
+            warn: (msg) => ctx.logger?.warn?.(msg),
+          })
+          return { ok: true, value: { accounts: values } satisfies RpcCreditsBalancesResponse }
         }
         if (req.provider === CLINE.id) {
           // 余额来自 `GET /api/v1/users/{accountId}/balance`（实测

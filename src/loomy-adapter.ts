@@ -33,6 +33,10 @@ import {
 } from './loomy.js'
 import { LOOMY, type LoomyFallbackModel, type LoomyProduct } from './loomy-product.js'
 import {
+  registerAdapterIdempotent,
+  registerConfigurableProvidersIdempotent,
+} from './llm-register-compat.js'
+import {
   collectImages,
   consumeOpenAiSse,
   errorDetail,
@@ -548,7 +552,7 @@ function resolveChunkTimeoutMs(): number {
  */
 export function registerLoomyLlm(ctx: Context, options: LoomyAdapterOptions): LoomyAdapter {
   const product = options.product ?? LOOMY
-  ctx.llm.registerConfigurableProviders([
+  registerConfigurableProvidersIdempotent(ctx.llm, [
     {
       provider: product.id,
       displayName: product.displayName,
@@ -557,6 +561,6 @@ export function registerLoomyLlm(ctx: Context, options: LoomyAdapterOptions): Lo
     },
   ])
   const adapter = new LoomyAdapter(options)
-  ctx.llm.registerAdapter([product.id], adapter)
+  registerAdapterIdempotent(ctx.llm, [product.id], adapter)
   return adapter
 }
