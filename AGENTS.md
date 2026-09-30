@@ -3034,28 +3034,74 @@ cline-pass 部分模型为什么不全**，例如当前这个模型就看不到�
 **两种「看不到」的判据不同，别混**：黑名单造成的在 Jet Hub 里能看到（带开关）、
 目录缺失的在任何地方都没有。
 
-#### ③ 「输出速率」的**分子与分母跨阶段** ⇒ 11814.8 t/s
+#### ③ 「输出速度（TPS）」= **DeepSeek 官方口径**（用户 2026-10-01 定案）
 
-- 原实现（与参考实现同式）：`outputTokens ÷ (totalMs − ttftMs)`。
-- ⚠️ 本仓库已实测：**`reasoning_tokens` 计入 `completion_tokens`**
-  （见本文件多处，如 `reasoningTokens == outputTokens == 128000`），
-  而思考产生于 `ttftMs`（首个**任意**块）**之前** ⇒ **分子含不在该窗口里
-  产生的 token**，速率被无限放大。实测 `11814.8 t/s` ≙ 约 `142 token ÷ 12ms`：
-  响应整段几乎一次性到达时 `首字 ≈ 总耗时`，窗口退化成十几毫秒，任何 token
-  数除下来都物理不可能。
-- **修法：让分子分母落在同一阶段（正文阶段）**
-  - 新增记录字段 **`ttfcMs`**（首个**正文**块耗时；文本/工具调用才算，
-    思考块不算；0 = 本次没有正文块）；
-  - 速率 = `(outputTokens − reasoningTokens) ÷ (totalMs − ttfcMs)`；
-  - 窗口 **< 250ms**（`MIN_RATE_WINDOW_MS`）视为**不可测** → 显示 `—`
-    （宁可显示不可测，也不报一个看起来精确的假数字）。
-- ⚠️ 「首字」那一行**不变**（仍是首个任意块）—— 那是用户真实等待的时刻；
-  变的只是速率的分子分母要对齐到正文阶段。
-- 反向验证：把 `ttfcMs` 退回「任意块」→ 用例红
-  （`expected 53 to be greater than 53`，两者落在同一毫秒）。
-- ⚠️ 两个旧断言锁的正是**修复前**的写法（`const streaming = total - first`
-  与 `out / (streaming / 1000)`），已随之改写 —— 与「账号池 id」那次同型：
-  **旧断言可能锁死缺陷本身**，改口径时必须一并改。
+> 用户原话：「**按照官方速率显示规则来**」（此前明确「我说的 deep seek」）。
+> ⚠️ **这一节取代了我 2026-09-30 那版「正文阶段」口径 —— 那版被用户否掉了。**
+
+**官方规则**（只读核对，出处是本机 DSH 自己的聊天 UI：
+`@deepseek-ai/dsh-client-ui-chat/lib/client.js`，可在
+`D:\Program Files\DeepSeek Harness\resources\app.asar` 里直接读到）：
+
+```js
+// assistantStepReading(node)：一「步」的读数
+ttftMs   = firstTokenTime - stepStartTime      // 首个 token（任意块，含推理块）
+decodeMs = completedTime  - firstTokenTime     // 首 token 之后 → 结束
+outputTokens = usage.outputTokens              // 该步全部输出 token
+
+// TimePill()：显示（decodeMs > 0 才显示，否则整项不渲染）
+tps = formatTokensPerSecond(outputTokens / (decodeMs / 1e3))
+
+// formatTokensPerSecond()：取整规则（先 clamp 负值）
+x >= 10 ? String(Math.round(x)) : String(Math.round(x * 10) / 10)
+```
+
+官方 i18n：`message.tokensPerSecond = "{tps} tok/s"`、
+`stats.dialog.speed = "输出速度（TPS）"`。
+
+**本插件据此落地**（`plugin-src/client/tokens-per-second.js`，纯函数可逐值单测；
+`jet-hub.js` 只负责组装三行）：
+
+| 项 | 取值 |
+|---|---|
+| 分子 | **全部输出 token（含推理 token）** —— ⚠️ **不减** `reasoningTokens` |
+| 分母 | `总耗时 − 首字`（`decodeMs`），**不含**首字之前那段 |
+| 门禁 | 只有 `decodeMs > 0`；⚠️ **没有**最小窗口下限 |
+| 单位/标签 | `tok/s` / 「输出速度（TPS）」（单元格里用短版「输出速度」） |
+
+⚠️⚠️ **三处曾经的错误做法，别再改回去**（每条都有反向验证过的用例守着）：
+
+1. **`11814.8 t/s` 那次不是"公式错"**：官方口径在**短窗口**下本来就会给出很大的数
+   （响应几乎一次性到达时 `首字 ≈ 总耗时`，`142 token ÷ 12ms ≈ 11833 tok/s`）。
+   我 09-30 的反应是改分子分母 + 加 250ms 下限 —— **那是过度纠正**，官方没有下限，
+   改了反而与本 app 自己的读数不一致。
+2. **不要减推理 token**：`reasoning_tokens` 计入 `completion_tokens`（本仓库多处实测），
+   官方就是这么算的。减了会让同一笔请求的 TPS 与 DSH 显示的不同。
+3. **不要退回 `toFixed(1)`**：官方的精度是**两段式**（`≥10` 整数、`<10` 一位小数），
+   不是统一小数位。反向验证：把取整换成 `toFixed(1)` → **7 条**用例变红
+   （`expected '273.9 tok/s' to be '274 tok/s'` 等）；把分子改成「减推理」→ 1 条变红。
+
+⚠️ **`ttfcMs`（首个正文块耗时）现在只是诊断字段**，**不参与**速率计算：
+官方口径只用 `首字`（首个任意块）。字段仍照常记录（适配器 → 请求记录 → RPC），
+将来若要显示「首正文」可直接用；但**不要**拿它当速率分母。
+
+⚠️ **`ttftMs === 0` 在我们的数据模型里是「没有任何块到达」= 未知**（官方用 `null`），
+故 `formatRowTokensPerSecond` 把 `0` 显式映射成**不可测**（显示 `—`）——
+照字面算 `total - 0` 会把「首字时刻未知」当成「首字在 0ms」，报出假速率。
+这条映射有专门用例（`缺首字时刻（ttft=0 = 未知）→ —`）。
+
+⚠️ **旧断言又锁死了一次旧实现**：`cline-quota-panel.spec.ts` 里原先那条
+「输出速率按正文阶段算」的用例（断言 `MIN_RATE_WINDOW_MS` / `contentTokens`）
+正是锁 09-30 那版口径的，本次已改写为「接线到 `tokens-per-second.js`」。
+**改口径必须同步改用例** —— 这在本仓库已是第三次同型情况
+（账号池 id、平铺渲染、此处）。
+
+⚠️ **反向验证脚本自身的坑（第 4 次同型）**：`swap-tps-official.mjs` 打补丁时
+**第一版打到了文档注释里那行官方代码**（我在模块头注释里引用了
+`x >= 10 ? … : …`），于是「取消官方取整」的反向验证**假绿**（13 条全过）。
+判据：**要改的是函数体，必须取最后一次出现**（`lastIdx`）。
+这与本文件记过的「同一表达式出现两次、替换打到第一处」是同一条教训 ——
+**换行数/取最后出现**，并在反向验证后**确认它真的变红**（假绿比不验证更危险）。
 
 ⚠️ **另记一处未修的小缺口**（不属本次报障，留给后续）：
 `recommended-models` 实测还有第 4 个数组 **`clineCloud`**（3 条，如

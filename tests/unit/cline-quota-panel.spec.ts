@@ -23,7 +23,7 @@ import { dirname, resolve } from 'node:path'
  * |---|---|
  * | 百分比数值**不夹取**（「120%」要显示出来） | 参考 `Math.max(0, Math.min(100, percentUsed))` + `Math.round` —— **夹取并取整** |
  * | 正常档用品牌蓝、≥80 黄、≥100 红 | 参考 `usageColor`：≥90 红 / ≥70 黄 / 其余**绿** |
- * | 延迟列单行「首块 X · 共 Y」 | 参考三行：**首字 / 总耗时 / 输出速率** |
+ * | 延迟列单行「首块 X · 共 Y」 | 参考三行：**首字 / 总耗时 / 输出速度（TPS，官方口径）** |
  * | TOKEN 列 `123 + 456`、无 usage 时显示 `0 + 0` | 参考 `↓输入 ↑输出 [⚡缓存] [🧠推理]`，无 usage 显示 **`—`** |
  * | 失败行 `colSpan 4`、无状态点列 | 参考 **5 列含状态点**，失败行空 2 格 + **`colSpan 3`** |
  *
@@ -252,20 +252,20 @@ describe('Cline 订阅额度：客户端接线', () => {
   })
 
   /**
-   * 延迟列**三行**：首字 / 总耗时 / 输出速率（参考实现同款）。
+   * 延迟列**三行**：首字 / 总耗时 / 输出速度（TPS）。
    *
-   * ⚠️ 速率的分母**不含首字之前那段**（`总耗时 − 首字`），否则「想得久、
-   * 吐字快」的请求会被报成慢速 —— 但**分子分母必须同一阶段**，
-   * 故分母实际取的是「首个**正文**块」而非「首个任意块」（见下面那条用例：
-   * 首块常常是思考增量）。这两条约束合起来才是正确口径。
+   * ⚠️ 速率口径 = **DeepSeek 官方（DSH 聊天 UI）的显示规则**（用户 2026-10-01
+   * 明确指定，见下一条用例的完整说明）：分母不含首字之前那段
+   * （`总耗时 − 首字`），分子是**全部输出 token（含推理）**。
    */
-  it('延迟列三行(首字/总耗时/输出速率)', () => {
+  it('延迟列三行(首字/总耗时/输出速度)', () => {
     expect(client).toMatch(/'首字'/)
     expect(client).toMatch(/'总耗时'/)
-    expect(client).toMatch(/'输出速率'/)
+    // 官方标签是「输出速度（TPS）」，单元格里用短版「输出速度」。
+    expect(client).toMatch(/'输出速度'/)
     expect(client).toMatch(/function latencyParts\(row\)/)
-    // 分母起点是「首个正文块」，不是「首个任意块」也不是 0
-    expect(client).toMatch(/const firstContent = Number\(row\?\.ttfcMs \?\? 0\)/)
+    // 分母起点是「首字之后」（`总耗时 − 首字`），不是 0、也不是首正文块
+    expect(client).toMatch(/const decodeMs = total - first/)
   })
 
   /**
@@ -274,8 +274,9 @@ describe('Cline 订阅额度：客户端接线', () => {
    */
   it('未知耗时用破折号 — （不是 0，也不是半角 -）', () => {
     expect(client).toMatch(/function formatMs\(value\) \{[\s\S]{0,140}?return '—'/)
-    // 速率不可测时（没有正文块 / 窗口过短）同样是破折号，**不报假数字**
-    expect(client).toMatch(/const rate = firstContent > 0 && contentTokens > 0 && window >= MIN_RATE_WINDOW_MS[\s\S]{0,140}?: '—'/)
+    // 拿不到用量、或生成阶段不可测时同样是破折号，**不报假数字**
+    // （判定落在 ./tokens-per-second.js 的 formatRowTokensPerSecond，逐值断言见那边）
+    expect(client).toMatch(/const rate = formatRowTokensPerSecond\(row\)/)
     // 不允许退回半角
     expect(client).not.toMatch(/function formatMs\(value\) \{[\s\S]{0,140}?return '-';/)
   })
@@ -355,23 +356,33 @@ describe('Cline 订阅额度：客户端接线', () => {
   })
 
   /**
-   * ⚠️⚠️ **真实缺陷**（用户报障 2026-09-30）：「输出速率 11814.8 t/s」。
+   * ⚠️⚠️ 速率口径 = **DeepSeek 官方（DSH 聊天 UI）的显示规则**
+   * （用户 2026-10-01 明确要求「按照官方速率显示规则来」）。
    *
-   * 速率原先写成 `outputTokens ÷ (总耗时 − 首字)` —— **分子分母跨阶段**：
-   * `outputTokens` 含思考 token（本仓库已实测 `reasoning_tokens` 计入
-   * `completion_tokens`），而思考产生于首字**之前**。思考越多、正文越短，
-   * 虚高越离谱（实测 11814.8 t/s，物理上不可能）。
+   * ## 口径的三次演变（别把中间那版当"正确"改回去）
    *
-   * 正确口径：分子 = `outputTokens − reasoningTokens`（正文 token），
-   * 分母 = `总耗时 − 首个正文块耗时`（正文阶段）；窗口过短时显示 `—`。
-   * ⚠️ 退回旧写法会让本用例变红（那条 `not.toMatch` 就是防回退的）。
+   * 1. **最初**：`outputTokens ÷ (总耗时 − 首字)` —— 与官方一致，但**没有取整**，
+   *    用户看到 `11814.8 t/s` 报障（那是短窗口下的真实现象）。
+   * 2. **2026-09-30**：我改成「正文 token ÷ 正文阶段 + 250ms 下限」，理由是
+   *    「分子分母跨阶段」。**这一版被用户否掉了** —— 官方口径就是这么算的，
+   *    改了反而不一致。
+   * 3. **现在（官方口径）**：只读核对 `@deepseek-ai/dsh-client-ui-chat` 的
+   *    `lib/client.js` 后照抄，落在 **`./tokens-per-second.js`**（纯函数，
+   *    逐值断言见 `tests/unit/tokens-per-second.spec.ts`）。
+   *
+   * 本用例只锁**接线**：面板确实用那个模块、标签是官方的「输出速度」。
    */
-  it('输出速率按「正文阶段」算（分子扣思考、分母用首个正文块）', () => {
-    expect(client).toMatch(/const MIN_RATE_WINDOW_MS = 250/)
-    expect(client).toMatch(/const contentTokens = Math\.max\(0, out - thinking\)/)
-    expect(client).toMatch(/const window = total - firstContent/)
-    expect(client).toMatch(/window >= MIN_RATE_WINDOW_MS/)
-    // 不得退回「outputTokens ÷ 首字之后」那种跨阶段写法
-    expect(client).not.toMatch(/out \/ \(streaming \/ 1000\)/)
+  it('输出速度接线到 tokens-per-second 模块（官方口径）', () => {
+    expect(client).toMatch(/import \{ formatRowTokensPerSecond \} from '\.\/tokens-per-second\.js'/)
+    expect(client).toMatch(/const rate = formatRowTokensPerSecond\(row\)/)
+    // 生成阶段 = 首字之后 → 结束（官方 decodeMs）
+    expect(client).toMatch(/const decodeMs = total - first/)
+    // 官方标签「输出速度（TPS）」，单元格里用短版
+    expect(client).toMatch(/'输出速度'/)
+    // ⚠️ 不得再减推理 token、不得再有最小窗口下限（那是被否掉的第 2 版）
+    expect(client).not.toMatch(/const contentTokens = Math\.max\(0, out - thinking\)/)
+    expect(client).not.toMatch(/MIN_RATE_WINDOW_MS/)
+    // ⚠️ 也不得退回 09-30 之前的「toFixed(1) t/s」写法（官方单位是 tok/s）
+    expect(client).not.toMatch(/toFixed\(1\)\} t\/s/)
   })
 })

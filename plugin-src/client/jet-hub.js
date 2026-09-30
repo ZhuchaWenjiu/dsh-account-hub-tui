@@ -34,6 +34,7 @@ import {
   groupExpanded,
   groupModelsForDisplay,
 } from './model-groups.js';
+import { formatRowTokensPerSecond } from './tokens-per-second.js';
 import { decryptBackup, encryptBackup, isEncryptedBackup } from './backup-crypto.js';
 
 export const JET_HUB_RPC_CHANNEL = '/jet-hub';
@@ -1319,52 +1320,28 @@ function tokenTooltip(row) {
 }
 
 /**
- * 速率可测的**最小时长**（毫秒）。
+ * 速率取值 = **DeepSeek 官方（DSH 聊天 UI）的显示规则**（用户 2026-10-01 指定）。
  *
- * ⚠️ 窗口过短时**不报速率**：响应整段几乎一次性到达时
- * （`首个正文块 ≈ 总耗时`，只剩十几毫秒），任何 token 数除下来都会得到
- * 物理上不可能的值 —— 用户实测见到 `11814.8 t/s`（≈142 token ÷ 12ms）。
- * 宁可显示 `—`（不可测），也不要报一个看起来精确的假数字。
- */
-const MIN_RATE_WINDOW_MS = 250;
-
-/**
- * 延迟三行（参考实现同款）：**首字 / 总耗时 / 输出速率**。
+ * ⚠️ 官方实现的**出处与四条语义**（含取整规则、为什么分子不减推理 token、
+ * 为什么不设最小窗口下限、以及「本插件曾在 09-30 改成正文阶段口径、已被用户
+ * 否掉」这段历史）全部写在 `./tokens-per-second.js` 的模块注释里 ——
+ * **改动口径前先读那个文件**，别在这里另写一份说明（两处会漂移）。
  *
- * ⚠️ 速率的分母**不含首字之前那段**（`总耗时 − 首字`），否则「想得久、
- * 吐字快」的请求会被报成慢速（参考实现注释明确此坑）。
- *
- * ⚠️⚠️ 但**分子分母必须落在同一阶段**（真实缺陷，用户报障
- * 「输出速率 11814.8 t/s」）：`outputTokens` **含思考 token**
- * （本仓库已实测 `reasoning_tokens` 计入 `completion_tokens`），
- * 而思考是在首字**之前**产生的；首字之后那段时间里真正产出的只有**正文**。
- * 故：
- * - 分子 = `outputTokens − reasoningTokens`（正文 token）
- * - 分母 = `总耗时 − 首个正文块耗时`（正文阶段）
- *
- * 换回 `outputTokens ÷ (总耗时 − 首字)` 会让速率虚高到物理不可能的值
- * （思考越多、正文越短，虚高越离谱）。
+ * 这里只保留面板需要的「三行」组装：首字 / 总耗时 / 输出速度（TPS）。
  */
 function latencyParts(row) {
   const first = Number(row?.ttftMs ?? 0);
   const total = Number(row?.totalMs ?? 0);
-  const usageReported = row?.usageReported === true;
-  const out = usageReported ? Number(row.outputTokens ?? 0) : 0;
-  const thinking = usageReported ? Math.max(0, Number(row.reasoningTokens ?? 0)) : 0;
-  // 首个**正文**块耗时（0 = 本次没有正文块 ⇒ 速率不可测）。
-  const firstContent = Number(row?.ttfcMs ?? 0);
-  const contentTokens = Math.max(0, out - thinking);
-  const window = total - firstContent;
-  const rate = firstContent > 0 && contentTokens > 0 && window >= MIN_RATE_WINDOW_MS
-    ? `${(contentTokens / (window / 1000)).toFixed(1)} t/s`
-    : '—';
-  // ⚠️ `—` 的**原因**必须能查到（用户第二次报障时就怀疑「速率还是错的」，而
-  // 实际上一种情形是**不可测**）：两种不可测各有各的说法，别合并成一句。
+  const rate = formatRowTokensPerSecond(row);
+  // 生成阶段 = 首字之后 → 结束（官方 `decodeMs`）。
+  const decodeMs = total - first;
+  // ⚠️ `—` 的**原因**要能查到（用户曾怀疑「速率还是错的」，而其实是**不可测**）。
   const rateTitle = rate !== '—'
-    ? `正文 ${contentTokens} token ÷ 正文阶段 ${(window / 1000).toFixed(2)}s（不含首字前的思考阶段）`
-    : firstContent === 0
-      ? '本次没有正文块（只输出思考，或流在正文之前结束）—— 速率不可测'
-      : `正文阶段只有 ${window}ms（不足 ${MIN_RATE_WINDOW_MS}ms）—— 响应几乎一次性到达，速率不可测`;
+    ? `官方 TPS 口径：输出 ${Number(row?.outputTokens ?? 0)} tok ÷ 生成阶段 ${(decodeMs / 1000).toFixed(2)}s`
+      + `（首字之后到结束，含推理 token；官方取整：≥10 整数、<10 一位小数）`
+    : row?.usageReported === true
+      ? '缺少可用的生成阶段时长（首字时刻缺失或总耗时不大于首字）—— 速率不可测'
+      : '网关本次未返回用量 —— 速率不可测';
   return { first, total, rate, rateTitle };
 }
 
@@ -1638,7 +1615,7 @@ function ClineQuotaPanel({ rpcCall, onClose }) {
               React.createElement('span', { className: 'dim-jh-quotaLoadKey' }, '总耗时'),
               React.createElement('span', null, formatMs(figures.total))),
             React.createElement('span', { className: 'dim-jh-quotaLoadRow', title: figures.rateTitle },
-              React.createElement('span', { className: 'dim-jh-quotaLoadKey' }, '输出速率'),
+              React.createElement('span', { className: 'dim-jh-quotaLoadKey' }, '输出速度'),
               React.createElement('span', null, figures.rate))),
         ];
         const rowEl = React.createElement('tr', {
@@ -1650,7 +1627,7 @@ function ClineQuotaPanel({ rpcCall, onClose }) {
           title: [
             String(row.model ?? ''),
             `${row.upstream || '—'} · ${tokenSummary(row)}`,
-            `首字 ${formatMs(figures.first)} · 总耗时 ${formatMs(figures.total)} · 输出速率 ${figures.rate}`,
+            `首字 ${formatMs(figures.first)} · 总耗时 ${formatMs(figures.total)} · 输出速度 ${figures.rate}`,
             // 推理强度:有值时才有这一行(参考实现同款)。
             row.effort ? `推理强度 ${row.effort}` : '',
             failed ? String(row.error) : '',
