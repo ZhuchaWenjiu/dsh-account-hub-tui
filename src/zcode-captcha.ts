@@ -1,11 +1,25 @@
 /**
- * ZCode 的阿里云 captcha 产出（**唯一还需要浏览器的环节**）。
+ * ZCode 的阿里云 captcha 产出（**唯一还需要浏览器的环节，但只服务 claim 路径**）。
  *
- * ## 为什么需要它
+ * ## 谁还要 captcha（2026-10-01 直连上游实测，别再凭印象改）
  *
- * ZCode 免费额度通道（`/api/v1/zcode-plan/anthropic`）强制阿里云 captcha：
- * 缺 `x-aliyun-captcha-verify-param` 时上游回
- * `400 {"code":3007,"msg":"captcha verify failed"}`（实测）。
+ * | 端点 | 不带验证头 | 结论 |
+ * |---|---|---|
+ * | `/api/v1/zcode-plan/anthropic`（**模型请求**） | **HTTP 200**（6 个采样点） | **自 3.14.4（2026-09-29）起不再索要** |
+ * | `/api/v1/zcode-plan/billing/claim`（**领取**） | `400 {"code":3007}` | **始终索要**，且校验**前置于** plan 校验 |
+ *
+ * ⇒ 模型请求这条路现在**恒不产** param（`src/captcha-requirement.ts` 的
+ * 「先探后取」使 mint 次数归零）；仍在产的是**领取**（每日一次 / 手动点「一键领取」，
+ * **每个 plan 独立一个**，一次性，复用必 `3007`）。
+ * ⚠ 模型请求侧的 `3007` 防御分支**故意保留**：万一上游回滚再开校验，推理请求仍能自愈，
+ * 而不是把失败抛给用户。
+ *
+ * ## 载体：web 版必需浏览器，桌面版可用内部载体
+ * captcha 是**网页 SDK**（`o.alicdn.com/.../AliyunCaptcha.js`），任何有 DOM 能跑 JS 的
+ * 浏览器都能产。本文件这套外挂 chromium 路径是 **web 版的必需项**；
+ * DSH Desktop 下会优先用**桌面自己的 Electron 内核**（`dshDesktop.browser` 租约 +
+ * 隐藏 `<webview>` + `executeJavaScript`，见 `src/captcha-carrier.ts`），
+ * 本文件退为其**兜底**（`DSH_ZCODE_INTERNAL_CARRIER=0` 可强制只用它）。
  *
  * ## 为什么能用普通浏览器而不是 ZCode 那个壳
  *
@@ -22,9 +36,9 @@
  * 故任何「有 DOM + canvas + 能跑 JS」的浏览器都行。实测
  * **scoop 的 chromium（headful + 基本 stealth 补丁）** 可稳定产出。
  *
- * ## ⚠ 两个实测得到的硬约束（决定本文件的实现形态）
+ * ## ⚠ 两个实测得到的约束（第 1 条后来**被推翻**，结论以第 2 条为准）
  *
- * ### 1. 同一个页面**不能**重复 mint
+ * ### 1. ~~同一个页面**不能**重复 mint~~ → **已推翻**（当时页面停在 `about:blank`）
  *
  * 同一 page 上连续 `initAliyunCaptcha` 三次的实测结果：
  *
@@ -36,6 +50,12 @@
  *
  * ⇒ SDK 实例状态在页面内不可重复初始化。**每次 mint 必须新建 page target**。
  * 采用该策略后实测 **4/4 成功，中位 1246ms**（浏览器冷启动仅 690ms）。
+ *
+ * ⚠⚠ **上面那两行是当时的结论，现在别再照着做**：真正的变量是页面 origin ——
+ * 那三次是在 `about:blank`（origin 为字符串 `"null"`）上跑的。换到真实
+ * `https://zcode.z.ai/` 后同一页面可**连续 mint 5/5**，中位 426ms / 平均 546ms，
+ * 现行实现因此**复用常驻页面 + 每次重置 DOM**。证据与推理见
+ * {@link CAPTCHA_PAGE_ORIGIN}；上面的表保留仅作原始记录（改回去会让耗时翻 2.3 倍）。
  *
  * ### 2. `--headless=new` 过不了，必须 **headful**
  *
@@ -108,6 +128,28 @@ export const CAPTCHA_BUTTON_ID = 'zcode-aliyun-captcha-button'
 export const CAPTCHA_PAGE_ORIGIN = 'https://zcode.z.ai/'
 
 /**
+ * 解析**载体页 origin**：注入值优先，空白/缺省一律回落实测常量。
+ *
+ * ## 为什么存在（以及它为什么**不是**配置项）
+ * 唯一的用途是让本地探针 `scripts/probe-captcha-local-origin.mjs`（不入库）能验证
+ * 「在 `http://127.0.0.1:<port>` 这种本地 origin 上，阿里云 SDK 到底产不产得出合法
+ * param」—— 那是「DSH web 版能否用用户浏览器当载体」这条路线的唯一准入问题
+ * （跨域 iframe 拿不到 DOM、浏览器也不给页面 CDP 权，所以载体页只能是 GUI 自己的 origin）。
+ *
+ * ⚠ **不许**把它接到 env / settings / UI：真实 https origin 是实测硬前提
+ * （`about:blank` 的 origin 是 `"null"`，第二次 mint 必 `F001`）。
+ * 默认值与空白回退由 `tests/unit/zcode-captcha-origin.spec.ts` 锁死。
+ *
+ * ⚠ 空白也算回落：注入空串会让导航变成 `about:blank`（即上面那条已知失败形态）。
+ */
+export function resolveCaptchaPageOrigin(
+  options: { pageOrigin?: string } = {},
+): string {
+  const injected = options.pageOrigin?.trim() ?? ''
+  return injected.length > 0 ? injected : CAPTCHA_PAGE_ORIGIN
+}
+
+/**
  * captcha param 的合法判据（与桥侧 `isUsableCaptchaParam` 同一套）。
  *
  * 三条全中才算合法：
@@ -115,7 +157,8 @@ export const CAPTCHA_PAGE_ORIGIN = 'https://zcode.z.ai/'
  * 2. 是 base64 且能解出 JSON
  * 3. 含 `securityToken` 且长度 ≥ **50**（实测合法值 128）
  *
- * 任一条不中即判为降级 —— **不发请求**，省一次注定 3007 的往返。
+ * 任一条不中即判为降级 —— **不发请求**：在索要验证的窗口里那发注定 `3007`；
+ * 即便上游此刻不校验这个头，把降级产物发出去也不是「成功」，故本地判据不放宽。
  */
 export function validateCaptchaParam(param: unknown): { ok: boolean; reason?: string } {
   if (typeof param !== 'string' || param.length === 0) {
@@ -342,15 +385,20 @@ const sleep = (ms: number): Promise<void> => new Promise((resolve) => {
  * ⚠ 与之配套的修法在 {@link buildSdkInitExpression}：**DOM 重建后必须
  * 重新 `initAliyunCaptcha`**（销毁旧实例、用新元素重新初始化）。
  */
-function buildDomExpression(): string {
+export function buildDomExpression(): string {
   return `document.body.innerHTML =
     '<div id="${CAPTCHA_CONTAINER_ID}" aria-hidden="true">' +
     '<div id="${CAPTCHA_ELEMENT_ID}"></div>' +
     '<button id="${CAPTCHA_BUTTON_ID}">verify</button></div>'; 'ok'`
 }
 
-/** 构造注入 SDK 的表达式（用 `<script src>`，简单可靠）。 */
-function buildSdkInjectExpression(): string {
+/**
+ * 构造注入 SDK 的表达式（用 `<script src>`，简单可靠）。
+ *
+ * ⚠ **无参**：SDK 地址是常量，`region`/`prefix`/`SceneId` 由 {@link buildMintExpression}
+ * 在 `initAliyunCaptcha` 那一刻才用 —— 别在这里塞 config，那会多出一条无人读的形参。
+ */
+export function buildSdkInjectExpression(): string {
   return `new Promise((resolve) => {
     if (typeof window.initAliyunCaptcha === 'function') { resolve('already'); return; }
     const script = document.createElement('script');
@@ -381,8 +429,21 @@ export interface CaptchaMintOutcome {
   interactive: boolean
 }
 
-/** 构造「触发无感验证并等 param」的表达式。 */
-function buildMintExpression(config: ZcodeCaptchaConfig): string {
+/**
+ * 构造「触发无感验证并等 param」的表达式。
+ *
+ * ## 为什么这三个表达式构造函数现在**导出**（二期 Task 3）
+ * 内部载体的**载体页**（`src/zcode-carrier-page.ts`）必须由 server 渲染，
+ * 才守得住「captcha 表达式只在 server 侧一份」这条约束 ——
+ * client 里再写一遍 SDK 调用必然与本文件漂移（本仓库反复吃过同型缺陷）。
+ * 除载体页外**不得**有第二个消费方。
+ *
+ * ⚠ 与 {@link STEALTH_PATCH} 的区别刻意为之：那份反检测补丁是**外挂 chromium**
+ * 为了遮 `--headless` 痕迹才需要的，内部载体是 Electron 真实 guest，
+ * 实测 `webdriver=false`、UA 带 `Electron/44.0.0` 时 4/4 产出合法 param
+ * ⇒ 补丁**既不导出也不使用**（搬进载体页属于无据扩面）。
+ */
+export function buildMintExpression(config: ZcodeCaptchaConfig): string {
   return `new Promise((resolve) => {
     const done = (payload) => resolve(JSON.stringify(payload));
     /**
@@ -483,6 +544,13 @@ export interface ZcodeCaptchaBrowserOptions {
   debugPort?: number
   /** 是否隐藏窗口（默认 true —— 用户不应被打扰）。 */
   hideWindow?: boolean
+  /**
+   * 载体页 origin（缺省 `CAPTCHA_PAGE_ORIGIN` = `https://zcode.z.ai/`）。
+   *
+   * ⚠ 仅供本地探针验证「本地 origin 行不行」，**不是生产配置**；
+   * 取值规则与红线见 {@link resolveCaptchaPageOrigin}。
+   */
+  pageOrigin?: string
   /** 就绪等待上限（毫秒）。 */
   readyTimeoutMs?: number
   /**
@@ -625,7 +693,7 @@ function isPortFree(port: number): Promise<boolean> {
  * | 打上后 `inTaskbar` | 13 个窗口**全部 false** |
  * | 连续 3 次 mint 后样式是否被重置 | **全部保持**（不会被 chromium 重置） |
  * | 对 captcha 功能的影响 | mint 仍成功（1802~1950ms） |
- * | 成本 | 约 1.2 秒；**只需在启动时做一次**，可与 3.7 秒的启动并行 ⇒ 几乎免费 |
+ * | 成本 | 约 1.2 秒（**这是这一步 PowerShell 自身的耗时，不是 mint 的耗时**；mint 的稳态口径见上面 `CAPTCHA_PAGE_ORIGIN` 的矩阵）；**只需在启动时做一次**，可与 3.7 秒的启动并行 ⇒ 几乎免费 |
  *
  * ⚠ **失败必须静默**：这是「减少打扰」的优化，不是功能依赖。
  * 借外部 PowerShell 有失败可能（策略限制/无权限），此时最坏结果是回到
@@ -895,7 +963,11 @@ interface CaptchaPage {
  * ## 为什么常驻
  *
  * 冷启动实测约 690ms，但**每次请求都冷启动**会让首字延迟凭空多一秒。
- * 而每请求的 mint 开销实测约 1.2 秒 —— 常驻后总开销就在这个量级。
+ * 而 mint 只在**上游索要验证时**才发生：复用常驻页面的稳态约 0.4–0.5 秒
+ * （中位 426ms / 平均 546ms，见 `CAPTCHA_PAGE_ORIGIN` 的矩阵），含 chromium
+ * 冷启动的首发实测 4.2 秒；至于「每次新建 page」那个 1246ms，是 origin 修正
+ * **之前**的历史值，别当现行口径（数字汇总见 README 的 ZCode 章节）。
+ * （上游不要验证的窗口里这条路**一次都不走**，见文件头的「按需」段。）
  *
  * ## 生命周期
  *
@@ -1064,7 +1136,7 @@ export class ZcodeCaptchaBrowser {
      * 实测窗口此时已存在但 `visible=false`，`exStyle` 已可设置；
      * 而一旦页面渲染、窗口变可见，它就会获得任务栏按钮并开始闪烁。
      *
-     * ⚠ **不 await**：这是装饰性优化，让它在后台跑（约 1.2 秒），
+     * ⚠ **不 await**：这是装饰性优化，让它在后台跑（那个「约 1.2 秒」是这一步 PowerShell 自身的耗时，**与 mint 的 0.4–0.5 秒无关**），
      * 与后续导航重叠。失败静默，不影响 captcha。
      */
     if (this.child?.pid !== undefined) hideWindowFromTaskbar(this.child.pid)
@@ -1457,7 +1529,7 @@ export class ZcodeCaptchaBrowser {
        * ⚠ **导航到真实 https origin**（不是 `about:blank`）——
        * 这是能否重复 mint 的关键（实测 1/3 → 5/5）。
        */
-      await cdp.send('Page.navigate', { url: CAPTCHA_PAGE_ORIGIN })
+      await cdp.send('Page.navigate', { url: resolveCaptchaPageOrigin(this.options) })
       // 等 DOM 可用（domcontentloaded 之后 body 就存在了）。
       await sleep(this.options.navigationWaitMs ?? 1_500)
       const page: CaptchaPage = { targetId, ws, cdp, lastUsedAt: Date.now() }

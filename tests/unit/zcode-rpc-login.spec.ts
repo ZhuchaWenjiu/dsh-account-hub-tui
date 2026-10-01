@@ -31,7 +31,7 @@ import { describe, expect, it } from 'vitest'
 import { readFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { dirname, resolve } from 'node:path'
-import { registerJetHubRpc } from '../../src/jet-hub-rpc.js'
+import { registerJetHubRpc, JET_HUB_API_PATH } from '../../src/jet-hub-rpc.js'
 import { AccountPool } from '../../src/account-pool.js'
 import { ZcodeAuth } from '../../src/zcode-auth.js'
 import { ZCODE } from '../../src/zcode-product.js'
@@ -72,7 +72,14 @@ function makeCtx(): { ctx: Context; credentials: FakeCredentials; handler: () =>
   } as never)
   let handler: ((req: Request) => Promise<Response>) | undefined
   ;(ctx as unknown as Record<string, unknown>).connection = {
-    fetch: { register: (spec: { fetch: (req: Request) => Promise<Response> }) => { handler = spec.fetch } },
+    // ⚠️ **按 path 取处理器**：本模块除了 RPC 的 POST 端点，还注册了载体页的 GET
+    // 路由。替身若「谁最后注册就记谁」，加一条路由就会把下面所有 RPC 用例打到
+    // 载体页上（表现为成片 405/HTML，与所改的东西毫无关系）。
+    fetch: {
+      register: (spec: { path: string; fetch: (req: Request) => Promise<Response> }) => {
+        if (spec.path === JET_HUB_API_PATH) handler = spec.fetch
+      },
+    },
   }
   ;(ctx as unknown as Record<string, unknown>).inject = (_deps: string[], cb: (c: unknown) => void) => cb(ctx)
   return { ctx, credentials, handler: () => handler }

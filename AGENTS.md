@@ -6087,15 +6087,18 @@ mint 共用同一页面 —— captcha 是一次性的，必串状态）。
   `desktop` 用前者。改完两份 `src/` 都要 `pnpm build:all`，且**必须重启宿主**才生效。
 - `requestTimeoutMs`（`zcode-product.ts`，180s）现在**覆盖整轮**（含 captcha 与流读取），
   不再是「只到响应头」。
-- captcha 每请求现 mint（约 1.2 秒）**不是**本次卡住的原因：卡住前后的请求都正常，
-  且 17:20 那次卡死后 19:59 的 zcode 请求又成功了 —— 若是 `pageBusy` 死锁，
-  后续请求会**全部**一起卡。⇒ 别把 `imageUrls`/captcha 配额当成第一嫌疑人。
+- captcha **当时**每请求现 mint（每次新建 page，历史实测约 1.2 秒）**不是**本次卡住的原因：
+  卡住前后的请求都正常，且 17:20 那次卡死后 19:59 的 zcode 请求又成功了 ——
+  若是 `pageBusy` 死锁，后续请求会**全部**一起卡。⇒ 别把 `imageUrls`/captcha 配额当成第一嫌疑人。
+  ⚠ 那个 1.2 秒是「每次新建 page」时代的数字，**现行两条都已变**：页面复用（中位 426ms /
+  平均 546ms）+ 按需产出（不索要验证时一次都不 mint）。口径见本章第十节与 README 的 ZCode 章节。
 
 ---
 
 ## ⚠️ ZCode 上游节流三件套（吸收自 `dsh-free-glm`，2026-09-30）
 
-**起因**：`dsh-free-glm` 的作者指出我们的瓶颈是「每请求 +1.2s captcha」。
+**起因**：`dsh-free-glm` 的作者指出我们的瓶颈是「每请求 +1.2s captcha」（**当时的形态**：
+每请求都产、且每次新建 page；1.2 秒是那时的实测，现行口径见本章第十节）。
 核对后确认：**这不仅对，而且还有第二处更大的漏算**（见第 4 条）。
 本次把那边已验证的三套机制搬了过来，并顺手补上了 prompt caching 断点。
 
@@ -6169,7 +6172,7 @@ GLM-5.3         74 次 200   21 次重试     6 次最终 429
 ⚠ **`isZcodeQuotaExhausted` 必须先排除 `3009`** —— 否则会把一个完全可用的账号
 误标成「当日用尽」（与 qoder 那次「把 rate_limit 当 billing」同型）。
 
-⚠ **重试前必须重新 mint captcha**（一次性，沿用旧的必 `3007`）：
+⚠ **重试前必须重新 mint captcha**（一次性；在索要验证的窗口里，沿用旧的会回 `3007`）：
 实现上把 `mintCaptcha()` 放在**内层循环第一行**，天然满足。
 
 ⚠ **`emitted` 闸**：一旦已向调用方 yield 过内容，就不许再切号/重试
@@ -6190,7 +6193,8 @@ GLM-5.3         74 次 200   21 次重试     6 次最终 429
 
 ### 四、**prompt caching 断点**（本次额外发现的更大瓶颈）
 
-**用户反馈**：`dsh-free-glm` 的作者说我们「每请求 +1.2s」。
+**用户反馈**：`dsh-free-glm` 的作者说我们「每请求 +1.2s」（**当时的形态**：每请求都产、
+每次新建 page；现行已改按需 + 复用，见本章第十节）。
 captcha 只解释**一部分**；下面这条解释**每一步**的开销：
 
 `toAnthropicTools()` **从不产出 `cache_control`**，而 `system` 此前**每块都打**
@@ -6802,3 +6806,142 @@ rail 宽度：实测（无头 Edge + 真实源码 STYLES，rail 高 446px、纵�
    `apply` / `inject`；再调 `apply(fakeCtx)` → 断言注册了 `settings.section` 且未抛错。
    这一步直接验证「插件能加载并注册设置页」，是 tsc 与单测都覆盖不到的一层。
 3. **产物层**：新能力在、旧能力未被破坏、源码与部署产物哈希一致。
+
+### 十、captcha 改为「要了才取」：先探后取 + 2 分钟需求记忆（2026-10-01）
+
+**上游并非每次都要验证头**：外部仓库 `bonus-plan-4-open-zcode`（提交 `52b6389`）
+的抓包显示官方壳在 `access.mode = normal` 时全程零验证、只有 `off-peak` 才强制；
+本仓库 2026-10-01 深夜窗口的实测同向 —— **不带验证头 8/8 全 HTTP 200，连非法
+param 也 200，`3007` 命中 0 次**（10 发真实请求；探针
+`scripts/probe-zcode-captcha-need.mjs` 与设计稿
+`docs/superpowers/specs/2026-10-01-zcode-captcha-lazy-mint-design.md` 都是
+**本地文件、不入库**，需按本节思路自行重写）。
+⇒ 推理路径改为：默认**不带**验证头发一次，被 `3007` 拒才 mint 并重发，
+并按「账号 × 模型」记 2 分钟（真实 key 格式见 `src/captcha-requirement.ts` 的
+`captchaRequirementKey`，形如 `` `${accountId}|${model}` ``；策略与 TTL 同文件）。
+
+⚠️ **三条不可回退的口径**：
+1. `3007` 必须在**适配器内部**补产重发，不能走到 `throw` —— 它映射 `RATE_LIMIT`
+   且在 harness 可重试集合里，抛出去会让用户先看到一次我们**预期到**的失败；
+2. 不带也成功 ⇒ **必须清记忆**（否则在不需要验证的窗口里持续白产，白扣设备信誉）；
+3. 记忆只在**进程内**，不落 `jet-hub-store`（`state.json` 是同机多 profile 共享的
+   home 级文档，落盘会互相传染验证结论）。
+
+⚠️ **注释与文档的口径是双向的**（本仓库评审反复打回的就是这类）：
+- **不许**把「缺 captcha 必回 `3007`」写成无条件事实（上面那次实测一次都没发生）；
+- 也**不许**反过来写成「上游永不校验」，据此删掉 `3007 → 补产重发` 分支或改成
+  复用 param —— 历史上确实强制索要过，而**本次只采了深夜一个窗口、跨时段未复测**。
+  ⚠ 别据此造一条「读 `access.mode`」的逻辑：那是**那个壳**的 provider 配置开关，
+  我们的直连路径上没有它（依据是**本机取证、不在仓库**：本机那个壳的
+  `provider_config.json` 里只有 `{type:"api-key"}`）。
+
+⚠️ **收益不是常数，别写成「省 1.2 秒」**：省下的是「不需要验证的那些请求」的一次
+mint + 一份设备级验证配额与信誉；上游要验证时那一发照付。mint 的真实量纲：
+**稳态（复用常驻页面）0.4–0.5 秒**（同一组 5/5 样本：中位 426ms / 平均 546ms，
+两个统计量仓库里都有记载）、
+**首次 mint 含 chromium 冷启动实测 4.2 秒**（Task 1 那发的 4200ms 就是这个，
+不是稳态；⚠ 别与 `zcode-captcha.ts` 记的**浏览器进程**冷启动约 690ms 混为一谈 ——
+后者只是起进程，不含建页与阿里云 SDK 首次加载）。
+
+⚠️ **别把本节与本章 7.2 互相引用为依据**：7.2（「官方确实每请求一个 captcha」）
+是从**官方闭源版** `app.asar` 逆向出的**那个客户端的生产行为**（每个 model request
+都重新产 param）；本节说的是**上游服务端的校验行为**（深夜窗口不校验）+ 外部
+**开源壳**的抓包。两者是两个层面 —— 我们新逻辑跟随的是**后者**（服务端要不要），
+`mintCaptcha` 何时被调由探测结果决定，与 7.2 那条官方实现细节无关。
+
+⚠️ **TTL 与记忆键的依据是**外部仓库**那次提交 `52b6389`，不是本仓库实测** —— 那次采样一次都没命中
+「要验证」，所以 2 分钟 TTL 在本仓库**没有被证明过**。写注释时别记成「我们实测」，
+否则将来按它调参的人找不到依据就会随手改。
+
+⚠️ 与预取池是**对立**的：预取会让我们在不需要的窗口里也耗配额（同设备 150/小时），
+故 `DSH_ZCODE_CAPTCHA_POOL` 默认关闭保持不变，别「为了削峰」把它打开。
+
+⚠️ **`claim`/签到路径的 mint 语义不变**：`src/zcode-auth.ts` 里每个 plan 必单独
+mint（那是确定要带的），不走先探后取。
+
+⚠️ 载体（壳内 WebContentsView / CDP / 浏览器档）本期**一个都没做**：取证结论是
+DSH 桌面版里「只改配置就能拿到内部载体」不成立 —— 插件宿主是**以
+`ELECTRON_RUN_AS_NODE=1` 单独 spawn 的子进程**（`require('electron')` 拿不到
+`app`/`WebContentsView`）、全 bundle **零** `remote-debugging` 开关、自建 webview
+被主进程的 `will-attach-webview` 租约治理 `preventDefault()` 拒绝、而
+`cordis.patch.yml` 只是**配置包补丁**不是代码注入通道。
+⚠ 这四条的取证对象是 DSH 桌面版的 `app.asar`（**外部产物、不在本仓库**），
+记录在上面的本地设计稿 C 段 —— 要复用结论请先重取一遍，别当常量。
+
+回归：`tests/unit/captcha-requirement.spec.ts`（8）+
+`tests/unit/zcode-captcha-lazy.spec.ts`（17 = 判据 3 + 行为 8 + 观测 5 + 探测 1）。
+⚠️ 已做反向验证（均实跑）：把内层门控 `knownRequired || probeRejected` 改回
+**无条件 mint** ⇒ 行为段 5 条变红；去掉 `clearCaptchaRequirement()` 那一行 ⇒
+**只有**「不带也能成功 ⇒ 清记忆」变红；把 `httpErrorCodeForZcode` 的 `3007`
+改归 `SERVER` ⇒ **只有**「补产后仍 3007 仍抛 `RATE_LIMIT`」那条变红
+（它锁住的是「探测侧归**仍受限**、不标坏账号」，见 `isRateLimitFailure()`）。
+
+
+## ⚠️ ZCode captcha 的真实形状（2026-10-01，3.14.4 之后）
+
+**官方 3.14.4（2026-09-29 发布）更新说明：「关闭模型请求验证码校验」。**
+我们随后直连上游实测（`scripts/probe-claim-gate.mjs` 等）得到两个结论级的判据：
+
+| 端点 | 不带验证头 | 结论 |
+|---|---|---|
+| `/api/v1/zcode-plan/anthropic`（模型请求） | **HTTP 200**（6 个采样点，正文正常） | **不再索要** ⇒ 推理路径 mint 次数**恒为 0** |
+| `/api/v1/zcode-plan/billing/claim`（领取） | `400 / 3007`（带**非法** captcha 同样 3007） | **始终索要**，校验**前置于** plan 校验 ⇒ mint 只剩这条低频路径 |
+
+⚠ **三条不许再犯的**：
+1. **判据只能来自直连实测**。我们走的是 `zcode.z.ai` 的 HTTP，与客户端是哪种构建无关。
+2. **静态取证用错基准会得出假结论**：我曾拿本机 3.14.3 与 scoop 3.14.4 的 renderer 产物
+   做符号对比，想据此判断"官方是否索要" —— 但**两个都是开源构建**（`@zcode/desktop` +
+   `workspace:*` 依赖），而**开源版本来就不带 captcha 生产者**（开源/闭源差异见 bonus-plan
+   文档），于是 3.14.3 的"零命中"被误当成"官方不索要"的证据。真相来自上游实测。
+3. **"窗口期不校验"这个说法已经作废**：此前 6 次采样"不带也 200"并不是时段现象，
+   而是 3.14.4 之后的**常态**（模型请求）。别再为此挂哨兵等窗口。
+
+**桌面内部载体（`src/captcha-supply.ts` / `captcha-carrier.ts` / `captcha-carrier-server.ts`
+/ `zcode-carrier-page.ts` + `plugin-src/client/zcode-carrier.js`）**：
+`dshDesktop.browser.acquire()` → 隐藏 `<webview src="about:blank#<lease>">` → 问
+`captcha.carrierUrl` 要地址 → 导航到那个**独立回环端口**上的载体页 → `executeJavaScript` 读
+`window.__zcodeCaptcha` → RPC 回传供给槽。**零 CDP、零 DSH 本体源码改动**（走官方
+sidebar-browser 自己的通道）。
+
+### ⚠⚠ 载体页**必须**另起一个回环端口（2026-10-02 真机取证，别再改回同源）
+初版把页面挂在插件自己的 `/api/jet-hub/captcha-carrier`，理由是"与 GUI 同源"—— **这个前提是错的，
+真机上收益恒为 0**。DSH Desktop 0.2.0-rc.2 的 `resources/app.asar/lib/main.js` 原文：
+
+| 判据 | 后果 |
+|---|---|
+| `allowedNavigation(v)` = http(s) + 无账号密码 + `!isApplicationHost(url)` | 命中即 `preventDefault` |
+| `isApplicationHost(u)` = **`u.port === host.port`** 且（主机相同或回环） | 插件 API 与 Host 同端口 ⇒ 命中 |
+| `onBeforeRequest`：命中 `isApplicationHost` 就 `callback({cancel:true})` | 请求发不出去 |
+| `acquire()`：`partition = \`dsh-sidebar-browser-${randomUUID()}\`` | **无 `persist:`** ⇒ 内存 session，没有 Host 会话 cookie |
+
+⇒ 桌面 GUI 真实 origin 是自定义 scheme `dsh-app://app/`，插件 API 由 `forwardWebRequest(request,
+hostUrl, hostCookie)` 转发到 `http://127.0.0.1:<host 端口>` ⇒ 载体页挂在那个端口上
+**每轮都在第一个判断退出、guest 都不建**，且失败被 `preventDefault` 吞掉，日志一切正常。
+✅ **`isApplicationHost` 要求端口相同 ⇒ 换端口即绕开** ⇒ server 侧懒起一个
+**只监听 `127.0.0.1`、只有 `GET /carrier`、只回静态 HTML** 的小服务（`src/captcha-carrier-server.ts`），
+client **每轮**问 `captcha.carrierUrl`（`null` ⇒ 记 `no-carrier-url` 并安静退出）。
+⚠ 那条 `/api/jet-hub/captcha-carrier` 旧路由**保留**（web 版下手工诊断用），但**不许**再拿它当 guest 入口。
+
+✅ **真机已实测通过**（2026-10-01，DSH Desktop 0.2.0-rc.2 真窗口，开机自检逐段）：
+`carrierUrl` → `http://127.0.0.1:19469/carrier`（插件自起的独立随机端口）→ `acquire` 得
+`dsh-sidebar-browser-f34495a3-…` → 隐藏 `<webview>` 导航 → 注入读回 `origin=http://127.0.0.1:19469`
+⇒ **换端口确实绕开了 `isApplicationHost`** → guest 里成功产出 `len=280` / `interactive=false`。
+⚠ **只剩「上游接不接受这个 param」未实测** —— 领取是真实操作、会消耗用户额度，不代跑；
+它由降级链第 ④ 条兜住（当次换 chromium + 累计 3 次禁用内部载体）。
+⚠ 排查看日志里的 `reason=<分类码>`（人话见 `CARRIER_FAILURE_LABELS`）。
+
+⚠ **设备信誉不跨启动**（2026-10-02 纠正 I4）：主进程按 workspace 键缓存 partition，但那张表在
+**进程内存**里、partition 名**没有 `persist:` 前缀** ⇒ 内存 session。
+**同一次运行内**释放/重建 guest 仍是同一台设备；**DSH 一关，下次启动就是一台全新设备**
+⇒ 跨启动信誉不保留，这会**抬高**被降级成交互式验证的概率。
+那个信号现在会随 `captcha.contribute` 的 `interactive` 字段回传 host 并 `warn`
+（`captchaSupplyStats().interactive` / `pendingInteractive`，见 `carrier.stats().supply`）。
+
+⚠ **收益口径**：需求位只挂在 **claim** 入口（`ZcodeAuth.claimDailyWith` 的 try/finally），
+而 client 产一个 param 要 2–4 秒 > 槽的 1.5 秒等待 ⇒ **首个 plan 多数仍走 chromium**。
+内部载体的价值是**去掉对 chromium 的依赖**（没装可用 chromium 的用户从"领不了额度"变可领），
+**不是提速**。降级链：槽内有就用 → 空则等 ≤1.5s → 等不到用 chromium → 内部 param 被 `3007` 拒
+则当次改用 chromium 重发、累计 3 次禁用内部载体（`DSH_ZCODE_INTERNAL_CARRIER=0` 可全关）。
+⚠ 这条降级链**领取路径也接上了**（`claimDailyWith` 内，评审 C4）：领取端点**始终**索要 captcha
+且校验前置于 plan 校验，是内部 param 最容易被拒的地方；重发**上限一次**，
+换 chromium 后仍被拒的文案要能让用户看出「这更像设备信誉问题」。

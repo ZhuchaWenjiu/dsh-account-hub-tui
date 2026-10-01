@@ -24,6 +24,7 @@ import { ZcodeAuth } from './zcode-auth.js'
 import { registerZcodeLlm } from './zcode-adapter.js'
 import { ZCODE } from './zcode-product.js'
 import { ZCODE_CAPTCHA_FALLBACK } from './zcode-captcha.js'
+import type { CarrierOutcome } from './captcha-carrier.js'
 import type { ZcodeCredential } from './zcode.js'
 import { AccountPool } from './account-pool.js'
 import { hasLegacyNamespaceRegistration, settingsOf, suppressAutoSettingsPage } from './settings-compat.js'
@@ -1049,8 +1050,9 @@ export function apply(ctx: Context): void {
 // 与其余 provider 的三处差异（全部实测）：
 //   1. 协议是 **Anthropic Messages**（不是 OpenAI 兼容）——
 //      见 `zcode-anthropic.ts` 的转换层。
-//   2. 每请求要产出一个**一次性**的阿里云 captcha（约 1.2 秒）——
-//      见 `zcode-captcha.ts`。
+//   2. captcha **按需**产出（默认不带验证头探一次，被 `3007` 拒才 mint，并按
+//      「账号 × 模型」记 2 分钟）—— 见 `zcode-captcha.ts` 与 `captcha-requirement.ts`；
+//      mint 的耗时口径与「上游并非每次都要验证」的实测见 README 的 ZCode 章节。
 //   3. 请求体必须带官方身份块与首轮日期块，否则上游回 `3012` ——
 //      见 `zcode-identity.ts`。
 //
@@ -1069,7 +1071,21 @@ export function apply(ctx: Context): void {
 // Jet Hub 登录时创建的那个 ref（`ZCODE_ACCOUNT_XXXX`），而不是只认固定的
 // `ZCODE_CREDENTIAL`。不传的话「登录成功但面板显示未配置」——
 // 且该缺口会被「回退读官方凭据文件」掩盖，只有没装官方客户端的用户才看得到。
-const zcode = new ZcodeAuth(ctx, { accountPool: pool })
+const zcode = new ZcodeAuth(ctx, {
+  accountPool: pool,
+  /**
+   * ★ 二期内部载体（`src/captcha-carrier.ts`）的诊断日志。
+   *
+   * 那两条告警（「内部载体的 param 被上游拒（第 N 次）」「累计拒 3 次 ⇒ 本次运行禁用
+   * 内部载体」）是排查「内部载体为什么没起作用 / 为什么被自动关掉」的**唯一**线索，
+   * 缺省不接就等于线上什么都看不见。
+   * ⚠ 取 logger 用两级可选链（同文件既有的 `log` / `makeReadImageRequest` 写法）：
+   *   宿主某些形态不给 logger，写成点号直调会让调用点所在的产出路径抛 TypeError。
+   */
+  carrierLog: (message: string) => {
+    ctx.logger?.warn?.(message)
+  },
+})
 /**
  * captcha 配置：优先向服务端索取，失败回退内置兜底值。
  *
@@ -1166,7 +1182,45 @@ const zcodeAdapter = registerZcodeLlm(ctx, {
     const config = await resolveZcodeCaptchaConfig()
     return await zcode.mintCaptcha(config, options)
   },
+  /**
+   * ★ 二期内部载体：推理热路径取 param 走**载体链**（内部供给槽优先，等不到才落
+   * 上面那条 chromium 链）。与 `mintCaptcha` 的差别只有「返回值带来源」这一层。
+   *
+   * ⚠ 这两条回调**必须都在**：少接一条，被 `3007` 拒的那一发就退回普通入口重新取，
+   *   归因（内部 vs chromium）就此丢失 —— 累计拒绝到阈值的自动禁用也就永远到不了。
+   * ⚠ 载体链不可用（`DSH_ZCODE_INTERNAL_CARRIER=0` / web 版从未收到贡献）时
+   *   `zcode.mintCaptchaParam` 自己会退回那条 chromium 链 ⇒ 这里不需要判断开关。
+   */
+  mintCaptchaParam: async (options?: { signal?: AbortSignal }) => {
+    const config = await resolveZcodeCaptchaConfig()
+    return await zcode.mintCaptchaParam(config, options)
+  },
+  mintCaptchaAfterRejection: async (
+    outcome: CarrierOutcome,
+    options?: { signal?: AbortSignal },
+  ) => {
+    const config = await resolveZcodeCaptchaConfig()
+    return await zcode.mintCaptchaAfterRejection(outcome, config, options)
+  },
   captchaRegion: ZCODE_CAPTCHA_FALLBACK.region,
+  /**
+   * 诊断日志：把「先探后取」的前置耗时与补产事件接到宿主 logger。
+   *
+   * ⚠ **必须注入** —— 适配器里那三条出口（`zcode-adapter.ts` 的
+   * `前置耗时 …`、`上游要求 captcha（3007）…`、`captcha 被拒（3007），换新 param 重试`）
+   * 全走 `this.options.log?.()`，缺省**完全不输出**（见 `ZcodeAdapterOptions.log`
+   * 的注释）。不接上就是：带 captcha 的那一发比不带的慢一次 mint（稳态约 0.4–0.5
+   * 秒、首次含 chromium 冷启动 4.2 秒；口径见 README 的 ZCode 章节）在外部**没有任何可看的证据**
+   * —— 「先探后取到底生效没有」只能靠猜。
+   *
+   * ⚠ 取 logger 用可选链 `?.info?.()`：与同文件既有防御写法一致
+   * （`makeReadImageRequest` 的降级告警、`refreshAllCredentials` 的批量续期告警
+   * 都是 `ctx.logger?.warn?.(...)`）。宿主没给 logger 时**静默**，
+   * 绝不能在推理路径上抛错。
+   */
+  log: (message: string) => {
+    ctx.logger?.info?.(message)
+  },
   /**
    * ⚠ **图片字节桥接** —— 这是图片能真正发出去的关键。
    *

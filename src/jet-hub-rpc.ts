@@ -9,7 +9,11 @@
  *           account.reset / account.resetAll / login.poll /
  *           credits.status / credits.claimAll / credits.balances /
  *           model.list / model.setDisabled /
+ *           captcha.demand / captcha.carrierUrl / captcha.contribute（内部载体，
+ *           载体页见 src/zcode-carrier-page.ts 与 src/captcha-carrier-server.ts）/
  *           backup.export / backup.import / backup.status
+ * 另有一条 GET 路由 `/api/jet-hub/captcha-carrier`：渲染内部载体的载体页
+ * （⚠ 手工诊断用；guest 加载不到它，见该路由注释里的主进程取证）。
  */
 
 import type { Context } from '@deepseek-ai/cordis'
@@ -83,6 +87,12 @@ import {
   type CreditBalance,
 } from './credits.js'
 import { CODEBUDDY, WORKBUDDY, productById, type BuddyProduct } from './product.js'
+import {
+  captchaDemand,
+  putSuppliedParam,
+} from './captcha-supply.js'
+import { ZCODE_CAPTCHA_FALLBACK, type ZcodeCaptchaConfig } from './zcode-captcha.js'
+import { buildCarrierPageHtml } from './zcode-carrier-page.js'
 import {
   claimLobsteraiDailyCheckin,
   fetchLobsteraiCreditBalance,
@@ -159,11 +169,24 @@ import type {
   RpcProviderStatusResponse,
   RpcProviderSetEnabledRequest,
   RpcProviderSetEnabledResponse,
+  RpcCaptchaDemandResponse,
+  RpcCaptchaCarrierUrlResponse,
+  RpcCaptchaContributeRequest,
+  RpcCaptchaContributeResponse,
   ProviderStatus,
 } from './types.js'
 
 /** Jet Hub RPC API 路径 */
 export const JET_HUB_API_PATH = '/api/jet-hub'
+/**
+ * 内部 captcha **载体页**的 GET 路径（与 GUI 同源，故 `<webview>` 能导航过来）。
+ *
+ * ⚠ 它挂在 `/api/` 前缀下，因而不是「随便一个静态页」：DSH 的 `/api` 路由会先过
+ *   Connection 的 Host/Origin 栏与**浏览器会话认证**（`dsh-client-connection` 的
+ *   `admit()` ⇒ 未认证回 401）。桌面版的 guest 与 GUI 是否同 partition、
+ *   因而带得上那份会话 cookie，属 Task 5 的**实测项**，不在这里放宽。
+ */
+export const CAPTCHA_CARRIER_PATH = '/api/jet-hub/captcha-carrier'
 /** Gateway RPC 端点名（connection.rpc.call 的 endpoint 参数） */
 const JET_HUB_ENDPOINT = 'jet-hub'
 
@@ -866,6 +889,77 @@ function registerJetHubEndpoints(
           error: { code: 'jet-hub/handler-failed', message },
         })
       }
+    },
+  })
+
+  /**
+   * 载体页要用的 captcha 配置：**远端优先、拉不到就兜底**。
+   *
+   * ⚠ 远端那次请求**不是**在 GET 处理里现加的额外开销 —— `fetchCaptchaConfig()`
+   * 自带 60 秒 TTL 缓存（`src/zcode-auth.ts` 的 `captchaConfigCacheInstance`），
+   * 与推理侧 `index.ts` 走的是同一份缓存实例。
+   * ⚠ 拉不到（无凭据 / 网络失败 / 该形态的 zcode 实例没有这个方法）一律回落
+   *   `ZCODE_CAPTCHA_FALLBACK`：载体页**必须**给得出去。回 500 的话，client 那边
+   *   表现为「导航成功但没有 `window.__zcodeCaptcha`」，比配置旧一点难查得多。
+   */
+  async function carrierCaptchaConfig(): Promise<ZcodeCaptchaConfig> {
+    try {
+      const remote = await zcode.fetchCaptchaConfig()
+      return remote ?? ZCODE_CAPTCHA_FALLBACK
+    } catch {
+      return ZCODE_CAPTCHA_FALLBACK
+    }
+  }
+
+  /**
+   * 内部载体的载体页（**旧路由：已不是 guest 的入口**，见下面的取证）。
+   *
+   * ## ⚠⚠ 它**不可能**被 `<webview>` guest 加载（评审 C1/C2，2026-10-02 实测取证）
+   * 这条路由挂在应用自己的 host 上，而桌面版主进程对 guest 有两道硬闸
+   * （DSH Desktop 0.2.0-rc.2，`resources/app.asar/lib/main.js`）：
+   * - `allowedNavigation(value)` = http(s) + 无账号密码 + `!isApplicationHost(url)`；
+   * - `isApplicationHost(url)` = **`url.port === host.port` 且（主机相同或回环）**；
+   * - `configureSession().onBeforeRequest` 对命中者直接 `callback({ cancel: true })`；
+   * - guest 的 partition 是 `dsh-sidebar-browser-${randomUUID()}`（**无 `persist:`**），
+   *   Host 的会话 cookie 在 `defaultSession` 里 ⇒ 即便加载到了也过不了 `/api/*` 的认证。
+   *
+   * ⇒ 内部载体的真正入口是**独立回环端口上的小服务**
+   * （`src/captcha-carrier-server.ts`，地址由 `captcha.carrierUrl` 这条 RPC 给）。
+   *
+   * ## 那为什么还留着这条
+   * ① 它是**手工诊断**用的：web 版下 GUI 就是 `http://127.0.0.1:<port>`，
+   *   在浏览器标签里直接打开这一页可以验证「载体页本身能不能产 param」；
+   * ② 表达式只有这一份（`buildCarrierPageHtml`），删路由不会让逻辑分叉；
+   * ③ 保留 = 不破坏既有 `CAPTCHA_CARRIER_PATH` 契约（`tests/unit/zcode-carrier-rpc.spec.ts`）。
+   * ⚠ **别再把 client 导航指回这里** —— 那正是评审 C1/C2 指出的「收益恒为 0」的成因。
+   *
+   * ⚠ 只读、无凭据：这条 GET 不接收任何参数，输出里不含 JWT / token；
+   *   产出的 param 由 guest 自己经 `captcha.contribute` 回传，**不**经这条路由。
+   */
+  connection.fetch.register({
+    path: CAPTCHA_CARRIER_PATH,
+    methods: ['GET'],
+    requestBody: 'buffered' as const,
+    async fetch(request: Request): Promise<Response> {
+      /**
+       * ⚠ 真实挂载下这条**永远轮不到**：dsh 的分发器按 `methods` 集合筛过才调本 handler
+       * （`@deepseek-ai/dsh-client-connection` 里 `fetchRoutes.get(pathname)` +
+       * `methods.has(request.method)`）。留着它不是防御性装饰，是为了**不依赖挂载假设**：
+       * 直接调 handler 的用例（本仓库的 connection 替身就是这么跑的）要能自己判 405，
+       * 且将来有人把 `methods` 放宽成含 POST 时，这里不会静默把 RPC 流量当页面接走。
+       */
+      if (request.method !== 'GET') {
+        return new Response('method not allowed', { status: 405 })
+      }
+      const html = buildCarrierPageHtml(await carrierCaptchaConfig())
+      return new Response(html, {
+        status: 200,
+        headers: {
+          'content-type': 'text/html; charset=utf-8',
+          // 每次都现渲染：配置跟着远端 60 秒 TTL 变，缓存这份只会让载体页拿旧 SceneId。
+          'cache-control': 'no-store',
+        },
+      })
     },
   })
 
@@ -2098,7 +2192,7 @@ function registerJetHubEndpoints(
            * ZCode 的「一键领取」= 补激活上报 → preview → 逐个 claim。
            *
            * ⚠ **每个 plan 都要重新产一个 captcha**（captcha 一次性，
-           * 复用会得 `3007`）—— 故不能复用 `collectClaimResults`
+           * 复用会得 `3007`，这条路径每个 plan 都现产新的）—— 故不能复用 `collectClaimResults`
            * 那套「一个凭据一次 claim」的形状（它假设 `claim()` 内部
            * 自己处理幂等），这里自己遍历账号与 plan。
            *
@@ -2927,6 +3021,90 @@ function registerJetHubEndpoints(
           models: modelCount,
           accounts: accountCount,
         }
+        return { ok: true, value }
+      }
+
+      // ── 内部 captcha 载体（二期）──
+      //
+      // 这两条是**客户端驱动**的通道：DSH 的 `connection.fetch` 只有
+      // `client-request` / `server-response` 两种消息（server 无法反向要求 GUI 干活），
+      // 所以「server 要 param」只能被表达成一个**需求位**，由 GUI 轮询着读，
+      // 产出来再 POST 回这条 contribute。语义与取舍见 `src/captcha-supply.ts` 文件头。
+      //
+      // ⚠ web 版：GUI 里没有 `dshDesktop.browser` ⇒ 没人读需求位、也没人贡献
+      //   ⇒ 槽长期为空 ⇒ 载体链直接退回既有 chromium 路径，行为不变。
+
+      /** client 心跳问「现在要不要产 param」——不需要时 client 一次都不产（零配额消耗）。 */
+      case 'captcha.demand': {
+        const value: RpcCaptchaDemandResponse = { active: captchaDemand() }
+        return { ok: true, value }
+      }
+
+      /**
+       * ★ 评审 C1/C2：client 每轮问一次「载体页在哪个地址」。
+       *
+       * ## 为什么是 RPC 而不是 client 里的一个常量
+       * 载体页**不能**挂在插件自己的 `/api/…` 上：桌面版主进程的
+       * `allowedNavigation()` / `onBeforeRequest` 都会以 `isApplicationHost(url)`
+       * 拒掉「**端口相同** 且 主机相同/回环」的地址（asar `lib/main.js`），
+       * 而那个端口就是 Host 自己的端口 ⇒ guest 连文档都建不起来。
+       * 换端口才绕得开 ⇒ 端口是 server 运行时挑的，client 只能**问**（见
+       * `src/captcha-carrier-server.ts` 文件头的完整取证）。
+       *
+       * ## 返回 `null` 的含义
+       * 服务没起（`DSH_ZCODE_INTERNAL_CARRIER=0` / 候选端口全被占）。client 拿到
+       * `null` 就记一条 `no-carrier-url` 并**安静返回**：不建 guest、不导航。
+       * ⚠ 这是 web 版之外的另一条「安静退出」路径，别把它当错误报。
+       */
+      case 'captcha.carrierUrl': {
+        // ⚠ 判一下方法存不存在：这条 RPC 允许「没有内部载体能力」的宿主形态（老插件
+        //   骨架 / 替身）回答，**回 null 即可**，不该把整次分派变成错误。
+        const url = typeof zcode.carrierPageUrl === 'function'
+          ? await zcode.carrierPageUrl()
+          : null
+        const value: RpcCaptchaCarrierUrlResponse = { url: url ?? null }
+        return { ok: true, value }
+      }
+
+      /** client 把内部载体产的 param 放进供给槽（一次性，取走即清）。 */
+      case 'captcha.contribute': {
+        const req = payload as RpcCaptchaContributeRequest
+        /**
+         * param 的「产出时刻」= **server 到达时刻 − client 报告的相对耗时**。
+         *
+         * ⚠ 不用 client 的绝对时间戳：那会把跨端时钟漂移引进时效闸（快了永不判过期、
+         *   慢了一投放就过期 ⇒ 内部载体静默永不可用，日志还看着像「client 没产」）。
+         * ⚠ 也不用纯到达时刻：那会把年龄**低估**一个 client→server 的跳数。
+         *   相对耗时是同机单向差值，比绝对时钟可靠 ⇒ 两者结合既无漂移也不低估。
+         * elapsedMs 缺失/非法时退回到达时刻（保守地偏小年龄，由 PARAM_MAX_AGE_MS 兜住）。
+         */
+        const elapsed = typeof req.elapsedMs === 'number' && Number.isSafeInteger(req.elapsedMs)
+          && req.elapsedMs >= 0 && req.elapsedMs < 5 * 60_000 ? req.elapsedMs : 0
+        const interactive = req.interactive === true
+        const accepted = putSuppliedParam(
+          typeof req.param === 'string' ? req.param : '',
+          Date.now() - elapsed,
+          { interactive },
+        )
+        ctx.logger.info(
+          `[jet-hub] zcode 内部载体贡献 param: accepted=${String(accepted)} elapsedMs=${String(elapsed)}`
+          + `${interactive ? ' interactive=true' : ''}`,
+        )
+        /**
+         * ⚠ 交互式必须**显式告警**（评审 I2）：那是 SDK 被降级成滑块/拼图的唯一信号，
+         *   也是这台机器**设备信誉下降**的唯一预警 —— chromium 那条腿早就有同样的
+         *   `warn`（见 `ZcodeAuth.captchaPoolInstance()`），内部载体这段此前只打进
+         *   client 控制台，host 侧一个字都看不到（等于没有预警）。
+         * ⚠ 只在被**收下**时告警：被拒的那条（垃圾 param）报「交互式」是噪声。
+         */
+        if (accepted && interactive) {
+          ctx.logger?.warn?.(
+            '[jet-hub] zcode 内部载体的 captcha 被降级为**交互式验证**（滑块/拼图）—— '
+            + '设备信誉可能已下降；内部载体的价值是「去掉对 chromium 的依赖」，'
+            + '不是绕过风控，请降低调用频率或稍后再试。',
+          )
+        }
+        const value: RpcCaptchaContributeResponse = { accepted }
         return { ok: true, value }
       }
 

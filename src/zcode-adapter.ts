@@ -12,7 +12,7 @@
  * |---|---|---|
  * | 凭据来源 | 解密磁盘 `~/.zcode/v2/credentials.json`（AES-256-GCM） | 浏览器登录拿 token |
  * | 协议 | **Anthropic Messages**（非 OpenAI） | 其余多为 OpenAI 兼容 |
- * | 每请求前置 | **产出一个阿里云 captcha**（约 1.2 秒） | 无 |
+ * | 验证前置 | **按需**产出阿里云 captcha（索要时才产，稳态一次约 0.4–0.5 秒） | 无 |
  * | 请求体准入 | **必须带官方身份块 + 首轮日期块**（否则 3012） | 无 |
  * | 续期 | 无（静态凭据） | 多数有 refresh_token |
  *
@@ -27,11 +27,27 @@
  *    Qoder 与 TRAE 都因漏发而让模型在正文里臆造 XML 工具调用、harness
  *    认不出 → 任务终止。
  *
- * ## ⚠ captcha 是每请求一次，且**不能复用**
+ * ## ⚠ captcha 是**按需**索要的；索要时**不能复用**
  *
- * 上游对缺失 captcha 的请求回 `3007`。而 captcha param **一次性**——
- * 复用同一个会再得 `3007`（实测：同一页面上重复 mint 必 `F001`）。
- * 故每次 `stream()` 都要产出一个新 param（约 1.2 秒）。
+ * 上游并不每次都校验验证头 —— Task 1 实测：深夜窗口不带验证头连发 **8/8 全
+ * HTTP 200**，连**非法** param 也照样 200，`3007` **命中 0 次**。但历史上它
+ * 确实强制索要过（官方壳按 `access.mode` 决定是否校验，见
+ * `captcha-requirement.ts` 的头注释），所以**别把「按需」写成无条件事实**，
+ * 也**别**据此删掉下面两条分支：`3007 → 内部补产重发`、命中记忆后**每轮换
+ * 新 param**。
+ *
+ * 现行路径是**先探后取**：默认不带验证头发一次，被 `3007` 拒了才产出 param，
+ * 并按「账号 × 模型」记 2 分钟（策略与 TTL 见 `src/captcha-requirement.ts`，
+ * 行为由 `tests/unit/zcode-captcha-lazy.spec.ts` 的行为段锁死；设计文档
+ * `docs/superpowers/specs/2026-10-01-zcode-captcha-lazy-mint-design.md`
+ * 是**本地**文件、不入库）。不索要时**零成本**，索要时一次产出稳态约 0.4–0.5 秒
+ * （中位 426ms / 平均 546ms；含 chromium 冷启动的首发实测 4.2 秒，非常态）。
+ *
+ * param 本身仍是**一次性**：在索要验证的窗口里，复用同一个会再得 `3007` ——
+ * 故「需要验证」的每一轮都重新产出。⚠ 依据是外部仓库 `dsh-free-glm` 记过的
+ * 「第二轮修正」坑（见 `AGENTS.md` 的 ZCode 上游节流三件套第三节），
+ * **不是**「同一页面重复 mint 必 `F001`」—— 那条是页面 origin 问题（`about:blank`）
+ * 的旧结论，已被 `zcode-captcha.ts` 的 `CAPTCHA_PAGE_ORIGIN` 修正推翻，两者无关。
  */
 
 import type { Context } from '@deepseek-ai/cordis'
@@ -72,6 +88,15 @@ import { nextUtc8DayStartMs } from './model-queue.js'
 import {
   registerAdapterIdempotent,
 } from './llm-register-compat.js'
+import {
+  captchaRequirementKey,
+  clearCaptchaRequirement,
+  isCaptchaKnownRequired,
+  noteCaptchaRequired,
+  noteKnownRequiredHit,
+  noteProbeFirst,
+} from './captcha-requirement.js'
+import type { CarrierOutcome } from './captcha-carrier.js'
 
 /** 本适配器注册的 provider 路由名（等价于 `ZCODE.id`）。 */
 export const PROVIDER = 'zcode'
@@ -150,6 +175,26 @@ export interface ZcodeAdapterOptions {
    * 不透传就等于「用户点停止也停不下来」（真实缺陷，2026-09-29）。
    */
   mintCaptcha?: (options?: { signal?: AbortSignal }) => Promise<string>
+  /**
+   * ★ 二期内部载体：走**载体链**取 param（内部供给槽优先，等不到才落 chromium）。
+   *
+   * 与 {@link mintCaptcha} 的差别只有两件事：返回值带上 `source`（`3007` 的归因要看它），
+   * 以及内部槽可用时**不碰**外挂浏览器。
+   *
+   * ⚠ **缺省即整条载体链不参与**（退到 {@link mintCaptcha}）：一期行为逐字不变，
+   *   既有适配器测试与「没接 carrier 的调用方」都不受影响。
+   */
+  mintCaptchaParam?: (options?: { signal?: AbortSignal }) => Promise<CarrierOutcome>
+  /**
+   * ★ 带着 param 的那一发被上游 `3007` 拒之后的**归因 + 当次回退**通道。
+   *
+   * 归因规则在载体链那一侧（只有 `source === 'internal'` 才记一次 `internalRejected`）；
+   * 本回调**允许抛错**（chromium 退避冷却就是要抛），适配器不吞。
+   */
+  mintCaptchaAfterRejection?: (
+    outcome: CarrierOutcome,
+    options?: { signal?: AbortSignal },
+  ) => Promise<CarrierOutcome>
   /** captcha 的区域（进 `x-aliyun-captcha-verify-region`）。 */
   captchaRegion?: string
   /** 拉取远端模型目录；缺省用兜底表。 */
@@ -212,6 +257,25 @@ export interface ZcodeAdapterOptions {
   gate?: ModelGate
   /** 等待实现（注入以便单测；仅用于并发限流重试的退避）。 */
   sleep?: (ms: number, signal?: AbortSignal) => Promise<void>
+  /**
+   * 时钟（注入以便单测推进 TTL；缺省 `Date.now`）。
+   *
+   * ⚠ 只给「先探后取」的需求记忆用。别拿它去做别的计时 —— 计时与超时仍走
+   * 真实时钟，否则超时行为会随测试注入漂移。
+   */
+  now?: () => number
+  /**
+   * 诊断日志（**缺省完全不输出**）。
+   *
+   * 本选项存在是为了让「先探后取」的前置耗时与 `3007` 分支有出口。
+   * ✅ `index.ts` **已经**注入它，形态是 `ctx.logger?.info?.(message)` ——
+   * 两级可选链是必需的：宿主某些形态不给 logger，写成点号直调会让**每次成功的
+   * 推理**抛一次 TypeError（调用点在 `stream()` 的循环里），观测通道就成了故障源。
+   * ⚠ 这条接线由 `tests/unit/zcode-captcha-lazy.spec.ts` 观测段的源码用例守着
+   *   （删掉注入、或丢掉可选链，都会让那一条变红）—— 别把本选项的注释改回
+   *   「尚未接线」，也别照着那样的说法再「补」一次注入。
+   */
+  log?: (message: string) => void
 }
 
 /** ZCode 模型适配器。 */
@@ -234,6 +298,8 @@ export class ZcodeAdapter extends LlmAdapter {
   private readonly gate: ModelGate
   /** 退避等待实现（注入以便单测毫秒级完成）。 */
   private readonly sleepImpl: (ms: number, signal?: AbortSignal) => Promise<void>
+  /** 需求记忆的时钟（可注入，默认 `Date.now`）。 */
+  private readonly nowImpl: () => number
 
   constructor(private readonly options: ZcodeAdapterOptions) {
     super()
@@ -245,6 +311,7 @@ export class ZcodeAdapter extends LlmAdapter {
       gaps: this.product.modelGapMs,
     })
     this.sleepImpl = options.sleep ?? defaultAdapterSleep
+    this.nowImpl = options.now ?? (() => Date.now())
   }
 
   /**
@@ -423,6 +490,34 @@ export class ZcodeAdapter extends LlmAdapter {
     )
   }
 
+  /**
+   * 取一个 param 并说明**它从哪来**：接了载体链就走载体链，否则退到 {@link mintCaptcha}
+   * 并把来源如实记成 `chromium`（`3007` 的归因因此不会错记到内部载体头上）。
+   *
+   * ⚠ 两条路都**原样上抛**错误：chromium 退避冷却那句「冷却中」是既有语义，
+   *   吞掉或退化成「不带 param 再撞一次 `3007`」都是拆护栏。
+   */
+  private async mintCaptchaParam(options: { signal?: AbortSignal } = {}): Promise<CarrierOutcome> {
+    if (this.options.mintCaptchaParam !== undefined) {
+      return await this.options.mintCaptchaParam(options)
+    }
+    return { param: await this.mintCaptcha(options), source: 'chromium' }
+  }
+
+  /**
+   * 上一发 param 被 `3007` 拒之后的**当次回退**（换一个新的、并让载体链记账）。
+   * 没接载体链时与 {@link mintCaptchaParam} 同义（换一个新的 chromium param）。
+   */
+  private async mintCaptchaAfterRejection(
+    outcome: CarrierOutcome,
+    options: { signal?: AbortSignal } = {},
+  ): Promise<CarrierOutcome> {
+    if (this.options.mintCaptchaAfterRejection !== undefined) {
+      return await this.options.mintCaptchaAfterRejection(outcome, options)
+    }
+    return { param: await this.mintCaptcha(options), source: 'chromium' }
+  }
+
   /** 允许外部（`index.ts`）设置服务端下发的 captcha 配置。 */
   setCaptchaConfig(config: ZcodeCaptchaConfig | undefined): void {
     this.captchaConfig = config
@@ -589,7 +684,8 @@ export class ZcodeAdapter extends LlmAdapter {
      *
      * ⚠ 这一段**只依赖 messages / system / model**，与 captcha、凭据都无关 ——
      * 故提到重试循环**之外**只构建一次，重试与切号时复用同一份 body。
-     * 「每轮必须新产」的只有 captcha 与依赖它的 headers（见下面的双层循环）。
+     * 「**需要验证时**每轮必须新产」的只有 captcha 与依赖它的 headers
+     * （见下面的双层循环）；不需要验证时一发都不产。
      *
      * ⚠ 三个必须做对的点：
      *   - `system` 是顶层块数组，且第一块必须是官方 `cliPrefix`
@@ -653,8 +749,8 @@ export class ZcodeAdapter extends LlmAdapter {
     }
 
     /**
-     * ⚠ **headers 不在这里构造** —— 它依赖 captcha param，而 captcha 必须
-     * **每一轮重试都重新产出**（一次性）。故 headers 的构造在下面的
+     * ⚠ **headers 不在这里构造** —— 它依赖 captcha param，而**需要验证时**
+     * captcha 必须**每一轮重试都重新产出**（param 一次性）。故 headers 的构造在下面的
      * 双层循环内、内层循环的第一行之后（见那里的说明）。
      */
 
@@ -688,13 +784,13 @@ export class ZcodeAdapter extends LlmAdapter {
      *
      * | 层 | 触发 | 动作 | 依据 |
      * |---|---|---|---|
-     * | **内层** | `3009` 并发限流 | 退避后**重新 mint captcha** 再试 | 等一下就能过；旧 captcha 已消费 |
+     * | **内层** | `3009` 并发限流 | 退避后重发（**需要** captcha 时换新 param） | 等一下就能过；旧 param 已消费 |
      * | **外层** | `1005`/`1113` 额度用尽 | **标记该账号 + 换下一个账号** | 确定性错误，重试无意义 |
      * | **外层** | 秒回空（`<3s` + 无内容） | 同上（无权益） | 那边的实测：秒回空 = 实例拿不到该模型的鉴权材料 |
      *
-     * ⚠ **重试前必须重新 mint captcha** —— captcha param 是一次性的，
+     * ⚠ **需要 captcha 时，重试前必须重新 mint** —— captcha param 是一次性的，
      * 沿用旧的必得 `3007`（那边的注释把这个记为「第二轮修正」的坑）。
-     * 本实现把 mint 放在**内层循环的第一行**，天然满足。
+     * 本实现把 mint 放在**内层循环的每一轮之内**（只有「需要」的那轮才产），天然满足。
      *
      * ⚠ **以 `emitted` 为闸**：一旦已经向调用方 yield 过内容，
      * 就**不许**再切号/重试 —— 那会让用户看到两份重复输出。
@@ -705,20 +801,116 @@ export class ZcodeAdapter extends LlmAdapter {
       /** 本轮是否因额度用尽而成功切号（决定 continue 外层）。 */
       let switchedAccount = false
 
-      // ── 内层：并发限流重试（每轮都用一个**新的** captcha）──────────────
+      /**
+       * 本轮请求内是否已因 3007 被迫改用 captcha（下一轮起必须带）。
+       *
+       * ⚠ 与进程级的需求记忆**不是重复**：记忆会被同「账号 × 模型」上另一发
+       * **先探成功**清掉（`clearCaptchaRequirement` 那条），若只靠记忆，
+       * 本请求正在重试的那一发就会突然不带 param 再撞一次 `3007`。
+       * 故「本请求内要带」是**局部状态**，跨请求要不要带才问记忆。
+       */
+      let probeRejected = false
+      /**
+       * 上一发**带着 param** 被 `3007` 拒时留下的产出结果。
+       *
+       * 非 undefined 时下一发**不再重新取**，而是把它交回载体链做「归因 + 当次回退」——
+       * 那里本来就产一个新的 param，再走一遍普通入口等于**多付一次 mint**
+       * （一次上游往返之外还多烧一份设备级验证配额）。
+       */
+      let rejectedOutcome: CarrierOutcome | undefined
+      // ── 内层：并发限流 / 先探后取（需要时每轮一个**新的** captcha）──────
       for (let attempt = 0; ; attempt += 1) {
-        // ⚠ 每轮重新产：captcha **一次性**，复用会让上游回 `3007`。
-        //   也必须吃 signal：captcha 侧存在**无超时的等待**（见 `zcode-captcha.ts`），
-        //   一旦命中就是无输出的永久挂起 —— 与流式读取那条通道同型。
-        const captchaParam = await this.mintCaptcha({ signal: controller.signal })
+        /**
+         * ★ 「要了才取」（2026-10-01，吸收**外部仓库** `bonus-plan-4-open-zcode`
+         * —— 本机另一处 checkout、不在本仓库 —— 的提交 `52b6389`）：
+         * 上游**并非每次**都索要验证头（`access.mode=normal` 时官方通道全程零验证）。
+         * 故默认**不带**先发一次，只有被 `3007` 拒了才产出 —— 省下的是
+         * 「一次 mint 的时间 + 一份设备级验证配额与信誉」。
+         *
+         * 三个例外仍直接带：命中记忆窗口、本请求内已被拒过、以及额度领取路径
+         * （那条在 `zcode-auth.ts` 里，每个 plan 必单独 mint，不经这里）。
+         */
+        const requirementKey = captchaRequirementKey(activeAccountId, options.model)
+        const knownRequired = isCaptchaKnownRequired(requirementKey, this.nowImpl())
+        /**
+         * 计数**只在每个请求的开局那一发**记（`attempt === 0`）：两个计数因此互斥，
+         * `probeFirstCount + knownRequiredCount` 恒等于**内层循环的入口数**，
+         * 面板上才有意义。
+         *
+         * ⚠ 它**不等于**「用户请求数」：外层有三条重入路径会再进一次内层，
+         * 各自都要在 `attempt === 0` 上记一票 ——
+         *   ① 额度用尽切号成功（下面的 `break` → 外层 `switchedAccount` 的 `continue`）；
+         *   ② `response.body === null` 的空 body 分支换号后 `continue`；
+         *   ③ SSE 消费里「秒回空」分支换号后 `continue`。
+         * 故一次用户请求最多贡献 `quotaSwitchMax + 1` 票（当前 2 ⇒ 3）。
+         *
+         * ⚠ 不要把「本请求内被 `3007` 拒后补产的那一发」算成「命中记忆」——
+         * 那条记忆正是**本请求刚写下的**，它没有省掉任何往返（它就是那次往返）；
+         * 「命中」的定义是**跨请求**靠记忆少探一次（与 Task 5 写进 stats 的口径一致）。
+         */
+        if (attempt === 0) {
+          if (knownRequired) noteKnownRequiredHit()
+          else noteProbeFirst()
+        }
+
+        let captchaParam: string | undefined
+        let carrierOutcome: CarrierOutcome | undefined
+        let mintMs = 0
+        /**
+         * ⚠ 推理侧**不再**置起内部载体的需求位（`src/captcha-supply.ts` 的
+         *   `captchaDemand`）：需求位只跟着 **claim（领取）** 走。
+         *
+         * ## 为什么（ZCode 3.14.4 / 2026-09-29 起上游不再对模型请求校验 captcha）
+         * - **模型请求**：6 个采样点实测，**不带验证头也是 HTTP 200**（官方 3.14.4
+         *   更新说明同口径）⇒ 推理路径自那以后**不会再撞 `3007`**，
+         *   `knownRequired` 恒为假、`probeRejected` 恒为假 ⇒ 这里按位重算出来的需求位
+         *   **永远是假的**，client 永远不产 param，内部载体等于接了个空壳；
+         * - **领取**：`/zcode-plan/billing/claim` **始终强制索要** —— 实测带非法 captcha
+         *   与不带 captcha 都回 `400/3007`，且**校验前置于 plan 校验**（连 plan 都不给验）。
+         *
+         * ⇒ 需求位的唯一正确触发点是 claim 入口的 `try/finally`
+         *   （`ZcodeAuth.claimDailyWith`，见该方法注释），它一次同时覆盖
+         *   RPC 的「一键领取」与定时自动领取两条路。
+         *
+         * ⚠ 反向看守：`tests/unit/zcode-carrier-auth.spec.ts` 断言本文件里
+         *   **不得**再出现 `setCaptchaDemand` 的调用（注释里连这个拼法都不写）——
+         *   在推理路径置位会让 client 在上游根本不索要验证的窗口里空转产出、
+         *   白耗**设备级**验证配额（阿里云同设备每小时 150 次，见 `src/captcha-backoff.ts`）。
+         */
+        if (knownRequired || probeRejected) {
+          // ⚠ 每轮重新产：captcha **一次性**，复用会让上游回 `3007`。
+          //   也必须吃 signal：captcha 侧存在**无超时的等待**（见 `zcode-captcha.ts`），
+          //   一旦命中就是无输出的永久挂起 —— 与流式读取那条通道同型。
+          const mintStartedAt = Date.now()
+          // 上一发被拒过 ⇒ 走「归因 + 当次回退」那一腿，不再重新取一次。
+          carrierOutcome = rejectedOutcome === undefined
+            ? await this.mintCaptchaParam({ signal: controller.signal })
+            : await this.mintCaptchaAfterRejection(rejectedOutcome, { signal: controller.signal })
+          rejectedOutcome = undefined
+          captchaParam = carrierOutcome.param
+          /**
+           * ⚠ `mintMs` 是**墙上时钟差**（只用于诊断日志），与内部 param 的
+           *   `elapsedMs`/年龄口径无关（那三个数的分工见 `src/zcode-auth.ts` 的
+           *   `carrier` 字段注释）。它**包含**载体链那至多 1.5 秒的有界等待，
+           *   所以「内部命中」这一发的 `mintMs` 可能比 chromium 稳态的 0.4–0.5 秒更大 ——
+           *   那不是变慢了，是没启动 chromium。
+           */
+          mintMs = Date.now() - mintStartedAt
+        }
+
         const headers = buildZcodeHeaders(credential, {
           authorization: `Bearer ${credential.zcode_jwt}`,
-          captcha: {
-            param: captchaParam,
-            region: this.options.captchaRegion ?? 'cn',
-          },
+          ...(captchaParam === undefined
+            ? {}
+            : {
+              captcha: {
+                param: captchaParam,
+                region: this.options.captchaRegion ?? 'cn',
+              },
+            }),
         })
 
+        const upstreamStartedAt = Date.now()
         response = await this.sendUpstream({
           headers,
           body,
@@ -727,7 +919,26 @@ export class ZcodeAdapter extends LlmAdapter {
           timeoutMs,
           model: options.model,
         })
-        if (response.ok) break
+        /**
+         * ⚠ 响应头耗时必须在**读首帧之前**取：否则会把读流的耗时算进「响应头」，
+         * 日志写成「响应头 4545ms + 首帧 4167ms」（合计超过总时长），纯属误导
+         * —— 这条坑来自**外部仓库**那个提交（`52b6389`，不在本仓库）。
+         */
+        const headersMs = Date.now() - upstreamStartedAt
+        if (response.ok) {
+          if (captchaParam === undefined) {
+            // 不带也成功 ⇒ 上游当前不要验证，清掉记忆回到最省路径。
+            clearCaptchaRequirement(requirementKey)
+          }
+          this.options.log?.(
+            `zcode: 前置耗时 captcha ${mintMs}ms + 响应头 ${headersMs}ms（${
+              captchaParam === undefined
+                ? '未带 captcha'
+                : `带 captcha·${carrierOutcome?.source === 'internal' ? '内部载体' : 'chromium'}`
+            }）`,
+          )
+          break
+        }
 
         const text = await response.text().catch(() => '')
 
@@ -757,7 +968,13 @@ export class ZcodeAdapter extends LlmAdapter {
           )
         }
 
-        // ② 并发限流 → 退避 + 重新 mint 后再试（**不**换账号：换谁都一样撞）
+        // ② 并发限流 → 退避后再试（**不**换账号：换谁都一样撞）
+        //   ⚠ 「重试前必须带上新 param」这条一次性规则由上面的分支保证：
+        //     **本轮带过 param 时**（命中记忆或本请求内已被 `3007` 拒过），回的
+        //     是 `3009` 而不是 `3007`，说明验证那一关没把它拦下，下一轮仍在记忆
+        //     窗口内 ⇒ 继续带新 param；若是**先探**那一发（不带 param）撞上 `3009`，
+        //     推不出任何验证结论，下一轮仍不带（knownRequired / probeRejected 依旧
+        //     为假）—— 3009 与 captcha 无关，白产一个 param 才是错。
         if (
           isZcodeConcurrencyLimited(response.status, text)
           && attempt < this.product.concurrencyRetryMax
@@ -767,7 +984,42 @@ export class ZcodeAdapter extends LlmAdapter {
           continue
         }
 
-        // ③ 其余错误：按既有映射如实抛出（3012 等不可重试类不变）
+        // ③ ★ captcha 被拒（3007）→ **在适配器内部**补产并重发。
+        //    绝不能让它走到下面的 throw：`httpErrorCodeForZcode` 把它归
+        //    `RATE_LIMIT`（在 harness 可重试集合里），抛出去等于让用户
+        //    先看到一次**我们预期到**的失败，再白付一轮退避。
+        //
+        // ⚠⚠ **这条分支是防御性的，不许因为「3.14.4 起推理不校验了」就删掉**。
+        //   现状（2026-09-29 实测）：ZCode 3.14.4 起**模型请求**不再校验 captcha
+        //   （6 个采样点：不带验证头也是 HTTP 200，官方更新说明同口径），所以这条
+        //   分支在当前版本上走不到。但**上游随时可以再开启校验**，而那时
+        //   用户会看到「消息发不出去 + 一次 RATE_LIMIT 退避」—— 正是这条分支
+        //   当初要消除的体验。自愈是**当前可见、当前零成本**的保险：
+        //   不置需求位（推理侧不再驱动内部载体，见上面那段注释），
+        //   但保留「当次补产 + 重发」的既有语义。
+        if (
+          isZcodeCaptchaRejected(response.status, text)
+          && attempt < this.product.concurrencyRetryMax
+        ) {
+          if (captchaParam === undefined) {
+            // 探测被拒 ⇒ 上游确实要验证：记住该「账号×模型」需要它（2 分钟）。
+            // ⚠ 只记**需求记忆**（进程内、2 分钟 TTL），不动内部载体的需求位 ——
+            //   后者归 claim 路径所有（`ZcodeAuth.claimDailyWith`）。
+            noteCaptchaRequired(requirementKey, this.nowImpl())
+            this.options.log?.(
+              `zcode: 上游要求 captcha（3007）→ 本轮才产出并重发（账号 ${activeAccountId ?? '-'}）`,
+            )
+          } else {
+            // 带着 param 被拒 ⇒ **不在这里**多产一次：把上一次的结果记下来，
+            // 下一发的入口会走 `mintCaptchaAfterRejection`（归因 + 当次回退一次做完）。
+            rejectedOutcome = carrierOutcome
+            this.options.log?.('zcode: captcha 被拒（3007），换新 param 重试')
+          }
+          probeRejected = true
+          continue
+        }
+
+        // ④ 其余错误：按既有映射如实抛出（3012 等不可重试类不变）
         throw new LlmError(
           `zcode: ${describeUpstreamError(response.status, text)}`,
           httpErrorCodeForZcode(response.status, text),
@@ -1015,7 +1267,25 @@ export class ZcodeAdapter extends LlmAdapter {
     }
   }
 
-  /** 释放自建的浏览器（由 `index.ts` 的 cleanup 调用）。 */
+  /**
+   * 释放自建的浏览器（由 `index.ts` 的 cleanup 调用）。
+   *
+   * ## ⚠ 这里**不再**放内部载体的需求位（有意为之，不是漏了）
+   * 需求位是**进程级**状态，置位点自 2026-09-29 起唯一且只在
+   * {@link ZcodeAuth.claimDailyWith} 的 `try/finally`（领取窗口）里 ——
+   * **所有权随置位点一起搬走了**，于是清位也归它的 owner：
+   * ① 领取窗口结束（`claimDailyWith` 的 `finally`）；
+   * ② 进程卸载（`ZcodeAuth.stop()`，同一次 cleanup 里被调用）。
+   *
+   * 推理侧保留「清位」只会是个**无主的副作用**：它既不持有那个位，也没有任何
+   * 窗口需要它来收尾；而留着它等于让「谁在写这个进程级状态」有第三个来源，
+   * 下一个人改需求位的落点时更容易漏掉一处。
+   * ⚠ 反向看守：`tests/unit/zcode-carrier-auth.spec.ts` 断言本文件里
+   *   **不得**出现 `setCaptchaDemand` 的调用（在不需要验证的窗口里驱动 client 产出
+   *   = 白耗阿里云「同设备每小时 150 次」的设备级配额）。
+   * 归还 webview 租约那半在 client 侧
+   * （`plugin-src/client/index.js` 把停止函数挂在 `ctx.effect` 的清理路径上）。
+   */
   stop(): void {
     this.captchaBrowser?.dispose()
     this.captchaBrowser = undefined
@@ -1186,6 +1456,23 @@ export function isZcodeQuotaExhausted(status: number, body: string): boolean {
   // 只认码会漏判。关键词**必须窄** —— `quota`/`balance` 之类泛词会误伤
   // 模型正文里恰好讨论「额度」的内容（与 qoder 的 `looksLikeBillingError` 同因）。
   return /exceed\s+quota\s+limit|quota\s+(?:has\s+been\s+)?exhausted/i.test(body)
+}
+
+/**
+ * 判断是否是 **captcha 校验失败**（`3007`）——「换个新 param 就能过」。
+ *
+ * ## 为什么单独抽出来（2026-10-01）
+ * 它是「先探后取」的**触发条件**：不带验证头的请求被判 `3007` 时，适配器要在
+ * **内部**补产并重发（见 `stream()` 的分支 ③），而不是把它抛给 harness ——
+ * 后者会让用户先看到一次可见失败，而这次失败是我们**预期到**的探测代价。
+ *
+ * ⚠ **不判 HTTP 状态码**：`httpErrorCodeForZcode()` 现在就是按正文里的 `3007`
+ * 归类的（`RATE_LIMIT`），与 `isZcodeConcurrencyLimited` 允许「非 429 包裹」同理 ——
+ * 网关换个状态码包裹同一业务码时，判据不能跟着漏。
+ */
+export function isZcodeCaptchaRejected(status: number, body: string): boolean {
+  void status
+  return body.includes('3007') || /captcha\s+verify\s+failed/i.test(body)
 }
 
 /**

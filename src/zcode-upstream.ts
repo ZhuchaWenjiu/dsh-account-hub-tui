@@ -338,7 +338,8 @@ export async function fetchZcodeClaimablePlans(
  * 领取一个 plan。
  *
  * ⚠ **captcha 是一次性的**：每个 plan 都必须**重新 mint** 一个新 param。
- * 复用同一个 param 会得到 `3007`（captcha 校验失败）。
+ * 复用同一个 param 在索要验证的窗口里会得到 `3007`（captcha 校验失败）；
+ * 本路径**每个 plan 都现产一个新的**，不去赌上游这一次校不校验。
  *
  * 业务码语义（桥侧实测记录）：
  *

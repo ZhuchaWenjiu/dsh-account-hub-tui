@@ -230,8 +230,12 @@ export const ZCODE: ZcodeProduct = {
    * 上游限流重试 + 思考链；而多步 agent 的每一步都是一次独立请求。
    * 给 180s 是为了包住长尾，不是为了让正常请求等那么久。
    *
-   * ⚠ 不含 captcha 产出时间（那由 `zcode-captcha.ts` 自己的超时管，
-   * 实测每次约 1.2 秒）。
+   * ⚠ 它**覆盖整轮**：`stream()` 里定时器 abort 的那个 controller 同时传给 captcha
+   * 产出与上游 fetch（`zcode-captcha.ts` 自己那层超时只是其中更细的一环）。
+   * ⚠ 但 180s 这个**取值不依赖 mint 的耗时**：mint 只在上游索要验证时才发生，
+   * 稳态约 0.4–0.5 秒（中位 426ms / 平均 546ms），首次含 chromium 冷启动实测 4.2 秒；
+   * 「实测每次约 1.2 秒」是 origin 修正前「每次新建 page」的历史口径，已不作数。
+   * 这里包的是**推理长尾**（上游限流重试 + 思考链）；改这行的数字要另拿实测依据。
    */
   requestTimeoutMs: 180_000,
   fallbackModels: ZCODE_FALLBACK_MODELS,

@@ -1,4 +1,6 @@
 docs/superpowers
+# 流程进度 ledger（subagent-driven-development 的断点恢复记录），同属过程产物不入库
+.superpowers/
 node_modules/
 lib/
 *.tsbuildinfo

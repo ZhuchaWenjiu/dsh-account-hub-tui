@@ -5,7 +5,9 @@
  *
  * ZCode 免费通道**只认 Anthropic Messages 格式**（实测：`zcode-plan` 下
  * 的 `openai` / 裸 `v1/chat/completions` 路径一律 `404 page not found`，只有
- * `/api/v1/zcode-plan/anthropic/v1/messages` 存在——无 captcha 时回 `3007`）。
+ * `/api/v1/zcode-plan/anthropic/v1/messages` 存在——在索要验证的窗口里无 captcha
+ * 时它回 `3007` 而不是 404；上游不要验证的那些窗口里它会直接 200（见 README 的
+ * ZCode 章节实测表），但**端点存在**这条结论两种形态都支持）。
  *
  * 而 `openai-compat.ts` 的 `serializeMessages()` 产出的是 **OpenAI 形态**
  * （`tool_calls` / `tool_call_id` / `tools[].function`）—— 喂给 Anthropic

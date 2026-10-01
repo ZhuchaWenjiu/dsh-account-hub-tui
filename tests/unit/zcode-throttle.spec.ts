@@ -8,7 +8,10 @@
  *    - 把额度错误当限流 ⇒ 确定性错误被白重试（qoder 那边记过：`SERVER` 在
  *      harness 的可重试集合里，白退避 5 次约 15.5 秒）；
  *    - 把限流当额度 ⇒ **误标一个完全可用的账号**（当日用不了）。
- * 2. **重试前必须重新 mint captcha**（一次性，沿用旧的必 `3007`）。
+ * 2. **需要 captcha 时，重试前必须重新 mint**（一次性，沿用旧的必 `3007`）。
+ *    ⚠ 2026-10-01 起 mint 是**条件式**的（先探后取，见
+ *    `tests/unit/zcode-captcha-lazy.spec.ts`），故这条用例先注入需求记忆，
+ *    让两轮都落在「需要」那一侧 —— 规则本身没变。
  * 3. **秒回空 = 无权益 ⇒ 换账号**；而**慢回空**是链路故障，不换号。
  *
  * ## 反向验证（别写成同义反复）
@@ -32,6 +35,11 @@ import {
   zcodeConcurrencyRetryDelayMs,
   zcodeEntitlementErrorMessage,
 } from '../../src/zcode-adapter.js'
+import {
+  captchaRequirementKey,
+  clearCaptchaRequirement,
+  noteCaptchaRequired,
+} from '../../src/captcha-requirement.js'
 import { ModelGate } from '../../src/model-gate.js'
 import { ZCODE } from '../../src/zcode-product.js'
 
@@ -231,7 +239,7 @@ describe('ZCode 限流判据（两种 429 必须分开）', () => {
 /* ────────────────── 二、适配器行为（重试与切号） ────────────────── */
 
 describe('ZCode 并发限流重试（3009）', () => {
-  it('★ 429+3009 → 退避重试，且**每次都重新 mint captcha**', async () => {
+  it('★ 429+3009 → 退避重试，且**需要 captcha 时每轮都换新 param**', async () => {
     let minted = 0
     let inner = 0
     const adapter = new ZcodeAdapter({
@@ -253,7 +261,28 @@ describe('ZCode 并发限流重试（3009）', () => {
       product: ZCODE,
     })
 
-    const chunks = await drain(adapter.stream(streamOptions()))
+    /**
+     * ★ 前提：**本任务把「每请求必 mint」改成了「先探后取」**（见
+     * `src/captcha-requirement.ts` 与 `zcode-adapter.ts` 内层循环）。这条用例测的
+     * 规则是「**重试不许复用 param**」，它只在「上游要验证」时才有意义 ⇒ 先注入
+     * 一条需求记忆，让两轮都落在「需要」一侧。
+     *
+     * ⚠ 这条用例**没有**因此变弱（`minted` 仍精确等于 2、`inner` 仍等于 2）；
+     * 「未建记忆时先探、3009 那轮白 mint 才是错」这一侧由
+     * `tests/unit/zcode-captcha-lazy.spec.ts` 的行为段覆盖，两条合起来才是完整规则。
+     *
+     * ⚠ 键里的账号是 `undefined`（本用例没有 `currentAccountId`），
+     * `captchaRequirementKey` 把它归一成 `-`；记忆是**进程级**的 ⇒ 用完必须清，
+     * 否则会把同文件后面的用例也拖成「需要 captcha」。
+     */
+    const requirementKey = captchaRequirementKey(undefined, 'GLM-5.3-Flash')
+    noteCaptchaRequired(requirementKey, Date.now())
+    let chunks: unknown[]
+    try {
+      chunks = await drain(adapter.stream(streamOptions()))
+    } finally {
+      clearCaptchaRequirement(requirementKey)
+    }
     expect(chunks.length).toBeGreaterThan(0)
     expect(inner).toBe(2)
     // ★ 关键：重试必须**重新 mint**（captcha 一次性，沿用旧的必 3007）。

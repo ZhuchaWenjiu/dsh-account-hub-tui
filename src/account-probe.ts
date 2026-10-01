@@ -279,11 +279,14 @@ async function probeWithAdapter(
       product: clineProduct,
     })
   } else if (zcodeProduct !== undefined) {
-    // ZCode 的免费额度通道（`/zcode-plan/anthropic`）要求**每请求一个**阿里云
-    // captcha 参数（一次性：复用会让上游回 `3007`）。
+    // ZCode 的免费额度通道（`/zcode-plan/anthropic`）**按需**要 captcha：
+    // 默认先不带验证头探一次，被 `3007` 拒才产出（需要验证时复用同一个 param
+    // 必再得 `3007`）。
+    // ⇒ 探测路径若上游当下不要验证，**不会**拉起浏览器；要验证才拉。
     //
     // ⚠️ 已知取舍：探测路径**没有** `mintCaptcha` 透传通道（`ProbeDeps` 里没有
-    // 这一项），故这里的适配器会**自建**一个常驻浏览器。若宿主里已有 `index.ts`
+    // 这一项），故**一旦上游索要验证**，这里的适配器就**自建**一个常驻浏览器
+    // （上游不要验证时压根不 mint，也就不会拉）。若宿主里已有 `index.ts`
     // 注入的那台（`zcode.mintCaptcha`），短时会并存两台（约 200MB/台）。
     // 这仍然远好于本缺陷的形态 —— 落 else 会被交给**华为云 HMAC 签名**的
     // `CodeArtsAdapter` 去发 zcode 凭据，探测必然失败，而 zcode 的额度标记

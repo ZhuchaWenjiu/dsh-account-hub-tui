@@ -11,9 +11,14 @@ import {
   collectCreditBalances,
   collectCreditsStatus,
   computeClaimSummary,
+  JET_HUB_API_PATH,
   registerJetHubRpc,
 } from '../../src/jet-hub-rpc.js'
 import type { CreditsEndpointDeps } from '../../src/jet-hub-rpc.js'
+// ⚠️ 下面每个 `connection.fetch` 替身都**按 path 挑处理器**（用 `JET_HUB_API_PATH`）。
+// 本模块除了 RPC 的 POST 端点还注册了内部载体的 GET 路由；替身若写成
+// 「谁最后注册就记谁」，加一条路由就会让所有 RPC 用例莫名其妙地打到载体页上，
+// 表现为成片 405 —— 与本次改动毫无关系，极难归因。别把它「简化」回去。
 import { AccountPool } from '../../src/account-pool.js'
 import type { ClaimOutcome, CheckinStatus, CreditBalance } from '../../src/credits.js'
 import { WORKBUDDY } from '../../src/product.js'
@@ -632,7 +637,7 @@ describe('account.create 必须立即返回 loginUrl（两步式登录回归）'
 
     const ctx = {
       get: (key: string) => key === 'connection'
-        ? { fetch: { register: (config: { fetch: Handler }) => { handler = config.fetch } } }
+        ? { fetch: { register: (config: { path: string; fetch: Handler }) => { if (config.path === JET_HUB_API_PATH) handler = config.fetch } } }
         : undefined,
       inject: (_deps: string[], callback: (ctx: unknown) => void) => { callback(ctx) },
       logger: { warn: () => {}, info: () => {} },
@@ -718,7 +723,7 @@ describe('account.create 必须立即返回 loginUrl（两步式登录回归）'
     let handler: Handler | undefined
     const ctx = {
       get: (key: string) => key === 'connection'
-        ? { fetch: { register: (config: { fetch: Handler }) => { handler = config.fetch } } }
+        ? { fetch: { register: (config: { path: string; fetch: Handler }) => { if (config.path === JET_HUB_API_PATH) handler = config.fetch } } }
         : undefined,
       inject: (_deps: string[], callback: (ctx: unknown) => void) => { callback(ctx) },
       logger: { warn: () => {}, info: () => {} },
@@ -765,7 +770,7 @@ describe('account.create 必须立即返回 loginUrl（两步式登录回归）'
     let handler: Handler | undefined
     const ctx = {
       get: (key: string) => key === 'connection'
-        ? { fetch: { register: (config: { fetch: Handler }) => { handler = config.fetch } } }
+        ? { fetch: { register: (config: { path: string; fetch: Handler }) => { if (config.path === JET_HUB_API_PATH) handler = config.fetch } } }
         : undefined,
       inject: (_deps: string[], callback: (ctx: unknown) => void) => { callback(ctx) },
       logger: { warn: () => {}, info: () => {} },
@@ -919,7 +924,9 @@ describe('model.list / model.setDisabled 端点', () => {
         if (key === 'connection') {
           return {
             fetch: {
-              register: (config: { fetch: Handler }) => { handler = config.fetch },
+              register: (config: { path: string; fetch: Handler }) => {
+                if (config.path === JET_HUB_API_PATH) handler = config.fetch
+              },
             },
           }
         }
@@ -1628,7 +1635,7 @@ describe('积分端点的 provider 能力边界', () => {
     let handler: Handler | undefined
     const ctx: Record<string, unknown> = {
       get: (key: string) => key === 'connection'
-        ? { fetch: { register: (config: { fetch: Handler }) => { handler = config.fetch } } }
+        ? { fetch: { register: (config: { path: string; fetch: Handler }) => { if (config.path === JET_HUB_API_PATH) handler = config.fetch } } }
         : undefined,
       // 生产代码用惰性注入挂载 connection 端点（见 registerJetHubRpc 的说明）：
       // 替身必须提供 inject，否则会以 `ctx.inject is not a function` 抛错。
@@ -1812,7 +1819,7 @@ describe('account.reorder 端点', () => {
     } as never)
     const ctx = {
       get: (key: string) => key === 'connection'
-        ? { fetch: { register: (config: { fetch: Handler }) => { handler = config.fetch } } }
+        ? { fetch: { register: (config: { path: string; fetch: Handler }) => { if (config.path === JET_HUB_API_PATH) handler = config.fetch } } }
         : undefined,
       inject: (_deps: string[], callback: (ctx: unknown) => void) => { callback(ctx) },
       logger: { warn: () => {}, info: () => {} },
@@ -1964,7 +1971,7 @@ describe('provider.status / provider.setEnabled 端点', () => {
     const ctx = {
       get: (key: string) => {
         if (key === 'connection') {
-          return { fetch: { register: (config: { fetch: Handler }) => { handler = config.fetch } } }
+          return { fetch: { register: (config: { path: string; fetch: Handler }) => { if (config.path === JET_HUB_API_PATH) handler = config.fetch } } }
         }
         if (key === 'llm' && options.withoutLlm !== true) {
           return {
@@ -2386,7 +2393,12 @@ describe('cline.quota / cline.requestLog 端点', () => {
       credentials,
       get: (key: string) => {
         if (key === 'connection') {
-          return { fetch: { register: (config: { fetch: Handler }) => { handler = config.fetch } } }
+          // ⚠ 必须**按 path 精确匹配**（真实 dsh 是 `fetchRoutes.get(url.pathname)` 精确命中）：
+          //   不看 path 的「最后注册的赢」替身，会被**后注册**的另一条路由偷走
+          //   （当前是 `GET /api/jet-hub/captcha-carrier` 载体页路由）⇒ 本组测试的
+          //   POST 落到载体页 handler 上 → 405 `method not allowed` → JSON.parse 炸。
+          //   这是 AGENTS.md「合并上游新增端点后必须重跑位置占位组」那条纪律的复发。
+          return { fetch: { register: (config: { path: string; fetch: Handler }) => { if (config.path === JET_HUB_API_PATH) handler = config.fetch } } }
         }
         return undefined
       },

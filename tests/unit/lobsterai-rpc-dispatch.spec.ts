@@ -14,7 +14,7 @@
  */
 
 import { describe, expect, it, vi } from 'vitest'
-import { registerJetHubRpc } from '../../src/jet-hub-rpc.js'
+import { registerJetHubRpc, JET_HUB_API_PATH } from '../../src/jet-hub-rpc.js'
 import type { ProviderAccountEntry } from '../../src/types.js'
 
 /** 采集到的「某服务被要求刷新的 credentialRef」。 */
@@ -25,14 +25,17 @@ interface RefreshCall {
 
 /**
  * 构造一个 fake `ctx`，捕获 `connection.fetch.register` 的处理器。
+ *
+ * ⚠️ **按 path 取处理器**：本模块注册的不止 RPC 的 POST 端点（还有载体页的 GET 路由），
+ * 「谁最后注册就记谁」会让加一条路由变成「成片 RPC 用例莫名其妙地红」。
  */
 function makeCtx(accounts: ProviderAccountEntry[]) {
   let handler: ((request: Request) => Promise<Response>) | undefined
   const ctx = {
     connection: {
       fetch: {
-        register: (options: { fetch: (request: Request) => Promise<Response> }) => {
-          handler = options.fetch
+        register: (options: { path: string; fetch: (request: Request) => Promise<Response> }) => {
+          if (options.path === JET_HUB_API_PATH) handler = options.fetch
         },
       },
     },
