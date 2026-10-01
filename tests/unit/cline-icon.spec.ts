@@ -1,14 +1,38 @@
 import { describe, expect, it } from 'vitest'
 import { existsSync, readFileSync } from 'node:fs'
 import { dirname, join, resolve } from 'node:path'
-import { fileURLToPath } from 'node:url'
-// .mjs 无类型声明，但 tsconfig 只 include `src`、tests 不参与 typecheck，
-// 且 vitest 用 esbuild 转译，故这里直接 import 纯函数是安全的。
-import { decodePng, encodePng, resizeArea } from '../../scripts/extract-cline-icon.mjs'
+import { fileURLToPath, pathToFileURL } from 'node:url'
 
 const HERE = dirname(fileURLToPath(import.meta.url))
 const REPO_ROOT = resolve(HERE, '../..')
 const JET_HUB_SOURCE = join(REPO_ROOT, 'plugin-src', 'client', 'jet-hub.js')
+
+/**
+ * ⚠️ 提取脚本**不入库**（`scripts/` 整目录在 `.gitignore` 里：只读排查与研究工具
+ * 仅本地保留），所以这里**不能**写静态 `import`。
+ *
+ * **真实缺陷**（2026-10-02 定位）：本文件原先在顶部静态
+ * `import { decodePng, … } from '../../scripts/extract-cline-icon.mjs'` —— 静态 import
+ * 会在 **收集阶段**解析模块，脚本不存在时（干净克隆 / CI / 换台机器）整份套件直接
+ * 变成 **Failed Suite（0 条用例）**，报错只有一句 `Failed to load url …`，既不是
+ * 断言失败、也没有任何「已跳过」提示。而这**正是本文件下方注释早已警告过的失效
+ * 模式**（「收集阶段读文件会让 skip 变成 Failed Suite」）—— 当时只为官方 PNG 路径
+ * 加了 `existsSync` 守卫，静态 import 这条通路漏掉了，自相矛盾。
+ *
+ * 现在改为 **惰性动态加载 + 存在性守卫**：脚本不在时，需要它的两条用例干净跳过。
+ */
+const ICON_SCRIPT = resolve(REPO_ROOT, 'scripts', 'extract-cline-icon.mjs')
+const hasIconScript = existsSync(ICON_SCRIPT)
+interface IconTools {
+  decodePng: (bytes: Buffer) => { width: number; height: number; rgba: Uint8Array }
+  encodePng: (rgba: Uint8Array, width: number, height: number, filter?: string) => Buffer
+  resizeArea: (rgba: Uint8Array, w: number, h: number, tw: number, th: number) => Uint8Array
+}
+let iconTools: Promise<IconTools> | null = null
+const loadIconTools = async (): Promise<IconTools> => {
+  iconTools ??= import(/* @vite-ignore */ pathToFileURL(ICON_SCRIPT).href) as Promise<IconTools>
+  return iconTools
+}
 
 /**
  * Cline 面板图标的回归测试。
@@ -66,7 +90,8 @@ describe('Cline 面板图标（必须来自官方提取，不得手绘）', () =
     expect(bytes.length).toBeGreaterThan(1_000)
   })
 
-  it('能被提取脚本自己的解码器读回（编码/解码自洽）', () => {
+  it.skipIf(!hasIconScript)('能被提取脚本自己的解码器读回（编码/解码自洽）', async () => {
+    const { decodePng } = await loadIconTools()
     const uri = readIconDataUri()
     const bytes = Buffer.from(uri.slice('data:image/png;base64,'.length), 'base64')
     const decoded = decodePng(bytes)
@@ -84,7 +109,8 @@ describe('Cline 面板图标（必须来自官方提取，不得手绘）', () =
   })
 
   /**
-   * ⚠️ 需要本机装了 Cline（官方图标源存在）。未装则跳过 —— 不断言失败。
+   * ⚠️ 需要「本机装了 Cline」（官方图标源存在）**且**「提取脚本存在」（它不入库）。
+   * 两者缺任一则跳过 —— 不断言失败。
    */
   const appDir = process.env.CLINE_APP_DIR !== undefined && process.env.CLINE_APP_DIR.length > 0
     ? process.env.CLINE_APP_DIR
@@ -92,9 +118,10 @@ describe('Cline 面板图标（必须来自官方提取，不得手绘）', () =
   const officialClassic = join(appDir, 'icons', 'app', 'macos', 'classic.png')
   const hasOfficialSource = existsSync(officialClassic)
 
-  it.skipIf(!hasOfficialSource)(
+  it.skipIf(!hasOfficialSource || !hasIconScript)(
     '与「从官方 classic.png 重新提取」的结果逐字节一致',
-    () => {
+    async () => {
+      const { decodePng, encodePng, resizeArea } = await loadIconTools()
       // 惰性读取（见文件头注释：收集阶段读文件会让 skip 变成 Failed Suite）
       const source = decodePng(readFileSync(officialClassic))
       const regenerated = encodePng(
@@ -105,10 +132,14 @@ describe('Cline 面板图标（必须来自官方提取，不得手绘）', () =
     },
   )
 
-  it('官方图标源缺失时明确记录（便于解释为何上面的用例被跳过）', () => {
+  it('前置条件缺失时明确记录（便于解释上面哪些用例被跳过）', () => {
+    if (!hasIconScript) {
+      console.log(`\n[cline-icon] 未找到提取脚本：${ICON_SCRIPT}\n  → 依赖它的两条用例已跳过。该脚本不入库（scripts/ 在 .gitignore 内），干净克隆与 CI 本来就没有它，属预期。`)
+    }
     if (!hasOfficialSource) {
       console.log(`\n[cline-icon] 未找到官方图标源：${officialClassic}\n  → 逐字节比对用例已跳过；如需校验请安装 Cline 或设置 CLINE_APP_DIR。`)
     }
+    expect(typeof hasIconScript).toBe('boolean')
     expect(typeof hasOfficialSource).toBe('boolean')
   })
 })

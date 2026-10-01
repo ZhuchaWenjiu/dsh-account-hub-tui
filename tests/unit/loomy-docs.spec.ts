@@ -1,10 +1,23 @@
-import { readFileSync } from 'node:fs'
+import { existsSync, readFileSync } from 'node:fs'
 import { dirname, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { describe, expect, it } from 'vitest'
 
 const here = dirname(fileURLToPath(import.meta.url))
 const read = (rel: string) => readFileSync(resolve(here, rel), 'utf8')
+
+/**
+ * ⚠️ 这份协议文档**不入库**（`.gitignore` 的 `docs/loomy-protocol-notes.md`）——
+ * 它装的正是上面那条用例要求**不得**出现在公开 README/AGENTS.md 里的内容
+ * （AccessKey、`env-file-crypto`、排查脚本清单）。
+ *
+ * 因此「校验它存在且含这些细节」这条用例**只在本地存在该文件时才有意义**：
+ * 干净克隆 / CI，或本机删过它，`readFileSync` 会抛 **ENOENT** 把整轮测试判红。
+ * 那是**测试自身对本地私有产物的依赖**，不是产品缺陷 —— 故改为
+ * **存在性守卫 + 干净跳过**（与 `cline-icon.spec.ts` 对官方图标源的同一手法）。
+ */
+const LOCAL_NOTES = resolve(here, '../../docs/loomy-protocol-notes.md')
+const hasLocalNotes = existsSync(LOCAL_NOTES)
 
 /**
  * 文档回归：Loomy 的**特有差异**必须写进 README/AGENTS.md，
@@ -97,12 +110,19 @@ describe('Loomy 文档覆盖', () => {
     }
   })
 
-  it('不入库的协议文档确实存在且含这些细节', () => {
+  it.skipIf(!hasLocalNotes)('不入库的协议文档确实存在且含这些细节', () => {
     // 细节被移到这里（该文件在 .gitignore 里，故用 readFileSync 直读磁盘）
     const notes = read('../../docs/loomy-protocol-notes.md')
     expect(notes).toContain('AccessKey')
     expect(notes).toContain('env-file-crypto')
     expect(notes).toContain('scripts/loomy')
+  })
+
+  it('本地协议文档缺失时明确记录（便于解释上一条为何被跳过）', () => {
+    if (!hasLocalNotes) {
+      console.log(`\n[loomy-docs] 未找到本地协议文档：${LOCAL_NOTES}\n  → 私有细节校验已跳过。该文件在 .gitignore 内，干净克隆与 CI 本来就没有它，属预期。`)
+    }
+    expect(typeof hasLocalNotes).toBe('boolean')
   })
 
   it('AGENTS.md 记录 Loomy 的协议要点', () => {
