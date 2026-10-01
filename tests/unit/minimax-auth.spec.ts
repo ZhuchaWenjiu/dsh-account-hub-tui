@@ -144,6 +144,49 @@ describe('fetchModels', () => {
     }).fetchModelsWith(CRED)
     expect(models).toHaveLength(4)
   })
+
+  /**
+   * ⚠ **接线契约**：适配器判「这次拿到目录了吗」靠的是「返回空数组」，故
+   * 接线必须用 `fetchRemoteModelsOnly()`。若误用 `fetchModels()`（失败时回吐
+   * 兜底表），判据永不命中 ⇒ 兜底表被当成远端结果永久缓存，用户登录 / 网络
+   * 恢复后再也不会重拉。下面三条把两种语义钉死，防止以后有人「顺手统一」。
+   */
+  const only = (auth: MinimaxAuth, pool?: unknown): Promise<readonly { id: string }[]> =>
+    (auth as unknown as {
+      fetchRemoteModelsOnly: (p?: unknown) => Promise<readonly { id: string }[]>
+    }).fetchRemoteModelsOnly(pool)
+
+  it('★ fetchRemoteModelsOnly 在远端失败时返回空数组（不回吐兜底表）', async () => {
+    const fetcher = vi.fn().mockRejectedValue(new Error('network down'))
+    const auth = new MinimaxAuth(makeContext({
+      resolve: async () => ({ value: JSON.stringify(CRED) }),
+    }), { fetchImpl: fetcher as never })
+    expect(await only(auth)).toEqual([])
+  })
+
+  it('★ fetchRemoteModelsOnly 在未登录时返回空数组（不发请求）', async () => {
+    const fetcher = vi.fn()
+    const auth = new MinimaxAuth(makeContext(), { fetchImpl: fetcher as never })
+    expect(await only(auth)).toEqual([])
+    expect(fetcher).not.toHaveBeenCalled()
+  })
+
+  it('★ fetchRemoteModelsOnly 在远端成功时原样返回', async () => {
+    const fetcher = vi.fn().mockResolvedValue(json({
+      providers: [{
+        providerId: 'minimax',
+        config: {
+          models: {
+            'MiniMax-M3': { name: 'MiniMax-M3', limit: { context: 512_000, output: 128_000 } },
+          },
+        },
+      }],
+    }))
+    const auth = new MinimaxAuth(makeContext({
+      resolve: async () => ({ value: JSON.stringify(CRED) }),
+    }), { fetchImpl: fetcher as never })
+    expect((await only(auth)).map((m) => m.id)).toEqual(['MiniMax-M3'])
+  })
 })
 
 describe('refreshAll', () => {

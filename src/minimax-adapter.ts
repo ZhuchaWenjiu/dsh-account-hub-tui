@@ -40,6 +40,7 @@ import type {
 import type { Context } from '@deepseek-ai/cordis'
 import type { CredentialRef } from '@deepseek-ai/dsh-credentials'
 import { providerCatalogVisible } from './account-pool.js'
+import { RemoteCatalogGate } from './remote-catalog-gate.js'
 import type { AccountPool } from './account-pool.js'
 import { settingsNamespaceFor } from './settings-compat.js'
 import { httpErrorCode, collectImages } from './openai-compat.js'
@@ -179,6 +180,8 @@ export interface MinimaxAdapterOptions {
 export class MinimaxAdapter extends LlmAdapter {
   private readonly product: MinimaxProduct
   private remoteModels: readonly MinimaxModelEntry[] | undefined
+  /** 目录加载闸门：并发去重 + 失败/空结果冷却（见 `remote-catalog-gate.ts`）。 */
+  private readonly catalogGate = new RemoteCatalogGate()
 
   constructor(private readonly options: MinimaxAdapterOptions) {
     super()
@@ -190,23 +193,28 @@ export class MinimaxAdapter extends LlmAdapter {
     return { id, name: this.product.displayName }
   }
 
-  /** 取（并缓存）模型目录；远端失败回退兜底表。 */
+  /**
+   * 取远端模型目录；**失败时不把兜底表写进缓存**。
+   *
+   * ⚠ 原实现是 `this.remoteModels = fallback; return fallback` —— 把兜底表当成
+   * 「已加载」记下，于是一次瞬时失败会让该 provider **整个进程生命周期**都只剩
+   * 兜底模型（用户看不到自己的模型，且无从触发重试，只能重启）。
+   * 改为：只缓存**真实远端目录**，兜底表每次现算（纯本地、零成本），
+   * 并用 {@link RemoteCatalogGate} 的冷却挡住「每模型重试一次」的放大。
+   */
   private async loadModels(): Promise<readonly MinimaxModelEntry[]> {
     if (this.remoteModels !== undefined) return this.remoteModels
-    if (this.options.fetchRemoteModels !== undefined) {
-      try {
-        const fetched = await this.options.fetchRemoteModels()
-        if (fetched.length > 0) {
-          this.remoteModels = fetched
-          return fetched
-        }
-      } catch {
-        // 远端失败静默回退：模型目录是展示信息
-      }
+    const fetchRemote = this.options.fetchRemoteModels
+    if (fetchRemote !== undefined) {
+      await this.catalogGate.run(async () => {
+        const fetched = await fetchRemote()
+        if (fetched.length === 0) return false
+        this.remoteModels = fetched
+        return true
+      })
+      if (this.remoteModels !== undefined) return this.remoteModels
     }
-    const fallback = minimaxFallbackEntries(this.product)
-    this.remoteModels = fallback
-    return fallback
+    return minimaxFallbackEntries(this.product)
   }
 
   /**

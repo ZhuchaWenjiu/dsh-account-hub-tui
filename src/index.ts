@@ -983,7 +983,7 @@ export function apply(ctx: Context): void {
     // ⚠️ **必须走远端** —— 客户端内置静态表只有 3 个模型，远端下发 4 个，
     // 照抄内置表会漏掉 `MiniMax-M3.1-Flash-Preview`（用户截图里选中的那个）。
     // 失败时返回兜底表（适配器侧也有兜底）。
-    fetchRemoteModels: () => minimax.fetchModels(pool),
+    fetchRemoteModels: () => minimax.fetchRemoteModelsOnly(pool),
     // 图片字节桥接：模态按模型判定（远端 `modalities.input` 含 image，
     // 只有 M3.1-Flash-Preview 与 M3 是）。适配器声明不支持时会**报错**，
     // 不会把图片发出去让服务端 400。
@@ -1114,24 +1114,20 @@ const zcodeAdapter = registerZcodeLlm(ctx, {
     return await zcode.current()
   },
   refresh: async () => {
-    // ⚠ ZCode **没有** refresh 端点（与 Loomy 恒 false 同类，但原因不同）：
-    // 凭据是**静态**的（在官方客户端登录一次就固定下来）。
-    // 这里做的是「重读磁盘凭据并回写账号条目」——
-    // 使用户在官方客户端重新登录后，本插件无需重启即可用上新凭据。
-    const credential = await zcode.current()
-    if (credential === undefined) return
-    const available = await pool.getAvailableAccount(ZCODE.id, '')
-    // ⚠ `getAvailableAccount` 返回的可能是 `null`（本仓库该 API 的约定），
-    // 只判 `undefined` 会漏掉它 —— 用显式判空覆盖两者。
-    if (available === null || available === undefined) return
-    try {
-      await ctx.credentials.set(
-        credentialRef(available.entry.credentialRef),
-        JSON.stringify(credential),
-      )
-    } catch {
-      // 回写失败不影响请求（请求走磁盘凭据）。静默即可。
-    }
+    /**
+     * ⚠ ZCode **没有** refresh 端点（与 Loomy 恒 false 同类，但原因不同）：
+     * 凭据是**静态**的（在官方客户端登录一次就固定下来）。
+     *
+     * 这里做的是「重读凭据并回写账号条目」，使官方客户端重新登录后不重启即可生效。
+     *
+     * ⚠⚠ **绝不能用 `current()` + `getAvailableAccount()` 的组合**（审查发现的
+     * 真实缺陷，与 `refreshAll` 里记录的那个数据破坏同类）：`current()` 会**先读池**
+     * 且**不看 `enabled`**（它按数组顺序取第一个能解析的），而 `getAvailableAccount`
+     * **会过滤 `enabled`** —— 两者选的可能是**不同账号**，于是「把 A 的凭据写进 B 的
+     * ref」，30 分钟一轮就会串掉整池。
+     * 正确做法是交给 `refreshAll`：它逐账号读**自己的** ref、写回**自己的** ref。
+     */
+    await zcode.refreshAll(pool)
   },
   // ⚠ captcha 是**一次性**的 —— 每次调用都必须现产一个新 param。
   // 走 `zcode.mintCaptcha`：整个插件**共用一台**常驻浏览器
@@ -1164,7 +1160,7 @@ const zcodeAdapter = registerZcodeLlm(ctx, {
   readImageRequest: makeReadImageRequest(ctx),
   // 模型目录用静态白名单（实测可用的两个）—— 上游模型池含
   // 实测返回空响应的两条（GLM-5-Turbo / GLM-5.2），故不枚举远端。
-  fetchRemoteModels: () => zcode.fetchModels(),
+  fetchRemoteModels: () => zcode.fetchRemoteModelsOnly(),
   accountPool: pool,
   product: ZCODE,
   // 就绪判据 = 有可用凭据（插件自存或官方客户端凭据）。
@@ -1178,6 +1174,26 @@ const zcodeAdapter = registerZcodeLlm(ctx, {
   currentAccountId: () => activeZcodeAccountId.get(ZCODE.id),
 })
 
+/**
+ * ⚠ **必须用 `fetchRemoteModelsOnly()` 而不是 `fetchModels()`**（来自 PR #31
+ * `05e4ad7`，保留其与桥无关的部分；本地桥 `zcode-bridge.ts` 已随 PR #29 的
+ * 过时方案一并弃用，故这里只剩适配器这**一个**消费点）。
+ *
+ * 为什么必须有这条：适配器判「这次拿到目录了吗」的判据是「返回空数组」。
+ * 若接线用 `fetchModels()`（失败时回吐兜底表），那个判据**永不命中**
+ * ⇒ 兜底表被当成远端结果写进 `remoteModels` 并永久缓存，用户登录 /
+ * 网络恢复后**再也不会重拉**（连失败冷却都不会开），只能重启 DSH。
+ * 「回退兜底表」这件事只应由**展示侧**（适配器）做一次。
+ *
+ * ## 为什么不接本地桥（原 PR 的说明，保留供日后参考）
+ *
+ * 原 PR 让 ZCode 同时走一条「官方 pi-ai 声明式 provider + 本地 Anthropic
+ * 透明桥」的镜像 route（`zcode-free`），其核心假设是「每个请求必须现产
+ * captcha」。该假设已被 master 的大重构（`19226ca`）推翻：ZCode 3.14.4 起
+ * **推理不再校验 captcha**，只有领取才要 —— 桥每请求白产一个，白烧设备级
+ * 验证配额（阿里云同设备 150 次/小时）。故**只保留**「目录拉取不污染缓存 +
+ * 自愈两闸 + 写盘串行化」这些与桥无关的修复，桥与镜像整个弃用。
+ */
 
   // 一次性修复**老 TRAE 账号**的展示名（与上面 Raccoon 同类，同因）：
   // 服务端 ScreenName 是**按 uid 自动生成的默认名**（`用户26815487395`），

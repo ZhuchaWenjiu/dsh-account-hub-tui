@@ -94,6 +94,50 @@ describe('LoomyAdapter.listModels', () => {
     expect(models.map((m) => m.id)).toContain('qwen3.8-flash')
   })
 
+  /**
+   * ⚠ **兜底表不得被当成缓存**（真实缺陷，2026-08 起长期存在）。
+   *
+   * 原实现是 `this.remoteModels = fallback; return fallback`：一次瞬时失败会把
+   * 兜底表写进 `remoteModels`，此后 `if (this.remoteModels !== undefined)` 永远短路
+   * ⇒ 该 provider **整个进程生命周期**都只剩兜底模型，用户看不到自己的模型，
+   * 也无从触发重试，只能重启 DSH。
+   *
+   * 修好之后：兜底表每次现算，`remoteModels` 只装**真实远端目录**。
+   * 恢复时机由 `RemoteCatalogGate` 的冷却窗口决定（30s，见
+   * `tests/unit/remote-catalog-gate.spec.ts`），这里只锁「缓存没被污染」。
+   */
+  it('★ 远端失败后**不**把兜底表写进 remoteModels', async () => {
+    const adapter = makeAdapter({ fetchRemoteModels: async () => { throw new Error('boom') } })
+    expect(await adapter.listModels('loomy')).toHaveLength(8)
+    const cache = (adapter as unknown as { remoteModels: unknown }).remoteModels
+    expect(cache, '兜底表不得进缓存 —— 否则远端恢复后也永远看不到真实目录').toBeUndefined()
+  })
+
+  it('★ 远端返回空目录同样不落缓存（空结果也会被冷却挡住，不会每模型重试一次）', async () => {
+    let calls = 0
+    const adapter = makeAdapter({
+      fetchRemoteModels: async () => { calls += 1; return [] },
+    })
+    expect(await adapter.listModels('loomy')).toHaveLength(8)
+    // ⚠ 只应拉一次：`buildModelCatalog` 会为每个模型各调一次 resolveModel，
+    // 不去重/不冷却的话这里会变成 N 次串行请求。
+    expect(await adapter.listModels('loomy')).toHaveLength(8)
+    expect(await adapter.resolveModel('loomy', 'qwen3.8-flash')).toBeDefined()
+    expect(calls).toBe(1)
+    expect((adapter as unknown as { remoteModels: unknown }).remoteModels).toBeUndefined()
+  })
+
+  it('★ 远端成功时缓存生效：后续调用不再打网络', async () => {
+    let calls = 0
+    const adapter = makeAdapter({
+      fetchRemoteModels: async () => { calls += 1; return parseLoomyRemoteModels({ data: [remoteEntry()] }) },
+    })
+    await adapter.listModels('loomy')
+    await adapter.listModels('loomy')
+    await adapter.listModels('loomy')
+    expect(calls).toBe(1)
+  })
+
   it('无账号池时目录可见（headless/单测保守放行）', async () => {
     const adapter = makeAdapter()
     expect((await adapter.listModels('loomy')).length).toBeGreaterThan(0)

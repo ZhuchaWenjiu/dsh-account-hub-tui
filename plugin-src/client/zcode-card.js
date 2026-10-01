@@ -420,6 +420,10 @@ function ZcodeProviderCardBody({ rpcCall }) {
       if (reused) {
         setManualLoginUrl(null);
         await loadAccounts();
+        // ⚠ 必须顺手刷一次额度（真实缺陷）：自动刷额度的 effect 依赖
+        //   `[phase, accounts.length]`，而复用路径下**账号条数与 phase 都没变**
+        //   （账号本来就在池里），effect 不会重跑 ⇒ 额度行会一直停在旧数字上。
+        void refreshCredits(true);
         setNotice({ tone: 'ok', text: '已复用本机已有的账号凭据，未新建账号。' });
         return;
       }
@@ -436,6 +440,10 @@ function ZcodeProviderCardBody({ rpcCall }) {
       pollRef.current = setInterval(async () => {
         if (!mounted.current) { stopPoll(null); return; }
         if (Date.now() > deadline) {
+          // ⚠ 超时也要关掉登录窗、清掉手动链接（与成功路径一致）：否则用户
+          //   看到一个已经无用的「手动打开」链接，点进去只会打开一个已废弃的授权页。
+          if (loginWindow && !loginWindow.closed) loginWindow.close();
+          setManualLoginUrl(null);
           stopPoll({ tone: 'warn', text: '登录超时（5 分钟内未完成授权）。请重新点击「添加账号」。' });
           return;
         }

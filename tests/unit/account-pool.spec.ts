@@ -26,6 +26,24 @@ function createMockContext(
      * （由 `DSH_JET_HUB_STATE_DIR` 指到临时目录），测试用 `readLockDoc()` 读。
      */
     initialLoomyPermanentLocked?: boolean
+    /**
+     * 让 `replace()` 变成**可乱序的异步写**（模拟 `SettingsStore` 的真实后端）。
+     *
+     * 入参是本次要写的载荷，返回延迟毫秒数：延迟大的那次 `replace` 会**后**
+     * 完成，从而用它**更早**的快照覆盖磁盘。`undefined` = 立即完成
+     * （`FileStore` 的同步行为）。
+     *
+     * ⚠ 这是「磁盘级竞态」用例的唯一复现手段：内存副本总是收敛的，
+     * 分叉只发生在 `await store.save(...)` 的**完成顺序**上。
+     */
+    replaceDelayOf?: (value: { accounts?: ProviderAccountEntry[] }) => number | undefined
+    /**
+     * 让某次 `replace()` 抛错（模拟落盘失败）。判据是**调用序号**（0 基）。
+     *
+     * ⚠ 与 `replaceDelayOf` 的区别：这个决定「这次写失不失败」，用于验证
+     * 写队列**不被一次失败打断**（见对应用例）。
+     */
+    failReplaceOf?: (call: number) => boolean
   } = {},
 ) {
   let stored: {
@@ -45,6 +63,14 @@ function createMockContext(
   // 每次 replace 的完整载荷：用于断言「写账号时没有把黑名单抹掉」这类
   // 整体替换语义带来的数据丢失。
   const replacePayloads: Array<Record<string, unknown>> = []
+  let replaceCount = 0
+  /**
+   * 真正「落盘」的那份文档 —— 与 `stored` 的区别是它只被**完成**的写更新。
+   *
+   * `replaceDelayOf` 未配置时两者恒等（同步后端）；配置后它就是
+   * 「进程重启后会读到什么」，也就是竞态的可观测结果。
+   */
+  let onDisk: typeof stored = stored
   const mockSettings = {
     register: (_ns: string, _schema: unknown) => ({
       get: () => (options.staleReads ? visible : stored),
@@ -53,11 +79,20 @@ function createMockContext(
         disabledModels?: Record<string, Record<string, boolean>>
         loomyPermanentLocked?: boolean
       }) => {
+        const call = replaceCount
+        replaceCount += 1
+        if (options.failReplaceOf?.(call) === true) throw new Error('disk full')
+        const delay = options.replaceDelayOf?.(value)
+        if (delay !== undefined) {
+          await new Promise<void>((resolve) => { setTimeout(resolve, delay) })
+        }
         if (options.staleReads) {
           // 模拟滞后：get() 始终慢一拍，本次写入要等下一次 replace 才可见
           visible = stored
         }
         stored = value
+        // ⚠ 只有**完成**的写才落到"磁盘"上。乱序完成时后写的旧快照会覆盖新快照。
+        onDisk = value
         replaceCalls.push(value.accounts ?? [])
         replacePayloads.push(value as Record<string, unknown>)
       },
@@ -68,12 +103,15 @@ function createMockContext(
   return {
     replaceCalls,
     replacePayloads,
+    /** 已经**完成**的写最后落成的那份文档（= 模拟重启后读到的内容）。 */
+    diskAccounts: (): ProviderAccountEntry[] => onDisk.accounts ?? [],
     /**
      * 直接改写「后端里的文档」，用于模拟**同机另一条工作区里的旧版本代码**
      * 全量重写账号池文档（只带它认识的那几个键）。
      */
     overwriteStored(value: Record<string, unknown>): void {
       stored = value as typeof stored
+      onDisk = stored
       if (options.staleReads) visible = stored
     },
     logger: { warn: () => {}, info: () => {} },
@@ -515,6 +553,121 @@ describe('AccountPool', () => {
     await pool.removeAccount('nonexistent')
     const list = await pool.listAllAccounts()
     expect(list).toHaveLength(0)
+  })
+
+  /**
+   * ⚠ **删除与添加并发时不得丢账号**（审查发现）。
+   *
+   * 原实现是：`const accounts = this.readAccounts()` → `await credentials.unset(...)`
+   * → `writeAccounts(accounts.filter(...))` —— 那个 `await` 期间并发的
+   * `addAccount` 已经把新条目写进了 `cache` 与磁盘，而回写用的是**await 之前**
+   * 的快照 ⇒ 新账号被静默丢弃。`account.create`（登录成功即 addAccount）与
+   * `account.delete` 在这台机器上天然可并发（用户点了添加又点删除）。
+   *
+   * 修复：`await` 之后**重新读一次**再 filter（读到 write 之间没有 await，
+   * 这一段是原子的）。
+   */
+  it('★ removeAccount 与 addAccount 并发时不丢新增的账号', async () => {
+    await pool.addAccount(makeMockAccount({ id: 'keep', credentialRef: 'REF_KEEP' }))
+    await pool.addAccount(makeMockAccount({ id: 'victim', credentialRef: 'REF_VICTIM' }))
+
+    // 让 unset 真的让出到微任务队列之后（模拟真实 IO），期间插入一次 addAccount。
+    const removal = pool.removeAccount('victim')
+    await pool.addAccount(makeMockAccount({ id: 'added-later', credentialRef: 'REF_ADDED' }))
+    await removal
+
+    const ids = (await pool.listAllAccounts()).map(a => a.id).sort()
+    expect(ids).toEqual(['added-later', 'keep'])
+  })
+
+  /**
+   * ★ **磁盘级**竞态（审查发现的 Blocking；`writeAccounts` 里重读快照修不掉它）。
+   *
+   * 根因：`SettingsStore.save` 是 `await scope.replace(...)`，**完成顺序可与
+   * 发起顺序不同**。上面那条用例只看 `listAllAccounts()`（= `this.cache`，
+   * 内存总是收敛），故它在旧实现下也会绿 —— 磁盘分叉是**静默**的。
+   *
+   * 这里的后端让**第 0 次**写慢 30 ms、第 1 次写立即完成 ⇒ 先发起的删除
+   * 最后才落地，把后发起的添加覆盖掉。实测形态（旧实现）：
+   * `cache=["added","keep"]` 而 `disk=["keep"]`。
+   *
+   * 修复后写被 {@link AccountPool} 的 `queueStoreSave` 串行化，磁盘必然
+   * 收敛到最后一次排队的快照。
+   */
+  it('★ 磁盘级：异步后端下并发的删除与添加不得乱序覆盖（模拟 SettingsStore）', async () => {
+    /**
+     * 让**先发起**的那次写慢 40 ms ⇒ 它后完成，用它更早的快照覆盖磁盘。
+     *
+     * 判据用载荷内容（而非调用序号），这样无论实现怎么变，被拖慢的恒是
+     * 「含 victim 的那一份」= 旧快照。
+     */
+    const racingCtx = createMockContext([], {
+      replaceDelayOf: (value) =>
+        (value.accounts ?? []).some(a => a.id === 'victim') ? 40 : undefined,
+    })
+    const racingPool = new AccountPool(racingCtx as never)
+
+    await racingPool.addAccount(makeMockAccount({ id: 'keep', credentialRef: 'REF_KEEP' }))
+    await racingPool.addAccount(makeMockAccount({ id: 'victim', credentialRef: 'REF_VICTIM' }))
+
+    const removal = racingPool.removeAccount('victim')
+    await racingPool.addAccount(makeMockAccount({ id: 'added-later', credentialRef: 'REF_ADDED' }))
+    await removal
+
+    const memory = (await racingPool.listAllAccounts()).map(a => a.id).sort()
+    const disk = racingCtx.diskAccounts().map(a => a.id).sort()
+    // ★ 关键断言：磁盘必须与内存一致（旧实现这里 disk 会含 victim 而缺 added-later）。
+    expect(disk).toEqual(memory)
+    expect(disk).toEqual(['added-later', 'keep'])
+  })
+
+  /**
+   * ★ 并发的**两个删除**不得让已删账号在磁盘上复活。
+   *
+   * 旧实现实测：`cache=["keep"]` 而 `disk=["b","keep"]` —— 进程重启后
+   * 用户删掉的账号又回来了。
+   */
+  it('★ 磁盘级：并发删除两个账号时，磁盘上不得残留任何一个', async () => {
+    // 拖慢「还含 b」的那一份（= 较旧的快照），让它最后落地。
+    const racingCtx = createMockContext([], {
+      replaceDelayOf: (value) =>
+        (value.accounts ?? []).some(a => a.id === 'b') ? 40 : undefined,
+    })
+    const racingPool = new AccountPool(racingCtx as never)
+
+    await racingPool.addAccount(makeMockAccount({ id: 'keep', credentialRef: 'REF_KEEP' }))
+    await racingPool.addAccount(makeMockAccount({ id: 'a', credentialRef: 'REF_A' }))
+    await racingPool.addAccount(makeMockAccount({ id: 'b', credentialRef: 'REF_B' }))
+
+    const first = racingPool.removeAccount('a')
+    const second = racingPool.removeAccount('b')
+    await Promise.all([first, second])
+
+    const memory = (await racingPool.listAllAccounts()).map(a => a.id).sort()
+    const disk = racingCtx.diskAccounts().map(a => a.id).sort()
+    expect(disk).toEqual(memory)
+    expect(disk).toEqual(['keep'])
+  })
+
+  /**
+   * ★ 一次落盘失败不得让后续写全部拒绝（写队列的"断链"回归）。
+   *
+   * 若把队列直接串在会 reject 的 Promise 上，第一次失败后链上所有后续写都会
+   * 立刻以同一个错误拒绝 ⇒ 账号池进入**永不落盘**状态（且用户看到的是
+   * 「每次都失败」而找不到原因）。
+   */
+  it('★ 一次落盘失败之后，后续写仍能正常落盘（写队列不得断链）', async () => {
+    const ctx = createMockContext([], { failReplaceOf: (call) => call === 0 })
+    const brokenPool = new AccountPool(ctx as never)
+
+    // 第一次写必须**照旧抛给调用方**（登录成功后落盘失败不能假装成功）。
+    await expect(brokenPool.addAccount(makeMockAccount({ id: 'first', credentialRef: 'REF_1' })))
+      .rejects.toThrow('disk full')
+    // ★ 第二次必须能成功（若把队列直接串在会 reject 的 Promise 上，这里会永远失败）。
+    await brokenPool.addAccount(makeMockAccount({ id: 'second', credentialRef: 'REF_2' }))
+    const ids = (await brokenPool.listAllAccounts()).map(a => a.id).sort()
+    expect(ids).toEqual(['first', 'second'])
+    expect(ctx.diskAccounts().map(a => a.id)).toEqual(['first', 'second'])
   })
 
   it('should handle updateModelRateLimit for non-existent account gracefully', async () => {

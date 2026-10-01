@@ -355,7 +355,24 @@ export class MinimaxAuth extends Service {
    * ⚠️ **测试专用入口**（无需账号池）：`fetchModels` 是它的薄包装。
    */
   async fetchModelsWith(credential: MinimaxCredential): Promise<readonly MinimaxModelEntry[]> {
-    const fallback = this.product.fallbackModels.map(fallbackToEntry)
+    const raw = await this.fetchRawModels(credential)
+    return raw ?? this.product.fallbackModels.map(fallbackToEntry)
+  }
+
+  /**
+   * 拉取**裸**远端目录：拿到就是拿到，拿不到一律 `undefined`（**不**回退兜底表）。
+   *
+   * 这是全插件唯一一处真正解析远端模型目录的地方；两个公开入口的差别只在
+   * 「拿不到时回吐什么」：
+   * - {@link fetchModelsWith} / {@link fetchModels} ⇒ **展示侧**语义，回退兜底表；
+   * - {@link fetchRemoteModelsOnly} ⇒ **接线侧**语义，回 `[]`。
+   *
+   * ⚠ 把这个区分做在**这里**（而不是让接线自己去比对结果与兜底表）是刻意的：
+   * 兜底表内容可以被改写，若远端下发的恰好与兜底表相同，「比较内容」的判据会把
+   * 一次成功的拉取误判为失败。只有「解析函数返回了几个条目」这个**内部事实**
+   * 能可靠区分两者。
+   */
+  private async fetchRawModels(credential: MinimaxCredential): Promise<readonly MinimaxModelEntry[] | undefined> {
     try {
       const url = new URL(`${this.product.apiHost}${MINIMAX_MODELS_PATH}`)
       url.searchParams.set('region', this.product.region)
@@ -364,7 +381,7 @@ export class MinimaxAuth extends Service {
         headers: minimaxHeaders(credential),
         signal: AbortSignal.timeout(MINIMAX_REQUEST_TIMEOUT_MS),
       })
-      if (!response.ok) return fallback
+      if (!response.ok) return undefined
       const body: unknown = await response.json().catch(() => undefined)
       const entries = parseMinimaxModelsPayload(body)
       // ⚠️ 远端成功但解析出 0 条时也回退兜底表（避免空列表让整个 provider 消失）
@@ -375,7 +392,7 @@ export class MinimaxAuth extends Service {
         this.ctx.logger?.warn?.(
           `[${this.product.id}] 远端模型目录解析出 0 条，已回退兜底表`,
         )
-        return fallback
+        return undefined
       }
       return entries
     } catch (error) {
@@ -384,25 +401,48 @@ export class MinimaxAuth extends Service {
         `[${this.product.id}] 远端模型目录获取失败，已回退兜底表：`
         + `${error instanceof Error ? error.message : String(error)}`,
       )
-      return fallback
+      return undefined
     }
   }
 
   /** 拉取远端模型目录（账号池版本）。 */
   async fetchModels(pool?: AccountPool): Promise<readonly MinimaxModelEntry[]> {
-    let credential: MinimaxCredential | undefined
+    const credential = await this.resolveModelsCredential(pool)
+    if (credential === undefined) return this.product.fallbackModels.map(fallbackToEntry)
+    return this.fetchModelsWith(credential)
+  }
+
+  /** 目录拉取用哪份凭据：账号池优先，其次插件自存的默认凭据。 */
+  private async resolveModelsCredential(
+    pool?: AccountPool,
+  ): Promise<MinimaxCredential | undefined> {
     if (pool !== undefined) {
-      // ⚠️ `getAvailableAccount` 返回 **`{ entry, credential }`**（两层），
+      // ⚠ `getAvailableAccount` 返回 **`{ entry, credential }`**（两层），
       // **不是**「账号条目本身」—— 照抄既有 provider 的写法：
       // `const available = await pool.getAvailableAccount(id, ''); available?.credential`
       const available = await pool.getAvailableAccount(this.product.id, '')
-      if (available) {
-        credential = available.credential as unknown as MinimaxCredential
-      }
+      if (available) return available.credential as unknown as MinimaxCredential
     }
-    if (credential === undefined) credential = await this.resolveDefaultCredential()
-    if (credential === undefined) return this.product.fallbackModels.map(fallbackToEntry)
-    return this.fetchModelsWith(credential)
+    return await this.resolveDefaultCredential()
+  }
+  /**
+   * 只取**真远端**目录；未登录 / 上游失败 / 解析出 0 条 ⇒ `[]`。
+   *
+   * ⚠ 与 {@link fetchModels} 的区别是**不回退兜底表**，专供适配器与本地桥使用。
+   *
+   * 为什么必须有这条：适配器判「这次拿到目录了吗」的判据是「返回空数组」。
+   * 若接线用 `fetchModels()`（失败时回吐兜底表），那个判据**永不命中**
+   * ⇒ 兜底表被当成远端结果写进 `remoteModels` 并永久缓存，用户登录 /
+   * 网络恢复后**再也不会重拉**（连失败冷却都不会开），只能重启 DSH。
+   * 「回退兜底表」这件事只应由**展示侧**（适配器）做一次。
+   *
+   * 日志语义与 {@link fetchModelsWith} 一致（失败 / 解析 0 条都留 warn），
+   * 只是**不**把兜底表当结果返回。
+   */
+  async fetchRemoteModelsOnly(pool?: AccountPool): Promise<readonly MinimaxModelEntry[]> {
+    const credential = await this.resolveModelsCredential(pool)
+    if (credential === undefined) return []
+    return (await this.fetchRawModels(credential)) ?? []
   }
 }
 

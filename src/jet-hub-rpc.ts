@@ -31,7 +31,7 @@ import type { RaccoonAuth } from './raccoon-auth.js'
 import type { ZcodeAuth } from './zcode-auth.js'
 import { ZCODE } from './zcode-product.js'
 import type { ZcodeCredential } from './zcode.js'
-import { phoneFromUserId } from './zcode.js'
+import { phoneFromUserId, isUsableZcodeCredential } from './zcode.js'
 import type { ZcodeBalanceResult } from './zcode-upstream.js'
 import type { RaccoonCredential } from './raccoon.js'
 import type { StartedRaccoonLoginFlow } from './raccoon-login-page.js'
@@ -1637,10 +1637,24 @@ function registerJetHubEndpoints(
         const accounts = await pool.listAllAccounts()
         const entry = accounts.find((a) => a.id === req.accountId)
         if (!entry) return { ok: true, value: { done: false } }
-        // 检查凭据是否已实际写入（占位条目没有凭据）
+        // 检查凭据是否已实际写入（占位条目没有凭据）。
+        //
+        // ⚠ **不能只判「resolve 出了非空字符串」**（审查发现）：占位条目被
+        //   `credentials.set` 写入过一段**残缺 JSON** 时（例如只有 `zcode_jwt`、
+        //   没有 `device_mid`），`resolve` 照样返回字符串，UI 就会弹「账号已添加」
+        //   而实际上该账号一发请求就 `凭据无效`。这里对 zcode 追加**形状校验**。
         const ref = credentialRef(entry.credentialRef)
         const resolved = await ctx.credentials.resolve(ref)
         if (!resolved) return { ok: true, value: { done: false } }
+        if (entry.provider === ZCODE.id) {
+          let parsed: unknown
+          try {
+            parsed = JSON.parse(resolved.value)
+          } catch {
+            return { ok: true, value: { done: false } }
+          }
+          if (!isUsableZcodeCredential(parsed)) return { ok: true, value: { done: false } }
+        }
         return { ok: true, value: { done: true, success: true } }
       }
 

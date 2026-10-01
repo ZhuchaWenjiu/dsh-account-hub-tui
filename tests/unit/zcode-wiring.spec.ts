@@ -338,6 +338,124 @@ describe('ZCode 无实例依赖（核心架构声明）', () => {
   })
 })
 
+/**
+ * ★ **自愈链路的两道闸**（审查补的回归防线）。
+ *
+ * `adoptOfficialCredential` 是本插件里**唯一**会把「磁盘上官方客户端的凭据」
+ * 写进某个账号 ref 的地方，故它也是唯一可能重演历史数据破坏缺陷的入口。
+ * 历史缺陷：旧 `refreshAll` 拿池里第一个可用账号的凭据去覆盖**每一个** ref，
+ * 30 分钟一轮把账号 A 的凭据铺满整池。
+ */
+describe('ZCode 自愈链路的两道闸（★ 防跨账号覆盖）', () => {
+  const OFFICIAL = {
+    zcode_jwt: 'official-jwt',
+    device_mid: 'official-mid',
+    user_id: 'u-official',
+    account_label: '官方账号',
+  }
+
+  it('★ 闸①：目标 ref 已有可用凭据 ⇒ 绝不覆盖（原样返回 undefined）', async () => {
+    const ctx = makeCtx()
+    await ctx.credentials.set('TARGET' as never, JSON.stringify({
+      zcode_jwt: 'own-jwt', device_mid: 'own-mid', user_id: 'u-own',
+    }))
+    const auth = new ZcodeAuth(ctx, { readCredential: () => OFFICIAL as never })
+    expect(await auth.adoptOfficialCredential('TARGET')).toBeUndefined()
+    // 原凭据必须一字未动。
+    const got = JSON.parse((await ctx.credentials.resolve('TARGET' as never))?.value ?? '{}')
+    expect(got.zcode_jwt).toBe('own-jwt')
+  })
+
+  /**
+   * ⚠ **闸①′（审查发现的缺陷）**：`readCredentialFromRef` 对「从未写入」与
+   * 「写了但损坏」**都返回 `undefined`**。若只拿它当闸① 判据，一个已损坏、
+   * 但**确实属于某个账号**的 ref 会被当成孤儿，被本机凭据**静默覆盖**
+   * —— 那份损坏数据可能只是少一个字段、还能救回来。
+   */
+  it('★ 闸①′：ref 里有内容但已损坏 ⇒ 失败关闭（不覆盖，也不静默）', async () => {
+    const ctx = makeCtx()
+    // 合法的 JSON，但缺 device_mid ⇒ isUsableZcodeCredential 为 false。
+    await ctx.credentials.set('TARGET' as never, JSON.stringify({ zcode_jwt: 'half-a-credential' }))
+    const auth = new ZcodeAuth(ctx, { readCredential: () => OFFICIAL as never })
+    expect(await auth.adoptOfficialCredential('TARGET')).toBeUndefined()
+    // ★ 关键：损坏内容必须**原样保留**（用户还能自己看一眼 / 手动修）。
+    const got = JSON.parse((await ctx.credentials.resolve('TARGET' as never))?.value ?? '{}')
+    expect(got.zcode_jwt).toBe('half-a-credential')
+    expect(got.device_mid).toBeUndefined()
+  })
+
+  it('★ 闸①′：连 JSON 都不是时同样失败关闭（不覆盖）', async () => {
+    const ctx = makeCtx()
+    await ctx.credentials.set('TARGET' as never, 'not-json-at-all')
+    const auth = new ZcodeAuth(ctx, { readCredential: () => OFFICIAL as never })
+    expect(await auth.adoptOfficialCredential('TARGET')).toBeUndefined()
+    expect((await ctx.credentials.resolve('TARGET' as never))?.value).toBe('not-json-at-all')
+  })
+
+  it('★ 闸②：本机凭据的 user_id 已被别的账号持有 ⇒ 拒绝写入', async () => {
+    const ctx = makeCtx()
+    // 池里已有其它账号（id 为 'other'）持有 u-official。
+    const pool = {
+      listAccountsByProvider: () => [
+        { id: 'other', credentialRef: 'REF_OTHER' },
+        { id: 'target', credentialRef: 'TARGET' },
+      ],
+      findAccountIdByIdentityField: async () => 'other',
+    } as unknown as AccountPool
+    const auth = new ZcodeAuth(ctx, { readCredential: () => OFFICIAL as never })
+    expect(await auth.adoptOfficialCredential('TARGET', pool)).toBeUndefined()
+    expect(await ctx.credentials.resolve('TARGET' as never)).toBeUndefined()
+  })
+
+  /**
+   * ⚠ **闸②′（审查发现的缺陷）**：`user_id` 缺失时旧代码**整个跳过**去重 ——
+   * 而 `findAccountIdByIdentityField` 本来就跳过没有该字段的条目，
+   * 于是在「老 ide 凭据（无 user_id）+ 池里已有别的账号」这个组合下，
+   * 同一份凭据会被写进多个 ref，正是要防的跨账号覆盖。
+   */
+  it('★ 闸②′：本机凭据缺 user_id 且池里另有账号 ⇒ 失败关闭', async () => {
+    const ctx = makeCtx()
+    const noId = { zcode_jwt: 'official-jwt', device_mid: 'official-mid' }
+    const pool = {
+      listAccountsByProvider: () => [
+        { id: 'other', credentialRef: 'REF_OTHER' },
+        { id: 'target', credentialRef: 'TARGET' },
+      ],
+    } as unknown as AccountPool
+    const auth = new ZcodeAuth(ctx, { readCredential: () => noId as never })
+    expect(await auth.adoptOfficialCredential('TARGET', pool)).toBeUndefined()
+    expect(await ctx.credentials.resolve('TARGET' as never)).toBeUndefined()
+  })
+
+  /**
+   * ⚠ 反向：**池里只有这一个账号**时，「覆盖别人」在物理上不可能，
+   * 此时必须放行 —— 否则 ⑦「凭据未配置」的自愈能力会被一起砍掉。
+   */
+  it('★ 闸②′ 反向：池里只有目标账号时仍放行（保住 ⑦ 的自愈）', async () => {
+    const ctx = makeCtx()
+    const noId = { zcode_jwt: 'official-jwt', device_mid: 'official-mid' }
+    const pool = {
+      listAccountsByProvider: () => [{ id: 'target', credentialRef: 'TARGET' }],
+    } as unknown as AccountPool
+    const auth = new ZcodeAuth(ctx, { readCredential: () => noId as never })
+    const adopted = await auth.adoptOfficialCredential('TARGET', pool)
+    expect(adopted?.zcode_jwt).toBe('official-jwt')
+    expect((await ctx.credentials.resolve('TARGET' as never))?.value).toContain('official-jwt')
+  })
+
+  it('★ 两条闸都过时才写入（正常自愈路径）', async () => {
+    const ctx = makeCtx()
+    const pool = {
+      listAccountsByProvider: () => [{ id: 'target', credentialRef: 'TARGET' }],
+      findAccountIdByIdentityField: async () => '',
+    } as unknown as AccountPool
+    const auth = new ZcodeAuth(ctx, { readCredential: () => OFFICIAL as never })
+    const adopted = await auth.adoptOfficialCredential('TARGET', pool)
+    expect(adopted?.user_id).toBe('u-official')
+    expect((await ctx.credentials.resolve('TARGET' as never))?.value).toContain('official-jwt')
+  })
+})
+
 describe('ZCode 客户端接入（缺口 3 / 4 / 5）', () => {
   it('★ PROVIDERS 里已登记 zcode（否则 Jet Hub 根本没这个面板）', () => {
     const source = readClient('jet-hub.js')

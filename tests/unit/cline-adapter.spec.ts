@@ -589,3 +589,103 @@ describe('Cline 接线（源码级回归）', () => {
     expect(source).toMatch(/cline:\s*Object\.freeze\(\{\s*balance:\s*true,\s*dailyCheckin:\s*false\s*\}\)/)
   })
 })
+
+/**
+ * ⚠ **「这次到底拿到远端目录没有」的判据必须是 warnings / remote，不能是 `models.length`**
+ * （审查发现的死代码）。
+ *
+ * `mergeClineModels` 会**无条件**把兜底表并进 `models`（这是展示需要 —— 目录服务
+ * 抖动时用户的模型列表不该整个消失），实测两个端点全挂时 `models.length` 仍是 5。
+ * 故 `if (models.length === 0) return false` 永远不命中 ⇒ 冷却永不触发，
+ * 兜底表被当成远端结果永久缓存（`if (this.remoteModels !== undefined) return` 短路），
+ * 网络恢复后也不会重拉，只能重启 DSH。
+ */
+describe('ClineAdapter 目录失败判据（★ 不能看 models.length）', () => {
+  it('★ 真接线：两个端点全挂 ⇒ models 里仍有兜底表（非空）但绝不落缓存', async () => {
+    // ★ 不覆盖 loadModels：**走真实接线** `loadClineModels`（两个端点各一次请求），
+    //   这才是生产形态 —— 注入式 loadModels 可以省略 `remote`，从而掩盖这个缺陷。
+    const adapter = makeAdapter({
+      loadModels: undefined,
+      fetchImpl: (async () => { throw new Error('network down') }) as never,
+    })
+    const listed = await adapter.listModels('cline')
+    // 兜底表被并进来了（展示需要：目录抖动不该让模型列表整个消失）。
+    expect(listed.length).toBeGreaterThan(0)
+    expect(listed.length).toBe(CLINE.fallbackModels.length)
+    // ★ 但它**不是**远端目录，绝不能当成「已加载」缓存下来。
+    expect((adapter as unknown as { remoteModels: unknown }).remoteModels).toBeUndefined()
+  })
+
+  it('★ 真接线：失败后再次 listModels 不再重拉（冷却挡住放大）', async () => {
+    let calls = 0
+    const adapter = makeAdapter({
+      loadModels: undefined,
+      fetchImpl: (async (url: string | URL | Request) => {
+        calls += 1
+        void url
+        throw new Error('network down')
+      }) as never,
+    })
+    await adapter.listModels('cline')
+    await adapter.listModels('cline')
+    await adapter.resolveModel('cline', 'cline-free/deepseek-v4.1-flash')
+    // 真实接线有两个端点（recommended-models + models）⇒ 首次失败最多 2 次请求。
+    // 关键：**不随调用次数增长**（旧实现看 models.length，每次都会重来一遍）。
+    expect(calls).toBeLessThanOrEqual(2)
+  })
+
+  it('★ warnings 非空且 models 非空时仍只拉一次（冷却生效）', async () => {
+    let calls = 0
+    const adapter = makeAdapter({
+      loadModels: async () => {
+        calls += 1
+        return {
+          models: CLINE.fallbackModels.map((m) => ({ ...m, isFree: m.isFree === true })) as never,
+          warnings: ['boom'],
+        }
+      },
+    })
+    await adapter.listModels('cline')
+    await adapter.listModels('cline')
+    await adapter.resolveModel('cline', 'cline-free/deepseek-v4.1-flash')
+    // 旧实现（看 models.length）每次都会返回 true，calls 会变成 3。
+    expect(calls).toBe(1)
+  })
+
+  it('★ 显式给了 remote（真接线形态）时按其内容判定：有远端 ⇒ 落缓存', async () => {
+    let calls = 0
+    const adapter = makeAdapter({
+      loadModels: async () => {
+        calls += 1
+        return {
+          models: MODELS,
+          warnings: [],
+          remote: { freeIds: ['cline-free/deepseek-v4.1-flash'], remoteIds: [], entries: [] },
+        }
+      },
+    })
+    await adapter.listModels('cline')
+    await adapter.listModels('cline')
+    expect(calls).toBe(1)
+    expect((adapter as unknown as { remoteModels: unknown }).remoteModels).toBeDefined()
+  })
+
+  it('★ 显式给了 remote 但远端全空 ⇒ 不落缓存，且冷却挡住后续重试', async () => {
+    let calls = 0
+    const adapter = makeAdapter({
+      loadModels: async () => {
+        calls += 1
+        // `models` 里有兜底表（非空），但 `remote` 说明远端一条都没拿到。
+        return {
+          models: MODELS,
+          warnings: ['recommended-models boom', 'models boom'],
+          remote: { freeIds: [], remoteIds: [], entries: [] },
+        }
+      },
+    })
+    await adapter.listModels('cline')
+    await adapter.listModels('cline')
+    expect(calls).toBe(1)
+    expect((adapter as unknown as { remoteModels: unknown }).remoteModels).toBeUndefined()
+  })
+})

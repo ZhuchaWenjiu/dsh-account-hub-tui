@@ -273,6 +273,28 @@ export class ZcodeAuth extends Service {
   }
 
   /**
+   * 该 ref 里**有没有存过任何东西**（不做形状校验）。
+   *
+   * ⚠ 与 {@link readCredentialFromRef} 的区别很关键：后者对「从未写入」和
+   * 「写进去了但 JSON 损坏 / 形状不全」**都返回 `undefined`**。若拿它当闸①
+   * 的判据，一个**已损坏但确实属于某个账号**的 ref 会被当成孤儿，被本机凭据
+   * 静默覆盖 —— 而那正是审查指出的「永久覆盖且无日志」缺陷。
+   *
+   * 这里用 `credentials.resolve` 的**存在性**（不看内容）区分两种情况，
+   * 让闸①对「有东西但坏了」**失败关闭**：调用方会 warn 让用户手动删除重登。
+   */
+  private async hasStoredCredential(ref: CredentialRef): Promise<boolean> {
+    try {
+      const resolved = await this.ctx.credentials.resolve(ref)
+      return resolved !== undefined && resolved !== null
+        && typeof resolved.value === 'string' && resolved.value.length > 0
+    } catch {
+      // resolve 抛错（存储损坏）⇒ 保守当作「有东西」，不覆盖。
+      return true
+    }
+  }
+
+  /**
    * 读**本机官方客户端**那份凭据（纯磁盘读取，不经账号池）。
    *
    * 供 ⑯「添加账号先复用本机已有账号」使用 —— 与 `current()` 的区别：
@@ -356,9 +378,15 @@ export class ZcodeAuth extends Service {
    *
    * - 闸①：目标 ref **自己解析不出**凭据（`readCredentialFromRef` 为 `undefined`）。
    *   能解析出就**原样返回**，绝不覆盖 —— 这是 `refreshAccountCredential` 的同款判据。
+   *   ⚠ **但「解析不出」必须再分成两种**（审查发现的缺陷）：真的从未写入 vs
+   *   写进去了但 JSON 损坏 / 形状不全。后者若被当成孤儿收编，就是**静默覆盖一份
+   *   可能还救得回来的凭据**。故这里用 `hasStoredCredential` 再判一次：
+   *   有内容但解析不出 ⇒ **失败关闭**（warn + 返回 `undefined`），让用户手动删除重登。
    * - 闸②：本机凭据的 `user_id` **没有被池里其它账号持有**
    *   （`findAccountIdByIdentityField` 查不到，或查到的就是目标自己）。
    *   否则说明这份凭据是**别的账号**的，写进去就是重犯覆盖缺陷。
+   *   ⚠ `user_id` **缺失**时同样**失败关闭**：`findAccountIdByIdentityField` 会
+   *   跳过没有该字段的条目，去重判据直接失效，一次写入可能同时落进两个 ref。
    *
    * ## 为什么读 `readCredential()` 而不是 `current()`
    *
@@ -378,6 +406,14 @@ export class ZcodeAuth extends Service {
     // 闸①：该 ref 自己已有可用凭据 ⇒ 什么都不做（绝不覆盖）。
     const own = await this.readCredentialFromRef(ref)
     if (own !== undefined) return undefined
+    // 闸①′（审查发现的缺陷）：ref 里**有东西**但解析不出来 ⇒ 那是**损坏的凭据**，
+    // 不是孤儿条目。收编它就等于静默覆盖一份可能还救得回来的数据，故失败关闭。
+    if (await this.hasStoredCredential(ref)) {
+      this.lastError = `\`${refName}\` 里存有凭据但已损坏 / 字段不全，`
+        + '已跳过（不会覆盖它）。请在 Jet Hub 里删除该账号后重新添加。'
+      this.ctx.logger?.warn?.(`[jet-hub] zcode ${this.lastError}`)
+      return undefined
+    }
 
     // 读**磁盘上**的官方客户端凭据（不经账号池，见上面的说明）。
     let official: ZcodeCredential | undefined
@@ -397,10 +433,36 @@ export class ZcodeAuth extends Service {
         this.lastError = `本机官方凭据属于账号 ${holder}，不写入 ${refName}（防止跨账号覆盖）`
         return undefined
       }
+    } else if (pool !== undefined && this.hasOtherZcodeAccounts(refName, pool)) {
+      /**
+       * ⚠ **闸②必须失败关闭**（审查发现的缺陷）：`user_id` 缺失时旧代码**整个跳过**
+       * 去重 —— 而 `findAccountIdByIdentityField` 本来就跳过没有该字段的条目，
+       * 于是在「老 ide 凭据 + 池里已有别的账号」这个组合下，同一份凭据会被
+       * 写进多个 ref，正是要防的跨账号覆盖。
+       *
+       * 只在**池里确实存在**其它 zcode 账号时收紧：池里只有这一个目标账号时，
+       * 「覆盖别人」在物理上不可能，此时放行以免把 ⑦ 的自愈能力也一起砍掉。
+       */
+      this.lastError = '本机官方凭据缺少 user_id，无法确认它是否属于别的账号，'
+        + `故不写入 ${refName}（防止跨账号覆盖）`
+      this.ctx.logger?.warn?.(`[jet-hub] zcode ${this.lastError}`)
+      return undefined
     }
 
     await this.ctx.credentials.set(ref, JSON.stringify(official))
     return official
+  }
+
+  /** 池里是否存在**除该 ref 所属账号以外**的其它 zcode 账号。 */
+  private hasOtherZcodeAccounts(refName: string, pool: AccountPool): boolean {
+    try {
+      const mine = this.accountIdOf(refName, pool)
+      return pool.listAccountsByProvider(this.product.id)
+        .some((entry) => entry.id !== mine || entry.credentialRef !== refName)
+    } catch {
+      // 池异常 ⇒ 保守当作「有别的账号」（更安全：拦住写入）。
+      return true
+    }
   }
 
   /** 由 ref 名反查它对应的账号 id（闸②用来放行「凭据就是自己的」这种情形）。 */
@@ -874,11 +936,8 @@ export class ZcodeAuth extends Service {
      *
      * ⇒ 档位、视觉能力、窗口、输出上限**全部以上游为准**。
      */
-    const credential = await this.current()
-    if (credential !== undefined) {
-      const remote = await fetchZcodeModels(credential, this.fetchImpl)
-      if (remote !== undefined && remote.length > 0) return remote
-    }
+    const remote = await this.fetchRemoteModelsOnly()
+    if (remote.length > 0) return remote
     // 上游不可用（未登录 / 网络异常）→ 回退兜底表（其值已与上游对齐）。
     return this.product.fallbackModels.map((model) => ({
       id: model.id,
@@ -891,6 +950,24 @@ export class ZcodeAuth extends Service {
         ? { defaultReasoningLevel: model.defaultReasoningLevel }
         : {},
     }))
+  }
+
+  /**
+   * 只取**真远端**目录；未登录 / 上游失败 / 上游解析出 0 条 ⇒ `[]`。
+   *
+   * ⚠ 与 {@link fetchModels} 的区别是**不回退兜底表**，专供适配器与本地桥使用。
+   *
+   * 为什么必须有这条：适配器判「这次拿到目录了吗」的判据是「返回空数组」。
+   * 若接线用 `fetchModels()`（失败时回吐兜底表），那个判据**永不命中**
+   * ⇒ 兜底表被当成远端结果写进 `remoteModels` 并永久缓存，用户登录 /
+   * 网络恢复后**再也不会重拉**（连失败冷却都不会开），只能重启 DSH。
+   * 「回退兜底表」这件事只应由**展示侧**（适配器）做一次。
+   */
+  async fetchRemoteModelsOnly(): Promise<ZcodeRemoteModelLike[]> {
+    const credential = await this.current()
+    if (credential === undefined) return []
+    const remote = await fetchZcodeModels(credential, this.fetchImpl)
+    return remote !== undefined && remote.length > 0 ? [...remote] : []
   }
 
   // ===== 签到（与 CodeArts / Buddy 等共用 CheckinStatus / ClaimOutcome 形状）=====
@@ -1109,6 +1186,10 @@ export class ZcodeAuth extends Service {
    * ZCode **不可续期**，故这里没有「续期」动作；做的是**逐账号对账**：
    * 每个账号重新解析**自己的** ref，能解出就写回自己（规范化字段），
    * 解不出就**跳过并告警**（不填别人的凭据）。
+   *
+   * ⚠ **必须用它，不能自己写 `current()` + `getAvailableAccount()`**：
+   * `current()` 先读池且**不看 `enabled`**，`getAvailableAccount` **过滤 `enabled`**，
+   * 两者可能指向不同账号 ⇒ 「A 的凭据写进 B 的 ref」（见 `src/index.ts` 的 `refresh`）。
    *
    * ⚠ **只按 `refreshable` 过滤、不看 `enabled`**（`AGENTS.md` 既有约定：
    * 停用只影响自动选号，与凭据新鲜度无关）。

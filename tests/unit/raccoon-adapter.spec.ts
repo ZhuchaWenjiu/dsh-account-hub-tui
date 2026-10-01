@@ -3,6 +3,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { GenerateOptions, StreamChunk } from '@deepseek-ai/dsh-llm'
 import { RACCOON } from '../../src/raccoon-product.js'
 import { RaccoonAdapter, registerRaccoonLlm } from '../../src/raccoon-adapter.js'
+import type { RaccoonRemoteModel } from '../../src/raccoon-adapter.js'
 import type { RaccoonCredential } from '../../src/raccoon.js'
 import { raccoonDisplayName } from '../../src/raccoon.js'
 import type { AccountPool } from '../../src/account-pool.js'
@@ -408,5 +409,58 @@ describe('registerRaccoonLlm', () => {
     services.push(adapter as unknown as { [Symbol.dispose]?: () => void })
     expect(registered).toContain('raccoon')
     expect(adapter).toBeInstanceOf(RaccoonAdapter)
+  })
+})
+
+/**
+ * ⚠ **目录缓存不得被兜底表污染**（全仓同型缺陷，2026-08 起长期存在）。
+ *
+ * 原实现 `this.remoteModels = fallback; return fallback` 把兜底表当成「已加载」
+ * 记下 ⇒ 一次瞬时失败就让它**整个进程生命周期**都只剩兜底模型：用户看不到自己的
+ * 模型，且无从触发重试（`if (this.remoteModels !== undefined) return` 永远短路），
+ * 只能重启 DSH。同批修好的还有 loomy / minimax / zcode 三个同型适配器。
+ *
+ * 另见 `tests/unit/remote-catalog-gate.spec.ts`（并发去重 + 失败冷却）。
+ */
+describe('RaccoonAdapter 目录缓存语义（★ 兜底表不进缓存）', () => {
+  function makeFailing(fetchRemoteModels: () => Promise<RaccoonRemoteModel[]>): RaccoonAdapter {
+    const adapter = new RaccoonAdapter({
+      credentialRef: 'RACCOON_ACCESS_TOKEN' as never,
+      resolveCredential: async () => CRED,
+      refresh: async () => {},
+      fetchRemoteModels,
+    })
+    services.push(adapter as unknown as { [Symbol.dispose]?: () => void })
+    return adapter
+  }
+
+  it('★ 远端抛错时不把兜底表写进 remoteModels', async () => {
+    const adapter = makeFailing(async () => { throw new Error('network down') })
+    expect((await adapter.listModels('raccoon')).length).toBeGreaterThan(0)
+    expect((adapter as unknown as { remoteModels: unknown }).remoteModels).toBeUndefined()
+  })
+
+  it('★ 远端返回空目录时不落缓存，且只拉一次（不被每个模型的 resolveModel 放大）', async () => {
+    let calls = 0
+    const adapter = makeFailing(async () => { calls += 1; return [] })
+    expect((await adapter.listModels('raccoon')).length).toBeGreaterThan(0)
+    expect((await adapter.listModels('raccoon')).length).toBeGreaterThan(0)
+    await adapter.resolveModel('raccoon', 'sn-glm-5-3')
+    expect(calls).toBe(1)
+    expect((adapter as unknown as { remoteModels: unknown }).remoteModels).toBeUndefined()
+  })
+
+  it('远端成功时缓存生效（不破坏既有「成功即缓存」约定）', async () => {
+    let calls = 0
+    const adapter = makeFailing(async () => {
+      calls += 1
+      return [{
+        id: 'sn-glm-5-3', name: 'GLM-5-3 · x0.75', contextWindow: 1_000_000,
+        maxTokens: 100_000, supportsImage: false,
+      }] as RaccoonRemoteModel[]
+    })
+    await adapter.listModels('raccoon')
+    await adapter.listModels('raccoon')
+    expect(calls).toBe(1)
   })
 })

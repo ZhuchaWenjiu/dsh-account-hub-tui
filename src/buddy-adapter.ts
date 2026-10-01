@@ -18,6 +18,7 @@ import {
   ReasoningEffortId,
 } from '@deepseek-ai/dsh-llm'
 import { AccountPool, providerCatalogVisible } from './account-pool.js'
+import { RemoteCatalogGate } from './remote-catalog-gate.js'
 import { settingsNamespaceFor } from './settings-compat.js'
 import { RATE_LIMIT_FALLBACK_MS, isRateLimited, parseRateLimitError } from './llm-adapter.js'
 import { ToolCallId } from '@deepseek-ai/dsh-llm'
@@ -783,6 +784,11 @@ export class BuddyAdapter extends LlmAdapter {
   private readonly sessionId: string
   /** 动态模型缓存（首次 listModels 成功后填充）。 */
   private remoteModels: BuddyRemoteModel[] | undefined
+  /**
+   * 目录加载闸门：并发去重 + 失败/空结果冷却。
+   * 依据见 `src/remote-catalog-gate.ts`（首屏「加载模型巨长」的实测归因）。
+   */
+  private readonly catalogGate = new RemoteCatalogGate()
   /** 远端下发的模型元数据（id → 能力），listModels/resolveModel/stream 共用。 */
   private remoteMeta: ReadonlyMap<string, BuddyRemoteModel> = new Map()
   /** 远端下发的模型上下文窗口（/v3/config data.models[].maxInputTokens）。 */
@@ -857,25 +863,27 @@ export class BuddyAdapter extends LlmAdapter {
   }
 
   private async ensureRemoteModels(): Promise<void> {
-    if (this.remoteModels !== undefined || this.options.fetchRemoteModels === undefined) return
-    try {
-      const models = await this.options.fetchRemoteModels()
-      if (models.length > 0) {
-        // /v3/config data.models[] 是权威来源（对齐 Rust TUI buddy_context_limits
-        // 注入逻辑）：远端下发的上下文窗口优先于静态 fallback 表；
-        // 能力字段（supportsImages / reasoning.supportedEfforts）同理。
-        const reconciled = this.reconcileWithFallback(models)
-        this.remoteModels = reconciled
-        this.remoteMeta = new Map(reconciled.map((model) => [model.id, model]))
-        this.remoteContextWindows = new Map(
-          reconciled
-            .filter((model) => model.contextWindow !== undefined)
-            .map((model) => [model.id, model.contextWindow as number]),
-        )
-      }
-    } catch {
-      // 远端不可用：回退静态列表
-    }
+    const fetchRemote = this.options.fetchRemoteModels
+    if (this.remoteModels !== undefined || fetchRemote === undefined) return
+    // 闸门：并发去重 + 失败/空结果冷却（详见 src/remote-catalog-gate.ts 的
+    // 实测依据）。Buddy 的目录端点超时上限 60s，失败不冷却会让首屏在
+    // 「每个模型重试一次」的放大下长时间空转。
+    await this.catalogGate.run(async () => {
+      const models = await fetchRemote()
+      if (models.length === 0) return false
+      // /v3/config data.models[] 是权威来源（对齐 Rust TUI buddy_context_limits
+      // 注入逻辑）：远端下发的上下文窗口优先于静态 fallback 表；
+      // 能力字段（supportsImages / reasoning.supportedEfforts）同理。
+      const reconciled = this.reconcileWithFallback(models)
+      this.remoteModels = reconciled
+      this.remoteMeta = new Map(reconciled.map((model) => [model.id, model]))
+      this.remoteContextWindows = new Map(
+        reconciled
+          .filter((model) => model.contextWindow !== undefined)
+          .map((model) => [model.id, model.contextWindow as number]),
+      )
+      return true
+    })
   }
 
   /**

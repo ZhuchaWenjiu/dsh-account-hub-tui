@@ -23,6 +23,7 @@ import { LlmAdapter, LlmError, ReasoningEffortId } from '@deepseek-ai/dsh-llm'
 import type { GenerateOptions, LlmModelInfo, LlmProviderInfo, LlmResolvedModelInfo, StreamChunk } from '@deepseek-ai/dsh-llm'
 import { ToolCallId } from '@deepseek-ai/dsh-llm'
 import { AccountPool, providerCatalogVisible } from './account-pool.js'
+import { RemoteCatalogGate } from './remote-catalog-gate.js'
 import { settingsNamespaceFor } from './settings-compat.js'
 import {
   TRAE_DEFAULT_MODEL,
@@ -592,6 +593,11 @@ export class TraeAdapter extends LlmAdapter {
   private readonly fetchImpl: typeof fetch
   /** 动态模型缓存。 */
   private remoteModels: TraeRemoteModel[] | undefined
+  /**
+   * 目录加载闸门：并发去重 + 失败/空结果冷却。
+   * 依据见 `src/remote-catalog-gate.ts`（首屏「加载模型巨长」的实测归因）。
+   */
+  private readonly catalogGate = new RemoteCatalogGate()
   /** 远端模型元数据索引。 */
   private remoteMeta: ReadonlyMap<string, TraeRemoteModel> = new Map()
   /** 产品级兜底模型索引。 */
@@ -618,14 +624,18 @@ export class TraeAdapter extends LlmAdapter {
 
   /** 懒加载远端模型目录（仅拉取一次）。 */
   private async ensureRemoteModels(): Promise<void> {
-    if (this.remoteModels !== undefined || this.options.fetchRemoteModels === undefined) return
-    try {
-      const models = await this.options.fetchRemoteModels()
-      if (models.length > 0) {
-        this.remoteModels = models
-        this.remoteMeta = new Map(models.map((model) => [model.id, model]))
-      }
-    } catch { /* 远端不可用：回退兜底目录 */ }
+    const fetchRemote = this.options.fetchRemoteModels
+    if (this.remoteModels !== undefined || fetchRemote === undefined) return
+    // 闸门：并发去重 + 失败/空结果冷却（依据见 src/remote-catalog-gate.ts）。
+    // Trae 的目录超时上限 30s（src/trae.ts:68），失败不冷却会被 buildModelCatalog
+    // 放大成「每模型一次」。
+    await this.catalogGate.run(async () => {
+      const models = await fetchRemote()
+      if (models.length === 0) return false
+      this.remoteModels = models
+      this.remoteMeta = new Map(models.map((model) => [model.id, model]))
+      return true
+    })
   }
 
   /**
