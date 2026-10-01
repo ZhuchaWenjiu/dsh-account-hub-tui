@@ -12,6 +12,7 @@ import {
   supportsDailyCheckin,
   supportsOnboardingTasks,
   supportsPermanentLock,
+  supportsSubscriptionQuota,
 } from '../../plugin-src/client/credits-capabilities.js'
 import { PERMANENT_LOCK_PROVIDERS } from '../../src/jet-hub-rpc.js'
 import { BUDDY_EXPIRING_WINDOW_DAYS } from '../../src/buddy-balance-rank.js'
@@ -130,7 +131,41 @@ describe('积分能力矩阵', () => {
     for (const unknown of ['', 'newprovider', 'CODEARTS', '__proto__']) {
       expect(supportsCreditBalance(unknown), unknown).toBe(false)
       expect(supportsDailyCheckin(unknown), unknown).toBe(false)
+      expect(supportsSubscriptionQuota(unknown), unknown).toBe(false)
     }
+  })
+
+  /**
+   * ⚠️ **订阅额度目前只登记给 Cline**，这是与后端的硬约定：
+   * `src/jet-hub-rpc.ts` 的 `cline.quota` / `cline.requestLog` 对非 Cline
+   * 一律回 `bad-request`。前端若多登记一家，用户就会看到一个点了必然报错的
+   * 按钮（与 CodeArts 早期 `credits.balances` 那次是同一类缺陷）。
+   *
+   * 「只给 cline」用**全表推导**而不是逐个列举：将来新增渠道时，
+   * 若有人顺手也登记了 `subscriptionQuota`，这条会立刻变红，
+   * 迫使他同时改后端分派（否则就是死按钮）。
+   */
+  it('订阅额度只登记给 cline（其余渠道不得渲染该按钮）', () => {
+    const withQuota = Object.keys(CREDITS_CAPABILITIES).filter(supportsSubscriptionQuota)
+    expect(withQuota).toEqual(['cline'])
+    for (const id of ['codearts', 'buddy', 'workbuddy', 'lobsterai', 'qoder', 'qodercn', 'trae', 'loomy', 'raccoon']) {
+      expect(supportsSubscriptionQuota(id), `${id} 不应支持订阅额度`).toBe(false)
+    }
+  })
+
+  /**
+   * ⚠️ 三个能力**语义独立，不能互相推断**：
+   * Cline 是「有余额、有订阅额度、**无**签到」；Loomy 是「有余额、有签到、
+   * 无订阅额度」。任一为 true 都不蕴含另一个 —— 把它们合并成一个标志
+   * 会让「Cline 面板冒出签到按钮」或「Loomy 面板冒出额度按钮」。
+   */
+  it('订阅额度与余额/签到彼此独立（不能互相推断）', () => {
+    expect(supportsCreditBalance('cline')).toBe(true)
+    expect(supportsSubscriptionQuota('cline')).toBe(true)
+    expect(supportsDailyCheckin('cline')).toBe(false)
+    // 反向：Loomy 有签到、无订阅额度。
+    expect(supportsDailyCheckin('loomy')).toBe(true)
+    expect(supportsSubscriptionQuota('loomy')).toBe(false)
   })
 
   it('能力矩阵覆盖 PROVIDERS 中的每一个 provider', () => {

@@ -64,6 +64,8 @@ import { claimQoderDailyCheckin, fetchQoderCreditBalance } from './qoder-credits
 import { isTraeRefreshable, traeCredentialExpiresAtMs, traeDisplayNickname } from './trae.js'
 import type { TraeCredential } from './trae.js'
 import { fetchClineCreditBalance } from './cline-credits.js'
+import { fetchClineUsageLimits } from './cline-quota.js'
+import { clineUpstreamOf, readClineRequestHistory } from './cline-request-log.js'
 import {
   clineCredentialExpiresAtMs,
   isClineRefreshable,
@@ -129,6 +131,10 @@ import type {
   RpcCreditsClaimSummary,
   RpcCreditsBalancesRequest,
   RpcCreditsBalancesResponse,
+  RpcClineQuotaRequest,
+  RpcClineQuotaResponse,
+  RpcClineRequestLogRequest,
+  RpcClineRequestLogResponse,
   RpcCreditsClaimAccountResult,
   RpcSendSmsRequest,
   RpcSendSmsResponse,
@@ -147,6 +153,8 @@ import type {
   RpcModelSetDisabledResponse,
   RpcModelSetAllDisabledRequest,
   RpcModelSetAllDisabledResponse,
+  RpcModelSetDisabledManyRequest,
+  RpcModelSetDisabledManyResponse,
   RpcProviderStatusRequest,
   RpcProviderStatusResponse,
   RpcProviderSetEnabledRequest,
@@ -680,7 +688,7 @@ export function registerJetHubRpc(
  * 只声明用到的方法（结构化类型），避免让本模块依赖五个具体适配器类。
  */
 export interface ModelCatalogSource {
-  listAllModels(): readonly { id: string; name: string }[]
+  listAllModels(): readonly { id: string; name: string; isFree?: boolean }[]
 }
 
 /**
@@ -2493,6 +2501,106 @@ function registerJetHubEndpoints(
         }
       }
 
+      // ── Cline「订阅额度」：官方额度窗口 + 请求记录 ──
+      //
+      // 参考实现：`github.com/codeOct/dsh-cline-pass` 的额度管理与请求记录部分。
+      // 两者都用 Cline 网关自己的端点（不是本地记账），故与「余额」是三份
+      // 互不相同的读数：余额答「还剩多少」，额度答「各时间窗用掉百分之几」，
+      // 请求记录答「每一笔花了多少」。
+      //
+      // ⚠️ **两个端点都只认 Cline**（额度端点路径里的 `users/me` 与请求记录的
+      // `usages` 都是 Cline 网关的形状）。别的 provider 一律 `bad-request` ——
+      // 这正是「不要在 UI 上吞掉错误，而是不发起这个请求」那条既有约定的
+      // 服务端一半（客户端另由 `supportsSubscriptionQuota` 门控）。
+      case 'cline.quota': {
+        const req = payload as RpcClineQuotaRequest
+        if (typeof req.provider !== 'string' || req.provider !== CLINE.id) {
+          return { ok: false, error: { code: 'bad-request', message: `unsupported provider: ${String(req.provider)}` } }
+        }
+        const accounts = await pool.listAccounts(req.provider)
+        const values: RpcClineQuotaResponse['accounts'] = []
+        for (const account of accounts) {
+          const resolved = await ctx.credentials.resolve(credentialRef(account.credentialRef))
+          if (!resolved) {
+            values.push({
+              accountId: account.id, nickname: account.nickname,
+              ok: false, windows: [], error: '凭据未配置',
+            })
+            continue
+          }
+          let credential: ClineCredential
+          try {
+            credential = JSON.parse(resolved.value) as ClineCredential
+          } catch {
+            values.push({
+              accountId: account.id, nickname: account.nickname,
+              ok: false, windows: [], error: '凭据解析失败',
+            })
+            continue
+          }
+          const result = await fetchClineUsageLimits(credential, CLINE)
+          values.push({
+            accountId: account.id,
+            nickname: account.nickname,
+            ok: result.ok,
+            windows: result.windows,
+            // ⚠️ 失败时带上**具体原因**（含 HTTP 状态与网关文案），
+            // 而不是笼统一句「查询失败」—— 面板要显示原因而非 0%。
+            ...result.error === undefined ? {} : { error: result.error },
+          })
+        }
+        return { ok: true, value: { accounts: values } satisfies RpcClineQuotaResponse }
+      }
+
+      case 'cline.requestLog': {
+        const req = payload as RpcClineRequestLogRequest
+        if (typeof req.provider !== 'string' || req.provider !== CLINE.id) {
+          return { ok: false, error: { code: 'bad-request', message: `unsupported provider: ${String(req.provider)}` } }
+        }
+        if (typeof req.accountId !== 'string' || req.accountId.trim().length === 0) {
+          return { ok: false, error: { code: 'bad-request', message: 'accountId 不能为空' } }
+        }
+        // 记录是**本插件自己发出的请求流水**(进程内存,重启即丢,见
+        // src/cline-request-log.ts),不是网关的 /usages —— 后者记的是该账号
+        // 在官方所有渠道的消费:没有延迟/首块时间,表格字段也对不齐参考实现。
+        //
+        // ⚠️ `accountId` 必传(按账号过滤)——「订阅额度」面板用**同一个**
+        // 翻页索引同时切额度窗口与请求记录,两个区域必须看同一个账号。
+        // ⚠️ 记录可能是**失败**行(error 有值):失败的请求是排查
+        // 「为什么没回复」的第一线索,与成功行同表展示、错误消息随行给出。
+        return {
+          ok: true,
+          value: {
+            rows: readClineRequestHistory({ accountId: req.accountId, limit: req.limit }).map((row) => ({
+              ts: row.ts,
+              model: row.model,
+              // ⚠️ **优先用网关报的真实上游渠道**（`alibaba` 等，见
+              // `src/cline-routing.ts`）；它没报时才回落到模型命名空间
+              // （`cline-pass` / `cline-free`）—— 后者是**订阅通道**
+              // （甚至可能是厂商名），不是 serving channel，用户报障点正在于此。
+              upstream: row.upstream.length > 0 ? row.upstream : clineUpstreamOf(row.model),
+              // ⚠️ 必须透传「是否收到 usage」：表格据此把未知显示成 `—`,
+              // 而不是 0（0 会被读成「瞬间完成、没花 token」）。
+              usageReported: row.usageReported,
+              inputTokens: row.inputTokens,
+              outputTokens: row.outputTokens,
+              ...row.cacheReadTokens !== undefined ? { cacheReadTokens: row.cacheReadTokens } : {},
+              ...row.reasoningTokens !== undefined ? { reasoningTokens: row.reasoningTokens } : {},
+              // 推理强度：空串也照传（展示层据「空串 ⇒ 不渲染那一行」判断，
+              // 若在这里省略字段，前端就得同时处理 undefined 与 '' 两种缺省）。
+              effort: row.effort,
+              ttftMs: row.ttftMs,
+              // ⚠️ 首个**正文**块耗时必须透传：展示层的「输出速率」拿它当分母
+              // 起点（分子是正文 token 数）。缺了它速率会虚高到物理不可能的值
+              // —— 用户报障的 `11814.8 t/s` 就是分子分母跨阶段的产物。
+              ttfcMs: row.ttfcMs,
+              totalMs: row.totalMs,
+              ...row.error !== undefined ? { error: row.error } : {},
+            })),
+          } satisfies RpcClineRequestLogResponse,
+        }
+      }
+
       // ── 模型列表可见性（黑名单开关）──
       //
       // 列表来自 `ctx.llm.listModels()`——**适配器播报的权威目录**，正是
@@ -2535,7 +2643,7 @@ function registerJetHubEndpoints(
         // 对话框模型选择器读的仍是过滤后的 `listModels`，可见性行为完全不变。
         const catalogSource = modelAdapters?.[req.provider]
         const all = catalogSource?.listAllModels()
-        let catalog: Array<{ id: string; name: string }>
+        let catalog: Array<{ id: string; name: string; isFree?: boolean }>
         if (all !== undefined) {
           catalog = [...all]
           // 全量目录里若仍有黑名单命中却缺失者，一并补上（保底，正常不会发生）。
@@ -2558,6 +2666,10 @@ function registerJetHubEndpoints(
             id: model.id,
             name: model.name,
             disabled: disabledMap[model.id] === true,
+            // ⚠️ 免费标记**照原样透传，缺失就不写**（不编造 `false`）：Jet Hub 的
+            // 模型列表按「计费/来源」分组，把「适配器没报」当成「按量计费」是
+            // 保守归组，但字段本身仍保持「未知」语义（与全仓约定一致）。
+            ...model.isFree === undefined ? {} : { isFree: model.isFree },
           })),
         }
         return { ok: true, value }
@@ -2582,6 +2694,49 @@ function registerJetHubEndpoints(
         // 必须广播：否则开关只写进磁盘、界面一直显示旧目录（成因见该函数注释）。
         broadcastCatalogChanged(ctx)
         const value: RpcModelSetDisabledResponse = {
+          provider: req.provider,
+          disabledModels: pool.listDisabledModels(req.provider),
+        }
+        return { ok: true, value }
+      }
+
+      /**
+       * 批量打开/关闭**指定的一批**模型（Jet Hub 模型列表里「按分组」的
+       * 本组全开 / 本组全关）。
+       *
+       * ⚠️ **不能复用 `model.setAllDisabled`**：那个的范围是「该 provider 的
+       * 全部模型」，且打开方向会清空整张黑名单（含用户特意关着的其它组）。
+       * 分组开关只动本组的 id，故服务端需要一个「按子集清除」的路径
+       * （`AccountPool.clearModelsDisabled`）。
+       *
+       * 与另外两个开关端点同约定：`disabled` 不做默认值猜测、只落盘一次、
+       * 只广播一次（逐条调用会写 N 次文档、广播 N 次）。
+       */
+      case 'model.setDisabledMany': {
+        const req = payload as RpcModelSetDisabledManyRequest
+        if (
+          typeof req.provider !== 'string' || req.provider.length === 0
+          || !Array.isArray(req.modelIds)
+          || typeof req.disabled !== 'boolean'
+        ) {
+          return {
+            ok: false,
+            error: { code: 'bad-request', message: 'provider、modelIds（数组）与 disabled（布尔）必填' },
+          }
+        }
+        // 去重 + 剔除非字符串/空串：前端按组传 id，重复项或脏值只会白写一次文档。
+        const ids = [...new Set(req.modelIds.filter((id): id is string => typeof id === 'string' && id.length > 0))]
+        if (ids.length === 0) {
+          return { ok: false, error: { code: 'bad-request', message: 'modelIds 不能为空' } }
+        }
+        if (req.disabled) await pool.setModelsDisabled(req.provider, ids)
+        else await pool.clearModelsDisabled(req.provider, ids)
+        ctx.logger.info(
+          `[jet-hub] ${req.disabled ? '关闭' : '打开'} ${req.provider} 的 ${ids.length} 个模型（按分组）`,
+        )
+        // 与其它开关端点一致：必须广播，否则界面一直显示旧目录。
+        broadcastCatalogChanged(ctx)
+        const value: RpcModelSetDisabledManyResponse = {
           provider: req.provider,
           disabledModels: pool.listDisabledModels(req.provider),
         }

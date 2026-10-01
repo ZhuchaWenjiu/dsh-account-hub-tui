@@ -97,7 +97,12 @@ export const CREDITS_CAPABILITIES = Object.freeze({
   // `daily` 是 YAML cron 别名与 Blob 导出频率枚举）。
   // 这比「某次调用没看到」强，但仍不等于「永远不存在」—— 若将来 Cline 增加
   // 签到，需按 Qoder 那次教训重新采集（见 AGENTS.md 的对应章节）。
-  cline: Object.freeze({ balance: true, dailyCheckin: false }),
+  //
+  // `subscriptionQuota`：**订阅额度窗口 + 请求记录**（官方端点，见
+  // `src/cline-quota.ts`）。这是**本表唯一**具备该项的渠道 —— 另外九家的
+  // 订阅计量形状未知（多为按积分余额计费，没有「5 小时 / 周 / 月窗口」这一层），
+  // 故不登记；未登记即不支持，面板也就不渲染按钮、不发请求。
+  cline: Object.freeze({ balance: true, dailyCheckin: false, subscriptionQuota: true }),
   // Loomy（讯飞）：三项能力齐全，且是**唯一**有第三项（新手任务）的渠道。
   //
   // 余额：`GET /api/v1/points/records`（**只读**）—— 刻意不用 `first-login`，
@@ -362,4 +367,20 @@ export function supportsOnboardingTasks(provider) {
  */
 export function onboardingTaskProviders() {
   return Object.keys(CREDITS_CAPABILITIES).filter(supportsOnboardingTasks);
+}
+
+/**
+ * 该 provider 是否支持「订阅额度」（官方额度窗口 + 请求记录）。
+ *
+ * 目前**只有 Cline**：它的网关提供按时间窗（5 小时 / 周 / 月）的订阅计量
+ * 与逐笔请求流水（见 `src/cline-quota.ts`）。其余渠道是积分余额制，
+ * 没有这一层窗口。
+ *
+ * 为 false 时面板**不得**渲染「订阅额度」按钮，也不得发起
+ * `cline.quota` / `cline.requestLog` —— 服务端对非 Cline 一律 `bad-request`，
+ * 无条件发请求就会在控制台留下必然失败的报错（与 CodeArts 早期
+ * 「对不支持的 provider 无条件调 credits.balances」是同一类缺陷）。
+ */
+export function supportsSubscriptionQuota(provider) {
+  return CREDITS_CAPABILITIES[provider]?.subscriptionQuota === true;
 }

@@ -11,8 +11,20 @@ import {
 import { CLINE } from '../../src/cline-product.js'
 import { mergeClineModels, type ClineModel } from '../../src/cline-models.js'
 import type { ClineCredential } from '../../src/cline.js'
+import {
+  readClineRequestHistory,
+  resetClineRequestHistory,
+} from '../../src/cline-request-log.js'
 
 const here = dirname(fileURLToPath(import.meta.url))
+
+/**
+ * 账号池里的账号 id。
+ *
+ * ⚠️ 它与 {@link cred} 里的 `account_id`（`usr-…`）是**两个 id 空间** ——
+ * 「请求记录中数据空白」这个真实缺陷的根因就是两者被混用。
+ */
+const POOL_ACCOUNT_ID = 'cline-bb211a53'
 
 /** 实测凭据形态（access_token 自带 workos: 前缀）。 */
 const cred: ClineCredential = {
@@ -42,6 +54,9 @@ function makeAdapter(overrides: Partial<ConstructorParameters<typeof ClineAdapte
     refresh: async () => {},
     product: CLINE,
     loadModels: async () => ({ models: MODELS, warnings: [] }),
+    // ⚠️ models.dev 目录也必须注入：默认加载器会去拉真实网络。
+    // 空表 = 「没读到」，各用例按需覆盖。
+    loadModelsDev: async () => new Map(),
     ...overrides,
   })
 }
@@ -52,6 +67,25 @@ function sseResponse(frames: string[]): Response {
     status: 200,
     headers: { 'Content-Type': 'text/event-stream' },
   })
+}
+
+/**
+ * **逐帧延迟**下发的 SSE —— 用来把 `ttft`（首块）与 `ttfc`（首个正文块）
+ * 在时间上分开。`sseResponse` 一次性给完，两者会落在同一毫秒上，测不出区别。
+ */
+function slowSseResponse(frames: Array<{ delayMs: number; payload: string }>): Response {
+  const encoder = new TextEncoder()
+  const stream = new ReadableStream({
+    async start(controller) {
+      for (const frame of frames) {
+        await new Promise((resolve) => setTimeout(resolve, frame.delayMs))
+        controller.enqueue(encoder.encode(`data: ${frame.payload}\n\n`))
+      }
+      controller.enqueue(encoder.encode('data: [DONE]\n\n'))
+      controller.close()
+    },
+  })
+  return new Response(stream, { status: 200, headers: { 'Content-Type': 'text/event-stream' } })
 }
 
 /** 收集一次 stream 的全部 chunk。 */
@@ -584,8 +618,294 @@ describe('Cline 接线（源码级回归）', () => {
     expect(source).toContain('const CLINE_ICON')
   })
 
-  it('能力矩阵登记 cline 为「有余额、无签到」', () => {
+  /**
+   * ⚠️ 这条原先断言**整段字面量** `{ balance: true, dailyCheckin: false }`，
+   * 于是任何新增能力字段（如 `subscriptionQuota`）都会让它假失败 ——
+   * 与上面那条「不要写死整串前缀」是同一类脆断言。
+   * 改为逐字段断言，容忍新增字段与格式变化；而「订阅额度**只**给 cline」
+   * 这条真正的不变式由 `credits-capabilities.spec.ts` 的行为级用例守住。
+   */
+  /**
+   * ⚠️ 请求记录的**接线完整性**：stream() 有**两个**消费出口
+   * （换号成功后的 consume 与正常路径的 consume），漏掉任何一个，
+   * 那条路径上的请求就不会出现在「订阅额度 → 请求记录」里。
+   * 两个出口都必须走 consumeWithLog（它内部再调 this.consume）。
+   */
+  it('推理流在两个消费出口都记录请求流水', () => {
+    const source = read('src/cline-adapter.ts')
+    expect(source.match(/yield\* this\.consumeWithLog\(/g)).toHaveLength(2)
+    // 不得有绕过记录的消费出口（记录失败不反噬推理，但漏记会丢数据）
+    expect(source).not.toMatch(/yield\* this\.consume\(/)
+  })
+
+  /**
+   * ⚠️⚠️ **真实缺陷**（用户报障「请求记录中数据空白，没有记录下来」）：
+   * 请求记录的「账号」必须是**账号池 id**（`cline-bb211a53`），
+   * **不是**凭据里的 `account_id`（`usr-…`）。
+   *
+   * 面板用 `cline.quota` 下发的**池 id** 去过滤记录（`cline.requestLog` 的
+   * `accountId`），而成功路径原先记的是 `credential.account_id` ——
+   * 两个 id 空间不一致 ⇒ `readClineRequestHistory({ accountId })` 恒返回空
+   * ⇒ **表格永远空白**（换号路径记的却是池 id，两条路径口径还不一致，
+   * 属同一缺陷的两半）。
+   *
+   * ⚠️ **反向验证**：把适配器改回 `credential.account_id ?? …` → 本用例变红。
+   */
+  it('请求记录归属「账号池 id」（不是凭据里的 usr- 用户 id）', async () => {
+    resetClineRequestHistory()
+    const adapter = makeAdapter({
+      currentAccountId: () => POOL_ACCOUNT_ID,
+      fetchImpl: (async () => sseResponse([
+        JSON.stringify({ choices: [{ delta: { content: 'hi' } }] }),
+        JSON.stringify({ choices: [{ delta: {}, finish_reason: 'stop' }] }),
+      ])) as unknown as typeof fetch,
+    })
+    await collect(adapter)
+
+    const rows = readClineRequestHistory()
+    expect(rows).toHaveLength(1)
+    expect(rows[0]!.accountId).toBe(POOL_ACCOUNT_ID)
+    // 关键：**不能**是凭据里的 `usr-…` —— 那正是空白的原因
+    expect(rows[0]!.accountId).not.toBe(cred.account_id)
+    // 面板用的过滤条件（池 id）必须能查到这一行，且用 usr-… 查不到
+    expect(readClineRequestHistory({ accountId: POOL_ACCOUNT_ID })).toHaveLength(1)
+    expect(readClineRequestHistory({ accountId: cred.account_id! })).toHaveLength(0)
+  })
+
+  /**
+   * 没有池账号（回退到单凭据 `CLINE_ACCESS_TOKEN` 模式）时仍要记一行，
+   * 只是退回凭据里的 `account_id` —— 那种模式下 `cline.quota` 同样没有账号
+   * 可翻页，记录查不到但至少不丢数据、也不会张冠李戴。
+   */
+  it('无池账号时退回记凭据的 account_id（单凭据模式不丢记录）', async () => {
+    resetClineRequestHistory()
+    const adapter = makeAdapter({
+      fetchImpl: (async () => sseResponse([
+        JSON.stringify({ choices: [{ delta: { content: 'hi' } }] }),
+        JSON.stringify({ choices: [{ delta: {}, finish_reason: 'stop' }] }),
+      ])) as unknown as typeof fetch,
+    })
+    await collect(adapter)
+    expect(readClineRequestHistory()[0]!.accountId).toBe(cred.account_id)
+  })
+
+  /**
+   * ⚠️⚠️ **真实缺陷**（用户报障 2026-09-30）：「这个插件中支持图片的模型
+   * 发送不了图片」。
+   *
+   * 根因：图片能力原先**只看本地兜底表**（全表只有 5 条 `cline-free/*`），
+   * 于是 `cline-pass/*` 一律被播报成纯文本 ⇒ DSH 根本不把图片送进来。
+   * 修复后补上 models.dev 这一级（见 `src/cline-modalities.ts`）。
+   *
+   * ⚠️ **反向验证**：注释掉 `inputModalitiesFor` 里 `remoteModalities` 那一行
+   * → 本用例变红（抛 `不支持图片输入`）。
+   */
+  it('图片能力取自 models.dev：cline-pass/* 也能发图（不再被误判纯文本）', async () => {
+    const bodies: string[] = []
+    const adapter = makeAdapter({
+      loadModelsDev: async () => new Map([
+        ['cline-pass/deepseek-v4.1-flash', { id: 'cline-pass/deepseek-v4.1-flash', supportsImage: true }],
+      ]),
+      readImage: async () => ({ data: new Uint8Array([1, 2, 3]), mediaType: 'image/png' }),
+      fetchImpl: (async (_url: string, init: RequestInit) => {
+        bodies.push(String(init.body))
+        return sseResponse([
+          JSON.stringify({ choices: [{ delta: { content: 'ok' } }] }),
+          JSON.stringify({ choices: [{ delta: {}, finish_reason: 'stop' }] }),
+        ])
+      }) as unknown as typeof fetch,
+    })
+
+    await collect(adapter, {
+      model: 'cline-pass/deepseek-v4.1-flash',
+      messages: [{
+        role: 'user',
+        content: [
+          { type: 'text', text: '看看这张图' },
+          { type: 'image', attachment: { attachmentId: 'att-1' } },
+        ],
+      }],
+    })
+
+    expect(bodies).toHaveLength(1)
+    // 图片真的被内联成 data URL 发出去了
+    expect(bodies[0]).toContain('"image_url"')
+    expect(bodies[0]).toContain('data:image/png;base64,')
+    expect(bodies[0]).not.toContain('[image unavailable]')
+  })
+
+  /** 模态表说「不支持」时照旧拒绝（不能为了修缺陷就无条件放行）。 */
+  it('模态表明确不支持时仍拒绝图片（保守方向未失守）', async () => {
+    const adapter = makeAdapter({
+      loadModelsDev: async () => new Map([
+        ['cline-pass/glm-5.3', { id: 'cline-pass/glm-5.3', supportsImage: false }],
+      ]),
+      readImage: async () => ({ data: new Uint8Array([1]), mediaType: 'image/png' }),
+      fetchImpl: (async () => sseResponse([])) as unknown as typeof fetch,
+    })
+    await expect(collect(adapter, {
+      model: 'cline-pass/glm-5.3',
+      messages: [{ role: 'user', content: [{ type: 'image', attachment: { attachmentId: 'a' } }] }],
+    })).rejects.toThrow(/不支持图片输入/)
+  })
+
+  /**
+   * ⚠️⚠️ **真实缺陷**（用户两次报障：「上游显示的不正确」/「上游显示的还是错误的」）。
+   *
+   * 「上游」原先取模型 id 的 `/` 前缀（`cline-pass`），那是**订阅通道**、
+   * 甚至可能是厂商名，不是 serving channel。修复后取网关下发的路由元数据
+   * （`provider_metadata.gateway.routing.finalProvider`，参考实现同源）。
+   *
+   * ⚠️ **本用例的 fixture 必须用实测的真实形状**：第一版把路由写成**帧顶层**，
+   * 而真实流式响应挂在 **`choices[0].delta`** 上 —— 于是用例绿、功能坏，
+   * 用户第二次报障才暴露。**这就是「fixture 写错等于没有测试」的活例**：
+   * 凡外部载荷的层级，只能照实测写（探针 `probe-cline-routing-live.mjs`）。
+   */
+  it('请求记录记下网关报的真实上游渠道（而不是模型前缀）', async () => {
+    resetClineRequestHistory()
+    const adapter = makeAdapter({
+      fetchImpl: (async () => sseResponse([
+        JSON.stringify({ choices: [{ delta: { content: 'hi' } }] }),
+        // 实测量到的位置：`choices[0].delta.provider_metadata.gateway.routing.finalProvider`
+        // （modelAttempts 是真实帧里同时存在的嵌套字段，防止解析器误取嵌套 provider）
+        JSON.stringify({
+          choices: [{
+            index: 0,
+            delta: {
+              provider_metadata: {
+                gateway: {
+                  routing: {
+                    finalProvider: 'deepseek',
+                    modelAttempts: [{ providerAttempts: [{ provider: 'deepseek' }] }],
+                  },
+                },
+              },
+            },
+          }],
+        }),
+        JSON.stringify({ choices: [{ delta: {}, finish_reason: 'stop' }] }),
+      ])) as unknown as typeof fetch,
+    })
+    await collect(adapter, { model: 'cline-pass/deepseek-v4.1-flash' })
+
+    const row = readClineRequestHistory()[0]!
+    expect(row.upstream).toBe('deepseek')
+    // 关键：**不能**是模型命名空间
+    expect(row.upstream).not.toBe('cline-pass')
+  })
+
+  /** 另一种形态（帧顶层）保留兼容 —— 参考实现抓到过它，但**不是**主流式链路。 */
+  it('路由挂在帧顶层时同样读得到（兼容形态）', async () => {
+    resetClineRequestHistory()
+    const adapter = makeAdapter({
+      fetchImpl: (async () => sseResponse([
+        JSON.stringify({ choices: [{ delta: { content: 'hi' } }] }),
+        JSON.stringify({ provider_metadata: { gateway: { routing: { finalProvider: 'baseten' } } } }),
+        JSON.stringify({ choices: [{ delta: {}, finish_reason: 'stop' }] }),
+      ])) as unknown as typeof fetch,
+    })
+    await collect(adapter, { model: 'cline-pass/deepseek-v4.1-flash' })
+    expect(readClineRequestHistory()[0]!.upstream).toBe('baseten')
+  })
+
+  /** 网关没报路由时留空串 —— 由 RPC 侧回落到模型命名空间，**不在适配器里编造**。 */
+  it('网关未报路由时 upstream 留空串（不编造渠道名）', async () => {
+    resetClineRequestHistory()
+    const adapter = makeAdapter({
+      fetchImpl: (async () => sseResponse([
+        JSON.stringify({ choices: [{ delta: { content: 'hi' } }] }),
+        JSON.stringify({ choices: [{ delta: {}, finish_reason: 'stop' }] }),
+      ])) as unknown as typeof fetch,
+    })
+    await collect(adapter, { model: 'cline-pass/deepseek-v4.1-flash' })
+    expect(readClineRequestHistory()[0]!.upstream).toBe('')
+  })
+
+  /**
+   * ⚠️⚠️ **真实缺陷**（用户报障 2026-09-30）：「输出速率 11814.8 t/s」。
+   *
+   * 速率必须让**分子分母落在同一段时间**：`outputTokens` 含思考 token
+   * （本仓库已实测 `reasoning_tokens` 计入 `completion_tokens`），而思考
+   * 产生于首字之前 ⇒ 适配器必须**单独**记「首个**正文**块耗时」。
+   *
+   * ⚠️ **反向验证**：把 `ttfcMs` 的赋值改成与 `ttftMs` 相同（即任何块都算）
+   * → 本用例的 `ttfcMs > ttftMs` 断言变红。
+   */
+  it('分开记录「首块」与「首个正文块」（思考块不算正文）', async () => {
+    resetClineRequestHistory()
+    const adapter = makeAdapter({
+      fetchImpl: (async () => slowSseResponse([
+        { delayMs: 40, payload: JSON.stringify({ choices: [{ delta: { reasoning: '想一会儿…' } }] }) },
+        { delayMs: 60, payload: JSON.stringify({ choices: [{ delta: { content: '答' } }] }) },
+        { delayMs: 10, payload: JSON.stringify({ choices: [{ delta: {}, finish_reason: 'stop' }] }) },
+      ])) as unknown as typeof fetch,
+    })
+    await collect(adapter, { model: 'cline-pass/deepseek-v4.1-flash' })
+
+    const row = readClineRequestHistory()[0]!
+    expect(row.ttftMs).toBeGreaterThan(0)
+    expect(row.ttfcMs).toBeGreaterThan(0)
+    // 关键：正文块**晚于**首块（首块是思考增量）—— 这条断言就是本次修复的判据
+    expect(row.ttfcMs).toBeGreaterThan(row.ttftMs)
+  })
+
+  /** 只有思考、没有正文时 `ttfcMs` 为 0 ⇒ 展示层把速率显示成 `—` 而不是编一个值。 */
+  it('纯思考响应没有正文块：ttfcMs 为 0', async () => {
+    resetClineRequestHistory()
+    const adapter = makeAdapter({
+      fetchImpl: (async () => sseResponse([
+        JSON.stringify({ choices: [{ delta: { reasoning: '只想不说' } }] }),
+        JSON.stringify({ choices: [{ delta: {}, finish_reason: 'stop' }] }),
+      ])) as unknown as typeof fetch,
+    })
+    await collect(adapter, { model: 'cline-pass/deepseek-v4.1-flash' })
+    expect(readClineRequestHistory()[0]!.ttfcMs).toBe(0)
+  })
+
+  /**
+   * ⚠️⚠️ **真实缺陷**（用户报障 2026-09-30）：「cline-pass 部分模型列表不全」。
+   *
+   * 实测对账：网关 `recommended-models` 的 `clinePass` **只下发 14 条**，
+   * 而 models.dev 的 `cline-pass` 块有 **18 条** —— 差的 4 条
+   * （`kimi-k2.6` / `glm-5.2` / `kimi-k2.7-code` / `deepseek-v4-flash`）
+   * 在本插件里**根本不存在**，用户既看不到也选不到。
+   * 另外网关给 `cline-pass/*` 的 `name` 就是 id 本身，列表里全是裸 id。
+   *
+   * ⚠️ **反向验证**：把 `ensureRemoteModels` 里的 `applyModelsDevCatalog(...)`
+   * 换回 `models` → 本用例「补进来的模型在目录里」断言变红。
+   */
+  it('models.dev 补全 cline-pass 目录（网关没下发的模型 + 可读名）', async () => {
+    const adapter = makeAdapter({
+      loadModelsDev: async () => new Map([
+        ['cline-pass/kimi-k2.7-code', {
+          id: 'cline-pass/kimi-k2.7-code', name: 'Kimi K2.7 Code', supportsImage: true,
+        }],
+        ['cline-pass/deepseek-v4.1-flash', {
+          id: 'cline-pass/deepseek-v4.1-flash', name: 'DeepSeek V4.1 Flash', supportsImage: true,
+        }],
+      ]),
+    })
+    const models = await adapter.listModels('cline')
+    const byId = new Map(models.map((m) => [m.id, m]))
+
+    // ① 网关目录里没有的模型被补进来（这是「列表不全」的修复点）
+    expect(byId.has('cline-pass/kimi-k2.7-code')).toBe(true)
+    // ② 名字是可读的，不是裸 id
+    expect(byId.get('cline-pass/kimi-k2.7-code')?.name).toBe('Kimi K2.7 Code')
+    expect(byId.get('cline-pass/deepseek-v4.1-flash')?.name).toBe('DeepSeek V4.1 Flash')
+    // ③ 图片能力随之播报 —— DSH 据此才会把图片送进适配器
+    expect(byId.get('cline-pass/kimi-k2.7-code')?.inputModalities).toEqual(['text', 'image'])
+    // ④ 本地兜底表的策展条目不受影响
+    expect(byId.get('cline-free/gemini-3.8-flash')?.inputModalities).toEqual(['text', 'image'])
+  })
+
+  it('能力矩阵登记 cline 为「有余额、无签到、有订阅额度」', () => {
     const source = read('plugin-src/client/credits-capabilities.js')
-    expect(source).toMatch(/cline:\s*Object\.freeze\(\{\s*balance:\s*true,\s*dailyCheckin:\s*false\s*\}\)/)
+    const entry = /cline:\s*Object\.freeze\(\{([^}]*)\}\)/.exec(source)
+    expect(entry, '未找到 cline 的能力登记').not.toBeNull()
+    const body = entry![1]!
+    expect(body).toMatch(/balance:\s*true/)
+    expect(body).toMatch(/dailyCheckin:\s*false/)
+    expect(body).toMatch(/subscriptionQuota:\s*true/)
   })
 })

@@ -397,6 +397,124 @@ export interface RpcCreditsBalancesResponse {
 
 /**
  * ========================================
+ * Cline 订阅额度与请求记录
+ * ========================================
+ *
+ * 与 `credits.balances`（余额）**语义不同，两个端点不能互相替代**：
+ *
+ * | | 余额 | 订阅额度 | 请求记录 |
+ * |---|---|---|---|
+ * | 回答的问题 | 还剩多少钱 | 各时间窗用掉百分之几 | 每一笔请求花了多少 |
+ * | 端点 | `/users/{id}/balance` | `/users/me/plan/usage-limits` | `/users/{id}/usages` |
+ *
+ * 参考实现：`github.com/codeOct/dsh-cline-pass` 的额度管理与请求记录部分
+ * （见 `src/cline-quota.ts` 的模块头注释）。
+ */
+
+/** RPC: 查询某 provider 的**订阅额度窗口**（当前只有 Cline 支持）。 */
+export interface RpcClineQuotaRequest {
+  provider: string
+}
+
+/**
+ * 单个账号的订阅额度读数。
+ *
+ * ⚠️ **`ok:false` 与「窗口为 0 个」是两件不同的事**：前者是查询失败
+ * （凭据失效、网关报错），后者是「账号确实没有任何额度窗口」。
+ * 面板对两者的文案必须不同 —— 把失败显示成「无额度」会让用户
+ * 以为额度没了（与本仓库「查不到不显示成 0」的一贯约定同源）。
+ */
+export interface RpcClineQuotaAccount {
+  accountId: string
+  nickname: string
+  ok: boolean
+  /** 窗口按网关原序透传（网关新增窗口类型时无需改插件）。 */
+  windows: Array<{ type: string; percentUsed: number; resetsAt: string }>
+  error?: string
+}
+
+/** RPC: 订阅额度响应。 */
+export interface RpcClineQuotaResponse {
+  accounts: RpcClineQuotaAccount[]
+}
+
+/**
+ * RPC: 查询**请求记录**（本插件自己发出的推理请求流水，按时间倒序）。
+ *
+ * ⚠️ **不是**网关的 `/users/{id}/usages`（那是该账号在官方所有渠道的
+ * 消费账单：没有延迟/首块时间，表格字段也对不齐参考实现）。见
+ * `src/cline-request-log.ts`。
+ *
+ * `accountId` 必传：面板用**同一个**翻页索引同时切「额度窗口」与
+ * 「请求记录」，两个区域必须看同一个账号。
+ */
+export interface RpcClineRequestLogRequest {
+  provider: string
+  accountId: string
+  /** 最多返回多少条（省略用上限）。 */
+  limit?: number
+}
+
+/** 请求记录的一行。 */
+export interface RpcClineRequestLogRow {
+  /** 请求**发起**时刻（毫秒时间戳）。 */
+  ts: number
+  /** 模型 id（wire 上的 `model`）。 */
+  model: string
+  /**
+   * 真正服务这笔请求的**上游渠道**（网关下发的路由元数据，如 `alibaba`）。
+   *
+   * ⚠️ 与「模型命名空间」（`cline-pass` / `cline-free`）**不是一回事**：
+   * 后者是订阅通道，甚至可能是厂商名（`deepseek/…`）。网关本次没报路由时
+   * 这里回落到命名空间 —— 取值顺序见 `src/cline-routing.ts` 与 RPC 侧注释。
+   */
+  upstream: string
+  /**
+   * 是否收到过 usage 帧。
+   *
+   * ⚠️ 与「token 为 0」不是一回事：网关没发 usage 时（abort / 上游提前断开）
+   * 必须显示 `—`，给 0 会被读成「瞬间完成、没花 token」（参考实现同约定）。
+   */
+  usageReported: boolean
+  /** 输入 token（未命中缓存的部分）。 */
+  inputTokens: number
+  /** 输出 token。 */
+  outputTokens: number
+  /** 缓存命中的输入 token（表格的 ⚡ 那一项；缺失时省略）。 */
+  cacheReadTokens?: number
+  /** 思考 token（表格的 🧠 那一项；缺失时省略）。 */
+  reasoningTokens?: number
+  /**
+   * 本次请求的**推理强度**（DSH 注入的 `options.reasoningEffort`）。
+   *
+   * ⚠️ 空串 = 本次没指定，展示层据此**整行不渲染**（参考实现同约定）；
+   * 不要改成 `'auto'` —— 那会被读成「确实选了自动这一档」。
+   */
+  effort: string
+  /** 首个内容块耗时（毫秒）—— 解释「为什么等了这么久才出字」。 */
+  ttftMs: number
+  /**
+   * 首个**正文**块耗时（毫秒；0 = 本次没有任何正文/工具调用块）。
+   *
+   * ⚠️ 「输出速率」必须让分子分母落在**正文阶段**：分子 =
+   * `outputTokens − reasoningTokens`（思考 token 计入 `completion_tokens`，
+   * 且产生于 `ttftMs` 之前），分母 = `totalMs − ttfcMs`。缺这个字段，
+   * 速率会把思考 token 除进正文窗口 → 虚高到物理不可能的值（用户报障）。
+   */
+  ttfcMs: number
+  /** 全程耗时（毫秒）。 */
+  totalMs: number
+  /** 失败原因；成功行省略。 */
+  error?: string
+}
+
+/** RPC: 请求记录响应（最新在前）。 */
+export interface RpcClineRequestLogResponse {
+  rows: RpcClineRequestLogRow[]
+}
+
+/**
+ * ========================================
  * 短信验证码登录（仅 Loomy）
  * ========================================
  *
@@ -505,6 +623,14 @@ export interface RpcModelListEntry {
   name: string
   /** true = 已关闭（不出现在对话框的模型选择里）。 */
   disabled: boolean
+  /**
+   * 是否为**免费额度模型**（适配器按远端 `free` 集合判定的权威标记）。
+   *
+   * ⚠️ **缺失 = 该适配器没报**（不是「确认收费」）：Jet Hub 的模型列表按
+   * 「计费/来源」分组时，缺失项**保守归入「按量计费」**，但字段本身保持
+   * 「未知」语义 —— 不编造 `false`（与全仓「未知不编造」的约定一致）。
+   */
+  isFree?: boolean
 }
 
 /** RPC: 列出某 provider 的模型响应 */
@@ -545,6 +671,28 @@ export interface RpcModelSetAllDisabledRequest {
 
 /** RPC: 批量打开/关闭响应（回传写入后的完整黑名单，与单条端点同结构） */
 export type RpcModelSetAllDisabledResponse = RpcModelSetDisabledResponse
+
+/**
+ * RPC: 批量打开/关闭**指定的一批**模型（Jet Hub 模型列表里「按分组」的
+ * 本组全开 / 本组全关）。
+ *
+ * 与 {@link RpcModelSetAllDisabledRequest} 的区别是**范围**：那个是「该 provider
+ * 的全部模型」（且打开方向刻意顺带清掉已下线模型的历史死键），本端点只动传进来
+ * 的 id —— **分组开关必须用本端点**，否则一次「本组全开」会把用户特意关着的
+ * 其它组一起打开。
+ *
+ * ⚠️ `modelIds` **不接受空数组**：空组不该出现在界面上（前端按钮也按
+ * `bulkButtonState` 禁用），服务端再拒一次，避免一次无意义的写入与广播。
+ * ⚠️ `disabled` 同样**没有默认值**（与单条/全量端点同约定）。
+ */
+export interface RpcModelSetDisabledManyRequest {
+  provider: string
+  modelIds: string[]
+  disabled: boolean
+}
+
+/** RPC: 分组批量开关响应（回传写入后的完整黑名单，与其它两个开关端点同结构） */
+export type RpcModelSetDisabledManyResponse = RpcModelSetDisabledResponse
 
 /**
  * 单个供应商的汇总状态（Jet Hub 左侧导航的分组与一键开关据此渲染）。

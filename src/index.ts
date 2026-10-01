@@ -665,6 +665,19 @@ export function apply(ctx: Context): void {
   // 服务名由 ClineAuth 依 product.id 派生，注册为 ctx.clineAuth。
   // 不注册斜杠命令：入口在 Jet Hub 的 Cline 面板。
   const cline = new ClineAuth(ctx)
+  /**
+   * 「本次实际使用的是哪个 Cline **池账号**」——「订阅额度 → 请求记录」的
+   * 「账号」列按它归属，面板也是用这个 id 过滤的。
+   *
+   * ⚠️ 与 `activeQoderAccountId` 同因：必须在 `resolveCredential` 里记录
+   * **实际返回的那个账号**，不能事后自己再查一次池 —— 池的选号是即时决策，
+   * 与适配器本次拿到的凭据可能已经不是一个账号。
+   *
+   * ⚠️ 真实缺陷（用户报障「请求记录中数据空白」）：此处曾**完全没有**这个通道，
+   * 适配器只好退回记凭据里的 `account_id`（`usr-…`），而面板按池 id
+   * （`cline-bb211a53`）过滤 → 两个 id 空间不一致 → 表格永远空白。
+   */
+  let activeClineAccountId = ''
   const clineAdapter = registerClineLlm(ctx, {
     credentialRef: credentialRef(CLINE.defaultCredentialRef),
     resolveCredential: async (modelId?: string) => {
@@ -674,6 +687,8 @@ export function apply(ctx: Context): void {
       // 改名/多产品场景下会静默查不到账号（本插件在 workbuddy 上踩过同类坑）。
       // ⚠️ `modelId` 透传：否则模型级限流标记被忽略（详见 buddy 处说明）。
       const available = await pool.getAvailableAccount(CLINE.id, modelId ?? '')
+      // 记录实际选中的池账号（空串 = 回退到单凭据 ref 模式，见适配器注释）。
+      activeClineAccountId = available?.entry.id ?? ''
       if (available) return available.credential as ClineCredential
       const resolved = await ctx.credentials.resolve(credentialRef(CLINE.defaultCredentialRef))
       if (!resolved) return undefined
@@ -704,6 +719,8 @@ export function apply(ctx: Context): void {
     // 32 张（≈122 MiB）才 `TRANSPORT` —— 余量比其他家大，但仍需兜住长会话。
     readImageRequest: makeReadImageRequest(ctx),
     accountPool: pool,
+    // 「请求记录」的账号归属（见上面的 `activeClineAccountId`）。
+    currentAccountId: () => activeClineAccountId.length > 0 ? activeClineAccountId : undefined,
     product: CLINE,
   })
 

@@ -199,7 +199,12 @@ describe('ModelListPanel 搜索/筛选/多选接线（源码级回归）', () =>
    * 加「显示更多」只会凭空多一次点击（属于功能收缩），已被回退。
    */
   it('渲染的是筛选结果，且不做渲染上限（不引入「显示更多」）', () => {
-    expect(normalized).toContain('filtered.map(model => React.createElement(ModelToggle')
+    // ⚠️ 2026-10-01 起改为**按分组渲染**（订阅/免费/Cloud/按量计费，
+    // 见 `model-groups.js`）：这里因此由 `filtered.map(...)` 的平铺断言
+    // 改为「组内渲染筛选结果」——判据不变，仍是**筛选后**的集合
+    //（`groupModelsForDisplay` 内部对每组调用 `filterModels`），不是全量。
+    expect(normalized).toContain('group.models.map(model => React.createElement(ModelToggle')
+    expect(normalized).toContain('groupModelsForDisplay(all, { query, status: statusFilter })')
     expect(normalized).not.toContain('all.map(model => React.createElement(ModelToggle')
     expect(normalized).not.toContain('MODEL_RENDER_LIMIT')
     // ⚠️ 只断言**代码**里没有「显示更多」按钮，注释里提到它是有意的说明

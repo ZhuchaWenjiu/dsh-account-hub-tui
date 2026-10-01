@@ -759,6 +759,11 @@ allowBuilds 判定，不换 commit 会得到假的"成功"）：
   `esbuild`（`plugin-src/client/build.mjs`）打包到 `lib/client/jet-hub.js`。
   两者都产出到已 gitignore 的 `lib/`，`prepare` 执行 `pnpm build:all` 保证
   git 安装时两侧产物齐全。
+  ⚠️ **`tsc` 不清理「源文件已删除」的产物**：改名/删文件后 `lib/` 会留着旧的
+  `.js` / `.d.ts` / `.map`（2026-10-01 把 `cline-modalities.ts` 换成
+  `cline-models-dev.ts` 时实测到，`lib/cline-modalities.*` 四个文件仍在，
+  并随文件拷贝式安装一起进了 profile）。**删改源文件后手动清一次 `lib/`**
+  （或整目录重建），否则残留模块虽无人 import 却会一直跟着发布。
 - **测试**：Vitest（单元测试 + E2E 端到端测试）
   - `pnpm test` — 单元测试（快速，无网络，全部 mock）
   - `pnpm test:e2e:*` — 端到端测试，按 provider 分列（如 `test:e2e:codearts`、`test:e2e:buddy`、`test:e2e:workbuddy-claim`）；**均有闸门，默认全部跳过**，详见 `tests/e2e/README.md`
@@ -2912,8 +2917,548 @@ DSH_CLINE_CHAT_E2E_ALL_FREE=1            才遍历其余 4 个免费模型
   `X-Title: Cline`、`X-IS-MULTIROOT: false`、`X-CLIENT-TYPE: cline-sdk`。
 - `max_tokens` 上界收敛到 **943718**（内嵌目录最大 `maxTokens`，取自
   `muse-spark-1.3-contributor`），不自行编造更大值。
-- 单元测试 6 个文件：`cline.spec.ts` / `cline-models.spec.ts` / `cline-oauth.spec.ts` /
-  `cline-credits.spec.ts` / `cline-auth.spec.ts` / `cline-adapter.spec.ts`。
+- 单元测试 7 个文件：`cline.spec.ts` / `cline-models.spec.ts` / `cline-oauth.spec.ts` /
+  `cline-credits.spec.ts` / `cline-quota.spec.ts` / `cline-auth.spec.ts` / `cline-adapter.spec.ts`。
+
+### ⚠️ Cline「订阅额度」：官方额度窗口 + 请求记录（2026-09-29 新增）
+
+Cline 面板的账号管理区有一个**订阅额度**按钮（只在 Cline 出现），点开是弹窗：
+上半部是**官方额度窗口**（5 小时 / 周 / 月各用掉百分之几 + 重置时刻），
+下半部是**请求记录**（逐笔：时间、模型、token、积分）。
+
+与账号卡片上的「积分」是**多份不同的读数，不能互相替代**：
+
+| | 积分（既有） | 订阅额度（本次） | 请求记录（本地流水） |
+|---|---|---|---|
+| 回答的问题 | 还剩多少钱 | 各时间窗用掉百分之几 | **本插件发出的**每笔请求：多久、多少 token |
+| 来源 | `/api/v1/users/{id}/balance` | `/api/v1/users/me/plan/usage-limits` | `src/cline-request-log.ts`（进程内存） |
+
+参考实现：`github.com/codeOct/dsh-cline-pass` 的额度管理与请求记录部分。
+
+### ⚠️ 请求记录是**本地流水**，不是网关账单（2026-09-30 按用户反馈改造）
+
+**用户反馈**：「请求记录展示的字段和我给你的参考也不一样」——首版把请求记录
+对齐到了网关 `/users/{id}/usages`（字段 `createdAt / aiModelName / aiModelTypeName
+/ totalTokens / creditsUsed / costUsd`）。**那是错的**：网关记录的是该账号在
+**官方所有渠道**的消费账单，没有延迟、没有首块时间，字段也对不齐参考实现。
+
+**改法**（对齐参考实现的请求记录部分）：
+
+- 新增 `src/cline-request-log.ts`：适配器发出的每笔推理请求记录
+  `{ ts, model, accountId, usageReported, inputTokens, outputTokens,
+  cacheReadTokens?, reasoningTokens?, effort, ttftMs, totalMs, error? }`。
+- `src/cline-adapter.ts` 的 stream() 有**两个**消费出口（换号成功后的 consume
+  与正常路径的 consume），**都**走 `consumeWithLog()`（内部再调 `this.consume`）
+  —— 接线由 `cline-adapter.spec.ts` 的源码断言锁死（`yield* this.consume(`
+  不得再出现）。
+- 记录的**取舍**（与参考实现的差异及理由）：
+  - 不记 `ttfb`：单一网关、无 upstream 选路，响应头与首块之间没有独立阶段。
+    表格的延迟列仍按参考实现给**三行**（首字 / 总耗时 / 输出速率）。
+  - 换号过程**不逐笔记**：只记**最终结果**一笔 —— 参考实现会把每次
+    AUTH/QUOTA attempt 都记成失败行，本适配器的 429 换号风暴（最多 3 轮）
+    会把 100 条上限刷满；「所有账号均不可用」这行已包含换号语义。
+  - usage 帧在**经过时捕获**：流中途 abort / 上游提前断开时 usage 没被消费到，
+    此时记 `usageReported: false`（**不是记 0**）—— 表格据此显示 `—`；
+    记 0 会被读成「瞬间完成、没花 token」（参考实现同约定）。
+  - **记录绝不抛错**：它在推理关键路径上，记账失败不得反噬推理
+    （record 内部全部 try/catch + 钳制 + 截断）。
+- 存储：**进程内存，100 条，重启即丢**（刻意，与参考一致；高频写不适合持久化）。
+
+### ⚠️⚠️ 请求记录的「账号」必须用**账号池 id**，不能用凭据里的 `account_id`（真实缺陷，2026-09-30）
+
+**用户报障**：「请求记录中数据空白，没有记录下来」。
+
+**根因是两个 id 空间被混用** —— 字段名叫 `accountId` 的有**两套值**：
+
+| 位置 | 值 | 形如 |
+|---|---|---|
+| 面板的过滤条件 `cline.requestLog.accountId` | **账号池 id**（取自 `cline.quota` 的 `accounts[].accountId`，即 `account.id`） | `cline-bb211a53` |
+| 适配器原先在**成功路径**记的 | 凭据里的 `account_id`（Cline 的**用户 id**） | `usr-01M3BCV4FY…` |
+
+两者不相等 ⇒ `readClineRequestHistory({ accountId })` 恒返回空 ⇒ 表格**永远空白**。
+（换号路径当时记的却是池 id —— 同一缺陷的两半，两条出口口径不一致。）
+
+**修法**：`ClineAdapterOptions` 新增 `currentAccountId?: () => string | undefined`，
+由 `src/index.ts` 在 `resolveCredential` 里记录**实际选中的池账号**
+（`activeClineAccountId`，与 `activeQoderAccountId` 同因、同写法）；
+适配器在 stream() 开头用它做**局部变量**的起点（只在首次取值，
+换号后自行跟进），两个出口都用「池 id 优先、无池账号才退回 `usr-…`」。
+
+⚠️ **反向验证已做**（本仓库要求）：把正常路径改回 `credential.account_id ?? …`
+→ `cline-adapter.spec.ts` 的「请求记录归属『账号池 id』」**变红**，报错为
+`expected 'usr-01M3BCV4FYCGJKAWD3MJG3DBQM' to be 'cline-bb211a53'`；还原后全绿。
+
+⚠️ **做这次反向验证时连踩两个工具坑**（都会让验证**假绿**，务必避开）：
+1. **同一表达式在文件里出现两次**（换号路径 + 正常路径，文本完全相同）——
+   用字符串 `replace` 命中的是**第一处（换号路径）**，而用例走的是正常路径，
+   于是「回退了却仍全绿」。必须按**上下文/最后一次出现**定位。
+2. **本仓库源文件是 CRLF**：脚本里写 `\n` 的**多行**锚点永远匹配不上
+   （单行锚点没事，所以第一次只替换成功的假象更难发现）。按行处理即可。
+   ⚠️ 另：**Windows 下别用内联 `node -e`**，PowerShell 会吃掉
+   `\``/`$`/引号（本次两次静默跑错），写成 `.mjs` 文件再跑。
+
+### ⚠️⚠️ 请求记录的三处**展示语义**缺陷（2026-09-30 用户复核，一次报三个）
+
+用户报障原文：「**上游显示的不正确**」「支持图片的模型**发送不了图片**」
+「请求记录中：输出速率 `11814.8 t/s` 这个是不是也有问题」。
+三者**根因各不相同**，但都属于「字段取错了口径」，逐个记下：
+
+#### ① 「上游」列取的是**模型命名空间**，不是 serving channel
+
+- 原实现：`clineUpstreamOf(model)` = 模型 id 的 `/` 前缀（`cline-pass` /
+  `cline-free`），**甚至是厂商名**（`deepseek/deepseek-v4.1-flash` → `deepseek`）。
+  那是「订阅通道/厂商」，不是「谁服务了这笔请求」。
+- 参考实现同一列显示的是 **`alibaba` / `baseten`** 这类真实渠道，取自网关
+  下发的路由元数据（其 `parseRouting()`）。
+- **落点**（三种实测形态，`src/cline-routing.ts`）：
+
+  | 形态 | 路径 |
+  |---|---|
+  | **流式（真实链路）** | `choices[0].delta.provider_metadata.gateway.routing.finalProvider` |
+  | 非流式 / planner | `choices[0].message.provider_metadata.gateway.routing.finalProvider` |
+  | 帧顶层 | `provider_metadata.gateway.routing.finalProvider` |
+  | direct | `delta.provider` / 顶层 `provider`（如 `GMICloud`，原样保留） |
+
+  ⚠️ **大小写两种拼写都要认**：本仓库另一处实测（Gemini-400 段）记的是
+  **camelCase** `providerMetadata`，参考样例是 snake_case；只认一种会在另一种
+  形态下静默读不到。
+  ⚠️ 参考注释：*"in a stream it appears on whichever frame carries it, so every
+  frame is inspected and the last non-null reading wins"* ⇒ **逐帧**观测、
+  最后一次非空为准。
+- **实现**：`consumeOpenAiSse` 新增**可选旁路** `onFrame`（回调抛错被吞掉 ——
+  观测绝不能打死一次正常推理）；适配器在 `consumeWithLog` 里累积，写进
+  `ClineRequestEntry.upstream`。**空串 = 网关没报**，RPC 侧才回落到模型命名空间。
+- 反向验证：停掉逐帧观测 → 用例红（`expected '' to be 'deepseek'`）。
+
+⚠️⚠️ **第一版读漏了 `delta` 这一层，整处修复在真实链路上完全没生效**
+（用户 2026-10-01 第二次报障：「**上游**和**请求速率**为什么显示的还是错误的」；
+进程核对过 —— 00:30 启动的进程**已含** 00:09 那次安装，不是「没加载」）。
+当时按「非流式挂 `message`、**流式挂帧顶层**」实现，而**实测的流式帧把它挂在
+`choices[0].delta` 上** ⇒ 每帧都读不到、`upstream` 恒为空串、展示层回落到
+`cline-pass`，用户看到的与修复前**一模一样**。
+
+**两条教训（都比这一处 bug 值钱）**：
+
+1. ⚠️ **外部载荷的确切层级只能实测，不能按参考实现的只言片语推断**。参考实现
+   只说了「出现在携带它的那一帧上」，**没有说挂在 `delta` 还是帧顶层**，我按
+   猜测填了帧顶层。一次性探针
+   （`scripts/probe-cline-routing-live.mjs`：用凭据库里的 token 发一次极小流式
+   请求，**逐帧打印命中的 JSON 路径**）当场就能定案 —— 这类「形状假设」必须
+   在写实现时就用探针钉死，或至少在注释里标成**未验证假设**。
+2. ⚠️⚠️ **fixture 写错等于没有测试**：适配器那条 `upstream` 用例当时用的是
+   **帧顶层**的 fixture（即我的猜测），于是**用例绿、功能坏**，直到用户第二次
+   报障才暴露。凡涉及外部响应形状的 fixture，必须照实测量到的报文写，
+   并把「实测来源 + 日期 + 探针名」写进注释（现已如此）。
+
+   ⚠️ 探针本身也踩了一个坑：仓库里的 `access_token` **已含 `workos:` 前缀**
+   （`buildClineCredential` 写入时就加了），再拼一次 ⇒ `Bearer workos:workos:…`
+   ⇒ **401**。第一版探针因此误判「两个账号的 token 都失效」。
+
+**顺带核清的 `finalProvider` 语义**：它既可能是**基础设施商**（参考实现抓到的
+`alibaba` / `baseten`），也可能是**模型厂商自己的 API** —— 本机实测
+`cline-pass/deepseek-v4.1-flash` → `finalProvider = "deepseek"`。两者都是
+「网关最终决定由谁服务」，故**原样展示**、不要试图归类。
+
+**同时给「输出速率」补了 `—` 的原因提示**（`latencyParts` 新增 `rateTitle`，
+挂在那一行的 `title` 上）：不可测有两种情形，各自给话 ——
+`本次没有正文块（只输出思考，或流在正文之前结束）` /
+`正文阶段只有 Nms（不足 250ms）—— 响应几乎一次性到达`。
+用户第二次报障时正是怀疑「速率还是错的」，而实际是**不可测**；
+一个横杠不解释，就会被读成「坏了」。
+
+#### ② 图片能力只查本地兜底表 + **`cline-pass` 目录不全**（同一处修复）
+
+用户后来又报了同一条链上的第二个症状：「**当前 cline 供应商的模型列表中关于
+cline-pass 部分模型为什么不全**，例如当前这个模型就看不到了」。两者同源：
+**models.dev 这份目录此前完全没被当作目录来源**。
+
+- 原实现：`inputModalitiesFor()` 只看 `product.fallbackModels[].supportsImage`
+  —— **全表只有 5 条、且全是 `cline-free/*`**；而远端两个目录端点
+  **都不下发能力字段**（实测 `recommended-models` 只有
+  `{id,name,description,tags}`，`/models` 只有裸 id）。
+  ⇒ DSH 按适配器播报的 `inputModalities` 决定要不要把图片投影成占位符，
+  于是**图片根本送不进适配器** —— 用户看到的就是「支持图片的模型发不了图」。
+- **目录也不全（实测对账，2026-09-30）**：
+
+  | 来源 | `cline-pass/*` 条数 |
+  |---|---|
+  | 网关 `recommended-models` 的 `clinePass` 数组 | **14** |
+  | models.dev 的 `cline-pass` provider 块 | **18** |
+
+  差的 4 条 —— `kimi-k2.6` / `glm-5.2` / `kimi-k2.7-code` / `deepseek-v4-flash`
+  —— 在本插件里**根本不存在**，用户既看不到也选不到。
+  另外网关给 `cline-pass/*` 的 `name` **就是 id 本身**
+  （`name === 'cline-pass/mimo-v2.6-flash'`），列表里全是裸 id 也让人无从辨认；
+  models.dev 给的是可读名（`DeepSeek V4.1 Flash`）。
+- **权威来源：`https://models.dev/api.json` 的 `cline-pass` provider 块**
+  （实测 18 条，逐条带 `modalities.input` 与 `limit`）：
+  `cline-pass/deepseek-v4.1-flash` → `["text","image"]`、
+  `cline-pass/minimax-m3` → `["text","image","video"]`、
+  `cline-pass/glm-5.3` → `["text"]`。参考实现用的**正是同一来源**
+  （其 `MODELS_DEV_URL`；面板里「Rescan the official subscription list and
+  **adopt newly published models**」就是这一步 —— 注释原文：
+  *"Without it a model newer than this release resolves to the `text` fallback
+  and the harness refuses every image for it, silently."* 两处报障同型）。
+- **实现口径**（`src/cline-models-dev.ts`，替代原先只管模态的
+  `cline-modalities.ts`）：models.dev 是**目录的第三个来源**，
+  在 `ensureRemoteModels()` 里用 `applyModelsDevCatalog()` 并入：
+  1. **补缺**：目录里没有的 id **追加在该前缀最后一条之后**
+     （不能挂第一条后 —— 那会插到同族中间；更不能追加到列表末尾 ——
+     那里沉在 460 条远端 id 之后，等于没人看得到）；
+  2. **补名字**：仅当 `name === id`（网关把 id 当名字下发）时用可读名替换；
+  3. **补窗口**：`contextWindow` 缺失时才用 models.dev 的 `limit.context`；
+  4. ⚠️ **不取 `limit.output`**：那是要**真的写进请求体 `max_tokens`** 的值，
+     本仓库有过「据印象填大值 → vertex/google 400」的真实缺陷
+     （见本文件 Gemini-400 段），故只补展示名与窗口，不碰输出上限。
+  ⚠️ **一律不覆盖已有值**：策展的本地兜底表与网关数据优先于社区目录
+  （显式 `supportsImage: false` 也照样赢）。
+  ⚠️ **只认 `image`**（夹取掉 audio/video/pdf —— DSH 词表只有 text/image）。
+  ⚠️ **失败向上抛、不缓存**（`TtlCache` 只在成功时写入 ⇒ 下次可重试），
+  适配器侧吞掉并保持「这一层没有补充」。TTL **6 小时**（发布节奏的数据）。
+- ⚠️ **「没读到」≠「不支持」**：读不到时目录照常工作、图片能力退回本地兜底表；
+  把前者当后者正是本次缺陷的形态。
+- 反向验证：停用 `applyModelsDevCatalog` 那一行 → **两条**用例同时变红：
+  `图片能力取自 models.dev：cline-pass/* 也能发图`（报错
+  `cline: 模型 "cline-pass/deepseek-v4.1-flash" 不支持图片输入`）
+  与 `models.dev 补全 cline-pass 目录`。
+
+⚠️ **排障提示（本次顺带查明的第三种「看不到」）**：目录里有 14 条 `cline-pass`，
+但**用户的黑名单关掉了 10 条**（`~/.dsh/jet-hub/state.json` 的
+`disabledModels.cline`，实测 474 条 cline 模型被关），模型选择器里因此只剩
+4 条 —— 那是**用户自己的模型开关**，不是目录缺失。Jet Hub 的模型列表会渲染
+被关闭的模型（`listAllModels()` 就是为此存在），所以能在那里重新打开。
+**两种「看不到」的判据不同，别混**：黑名单造成的在 Jet Hub 里能看到（带开关）、
+目录缺失的在任何地方都没有。
+
+#### ③ 「输出速度（TPS）」= **DeepSeek 官方口径**（用户 2026-10-01 定案）
+
+> 用户原话：「**按照官方速率显示规则来**」（此前明确「我说的 deep seek」）。
+> ⚠️ **这一节取代了我 2026-09-30 那版「正文阶段」口径 —— 那版被用户否掉了。**
+
+**官方规则**（只读核对，出处是本机 DSH 自己的聊天 UI：
+`@deepseek-ai/dsh-client-ui-chat/lib/client.js`，可在
+`D:\Program Files\DeepSeek Harness\resources\app.asar` 里直接读到）：
+
+```js
+// assistantStepReading(node)：一「步」的读数
+ttftMs   = firstTokenTime - stepStartTime      // 首个 token（任意块，含推理块）
+decodeMs = completedTime  - firstTokenTime     // 首 token 之后 → 结束
+outputTokens = usage.outputTokens              // 该步全部输出 token
+
+// TimePill()：显示（decodeMs > 0 才显示，否则整项不渲染）
+tps = formatTokensPerSecond(outputTokens / (decodeMs / 1e3))
+
+// formatTokensPerSecond()：取整规则（先 clamp 负值）
+x >= 10 ? String(Math.round(x)) : String(Math.round(x * 10) / 10)
+```
+
+官方 i18n：`message.tokensPerSecond = "{tps} tok/s"`、
+`stats.dialog.speed = "输出速度（TPS）"`。
+
+**本插件据此落地**（`plugin-src/client/tokens-per-second.js`，纯函数可逐值单测；
+`jet-hub.js` 只负责组装三行）：
+
+| 项 | 取值 |
+|---|---|
+| 分子 | **全部输出 token（含推理 token）** —— ⚠️ **不减** `reasoningTokens` |
+| 分母 | `总耗时 − 首字`（`decodeMs`），**不含**首字之前那段 |
+| 门禁 | 只有 `decodeMs > 0`；⚠️ **没有**最小窗口下限 |
+| 单位/标签 | `tok/s` / 「输出速度（TPS）」（单元格里用短版「输出速度」） |
+
+⚠️⚠️ **三处曾经的错误做法，别再改回去**（每条都有反向验证过的用例守着）：
+
+1. **`11814.8 t/s` 那次不是"公式错"**：官方口径在**短窗口**下本来就会给出很大的数
+   （响应几乎一次性到达时 `首字 ≈ 总耗时`，`142 token ÷ 12ms ≈ 11833 tok/s`）。
+   我 09-30 的反应是改分子分母 + 加 250ms 下限 —— **那是过度纠正**，官方没有下限，
+   改了反而与本 app 自己的读数不一致。
+2. **不要减推理 token**：`reasoning_tokens` 计入 `completion_tokens`（本仓库多处实测），
+   官方就是这么算的。减了会让同一笔请求的 TPS 与 DSH 显示的不同。
+3. **不要退回 `toFixed(1)`**：官方的精度是**两段式**（`≥10` 整数、`<10` 一位小数），
+   不是统一小数位。反向验证：把取整换成 `toFixed(1)` → **7 条**用例变红
+   （`expected '273.9 tok/s' to be '274 tok/s'` 等）；把分子改成「减推理」→ 1 条变红。
+
+⚠️ **`ttfcMs`（首个正文块耗时）现在只是诊断字段**，**不参与**速率计算：
+官方口径只用 `首字`（首个任意块）。字段仍照常记录（适配器 → 请求记录 → RPC），
+将来若要显示「首正文」可直接用；但**不要**拿它当速率分母。
+
+⚠️ **`ttftMs === 0` 在我们的数据模型里是「没有任何块到达」= 未知**（官方用 `null`），
+故 `formatRowTokensPerSecond` 把 `0` 显式映射成**不可测**（显示 `—`）——
+照字面算 `total - 0` 会把「首字时刻未知」当成「首字在 0ms」，报出假速率。
+这条映射有专门用例（`缺首字时刻（ttft=0 = 未知）→ —`）。
+
+⚠️ **旧断言又锁死了一次旧实现**：`cline-quota-panel.spec.ts` 里原先那条
+「输出速率按正文阶段算」的用例（断言 `MIN_RATE_WINDOW_MS` / `contentTokens`）
+正是锁 09-30 那版口径的，本次已改写为「接线到 `tokens-per-second.js`」。
+**改口径必须同步改用例** —— 这在本仓库已是第三次同型情况
+（账号池 id、平铺渲染、此处）。
+
+⚠️ **反向验证脚本自身的坑（第 4 次同型）**：`swap-tps-official.mjs` 打补丁时
+**第一版打到了文档注释里那行官方代码**（我在模块头注释里引用了
+`x >= 10 ? … : …`），于是「取消官方取整」的反向验证**假绿**（13 条全过）。
+判据：**要改的是函数体，必须取最后一次出现**（`lastIdx`）。
+这与本文件记过的「同一表达式出现两次、替换打到第一处」是同一条教训 ——
+**换行数/取最后出现**，并在反向验证后**确认它真的变红**（假绿比不验证更危险）。
+
+⚠️ **另记一处未修的小缺口**（不属本次报障，留给后续）：
+`recommended-models` 实测还有第 4 个数组 **`clineCloud`**（3 条，如
+`cline-cloud/glm-5.3`），而 `parseClineRecommendedModels` 只读
+`free`/`recommended`/`clinePass` ⇒ 这批模型拿不到 `name`/`description`
+（只能靠 `/models` 的裸 id 出现）。改动会影响模型列表内容，故未顺手做。
+
+### ⚠️ 模型列表的**「计费/来源」分组**（用户要求，2026-10-01）
+
+用户问「模型列表能够分组显示吗」→ 选定口径 **B：按计费/来源分 4 组**（而不是
+按 67 个命名空间），并要求**每组一个「全开 / 全关」**。实测目录规模 **488 条**
+（`openai` 104 / `qwen` 54 / `google` 41 / `anthropic` 29 …），平铺确实没法看。
+
+**只有 Jet Hub 的「显示列表」能分组**；⚠️ **对话框里的模型选择器不能** ——
+那是 harness 自己的 UI（`dsh-client-ui-model-selection`），它只按 **provider**
+分组，`cline` 在里面必然是一个大组；我们能影响的只有每个模型的 id/name。
+
+#### 分组口径（`plugin-src/client/model-groups.js`，纯函数）
+
+| 组 | 判据 | 实测规模 |
+|---|---|---|
+| 订阅额度 | `cline-pass/*` | 18 |
+| 免费额度 | **目录下发的 `isFree === true`** | 7（5 `cline-free/*` + 2 `stealth/*`） |
+| Cline Cloud | `cline-cloud/*` | 有则显示；**空组不渲染** |
+| 按量计费 | 其余全部（走账户余额结算） | 460+ |
+
+⚠️⚠️ **免费必须用 `isFree`，不能在前端按前缀猜**：免费集合是远端
+`recommended-models` 的 `free` 数组 + `:free` 后缀 + `cline-free/` 前缀的
+**并集**（见 `cline-models.ts`），而 **`stealth/pixel-canary` /
+`stealth/space-bunny-alpha` 在 `free` 数组里却不在 `cline-free/` 命名空间下**
+—— 按前缀判会把这两条**免费模型错归进「按量计费」**，用户以为要花钱而不敢用。
+⚠️ `isFree` **缺失**（老/外部适配器不报）时保守归入「按量计费」：那是兜底桶，
+「没说免费」比「谎称免费」安全（与全仓「未知不编造」一致）。
+
+#### 展开策略（`groupExpanded`）
+
+优先级：**用户点过 > 有筛选 > 默认**。默认**「按量计费」折叠、其余展开**
+（前者是兜底大桶、多数是关的，默认展开等于把列表撑到没法用）；**有搜索/筛选时
+一律展开**（否则搜到的结果藏在折叠组里，看起来像「没搜到」）。
+⚠️ **不要把默认值烘焙进 state**：只存「用户点过的组」，否则「清空筛选后恢复
+默认」就做不到了。
+
+#### ⚠️ 新增端点 `model.setDisabledMany`（按子集），**不能**复用 `setAllDisabled`
+
+分组的「本组全开/全关」必须只动本组的 id。若图省事复用
+`model.setAllDisabled`：**它的打开方向是「清空整张黑名单」** ⇒
+「只打开订阅额度这一组」会把用户特意关着的**按量计费 460 多条一起打开**。
+
+- 池新增 `AccountPool.clearModelsDisabled(provider, modelIds)`：**只删传入的 id**
+  （与 `clearDisabledModels` 的「清空全部、并顺带清掉已下线死键」是**两个语义**，
+  别混）；**无实际变更不落盘**（该组本就全开时不该产生一次文档重写 + 目录广播）。
+- 端点：校验 `provider` / `modelIds` 数组 / `disabled` 布尔（**不猜默认值**，
+  与另两个开关端点同约定），**去重 + 剔脏值后为空则拒**，只落盘一次、只广播一次。
+- 反向验证：把打开方向改回 `clearDisabledModels` → 用例红
+  （`expected {} to deeply equal { Object (buddy) }`，即「其它组的关闭项被一起清掉了」）。
+
+#### `model.list` 新增 `isFree`（缺失不编造）
+
+`ModelCatalogSource.listAllModels()` 的返回类型扩展为
+`{ id, name, isFree?: boolean }`，`ClineAdapter` 填上（它来自目录合并的
+`isFree`，与模型选择器里的「· 免费」标签**同源**）。RPC 层**照原样透传、缺失
+就不写这个字段** —— 不编造 `false`（类型上是 `isFree?: boolean`）。
+
+#### ⚠️⚠️ 验证盲区：客户端改动**单测全绿也不代表 bundle 能构建**
+
+`plugin-src/client/*.js` 的改动在本仓库**只被两种方式验证**：纯函数单测 + 把
+`jet-hub.js` 当**文本**读的源码级断言。二者都**不做语法解析** ⇒
+**必须另跑 `pnpm build:client`（或 `build:all`）**。
+本次真踩到：分组渲染用**块体箭头函数**（`group => { ... return ... }`），收尾括号
+比原来的**表达式体**少一层，我多打了一个 `)` —— 3809 条单测全绿、esbuild 报
+`Expected ";" but found ")"`。**改完客户端一律跑一次构建**。
+
+回归用例 `tests/unit/model-groups.spec.ts`（21 条：归组 / 并集不丢模型 /
+组内筛选与计数 / 展开策略 / 组内批量可用性 + 4 条源码级接线断言），
+端点用例在 `tests/unit/jet-hub-rpc.spec.ts` 的 `model.setDisabledMany` 段（10 条）。
+⚠️ 同时更新了 `model-filter.spec.ts` 里锁**旧平铺渲染**的那条断言
+（`filtered.map(...)` → `group.models.map(...)`）—— 与以往同型：**旧断言可能锁死
+被有意改掉的实现**。
+
+### ⚠️ 额度窗口与请求记录**共享同一个翻页索引**（用户要求）
+
+「订阅额度」弹窗改为：**一次只显示一个账号**，用左右箭头 `‹ ›` 翻页；
+**额度窗口与请求记录一起切**（用户明确要求「统一切换」）。参考实现同款。
+
+要点（多数是参考实现踩过的坑）：
+
+- 索引是**纯本地状态**，**不要用 useEffect 播种**（列表一到就 set(0)）——
+  那会让「浏览位置」与「显示的是谁」短暂分叉。当前账号在**渲染期纯计算**
+  （`quota[Math.min(viewIndex, quota.length - 1)]`），越界钳制但**不回写**，
+  账号恢复后还能回到原位。
+- 翻页是**纯本地**（额度数据一次性取回），切账号时只有请求记录需要重新拉取。
+- **环绕**：末个账号的右箭头回第一个（单向尽头会让用户以为「后面没了」）。
+- 单账号**整行名字都不渲染**（参考实现同款：箭头无处可去，账号名也不构成
+  区分信息）。「这是谁的额度」改由**弹窗副标题**给出（多账号 = `Cline · {n} 个账号`，
+  单账号 = `Cline · 账号 {名}`）—— 否则单账号用户看不到是谁的额度。
+- **竞态**：切账号会丢弃未完成的旧请求记录响应（按请求序号「最新获胜」），
+  否则旧响应后到会覆盖新账号的数据。
+
+### ⚠️ 与参考实现的**逐项对齐**（2026-09-30 用户报障「没有 1:1 还原」后重做）
+
+**用户判据**：额度窗口与请求记录要么**逐项**与
+`github.com/codeOct/dsh-cline-pass`（main @ `abab1dd`）一致，要么说明为什么不一致。
+首版是按「精神」做的**子集**，故这次逐条对照后重做。已对齐项与**被推翻的旧实现**：
+
+| 项 | 参考实现（main） | 首版（错） | 现状 |
+|---|---|---|---|
+| 记录表列 | **5 列含状态点**（绿/红点，title 给错误） | 4 列、无状态点 | ✅ 5 列 |
+| 延迟列 | **三行**：首字 / 总耗时 / **输出速率 t/s** | 单行「首块 X · 共 Y」 | ✅ 三行 |
+| TOKEN 列 | `↓入 ↑出 ⚡缓存 🧠推理`（图标 + k/M 有界缩写） | `123 + 456`，丢缓存 | ✅ 图标格式 |
+| 未收 usage 帧 | 显示 **`—`**（≠ 花 0） | `0 + 0` ← **语义错误** | ✅ `usageReported:false` → `—` |
+| 未知耗时 | **破折号 `—`**（`stamp`/`rate`） | 半角 `-` | ✅ `—` |
+| TOKEN tooltip | 精确数字 + **图例**（`—` 的含义） | 只有一句替代文案 | ✅ `TOKEN_LEGEND` |
+| 行 tooltip | 汇总 5 行事实（含**推理强度**） | 无 | ✅ 含 `effort` |
+| 额度窗口布局 | **grid 卡片**（auto-fit / 170px）+ **18px** 大字百分比 | 纵向列表 + 13px | ✅ grid + 18px |
+| 百分比 | `Math.max(0, Math.min(100, x))` + **取整** | 保留一位小数、**故意不夹** | ✅ 夹取+取整 |
+| 进度条配色 | ≥90 红 / ≥70 黄 / 其余**绿**（`usageColor`） | ≥100 红 / ≥80 黄 / 其余**蓝** | ✅ 三档绿底 |
+| 窗口顺序 | 已知窗口**固定顺序在前**、未知**追加在后** | 纯按网关原序 | ✅ `QUOTA_WINDOWS` |
+| 账号块 key | 按账号 id → **重挂载**（进度条不跨账号动画） | 无 key | ✅ `key: entry.accountId` |
+| 模型名 | 去 `cline-pass/` 前缀 + 上游 tag | 原样 | ✅ 去前缀 |
+| 失败行 | 空 2 格 + **`colSpan 3`**（消息从模型列起） | `colSpan 4` | ✅ `colSpan: 3` |
+| 表格 | 自带 **280px 滚动** + **sticky 表头** + 全列居中 | 靠弹窗滚动、左对齐 | ✅ 同款 |
+| 列宽 | `colgroup` 提示（状态点 16px / 时间 82px） | 无 | ✅ `colgroup` |
+
+⚠️ **被参考实现自己删除、我们也不补**：额度卡曾经有「token 用量 / 已用金额 /
+折算剩余 token」——参考 `client.js` 的 `UsageCard` 注释明确写了那些数字是
+*derived, unverifiable*，**作者已主动删除**，卡片只留「百分比 + 重置时刻」。
+排查时不要再去参考的 README（不同 commit 的描述）里找这三项。
+
+⚠️ **刻意保留的措辞差异**（不是漏改）：jet-hub 沿用本插件自己的命名
+「**订阅额度**」/「**请求记录**」（参考叫「官方额度」/「最近请求」）——
+按钮名是用户在前一轮明确指定的，改掉会让同一功能在两个入口有两套叫法。
+除措辞外，布局、字段、格式化与配色全部对齐。
+
+⚠️ **数据层随之扩了三件事**（缺任何一件都会让上面某行显示不出来）：
+`usageReported`（`—` 的判据）、`cacheReadTokens`（`⚡` 那一项）、
+`effort`（行 tooltip 的推理强度行）。三者都已接线
+`cline-adapter → cline-request-log → jet-hub-rpc → types`，
+并由 `cline-request-log.spec.ts` / `jet-hub-rpc.spec.ts` 锁死。
+
+回归用例 `tests/unit/cline-quota-panel.spec.ts` **在 2026-09-30 被整体重写**：
+旧断言锁的是首版自创形态（「百分比不夹取」「单行延迟」等），与用户给的判据
+直接冲突，故换判据而非删断言。**不要照着旧断言改回去。**
+
+### ⚠️ 五个实测坑（沿用参考实现已核实的结论，**不要重新踩**）
+
+1. **分页参数只认 `cursor`**，值取自响应 `data.nextToken`。
+   `nextToken` / `next_token` / `page` / `offset` / `skip` 作为**请求参数**会被网关
+   **静默忽略** —— 永远返回同一页。早期据此连翻会**重复计数**，得出
+   「已用 28 亿 token、超限 120%」这种荒谬结果。
+2. **`data.total` 恒为 0**，不能用来算页数或总量。
+3. **`/usages` 忽略 `startDate` / `endDate`**：只按时间**倒序**返回，
+   要按窗口截断只能读每行的 `createdAt`。
+4. **`resetsAt` 是 ISO 字符串**，不是数字时间戳 —— ⚠️ 故**不能**复用客户端的
+   `formatTime()`（它按毫秒运算，传字符串会一律显示「已过期」，
+   把 6 小时后重置的窗口说成已重置）。现由 `quotaCountdown` / `quotaResetsIn`
+   负责（`Date.parse` + 粗粒度倒计时），记录表的「时间」列另用 `formatStamp`。
+5. **`userId` 用凭据里的 `account_id`（`usr-…`）**，不是 JWT 的 `sub`（`user_…`）：
+   后者实测 `400 Invalid request format`。而**额度端点用字面量 `users/me`**，
+   不依赖 `account_id`（两者口径不同，别顺手统一）。
+
+#### 设计要点（改这个功能前先读）
+
+- **能力表两侧必须同时改**：客户端 `CREDITS_CAPABILITIES.cline.subscriptionQuota`
+  决定按钮是否渲染；服务端 `cline.quota` / `cline.requestLog` 对非 Cline 一律
+  `bad-request`。只改一边就是「按钮在、点了报错」或「功能存在却点不出来」。
+  `credits-capabilities.spec.ts` 用**全表推导**守住「只有 cline 登记」。
+- **`subscriptionQuota` 与 `balance` / `dailyCheckin` 语义独立，不能互相推断**：
+  Cline 是「有余额、有订阅额度、无签到」，Loomy 是「有余额、有签到、无订阅额度」。
+  合并成一个标志会让某个面板冒出不该有的按钮。
+- **额度逐账号隔离**：一个账号凭据坏掉只让**那一张卡片**显示原因，其余照常。
+  多账号用户不该因为一个号没配凭据就完全看不到额度。
+- **「查询失败」与「没有额度窗口」必须分开渲染**：前者是错误（显示原因），
+  后者是事实。合并成一句会让用户以为额度没了。
+- **失败不得显示成 0%**：0% 是「这个窗口没用过」的合法语义；
+  查询失败一律 `ok:false` + 原因（与其余 provider「查不到不显示成 0」同约定）。
+- **请求记录的失败是载荷（`ok:false`）而不是 RPC 级错误**：
+  面板要**保留已加载的行**、只把原因显示在表格下方；回成 RPC 错误会让整块换成错误页，
+  翻页途中失败就把用户已看到的记录清空了。
+- **百分比**：数值**夹取到 0–100 后取整**（参考实现），文案与进度条宽度共用
+  `quotaPercentValue` 这**一个**值 —— 两处各算一次是「进度条 100%、文案 120%」
+  这类不一致的来源。⚠️ 这条在 2026-09-30 **推翻了旧实现**（旧版故意不夹取）。
+- **窗口顺序**：已知窗口（`five_hour` / `weekly` / `monthly`）按 `QUOTA_WINDOWS`
+  固定顺序在前，网关下发的**未知窗口追加在后** —— 纯按网关原序会让新窗口插到中间，
+  同一账号两次读数的排列都可能不同。未知类型的标签回落到 `type` 原值（不丢弃）。
+- 按钮放在**面板级**而不是账号卡片的按钮行：那一行已有 5 个按钮且
+  `flex-wrap: nowrap`，再塞一个必然溢出（「领取新手任务」当时就是这么被挤出去的）。
+  且额度是**跨账号**读数，放面板级与语义一致。
+
+#### ✅ 验证状态（哪些已实证、哪些还没有）
+
+**已实发核对（2026-09-29，本机真实 Cline 账号，只读 GET、未触发续期）**：
+端点与响应形状与解析层**完全一致** ——
+
+- `/users/me/plan/usage-limits` → `data.limits[]`，`type` ∈
+  `five_hour` / `weekly` / `monthly`，带 `percentUsed` 与 `resetsAt`；
+- `/users/{account_id}/usages` → `data.items[]` + `data.nextToken`，行含
+  `createdAt` / `aiModelName` / `aiModelTypeName` / `totalTokens` /
+  `creditsUsed` / `costUsd`。**用 `account_id`（`usr-…`）实测可用**。
+
+两个实测形态已写进用例：
+
+- `resetsAt` 是**纳秒**精度（9 位小数），如 `2026-09-29T15:41:02.244817775Z`
+  —— 解析层**原样保留**（不截断、不归一化），`Date.parse` 可解析；
+- 用量为 0 的窗口 `resetsAt` 是**空串** —— 客户端因此**不渲染**那一行
+  （渲染一个空的「重置」会让人以为读取失败）。
+
+⚠️ 探针**没有入库**（`tests/e2e/tmp-*.ts` 用完即删）。需要复核时：照
+`tests/e2e/cline-credential.ts` 读凭据，再调 `fetchClineUsageLimits` /
+`fetchClineRequestLog` 即可（**只读、不要续期**）。
+
+⚠️ 顺带发现（**与本功能无关，刻意未改**）：`readClineCredentialsFromDshStore()`
+对本机当前的 `.credentials.yaml` 读出 **0 个账号** —— `extractYamlScalar` 取出的
+标量**尾部多 2 个杂字符**，`JSON.parse` 抛错后被该助手的 `catch` **静默跳过**。
+探针是靠「只取第一个完整 JSON 值」绕过的。若哪天别的 Cline e2e 报
+「0 个账号」，根因多半在这里，而不一定是凭据真的不存在。
+
+**已做**：`pnpm typecheck`、`pnpm test`（新增 54 条：`cline-quota` 32、
+能力表 3、RPC 端点 9、客户端接线 10）、`pnpm build:all`，并已安装到本机 profile
+（`lib/` 330 个文件**全量哈希一致**）。全量测试
+**1 failed | 3155 passed**，那 1 项是既有失败（`loomy-docs` 缺被 gitignore 的文档；
+另有 `cline-icon` 缺不入库脚本，属套件级加载失败）。
+
+**未做**：GUI 点击级实测（`/api/jet-hub` 需浏览器登录态，直接调用返回 401，
+与既有记录一致）。
+
+⚠️ **改了宿主侧（`src/`）必须重启 DSH 才生效**：客户端 bundle
+（`lib/client/jet-hub.js`）会被 `dsh-client-hmr` 热加载（刷新页面即可，无需重启），
+但 `cline.quota` / `cline.requestLog` 是**宿主侧**端点 —— 不重启只会看到
+「按钮出来了、点了报 unknown method」。
+
+### ⚠️ 修复记录：首版弹窗漏了 `.dim-jh-modalBody` + 数字列右对齐被压过
+（2026-09-29 用户报障：「弹窗位置不正确。内容显示不正确」）
+
+**根因一（位置）**：弹窗内容直接铺在 `.dim-jh-modal` 里，没包 `.dim-jh-modalBody`。
+
+`.dim-jh-modal` 是 `max-height: min(640px, calc(100vh - 48px))` 的 flex **列**容器，
+子项默认不可收缩（没有 `min-height: 0` / `overflow`），内容一多就
+**画出弹窗边界之外** —— 额度卡 + 请求表叠加，视觉上就是「弹窗错位、内容错乱」。
+
+**修法**：内容包进 `.dim-jh-modalBody`（`flex: 1 1 auto; min-height: 0;
+overflow-y: auto`，见样式）。模型列表弹窗同款 —— 它的 error / loading /
+empty / 列表四个分支**全部**在 modalBody 里，只有 modalHead / modalHint /
+筛选条 / 批量工具条在外面。
+
+**根因二（内容）**：`.dim-jh-quotaNumCol { text-align: right }` 的优先级
+**(0,1,0)**，压不过 `.dim-jh-quotaTable th/td { text-align: left }` 的
+**(0,1,1)** —— 右对齐**静默失效**：表头左对齐、数据右对齐，列错位。
+
+**修法**：复合选择器
+`.dim-jh-quotaTable td.dim-jh-quotaNumCol, .dim-jh-quotaTable th.dim-jh-quotaNumCol`。
+这正是参考实现 README 里「429 错误行撑宽请求记录表格」的**同一个选择器强度
+问题**（那边是 `(0,1,1)` 的 `td{white-space:nowrap}` 压过 `(0,1,0)` 的
+`.cp-history-error`，解法同样是复合选择器）。
+
+⚠️ 两条都已有**反向验证**（注入缺陷 → 对应断言变红，其余 8 条不受影响），
+用例在 `tests/unit/cline-quota-panel.spec.ts` 的
+「弹窗内容在 .dim-jh-modalBody 滚动区里」与「数字列右对齐用复合选择器」。
+
+顺带吸收参考实现的既有经验：时间列**定宽 82px**（防时间戳被截断）、
+模型名 `word-break: break-word`（长模型名不撑宽表格）。
+
 ## 常见开发任务
 
 ### 新增功能
