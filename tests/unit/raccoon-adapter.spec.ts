@@ -391,7 +391,8 @@ describe('stream', () => {
 })
 
 describe('registerRaccoonLlm', () => {
-  it('注册到 ctx.llm 并返回适配器实例', () => {
+  it('只注册适配器路由并返回实例（不声明可配置 provider）', () => {
+    // ⚠️ 2026-10-01（用户要求）：见 src/llm-register-compat.ts 模块头。
     const ctx = makeContext()
     const registered: string[] = []
     ctx.provide('llm', {
@@ -406,7 +407,8 @@ describe('registerRaccoonLlm', () => {
       refresh: async () => {},
     })
     services.push(adapter as unknown as { [Symbol.dispose]?: () => void })
-    expect(registered).toContain('raccoon')
+    // 唯一一次登记来自 registerAdapter：configurable 目录没被碰过。
+    expect(registered).toEqual(['raccoon'])
     expect(adapter).toBeInstanceOf(RaccoonAdapter)
   })
 })

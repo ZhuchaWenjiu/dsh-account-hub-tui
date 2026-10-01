@@ -45,7 +45,6 @@ import type {
   StreamChunk,
 } from '@deepseek-ai/dsh-llm'
 import { AccountPool, providerCatalogVisible } from './account-pool.js'
-import { settingsNamespaceFor } from './settings-compat.js'
 import { collectImages, serializeMessages } from './openai-compat.js'
 import { projectRequestImage, type ImageRequestTarget } from './image-budget.js'
 import type { ZcodeCredential } from './zcode.js'
@@ -72,7 +71,6 @@ import { GateAbortedError, ModelGate } from './model-gate.js'
 import { nextUtc8DayStartMs } from './model-queue.js'
 import {
   registerAdapterIdempotent,
-  registerConfigurableProvidersIdempotent,
 } from './llm-register-compat.js'
 
 /** 本适配器注册的 provider 路由名（等价于 `ZCODE.id`）。 */
@@ -1335,14 +1333,6 @@ export function httpErrorCodeForZcode(status: number, body: string): string {
  */
 export function registerZcodeLlm(ctx: Context, options: ZcodeAdapterOptions): ZcodeAdapter {
   const product = options.product ?? ZCODE
-  registerConfigurableProvidersIdempotent(ctx.llm, [
-    {
-      provider: product.id,
-      displayName: product.displayName,
-      settingsNs: settingsNamespaceFor(ctx, `llm-${product.id}`),
-      settingsPath: [],
-    },
-  ])
   const adapter = new ZcodeAdapter(options)
   registerAdapterIdempotent(ctx.llm, [product.id], adapter)
   return adapter

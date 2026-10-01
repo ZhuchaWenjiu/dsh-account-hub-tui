@@ -32,7 +32,6 @@ import type { CredentialRef } from '@deepseek-ai/dsh-credentials'
 import { LlmAdapter, LlmError, ReasoningEffortId } from '@deepseek-ai/dsh-llm'
 import type { GenerateOptions, LlmModelInfo, LlmProviderInfo, LlmResolvedModelInfo, StreamChunk } from '@deepseek-ai/dsh-llm'
 import { AccountPool, providerCatalogVisible } from './account-pool.js'
-import { settingsNamespaceFor } from './settings-compat.js'
 import { isClineExpired, clineHeaders, type ClineCredential } from './cline.js'
 import {
   clineDisplayName,
@@ -52,7 +51,6 @@ import { parseClineRouting } from './cline-routing.js'
 import { recordClineRequest } from './cline-request-log.js'
 import {
   registerAdapterIdempotent,
-  registerConfigurableProvidersIdempotent,
 } from './llm-register-compat.js'
 import {
   collectImages,
@@ -924,20 +922,13 @@ const CLINE_REGION_FORBIDDEN_MARKERS: readonly string[] = [
 /**
  * 在 `ctx.llm` 上注册 Cline provider 路由与适配器。
  *
- * 路由名与配置页展示名由产品配置驱动，得到 `cline`。`settingsNs` 经
- * `settingsNamespaceFor()` 解析：老契约（≤0.1.6）下是 `llm-cline`；
- * 0.1.7-rc.1 起 settings 命名空间只能是 profile 条目 id，故解析为本插件条目 id。
+ * 路由名与展示名由产品配置驱动，得到 `cline`。
+ *
+ * ⚠️ 刻意**不**向 DSH 声明可配置 provider（`registerConfigurableProviders`）——
+ * 详见 `llm-register-compat.ts` 模块头。
  */
 export function registerClineLlm(ctx: Context, options: ClineAdapterOptions): ClineAdapter {
   const product = options.product ?? CLINE
-  registerConfigurableProvidersIdempotent(ctx.llm, [
-    {
-      provider: product.id,
-      displayName: product.displayName,
-      settingsNs: settingsNamespaceFor(ctx, `llm-${product.id}`),
-      settingsPath: [],
-    },
-  ])
   const adapter = new ClineAdapter(options)
   registerAdapterIdempotent(ctx.llm, [product.id], adapter)
   // 返回实例：Jet Hub「显示列表」需要 `listAllModels()`（不受黑名单影响、

@@ -7,7 +7,6 @@ import {
 import type { GenerateOptions, LlmModelInfo, LlmProviderInfo, LlmResolvedModelInfo, StreamChunk } from '@deepseek-ai/dsh-llm'
 import { ReasoningEffortId, ToolCallId } from '@deepseek-ai/dsh-llm'
 import { AccountPool, providerCatalogVisible } from './account-pool.js'
-import { settingsNamespaceFor } from './settings-compat.js'
 import { isCodeArtsBenefitModel } from './models.js'
 import { normalizeHarnessMessages } from './message-shape.js'
 import { signRequestHuawei } from './sign.js'
@@ -15,7 +14,6 @@ import { createBlankReasoningSuppressor, createReasoningLoopDetector, hasUsableT
 import type { CodeArtsCredential } from './types.js'
 import {
   registerAdapterIdempotent,
-  registerConfigurableProvidersIdempotent,
 } from './llm-register-compat.js'
 
 export const CHAT_API_BASE = 'https://snap-access.cn-north-4.myhuaweicloud.com/api/v2'
@@ -1814,15 +1812,6 @@ export class CodeArtsAdapter extends LlmAdapter {
 
 /** 在 ctx.llm 上注册 codearts 提供商路由和适配器。 */
 export function registerCodeArtsLlm(ctx: Context, options: CodeArtsAdapterOptions): CodeArtsAdapter {
-  registerConfigurableProvidersIdempotent(ctx.llm, [
-    {
-      provider: PROVIDER,
-      displayName: 'CodeArts Agent',
-      // 0.1.7 起 settings 命名空间只能是 profile 条目 id（见 settingsNamespaceFor）。
-      settingsNs: settingsNamespaceFor(ctx, 'llm-codearts'),
-      settingsPath: [],
-    },
-  ])
   const adapter = new CodeArtsAdapter(options)
   registerAdapterIdempotent(ctx.llm, [PROVIDER], adapter)
   // 返回实例：Jet Hub「显示列表」需要 `listAllModels()`（不受黑名单影响、

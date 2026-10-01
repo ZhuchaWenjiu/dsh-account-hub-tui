@@ -18,7 +18,6 @@ import {
   ReasoningEffortId,
 } from '@deepseek-ai/dsh-llm'
 import { AccountPool, providerCatalogVisible } from './account-pool.js'
-import { settingsNamespaceFor } from './settings-compat.js'
 import { RATE_LIMIT_FALLBACK_MS, isRateLimited, parseRateLimitError } from './llm-adapter.js'
 import { ToolCallId } from '@deepseek-ai/dsh-llm'
 import type { GenerateOptions, LlmModelInfo, LlmProviderInfo, LlmResolvedModelInfo, StreamChunk } from '@deepseek-ai/dsh-llm'
@@ -36,7 +35,6 @@ import { projectRequestImage, type ImageRequestTarget } from './image-budget.js'
 import { createBlankReasoningSuppressor, createReasoningLoopDetector, hasUsableToolName, isProseTruncatedByStopString, isReasoningLoopGuardEnabled, isTruncatedArguments, normalizeToolArguments, readWithIdleTimeout, reasoningLoopFailure, resolveEmptyResponseReason, resolveToolPairing, splitThinkTaggedContent, stripBareThinkCloseTagIfEnabled, stripCourseLeakFromHistoryContent, stripCourseLeakIfEnabled } from './sse.js'
 import {
   registerAdapterIdempotent,
-  registerConfigurableProvidersIdempotent,
 } from './llm-register-compat.js'
 
 /**
@@ -216,8 +214,8 @@ export interface BuddyAdapterOptions {
    * 产品配置；默认为 CodeBuddy。
    *
    * 决定请求身份标识（X-Product-Code / User-Agent）、模型元数据的 provider
-   * 字段、providerInfo 的展示名，以及 registerBuddyLlm 注册的路由与
-   * settingsNs。两个内置产品（CodeBuddy / WorkBuddy）共用同一后端与协议，
+   * 字段、providerInfo 的展示名，以及 registerBuddyLlm 注册的路由名。
+   * 两个内置产品（CodeBuddy / WorkBuddy）共用同一后端与协议，
    * 差异全部由本配置承载。
    */
   product?: BuddyProduct
@@ -2238,22 +2236,14 @@ function positiveMaxTokens(value: number | undefined): number | undefined {
 /**
  * 在 ctx.llm 上注册 CodeBuddy 系产品的 provider 路由与适配器。
  *
- * 路由名、配置页展示名与 settingsNs 全部由产品配置驱动：
- * CodeBuddy 得到 `buddy`，WorkBuddy 得到 `workbuddy`。
- * `settingsNs` 经 `settingsNamespaceFor()` 解析：老契约（≤0.1.6）下是各产品的
- * `llm-<id>` 命名空间；0.1.7-rc.1 起 settings 命名空间只能是 profile 条目 id，
- * 故解析为本插件条目 id。
+ * 路由名与展示名由产品配置驱动：CodeBuddy 得到 `buddy`，WorkBuddy 得到 `workbuddy`。
+ *
+ * ⚠️ 刻意**不**调用 `ctx.llm.registerConfigurableProviders`（即不向「设置 → 模型 →
+ * 提供商」声明配置行）：账号、模型开关与模型目录都由 Jet Hub 设置页管理，声明只会
+ * 在该页留下无人使用的行。原因、依据与恢复方式见 `llm-register-compat.ts` 模块头。
  */
 export function registerBuddyLlm(ctx: Context, options: BuddyAdapterOptions): BuddyAdapter {
   const product = options.product ?? CODEBUDDY
-  registerConfigurableProvidersIdempotent(ctx.llm, [
-    {
-      provider: product.id,
-      displayName: product.displayName,
-      settingsNs: settingsNamespaceFor(ctx, `llm-${product.id}`),
-      settingsPath: [],
-    },
-  ])
   const adapter = new BuddyAdapter(options)
   registerAdapterIdempotent(ctx.llm, [product.id], adapter)
   // 返回实例：Jet Hub「显示列表」需要 `listAllModels()`（不受黑名单影响、

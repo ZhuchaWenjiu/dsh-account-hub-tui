@@ -2346,20 +2346,20 @@ describe('产品参数化', () => {
     }
   }
 
-  it('registerBuddyLlm 默认注册 buddy 路由与 llm-buddy 命名空间', () => {
+  it('registerBuddyLlm 默认只注册 buddy 路由（不声明可配置 provider）', () => {
     const fake = makeLlm()
     registerBuddyLlm({ llm: fake.llm } as never, {
       credentialRef: CREDENTIAL_REF,
       resolveCredential: async () => makeCredential(),
       refresh: async () => {},
     })
-    expect(fake.providers).toEqual([
-      { provider: 'buddy', displayName: CODEBUDDY.displayName, settingsNs: 'llm-buddy', settingsPath: [] },
-    ])
+    // ⚠️ 2026-10-01（用户要求）：不再向「设置 → 模型 → 提供商」声明配置行 ——
+    // 账号与模型开关都在 Jet Hub 设置页管理（见 src/llm-register-compat.ts 模块头）。
+    expect(fake.providers).toEqual([])
     expect(fake.adapters).toEqual([['buddy']])
   })
 
-  it('registerBuddyLlm 传入 WorkBuddy 时注册 workbuddy 路由与 llm-workbuddy 命名空间', () => {
+  it('registerBuddyLlm 传入 WorkBuddy 时只注册 workbuddy 路由（不声明可配置 provider）', () => {
     const fake = makeLlm()
     registerBuddyLlm({ llm: fake.llm } as never, {
       credentialRef: credentialRef('WORKBUDDY_ACCESS_TOKEN'),
@@ -2367,10 +2367,7 @@ describe('产品参数化', () => {
       refresh: async () => {},
       product: WORKBUDDY,
     })
-    // CodeBuddy 必须仍是 llm-buddy（与现状一致），WorkBuddy 得到 llm-workbuddy。
-    expect(fake.providers).toEqual([
-      { provider: 'workbuddy', displayName: WORKBUDDY.displayName, settingsNs: 'llm-workbuddy', settingsPath: [] },
-    ])
+    expect(fake.providers).toEqual([])
     expect(fake.adapters).toEqual([['workbuddy']])
   })
 

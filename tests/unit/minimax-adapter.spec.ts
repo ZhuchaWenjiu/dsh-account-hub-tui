@@ -439,7 +439,10 @@ describe('providerInfo / prepareCall / registerMinimaxLlm', () => {
       .rejects.toMatchObject({ code: 'MISSING_CREDENTIAL' })
   })
 
-  it('registerMinimaxLlm 注册配置项与适配器', async () => {
+  it('registerMinimaxLlm 只注册适配器，不声明可配置 provider（设置页不留行）', async () => {
+    // ⚠️ 2026-10-01（用户要求）：账号、模型开关与模型目录都在 Jet Hub 设置页管理，
+    // 声明只会在「设置 → 模型 → 提供商」留下无人使用的行。机制与代价评估见
+    // src/llm-register-compat.ts 模块头。
     const registered: unknown[] = []
     const ctx = {
       llm: {
@@ -457,15 +460,9 @@ describe('providerInfo / prepareCall / registerMinimaxLlm', () => {
       product: MINIMAX,
     })
     expect(adapter).toBeInstanceOf(MinimaxAdapter)
-    expect(registered[0]).toEqual([
-      {
-        provider: 'minimax',
-        displayName: 'MiniMax Code',
-        settingsNs: 'llm-minimax',
-        settingsPath: [],
-      },
-    ])
-    expect(registered[1]).toEqual([['minimax'], adapter])
+    // 唯一一次登记就是 adapter 路由：configurable 目录一次都没碰。
+    expect(registered).toHaveLength(1)
+    expect(registered[0]).toEqual([['minimax'], adapter])
   })
 })
 

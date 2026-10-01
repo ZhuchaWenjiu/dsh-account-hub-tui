@@ -130,10 +130,12 @@ describe('plugin entry', () => {
     }
   })
 
-  it('注册 codearts LLM 路由（目录、适配器、设置 namespace）', () => {
+  it('注册 codearts LLM 路由（适配器）', () => {
     const { ctx, llm } = makeContext()
     apply(ctx)
-    expect(llm.providers).toContain('codearts')
+    // ⚠️ 2026-10-01 起不再向模型设置页声明 provider（见 src/llm-register-compat.ts
+    // 模块头），故只断言 adapter 路由 —— 它才是模型选择器可见性的来源。
+    expect(llm.registeredProviders).toContain('codearts')
     expect(llm.adapters).toContain('codearts')
   })
 
@@ -191,12 +193,13 @@ describe('0.1.7 settings 契约（SettingsForms，无 register）', () => {
     expect(warns.filter(w => w.includes('settings 服务不可用'))).toEqual([])
   })
 
-  it('provider 的 settingsNs 解析为本插件条目 id（无条目时退回旧名，但不再假设其存在）', () => {
+  it('0.1.7 契约下同样不向模型设置页声明 provider（路由照常注册）', () => {
     const { ctx, llm } = make017Context()
     apply(ctx)
-    const codearts = llm.configurableProviders.find(entry => entry.provider === 'codearts')
-    // 该替身没有 profile 条目（fiber.entry 缺失）→ 退回旧命名空间名。
-    expect(codearts?.settingsNs).toBe('llm-codearts')
+    // 2026-10-01 起刻意不声明（见 src/llm-register-compat.ts 模块头）：原先这里
+    // 断言的是 settingsNs 解析结果，如今没有声明就没有观察点，故锁「一条都不声明」。
+    expect(llm.configurableProviders).toEqual([])
+    expect(llm.registeredProviders).toContain('codearts')
   })
 
   it('Config 暴露 volatile 的 providers 字段（否则 settings.describe 不收录本条目）', () => {
@@ -228,7 +231,7 @@ describe('buddy plugin entry', () => {
   it('registers the buddy LLM route', () => {
     const { ctx, llm } = makeContext()
     apply(ctx)
-    expect(llm.providers).toContain('buddy')
+    expect(llm.registeredProviders).toContain('buddy')
     expect(llm.adapters).toContain('buddy')
   })
 
@@ -254,23 +257,19 @@ describe('WorkBuddy provider 注册', () => {
     expect(WORKBUDDY.defaultCredentialRef).toBe('WORKBUDDY_ACCESS_TOKEN')
   })
 
-  it('注册 workbuddy 的可配置 provider 目录项', () => {
+  /**
+   * ⚠️ 2026-10-01（用户要求）：原先这里断言 WorkBuddy 在模型设置页的目录项与
+   * `settingsNs`。本插件已**刻意不再声明**可配置 provider —— 账号、模型开关与模型
+   * 目录都在 Jet Hub 设置页管理，声明只会在「设置 → 模型 → 提供商」留下无人使用的
+   * 行。机制与代价评估见 `src/llm-register-compat.ts` 模块头；此处改为反向断言，
+   * 防止日后误把声明加回来。
+   */
+  it('不向模型设置页声明 workbuddy 目录项（但路由与适配器照常注册）', () => {
     const ctx = createMockContext()
     apply(ctx as never)
-    const directory = ctx.llm.configurableProviders
-    const entry = directory.find((item: { provider: string }) => item.provider === 'workbuddy')
-    expect(entry).toMatchObject({ provider: 'workbuddy', displayName: WORKBUDDY.displayName })
-  })
-
-  // 关键前置：registerBuddyLlm 为 WorkBuddy 产生 settingsNs = llm-workbuddy。
-  // 该 namespace 未注册时，模型设置页会在 refFor → deriveKeyRef(provider)
-  // 处以 `provider.toUpperCase is not a function` 崩溃。
-  it('workbuddy 的 settingsNs 为 llm-workbuddy，且对应 settings namespace 已注册', () => {
-    const ctx = createMockContext()
-    apply(ctx as never)
-    const entry = ctx.llm.configurableProviders.find((item: { provider: string }) => item.provider === 'workbuddy')
-    expect(entry?.settingsNs).toBe('llm-workbuddy')
-    expect(ctx.settings.registeredNamespaces).toContain('llm-workbuddy')
+    expect(ctx.llm.configurableProviders).toEqual([])
+    expect(ctx.llm.registeredProviders).toContain('workbuddy')
+    expect(ctx.llm.adapters).toContain('workbuddy')
   })
 
   it('不注册任何 provider 的斜杠命令（入口都在 Jet Hub 设置页）', () => {
@@ -377,21 +376,14 @@ describe('LobsterAI provider 注册', () => {
     expect(ctx.llm.adapters).toContain('lobsterai')
   })
 
-  it('注册 lobsterai 的可配置 provider 目录项（含展示名）', () => {
+  // 与 workbuddy 同理（见上方说明）：不再声明可配置 provider。
+  it('不向模型设置页声明 lobsterai 目录项（但路由照常注册）', () => {
     const ctx = createMockContext()
     apply(ctx as never)
-    const entry = ctx.llm.configurableProviders.find((item: { provider: string }) => item.provider === 'lobsterai')
-    expect(entry).toMatchObject({ provider: 'lobsterai', displayName: LOBSTERAI.displayName })
-  })
-
-  // 与 workbuddy 同理：settingsNs 未注册时，模型设置页会在
-  // refFor → deriveKeyRef(provider) 处以 `provider.toUpperCase is not a function` 崩溃。
-  it('lobsterai 的 settingsNs 为 llm-lobsterai，且对应 settings namespace 已注册', () => {
-    const ctx = createMockContext()
-    apply(ctx as never)
-    const entry = ctx.llm.configurableProviders.find((item: { provider: string }) => item.provider === 'lobsterai')
-    expect(entry?.settingsNs).toBe('llm-lobsterai')
-    expect(ctx.settings.registeredNamespaces).toContain('llm-lobsterai')
+    expect(ctx.llm.configurableProviders).toEqual([])
+    expect(ctx.llm.registeredProviders).toContain('lobsterai')
+    // 展示名仍由产品配置承载（只是不再流向模型设置页）。
+    expect(ctx.lobsteraiAuth.product.displayName).toBe(LOBSTERAI.displayName)
   })
 
   it('不注册任何 lobsterai 斜杠命令（入口在 Jet Hub 设置页）', () => {
@@ -447,21 +439,14 @@ describe('TRAE provider 注册', () => {
     expect(ctx.llm.adapters).toContain('trae')
   })
 
-  it('注册 trae 的可配置 provider 目录项（含展示名）', () => {
+  // 与 workbuddy / lobsterai 同理（见上方说明）：不再声明可配置 provider。
+  it('不向模型设置页声明 trae 目录项（但路由照常注册）', () => {
     const ctx = createMockContext()
     apply(ctx as never)
-    const entry = ctx.llm.configurableProviders.find((item: { provider: string }) => item.provider === 'trae')
-    expect(entry).toMatchObject({ provider: 'trae', displayName: TRAE.displayName })
-  })
-
-  // 与 workbuddy / lobsterai 同理：settingsNs 未注册时，模型设置页会在
-  // refFor → deriveKeyRef(provider) 处以 `provider.toUpperCase is not a function` 崩溃。
-  it('trae 的 settingsNs 为 llm-trae，且对应 settings namespace 已注册', () => {
-    const ctx = createMockContext()
-    apply(ctx as never)
-    const entry = ctx.llm.configurableProviders.find((item: { provider: string }) => item.provider === 'trae')
-    expect(entry?.settingsNs).toBe('llm-trae')
-    expect(ctx.settings.registeredNamespaces).toContain('llm-trae')
+    expect(ctx.llm.configurableProviders).toEqual([])
+    expect(ctx.llm.registeredProviders).toContain('trae')
+    // 展示名仍由产品配置承载（只是不再流向模型设置页）。
+    expect(ctx.traeAuth.product.displayName).toBe(TRAE.displayName)
   })
 
   it('不注册任何 trae 斜杠命令（入口在 Jet Hub 设置页）', () => {
@@ -553,5 +538,31 @@ describe('makeReadImage 图片桥接', () => {
     expect(error).toBe(cause)
     expect(error).not.toBeUndefined()
 
+  })
+})
+
+/**
+ * 「设置 → 模型 → 提供商」里**不得**出现本插件的 provider 行。
+ *
+ * 用户报障（2026-10-01）：「设置中模型中有很多提供商是由 jet hub 插件提供的，
+ * 但是实际也不需要在模型的提供商中进行编辑」。根因是十个 adapter 各自调用
+ * `ctx.llm.registerConfigurableProviders()`，而 DSH 的模型设置页只渲染**声明过**
+ * 的目录项，且 `settingsPath: []` 使它们恒被判为「已配置」→ 十二行常驻、无法消失。
+ *
+ * 该声明已在本次改动中移除（机制与代价评估见 `src/llm-register-compat.ts` 模块头）。
+ * 这里用一条**跨全部 provider** 的断言锁死：目录一条都不声明，但十二条路由都在
+ *（模型选择器的可见性来自 adapter 路由，与声明无关）。
+ */
+describe('模型设置页：不声明可配置 provider', () => {
+  it('apply 后目录为空，但十二条 adapter 路由都已注册', () => {
+    const { ctx, llm } = makeContext()
+    apply(ctx)
+    expect(llm.configurableProviders).toEqual([])
+    for (const provider of [
+      'codearts', 'buddy', 'workbuddy', 'lobsterai', 'qoder', 'qodercn',
+      'trae', 'cline', 'loomy', 'raccoon', 'minimax', 'zcode',
+    ]) {
+      expect(llm.registeredProviders, provider).toContain(provider)
+    }
   })
 })

@@ -41,13 +41,11 @@ import type { Context } from '@deepseek-ai/cordis'
 import type { CredentialRef } from '@deepseek-ai/dsh-credentials'
 import { providerCatalogVisible } from './account-pool.js'
 import type { AccountPool } from './account-pool.js'
-import { settingsNamespaceFor } from './settings-compat.js'
 import { httpErrorCode, collectImages } from './openai-compat.js'
 import { MINIMAX, MINIMAX_INFER_PATH, type MinimaxProduct } from './minimax-product.js'
 import { minimaxInferHeaders } from './minimax.js'
 import {
   registerAdapterIdempotent,
-  registerConfigurableProvidersIdempotent,
 } from './llm-register-compat.js'
 import {
   buildMinimaxMessagesPayload,
@@ -434,14 +432,6 @@ export function registerMinimaxLlm(
   options: MinimaxAdapterOptions,
 ): MinimaxAdapter {
   const product = options.product ?? MINIMAX
-  registerConfigurableProvidersIdempotent(ctx.llm, [
-    {
-      provider: product.id,
-      displayName: product.displayName,
-      settingsNs: settingsNamespaceFor(ctx, `llm-${product.id}`),
-      settingsPath: [],
-    },
-  ])
   const adapter = new MinimaxAdapter(options)
   registerAdapterIdempotent(ctx.llm, [product.id], adapter)
   return adapter

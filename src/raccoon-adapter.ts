@@ -30,7 +30,6 @@ import type {
   StreamChunk,
 } from '@deepseek-ai/dsh-llm'
 import { AccountPool, providerCatalogVisible } from './account-pool.js'
-import { settingsNamespaceFor } from './settings-compat.js'
 import { isRaccoonExpired, type RaccoonCredential } from './raccoon.js'
 import {
   RACCOON,
@@ -45,7 +44,6 @@ import {
 import { projectRequestImage, type ImageRequestTarget } from './image-budget.js'
 import {
   registerAdapterIdempotent,
-  registerConfigurableProvidersIdempotent,
 } from './llm-register-compat.js'
 import {
   collectImages,
@@ -497,14 +495,6 @@ function resolveChunkTimeoutMs(): number {
  */
 export function registerRaccoonLlm(ctx: Context, options: RaccoonAdapterOptions): RaccoonAdapter {
   const product = options.product ?? RACCOON
-  registerConfigurableProvidersIdempotent(ctx.llm, [
-    {
-      provider: product.id,
-      displayName: product.displayName,
-      settingsNs: settingsNamespaceFor(ctx, `llm-${product.id}`),
-      settingsPath: [],
-    },
-  ])
   const adapter = new RaccoonAdapter(options)
   registerAdapterIdempotent(ctx.llm, [product.id], adapter)
   return adapter

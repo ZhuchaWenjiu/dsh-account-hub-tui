@@ -23,7 +23,6 @@ import { LlmAdapter, LlmError, ReasoningEffortId } from '@deepseek-ai/dsh-llm'
 import type { GenerateOptions, LlmModelInfo, LlmProviderInfo, LlmResolvedModelInfo, StreamChunk } from '@deepseek-ai/dsh-llm'
 import { ToolCallId } from '@deepseek-ai/dsh-llm'
 import { AccountPool, providerCatalogVisible } from './account-pool.js'
-import { settingsNamespaceFor } from './settings-compat.js'
 import {
   TRAE_DEFAULT_MODEL,
   TRAE_MAX_CONTEXT_TOKENS,
@@ -50,7 +49,6 @@ import { normalizeHarnessMessages } from './message-shape.js'
 import { createBlankReasoningSuppressor, createReasoningLoopDetector, hasUsableToolName, isProseTruncatedByStopString, isReasoningLoopGuardEnabled, isTruncatedArguments, normalizeToolArguments, readWithIdleTimeout, reasoningLoopFailure, resolveEmptyResponseReason, resolveToolPairing, splitThinkTaggedContent, stripBareThinkCloseTagIfEnabled, stripCourseLeakFromHistoryContent, stripCourseLeakIfEnabled } from './sse.js'
 import {
   registerAdapterIdempotent,
-  registerConfigurableProvidersIdempotent,
 } from './llm-register-compat.js'
 
 /** 本适配器注册的 provider 路由名。 */
@@ -1818,15 +1816,6 @@ function trimTraeHistory(
  */
 export function registerTraeLlm(ctx: Context, options: TraeAdapterOptions): TraeAdapter {
   const product = options.product ?? TRAE
-  registerConfigurableProvidersIdempotent(ctx.llm, [
-    {
-      provider: product.id,
-      displayName: product.displayName,
-      // 0.1.7 起 settings 命名空间只能是 profile 条目 id（见 settingsNamespaceFor）。
-      settingsNs: settingsNamespaceFor(ctx, `llm-${product.id}`),
-      settingsPath: [],
-    },
-  ])
   const adapter = new TraeAdapter(options)
   registerAdapterIdempotent(ctx.llm, [product.id], adapter)
   // 返回实例：Jet Hub 的「显示列表」需要它的 `listAllModels()`（不受用户黑名单
