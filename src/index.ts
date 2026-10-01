@@ -64,9 +64,11 @@ export const inject = ['credentials', 'commands', 'llm']
  * ⚠️ **DSH 0.1.7-rc.1 起，settings 表单的命名空间就是 profile 条目 id**
  * （本插件的条目 id 是 `codearts-auth`），且只投影本条目 Config 中标记了
  * `.volatile()` 的字段。因此这里保留一个 `providers` 映射：
- * - 它是六个 provider 各自 `registerConfigurableProviders({ settingsNs })` 的
- *   落地位置（0.1.7 下 `settingsNs` = 本条目 id），模型设置页据此把 provider
- *   判定为「已配置」（判据见 `dsh-client-ui-settings-models` 的 `configured`）；
+ * - **历史**：它曾是各 provider 用 `registerConfigurableProviders({ settingsNs })`
+ *   声明时的落地位置，模型设置页据此把它们判定为「已配置」（判据见
+ *   `dsh-client-ui-settings-models` 的 `configured`）。**2026-10-01 起本插件不再
+ *   声明可配置 provider**（见 `llm-register-compat.ts` 模块头），该映射因此没有
+ *   消费者，保留它只为不改变 `settings.describe()` 的既有形状；
  * - 本插件的凭据与账号管理**不**走这里（那是 Jet Hub 的账号池 +
  *   `ctx.credentials`），故该字段只承接一个宽松映射，不参与业务读取。
  *
@@ -87,10 +89,13 @@ export const Config = Schema.object({
  *   `refFor → deriveKeyRef(provider)` 处以
  *   `provider.toUpperCase is not a function` 崩溃，故注册后回读 `describe()` 自检。
  * - **0.1.7-rc.1**：settings 换成 `SettingsForms`，**没有 `register`**，命名
- *   空间只能是 profile 条目 id —— 此时不再（也无法）注册；各 provider 的
- *   `settingsNs` 由 `settingsNamespaceFor()` 指向本插件条目 id，模型设置页照常
- *   工作。这里刻意**静默跳过**：旧实现在这条分支上会打一条误导性的
+ *   空间只能是 profile 条目 id —— 此时不再（也无法）注册。这里刻意**静默跳过**：
+ *   旧实现在这条分支上会打一条误导性的
  *   「settings 服务不可用」告警（启动日志实证）。
+ *
+ * ⚠️ **2026-10-01 起各 provider 不再声明为可配置 provider**（`settingsNamespaceFor`
+ * 因此没有调用方），模型设置页不再有这些 namespace 的消费者 —— 这份注册此后只影响
+ * ≤0.1.6 的老契约 profile，属遗留行为，本次未一并删除。
  */
 function registerProviderSettings(ctx: Context, ...namespaces: string[]): void {
   const settings = settingsOf(ctx)
@@ -199,16 +204,17 @@ export function apply(ctx: Context): void {
   // （老契约没有 configure()，静默跳过）。
   suppressAutoSettingsPage(ctx)
 
-  // provider 配置命名空间的注册**只在老契约（≤0.1.6）下需要**：
-  // 那时 `settings.register` 可用，六个 namespace 分别对应 codearts 路由、
+  // provider 配置命名空间的注册**只在老契约（≤0.1.6）下执行**：
+  // 那时 `settings.register` 可用，十二个 namespace 分别对应 codearts 路由、
   // CodeBuddy（buddy）、WorkBuddy（workbuddy）、LobsterAI（lobsterai）、
-  // Qoder（qoder）、TRAE（trae）—— 后五者由 registerBuddyLlm /
-  // registerLobsteraiLlm / registerQoderLlm / registerTraeLlm 以
-  // `llm-${product.id}` 派生。
+  // Qoder（qoder / qodercn）、TRAE（trae）、Cline（cline）、Loomy（loomy）、
+  // Raccoon（raccoon）、MiniMax（minimax）与 Zcode（zcode）。
   //
   // 0.1.7-rc.1 起 settings 换成 SettingsForms（无 register），命名空间只能是
-  // profile 条目 id，故这里不做任何注册；各 provider 的 settingsNs 由
-  // `settingsNamespaceFor()` 解析为本插件条目 id。
+  // profile 条目 id，故这里不做任何注册。
+  //
+  // ⚠️ 2026-10-01 起各 provider 已**不再**声明为可配置 provider，故这批 namespace
+  // 在模型设置页上已无消费者（详见该函数头的说明）。
   registerProviderSettings(
     ctx, 'llm-buddy', 'llm-workbuddy', 'llm-codearts', 'llm-lobsterai',
     'llm-qoder', 'llm-qodercn', 'llm-trae', 'llm-cline', 'llm-loomy', 'llm-raccoon',

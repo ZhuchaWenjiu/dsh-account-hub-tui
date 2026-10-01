@@ -1130,7 +1130,10 @@ describe('LobsteraiAdapter 限流切换', () => {
 })
 
 describe('registerLobsteraiLlm', () => {
-  it('注册 provider 目录与适配器，settingsNs 为 llm-lobsterai', () => {
+  it('只注册适配器，不声明可配置 provider（设置页不留行）', () => {
+    // ⚠️ 2026-10-01（用户要求）：账号与模型开关都在 Jet Hub 设置页管理，
+    // 声明只会在「设置 → 模型 → 提供商」留下无人使用的行。
+    // 机制与代价评估见 src/llm-register-compat.ts 模块头。
     const configurable: Array<Record<string, unknown>> = []
     const adapters: string[] = []
     const ctx = {
@@ -1144,9 +1147,7 @@ describe('registerLobsteraiLlm', () => {
       resolveCredential: async () => undefined,
       refresh: async () => {},
     })
-    expect(configurable).toEqual([{
-      provider: 'lobsterai', displayName: 'LobsterAI (有道)', settingsNs: 'llm-lobsterai', settingsPath: [],
-    }])
+    expect(configurable).toEqual([])
     expect(adapters).toEqual(['lobsterai'])
   })
 })

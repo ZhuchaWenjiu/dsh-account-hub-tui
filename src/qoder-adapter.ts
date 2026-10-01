@@ -28,7 +28,6 @@ import { LlmAdapter, LlmError, ReasoningEffortId } from '@deepseek-ai/dsh-llm'
 import type { GenerateOptions, LlmModelInfo, LlmProviderInfo, LlmResolvedModelInfo, StreamChunk } from '@deepseek-ai/dsh-llm'
 import { randomUUID } from 'node:crypto'
 import { AccountPool, providerCatalogVisible } from './account-pool.js'
-import { settingsNamespaceFor } from './settings-compat.js'
 import { isQoderExpired, type QoderCredential } from './qoder.js'
 import { QoderEncryptedInfer, type QoderInferMessage, type QoderInferRequest, type QoderInferTool, type QoderInferToolCall } from './qoder-wasm.js'
 import { unwrapQoderEnvelopeStream } from './qoder-envelope.js'
@@ -36,7 +35,6 @@ import { QODER, type QoderFallbackModel, type QoderModelPromotion, type QoderPro
 import { projectRequestImage, type ImageRequestTarget } from './image-budget.js'
 import {
   registerAdapterIdempotent,
-  registerConfigurableProvidersIdempotent,
 } from './llm-register-compat.js'
 import {
   collectImages,
@@ -1125,20 +1123,13 @@ export function qoderDisplayName(model: QoderFallbackModel, now: Date = new Date
 /**
  * 在 `ctx.llm` 上注册 Qoder provider 路由与适配器。
  *
- * 路由名与配置页展示名由产品配置驱动，得到 `qoder`。`settingsNs` 经
- * `settingsNamespaceFor()` 解析：老契约（≤0.1.6）下是 `llm-qoder`；
- * 0.1.7-rc.1 起 settings 命名空间只能是 profile 条目 id，故解析为本插件条目 id。
+ * 路由名与展示名由产品配置驱动，得到 `qoder`。
+ *
+ * ⚠️ 刻意**不**向 DSH 声明可配置 provider（`registerConfigurableProviders`）——
+ * 详见 `llm-register-compat.ts` 模块头。
  */
 export function registerQoderLlm(ctx: Context, options: QoderAdapterOptions): QoderAdapter {
   const product = options.product ?? QODER
-  registerConfigurableProvidersIdempotent(ctx.llm, [
-    {
-      provider: product.id,
-      displayName: product.displayName,
-      settingsNs: settingsNamespaceFor(ctx, `llm-${product.id}`),
-      settingsPath: [],
-    },
-  ])
   const adapter = new QoderAdapter(options)
   registerAdapterIdempotent(ctx.llm, [product.id], adapter)
   // 返回实例：Jet Hub「显示列表」需要 `listAllModels()`（不受黑名单影响、
