@@ -476,6 +476,42 @@ const STYLES = `
 .dim-jh-zcNotice ul { margin: 4px 0 0; padding-left: 18px; }
 .dim-jh-zcLink { color: var(--dsw-alias-link); word-break: break-all; }
 
+/* ── 用量徽标（会话输入区，模型选择器旁） ────────────────────────────────
+   位置与展开方向取自参考实现 dsh-cline-pass：折叠态是一枚紧凑按钮，
+   浮层用 position:absolute + bottom:calc(100% + 8px) 向上展开。
+   ⚠ 输入区（RlGAzG_root / dock / trailing / standardControls）没有
+   overflow:hidden（只有文本域 .RlGAzG_scroll 是 overflow-y:auto），故浮层
+   不会被裁剪 —— 若将来上游给这些容器加上裁剪，这里要改成固定定位 + 锚点换算。 */
+.dim-jh-badge { position: relative; display: flex; align-items: center; flex: none; }
+.dim-jh-badgeBtn { display: flex; align-items: center; gap: 6px; max-width: 300px; padding: 2px 9px; border: .5px solid var(--dsw-alias-border-l2); border-radius: 999px; background: var(--dsw-alias-bg-layer-2); color: var(--dsw-alias-label-secondary); font: inherit; font-size: 11.5px; line-height: 1.5; cursor: pointer; white-space: nowrap; font-variant-numeric: tabular-nums; }
+.dim-jh-badgeBtn:hover { background: var(--dsw-alias-bg-layer-3); color: var(--dsw-alias-label-primary); }
+.dim-jh-badgeBtn[aria-expanded="true"] { background: var(--dsw-alias-bg-layer-3); color: var(--dsw-alias-label-primary); }
+/* min-width:0 是省略号生效的前提（flex 子项默认 min-width:auto，会撑破 max-width） */
+.dim-jh-badgeText { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.dim-jh-badgeDot { width: 6px; height: 6px; flex: none; border-radius: 999px; background: var(--dsw-alias-state-success-primary); }
+.dim-jh-badgeDot[data-tone="warn"] { background: var(--dsw-alias-state-warn-primary); }
+.dim-jh-badgeDot[data-tone="error"] { background: var(--dsw-alias-state-error-primary); }
+.dim-jh-badgeDot[data-tone="muted"] { background: var(--dsw-alias-label-tertiary); }
+.dim-jh-badgePop { position: absolute; bottom: calc(100% + 8px); right: 0; z-index: 40; width: 340px; max-width: min(340px, 88vw); max-height: 62vh; overflow-y: auto; display: flex; flex-direction: column; gap: 10px; padding: 12px 14px; border: .5px solid var(--dsw-alias-border-l2); border-radius: 10px; background: var(--dsw-alias-bg-layer-1); box-shadow: 0 8px 24px rgba(0, 0, 0, .16); text-align: left; white-space: normal; }
+.dim-jh-badgeHead { display: flex; align-items: center; gap: 10px; }
+.dim-jh-badgeTitle { flex: none; font-size: 12.5px; font-weight: 600; color: var(--dsw-alias-label-primary); }
+.dim-jh-badgeAt { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; font-size: 11px; color: var(--dsw-alias-label-tertiary); }
+.dim-jh-badgeAction { flex: none; padding: 3px 10px; border: .5px solid var(--dsw-alias-border-l2); border-radius: 8px; background: var(--dsw-alias-bg-layer-2); color: var(--dsw-alias-label-primary); font: inherit; font-size: 11.5px; cursor: pointer; }
+.dim-jh-badgeAction:hover:not(:disabled) { border-color: var(--dsw-alias-brand-primary); color: var(--dsw-alias-brand-primary); }
+.dim-jh-badgeAction:disabled { opacity: .6; cursor: default; }
+.dim-jh-badgePref { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; padding-bottom: 8px; border-bottom: .5px solid var(--dsw-alias-border-l2); }
+.dim-jh-badgePrefBtn { padding: 2px 9px; border: .5px solid transparent; border-radius: 999px; background: var(--dsw-alias-bg-layer-2); color: var(--dsw-alias-label-secondary); font: inherit; font-size: 11.5px; cursor: pointer; }
+.dim-jh-badgePrefBtn[aria-pressed="true"] { border-color: var(--dsw-alias-brand-primary); background: var(--dsw-alias-bg-layer-3); color: var(--dsw-alias-brand-primary); }
+.dim-jh-badgeSection { display: flex; flex-direction: column; gap: 8px; }
+.dim-jh-badgeSectionTitle { font-size: 11.5px; font-weight: 600; color: var(--dsw-alias-label-secondary); }
+.dim-jh-badgeRow { display: flex; flex-direction: column; gap: 4px; }
+.dim-jh-badgeRowHead { display: flex; align-items: center; justify-content: space-between; gap: 12px; font-size: 12px; color: var(--dsw-alias-label-primary); }
+.dim-jh-badgeValue { flex: none; font-weight: 600; font-variant-numeric: tabular-nums; }
+.dim-jh-badgeValue[data-tone="warn"] { color: var(--dsw-alias-state-warn-primary); }
+.dim-jh-badgeNote { font-size: 11px; line-height: 16px; color: var(--dsw-alias-label-tertiary); }
+.dim-jh-badgeFail { font-size: 11.5px; color: var(--dsw-alias-state-error-primary); }
+.dim-jh-badgeFoot { padding-top: 8px; border-top: .5px solid var(--dsw-alias-border-l2); font-size: 11px; line-height: 16px; color: var(--dsw-alias-label-tertiary); }
+
 `
 
 let injected = false

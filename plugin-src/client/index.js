@@ -1,20 +1,32 @@
 /**
  * Jet Hub 管理页面客户端插件。
  *
- * 注册两处：
+ * 注册三处：
  * 1. `settings.section` —— Jet Hub 设置页面；
  * 2. `settings.models.provider-card`（keyed 槽）—— 把 ZCode 的账号按键
- *    嵌进官方「设置 → 模型 → 模型卡片 → 编辑」里。
+ *    嵌进官方「设置 → 模型 → 模型卡片 → 编辑」里；
+ * 3. `conversation.input.right`（list 槽，会话作用域）—— 模型选择器旁的
+ *    **用量徽标**（订阅优先 / 积分兜底，点击展开明细）。
  */
 
 export const name = 'jet-hub-client'
-export const inject = ['slots', 'connection']
+/**
+ * ⚠️ `modelDirectories` 是徽标**唯一**的信息来源（当前选中的渠道）。
+ *
+ * 它由 `@deepseek-ai/dsh-client-ui-model-selection` 提供，故 `package.json` 的
+ * `dsh.client.inject` 必须声明该包 —— 声明的作用是让那个包的 bundle **先于**
+ * 本插件的 bundle 到达（见 `dsh-client-modules` 的 `arriveGraphRow`）。
+ * 未声明时本插件可能先被物化，`inject` 便会一直等服务，徽标不出现（不影响
+ * 设置页与其余功能）。
+ */
+export const inject = ['slots', 'connection', 'modelDirectories']
 
 import { callManagementRpc, unwrapRpcResult } from '../management-rpc.mjs'
 import { installJetHubStyles } from './jet-hub-styles.js'
-import { JET_HUB_RPC_CHANNEL, JetHubPage } from './jet-hub.js'
+import { JET_HUB_RPC_CHANNEL, JetHubPage, providerLabel } from './jet-hub.js'
 import { startCarrierContribution } from './zcode-carrier.js'
 import { ZcodeProviderCard } from './zcode-card.js'
+import { UsageBadge } from './usage-badge.js'
 
 export function apply(ctx) {
   ctx.effect(() => installJetHubStyles(), 'jet-hub: install styles')
@@ -60,4 +72,41 @@ export function apply(ctx) {
     { name: 'settings.models.provider-card', key: 'llm-pi-ai', inject: () => ({ rpcCall }) },
     ZcodeProviderCard,
   ))
+
+  /**
+   * 模型选择器旁的**用量徽标**（`conversation.input.right`）。
+   *
+   * ## 槽位契约
+   *
+   * 该槽是 **list + 会话作用域**（`dsh-client-ui-conversation` 声明），渲染位置
+   * 是 composer 的 `standardControls` 里、`conversation.input.model` **之前**，
+   * 故徽标天然落在模型选择器左侧（与参考实现 `dsh-cline-pass` 同位置）。
+   * `inject` 回调收到 `sessionId`，用它取**该会话**的模型目录。
+   *
+   * ## ⚠️ 为什么是 `inject`（惰性）而不是在 `apply` 里直接注册
+   *
+   * `ctx.modelDirectories.directoryFor(sessionId)` 需要会话 id，而它只在槽位
+   * 渲染时才知道；`inject` 回调正是"每个会话渲染时求值一次"的钩子。
+   * 目录按会话惰性解析、随会话 dispose，故这里**不缓存** directory 对象。
+   *
+   * ## ⚠️ 只在选中本插件渠道时才可能渲染
+   *
+   * 组件内部第一件事就是判 `supportsCreditBalance(provider)`（能力表，12 个
+   * 渠道），非本插件渠道直接 `return null` —— 既不渲染也不发请求。门控放在
+   * 组件里而不是这里：这里拿不到"当前选中的 provider"（它在目录快照里，
+   * 会随时间变化，必须由组件订阅）。
+   */
+  ctx.slots.inject('conversation.input.right', () => ctx.slots.register({
+    name: 'conversation.input.right',
+    id: 'jet-hub-usage',
+    order: 100,
+    inject: (sessionId) => ({
+      // 目录的 store（订阅它即可跟随「用户切了模型」重新渲染）。
+      directory: ctx.modelDirectories.directoryFor(sessionId).store,
+      providerLabel,
+      readBadge: (provider, options) => rpcCall('usage.badge', { provider, ...options }),
+      writePreference: (preference) => rpcCall('usage.badgePreference', { preference }),
+      claimCredits: (provider) => rpcCall('credits.claimAll', { provider }),
+    }),
+  }, UsageBadge))
 }
