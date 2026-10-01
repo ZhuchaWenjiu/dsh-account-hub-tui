@@ -93,7 +93,7 @@ export function UsageBadge(props) {
 
 /** 展开态的完整实现（数据、轮询、弹窗）。 */
 function UsageBadgeActive(props) {
-  const { provider, providerLabel, readBadge, writePreference, claimCredits } = props;
+  const { provider, providerLabel, readBadge, writePreference, setAutoCheckin, claimCredits } = props;
   const label = providerLabel(provider);
 
   /** `{ value, at }`：宿主返回的读数 + **到达**本地的时刻（兜底显示用）。 */
@@ -104,6 +104,8 @@ function UsageBadgeActive(props) {
   /** 本地偏好镜像：写入后立刻生效，不等待下一轮轮询（否则像「点了没反应」）。 */
   const [preference, setPreference] = React.useState(null);
   const [prefError, setPrefError] = React.useState('');
+  /** 自动签到开关的写入错误（与偏好分开：两者是不同的设置项，别互相顶掉）。 */
+  const [autoError, setAutoError] = React.useState('');
   /**
    * 领取状态。`claiming` 用**字符串**而不是布尔：
    * `'current'` = 只签当前渠道（单次请求）；`'all'` = 遍历全部支持签到的渠道
@@ -123,6 +125,7 @@ function UsageBadgeActive(props) {
     setFailed(false);
     setClaimNotice(null);
     setPrefError('');
+    setAutoError('');
   }, [provider]);
 
   React.useEffect(() => {
@@ -226,6 +229,73 @@ function UsageBadgeActive(props) {
     loading: snapshot === null && !failed,
     failed: failed && snapshot === null,
   });
+
+  /**
+   * 自动签到状态灯 —— 数据来自读数响应里的 `autoCheckin`（**不进宿主缓存**的
+   * 实时字段，所以每轮读都能拿到最新的 `running` / `ranToday`）。
+   */
+  const auto = value?.autoCheckin;
+
+  /**
+   * 切换自动签到开关。
+   *
+   * ⚠️ 宿主在「打开」时会**立刻跑一轮**（今天已跑过则由它内部拦住），所以这里：
+   * 1. 写完立刻 `read.current()` —— 拿回实时状态（`running` 会立刻是 true）；
+   * 2. 若这一轮正在跑，**12 秒后再读一次** —— 一轮是串行打十几个上游，通常十几秒
+   *    内结束；不补这一次，状态灯要等满 60 秒轮询才从「进行中」变成「今天已完成」，
+   *    用户会以为卡住了。只补一次，不做轮询循环（组件卸载后 `read.current` 已被置空）。
+   */
+  const onToggleAutoCheckin = async () => {
+    if (auto === undefined) return;
+    const next = auto.enabled !== true;
+    setAutoError('');
+    try {
+      await setAutoCheckin(next);
+      read.current();
+      if (next) setTimeout(() => read.current(), 12_000);
+    } catch (error) {
+      setAutoError(error?.message || '自动签到开关保存失败');
+    }
+  };
+
+  /**
+   * 状态灯与它的完整文字说明。
+   *
+   * 四态：关闭（空心灰环）/ 已开·今天未跑（实心绿点）/ 已开·今天已跑（绿点带外环）/
+   * 进行中（省略号）。文字里必须说清**作用范围（全部渠道）与日界**，否则用户
+   * 无法判断「为什么今天没动静」。
+   */
+  const autoTitle = (() => {
+    const base = '自动签到（全局，全部渠道）';
+    if (auto === undefined) return `${base}：状态读取中…`;
+    if (auto.enabled !== true) return `${base}：已关闭 —— 点击开启，此后每天首次启动 DSH 时自动为全部渠道签到`;
+    if (auto.running === true) return `${base}：正在执行（串行遍历有账号的渠道，请稍候）`;
+    const last = auto.lastResult === '' ? '' : `；上次：${auto.lastResult}`;
+    if (auto.ranToday === true) return `${base}：已开启，今天已完成${last} —— 点击关闭`;
+    return `${base}：已开启，今天尚未执行（下次启动 DSH 时自动签到）${last} —— 点击关闭`;
+  })();
+  const autoState = auto === undefined || auto.enabled !== true
+    ? 'off'
+    : (auto.ranToday === true ? 'done' : 'on');
+
+  /**
+   * 状态的**短文案**：状态灯（右上角）与签到按钮上方那枚小标识**共用同一份**，
+   * 免得两处口径漂移（用户 2026-10-02：「在全部签到按钮右上方标是否有自动的小标识…
+   * 这样别人才知道当前是否是自动签到状态」）。
+   *
+   * ⚠️ 只有四个词，但必须能**独立读懂**（不依赖颜色、不依赖另一个控件）：
+   * 用户看到的是「自动签到 已关闭」这样的完整短语，而不是一个孤零零的点。
+   */
+  const autoStateWord = auto === undefined
+    ? '读取中'
+    : auto.enabled !== true
+      ? '已关闭'
+      : auto.running === true
+        ? '进行中'
+        : auto.ranToday === true ? '今天已完成' : '已开启';
+
+  /** 小标识的提示：说清它和状态灯是同一个开关、以及去哪里改。 */
+  const autoTagTitle = `${autoTitle}（与右上角的自动签到状态灯是同一个开关，点那盏灯切换）`;
 
   /** 切换显示偏好：本地先生效，宿主写入失败时提示并回滚下一次渲染。 */
   const onPickPreference = async (next) => {
@@ -374,6 +444,19 @@ function UsageBadgeActive(props) {
             ? '读取中…'
             : `${stamp === '' ? '已读取' : stamp}${value?.cached === true ? ' · 缓存' : ''}`),
         React.createElement('button', {
+          key: 'auto',
+          type: 'button',
+          className: 'dim-jh-badgeAuto',
+          'data-state': autoState,
+          'data-running': auto?.running === true,
+          'aria-pressed': auto?.enabled === true,
+          title: autoTitle,
+          'aria-label': autoTitle,
+          onClick: () => { void onToggleAutoCheckin(); },
+        }, auto?.running === true
+          ? '…'
+          : React.createElement('span', { className: 'dim-jh-badgeAutoDot' })),
+        React.createElement('button', {
           key: 'refresh',
           type: 'button',
           className: 'dim-jh-badgeRefresh',
@@ -383,6 +466,11 @@ function UsageBadgeActive(props) {
           onClick: () => read.current(),
         }, busy ? '…' : '↻'),
       ]),
+      // 开关写入失败时单独一行说明：它属于设置写入，混进偏好那行会让人以为
+      // 是「显示偏好」没保存。
+      autoError === ''
+        ? null
+        : React.createElement('div', { key: 'autoErr', className: 'dim-jh-badgeFail', role: 'alert' }, autoError),
       renderPreference(),
     ];
 
@@ -556,6 +644,28 @@ function UsageBadgeActive(props) {
     const canClaimCurrent = supportsDailyCheckin(provider);
     const allBusy = claiming === 'all';
     return React.createElement('div', { key: 'claim', className: 'dim-jh-badgeSection dim-jh-badgeClaim' }, [
+      /**
+       * 签到按钮上方那枚「自动签到」小标识（**右对齐**，正落在「全部渠道签到」
+       * 按钮的右上方）。
+       *
+       * ⚠️ 为什么需要它：状态灯在弹窗**右上角**，与底部这两个按钮隔着整块内容，
+       * 用户看到「全部渠道签到」时无法判断「每天是不是已经自动签了」——
+       * 于是要么重复手点、要么以为没生效。这枚标识把同一个状态搬到按钮旁边
+       * （用户 2026-10-02 的建议），文案与状态灯**共用 `autoStateWord`**。
+       *
+       * ⚠️ 只读不写：它是**说明**而不是第二个开关 —— 两个控件都能改状态时，
+       * 误触会直接改变「每天自动打上游」的行为。要改请点右上角那盏灯（title 里写明）。
+       */
+      React.createElement('div', { key: 'autotag', className: 'dim-jh-badgeClaimHead' },
+        React.createElement('span', {
+          className: 'dim-jh-badgeAutoTag',
+          'data-state': autoState,
+          'data-running': auto?.running === true,
+          title: autoTagTitle,
+        }, [
+          React.createElement('span', { key: 'd', className: 'dim-jh-badgeAutoTagDot' }),
+          `自动签到 ${autoStateWord}`,
+        ])),
       React.createElement('div', { key: 'row', className: 'dim-jh-badgeClaimRow' }, [
         canClaimCurrent
           ? React.createElement('button', {

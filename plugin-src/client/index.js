@@ -106,6 +106,8 @@ export function apply(ctx) {
       providerLabel,
       readBadge: (provider, options) => rpcCall('usage.badge', { provider, ...options }),
       writePreference: (preference) => rpcCall('usage.badgePreference', { preference }),
+      // 自动签到开关（全局一个，不分渠道）：宿主在「打开」时会立刻跑一轮。
+      setAutoCheckin: (enabled) => rpcCall('usage.autoCheckin', { enabled }),
       claimCredits: (provider) => rpcCall('credits.claimAll', { provider }),
     }),
   }, UsageBadge))

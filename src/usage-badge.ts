@@ -34,6 +34,7 @@ import type {
   RpcCreditsBalanceAccount,
   RpcCreditsBalancesResponse,
   RpcClineQuotaResponse,
+  RpcUsageAutoCheckinState,
   RpcUsageBadgePlanAccount,
   RpcUsageBadgeResponse,
   RpcUsageBadgeSubscription,
@@ -126,6 +127,13 @@ export interface UsageBadgeDeps {
   listAccounts(provider: string): readonly ProviderAccountEntry[]
   /** 读当前生效的显示偏好。 */
   readPreference(): BadgePreference
+  /**
+   * 读「每日首次启动自动签到」的实时状态（顺带回传给弹窗右上角的状态灯）。
+   *
+   * ⚠️ 与 `readPreference` 一样**不进缓存**：`running` / `ranToday` 由宿主的
+   * 后台任务驱动，缓存住界面就会一直停在旧状态。
+   */
+  readAutoCheckin(): RpcUsageAutoCheckinState
   /** 取当前时刻（注入以便单测）。 */
   now?(): number
   /** 缓存时长（省略时读环境变量）。 */
@@ -275,6 +283,8 @@ export function createUsageBadge(deps: UsageBadgeDeps): UsageBadge {
           // 偏好**不进缓存**：它是用户随时可改的展示设置，缓存住会让「刚改完
           // 没生效」看起来像 bug（快照本身可能还是两分钟前的）。
           preference: deps.readPreference(),
+          // 同理不进缓存：后台任务的进度与「今天已跑」都要实时反映到状态灯上。
+          autoCheckin: deps.readAutoCheckin(),
         },
       }
     },

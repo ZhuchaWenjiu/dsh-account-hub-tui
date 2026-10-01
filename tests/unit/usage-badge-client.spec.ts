@@ -52,9 +52,10 @@ describe('用量徽标：槽位接线', () => {
     expect(index).toMatch(/inject:\s*\(sessionId\)\s*=>/)
   })
 
-  it('注入三个 RPC 包装：读读数 / 写偏好 / 签到', () => {
+  it('注入四个 RPC 包装：读读数 / 写偏好 / 写自动签到开关 / 签到', () => {
     expect(index).toContain("readBadge: (provider, options) => rpcCall('usage.badge'")
     expect(index).toContain("writePreference: (preference) => rpcCall('usage.badgePreference'")
+    expect(index).toContain("setAutoCheckin: (enabled) => rpcCall('usage.autoCheckin'")
     expect(index).toContain("claimCredits: (provider) => rpcCall('credits.claimAll'")
   })
 
@@ -267,6 +268,49 @@ describe('用量徽标：弹窗的紧凑布局（信息一项不少）', () => {
     expect(styles).toMatch(/\.dim-jh-badgeWinReset \{[^}]*text-align: right/)
     // 每行 display:contents 交给共享 grid ⇒ 等长与列对齐同时成立
     expect(styles).toMatch(/\.dim-jh-badgeWin \{[^}]*display: contents/)
+  })
+
+  it('自动签到状态灯在弹窗右上角，且**状态不只用颜色**表达', () => {
+    // 用户 2026-10-02：「给用量徽标小窗口右上角增加一个是否自动签到的按钮状态灯，
+    // 可选择关闭或者打开。」
+    expect(badge).toContain("className: 'dim-jh-badgeAuto'")
+    expect(badge).toContain("'data-state': autoState")
+    expect(badge).toContain("'data-running': auto?.running === true")
+    // 可切换：aria-pressed 跟随开关，点击调 setAutoCheckin
+    expect(badge).toMatch(/'aria-pressed': auto\?\.enabled === true/)
+    expect(badge).toMatch(/onClick: \(\) => \{ void onToggleAutoCheckin\(\); \}/)
+    expect(badge).toContain('await setAutoCheckin(next)')
+    // 四态派生：关闭 / 已开未跑 / 今天已跑 / 进行中（进行中显示省略号而不是点）
+    expect(badge).toMatch(/const autoState = auto === undefined \|\| auto\.enabled !== true/)
+    expect(badge).toMatch(/auto\.ranToday === true \? 'done' : 'on'/)
+    expect(badge).toMatch(/auto\?\.running === true\s*\?\s*'…'/)
+    // ⚠️ 灯本身有形态差异（关=空心环、开=实心点），不靠颜色单独承载语义
+    expect(styles).toMatch(/\.dim-jh-badgeAutoDot \{[^}]*border: 1\.5px solid currentColor/)
+    expect(styles).toMatch(/\.dim-jh-badgeAuto\[data-state="on"\] \.dim-jh-badgeAutoDot,[\s\S]{0,120}?background: currentColor; border: 0;/)
+    // 与刷新键同尺寸、同主题描边（浅色下靠描边才立得住）
+    expect(styles).toMatch(/\.dim-jh-badgeAuto \{[^}]*width: 20px; height: 20px/)
+    expect(styles).toMatch(/\.dim-jh-badgeAuto \{[^}]*border: \.5px solid var\(--dsw-alias-border-l2\)/)
+    // 进行中用品牌色
+    expect(styles).toMatch(/\.dim-jh-badgeAuto\[data-running="true"\] \{ color: var\(--dsw-alias-brand-primary\); \}/)
+  })
+
+  it('「全部渠道签到」按钮**右上方**有自动签到小标识（文案与状态灯同源）', () => {
+    // 用户 2026-10-02：「是否在全部签到按钮右上方标是否有自动的小标识？这样的设计
+    // 配合那个状态灯。这样别人才知道当前是否是自动签到状态。」
+    expect(badge).toContain("className: 'dim-jh-badgeClaimHead'")
+    expect(badge).toContain("className: 'dim-jh-badgeAutoTag'")
+    // 右对齐 ⇒ 视觉上正落在「全部渠道签到」（最右那个按钮）的上方
+    expect(styles).toMatch(/\.dim-jh-badgeClaimHead \{[^}]*justify-content: flex-end/)
+    // ⚠️ 文案必须能独立读懂（含「自动签到」字样与状态词），不能只有一个点
+    expect(badge).toMatch(/`自动签到 \$\{autoStateWord\}`/)
+    expect(badge).toMatch(/auto\.enabled !== true\s*\?\s*'已关闭'/)
+    expect(badge).toMatch(/auto\.ranToday === true \? '今天已完成' : '已开启'/)
+    // ⚠️ 它必须是**只读说明**而不是第二个开关：两个控件都能改状态会误触
+    const tag = badge.slice(badge.indexOf("className: 'dim-jh-badgeAutoTag'"), badge.indexOf('dim-jh-badgeClaimRow'))
+    expect(tag).not.toContain('onClick')
+    // 小标识与状态灯共用同一份状态词（避免两处口径漂移）
+    expect(badge).toContain('自动签到 ${autoStateWord}')
+    expect(badge).toMatch(/title: autoTagTitle/)
   })
 
   it('浅色模式下按钮与线条可见（用主题描边，取消上一轮的「去线条」）', () => {

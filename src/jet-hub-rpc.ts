@@ -179,6 +179,8 @@ import type {
   RpcUsageBadgeResponse,
   RpcUsageBadgePreferenceRequest,
   RpcUsageBadgePreferenceResponse,
+  RpcUsageAutoCheckinRequest,
+  RpcUsageAutoCheckinResponse,
   ProviderStatus,
 
   ProviderAccountStatus,
@@ -188,6 +190,7 @@ import {
   createBadgePreferenceStore,
 } from './badge-preferences.js'
 import { createUsageBadge, type BadgeRpcResult } from './usage-badge.js'
+import { createAutoCheckin, createAutoCheckinStore } from './auto-checkin.js'
 
 /** Jet Hub RPC API 路径 */
 export const JET_HUB_API_PATH = '/api/jet-hub'
@@ -868,6 +871,36 @@ function registerJetHubEndpoints(
   const badgePreferences = createBadgePreferenceStore(ctx)
 
   /**
+   * 「每日首次启动自动签到」（独立文档 `auto-checkin.json`）。
+   *
+   * ⚠️ **不维护第二份「哪些渠道能签到」的名单**：判据交给下面的 `claim` ——
+   * `credits.claimAll` 对不支持的渠道会**不发上游请求**就返回明确错误，本执行体
+   * 把它计为「跳过」。客户端的能力表（`credits-capabilities.js`）仍是唯一权威。
+   *
+   * ⚠️ 「有账号的渠道」由账号池派生（`pool.listAllAccounts()` 只是同步内存副本
+   * 的异步外壳），不遍历 12 个渠道里没账号的那些 —— 那些调下去只会拿到空结果。
+   */
+  const autoCheckin = createAutoCheckin({
+    store: createAutoCheckinStore(ctx),
+    listProviderIds: async () => {
+      const accounts = await pool.listAllAccounts()
+      return [...new Set(accounts.map((entry) => entry.provider))].sort()
+    },
+    claim: (provider) =>
+      handleMethod('credits.claimAll', { provider }) as Promise<BadgeRpcResult<RpcCreditsClaimAllResponse>>,
+    warn: (message) => ctx.logger?.warn?.(message),
+  })
+  // 启动时排定一轮（延迟 30s；内部自己判开关与「今天是否已跑」）。
+  autoCheckin.start()
+  /**
+   * ⚠️ `ctx.effect` 必须**可选调用**：本文件此前没用过它，而大量单测的 ctx 桩是
+   * 最小化的（没有 `effect`）—— 直接调用会让 138 条无关用例报
+   * `ctx.effect is not a function`（2026-10-02 实测到）。真实宿主里它一定存在，
+   * 故这里的降级只影响桩环境，不影响生产环境的清理语义。
+   */
+  ctx.effect?.(() => () => autoCheckin.stop(), 'jet-hub: auto checkin')
+
+  /**
    * 用量徽标读数服务（宿主侧 TTL 缓存 + 只保留启用账号 + 附加订阅读数）。
    *
    * ⚠️ **取数直接复用内部 `handleMethod`**，不另写 provider 分派：
@@ -888,6 +921,7 @@ function registerJetHubEndpoints(
         : undefined,
     listAccounts: (provider) => pool.listAccountsByProvider(provider),
     readPreference: () => badgePreferences.load(),
+    readAutoCheckin: () => autoCheckin.state(),
     warn: (message) => ctx.logger?.warn?.(message),
   })
 
@@ -2378,6 +2412,26 @@ function registerJetHubEndpoints(
             },
           }
         }
+        if (req.provider === 'workbuddy') {
+          // WorkBuddy **国际版没有签到接口**：客户端能力矩阵登记为
+          // `workbuddy: { balance: true, dailyCheckin: false }`，故它从不渲染
+          // 「一键领取积分」按钮、也从不调用本方法 —— 也就是说这条守卫此前
+          // **缺失但没被触发**（真实缺陷，2026-10-02 补）。
+          //
+          // ⚠️ 为什么必须补：没有它时 `workbuddy` 会落到下面 `productById` 拿到的
+          // buddy 产品上，用**国际版**凭据去发国内版的签到请求 —— 必然失败，而且是
+          // 一次真实的上游请求。而「每日首次启动自动签到」（`src/auto-checkin.ts`）
+          // 正是靠「调用 `claimAll`、按返回的信封判跳过」来决定遍历范围的，它**不维护
+          // 第二份能力名单** ⇒ 这里漏一个守卫，它就会真去发一轮必然失败的请求。
+          // 两处是同源改动，别只改一半。
+          return {
+            ok: false,
+            error: {
+              code: 'bad-request',
+              message: 'WorkBuddy 国际版不支持每日签到（其后端没有签到接口）',
+            },
+          }
+        }
         if (req.provider === RACCOON.id) {
           // raccoon **没有签到端点**：每日 300 积分由服务端按日自动发放
           //（账单里的 `daily_grant`，实测注册后 1 分钟即到账），
@@ -3428,6 +3482,36 @@ function registerJetHubEndpoints(
         }
         await badgePreferences.save(req.preference)
         const value: RpcUsageBadgePreferenceResponse = { preference: badgePreferences.load() }
+        return { ok: true, value }
+      }
+
+      /**
+       * 「每日首次启动自动签到」开关（读 / 写，**全局一个**，不分渠道）。
+       *
+       * ⚠️ `enabled` 省略时**只读**；给出时必须是布尔值。非法值拒绝而不是静默
+       * 回落 —— 理由与 `usage.badgePreference` 完全一致（回落会让「设置没生效」
+       * 看起来像「保存成功」）。
+       *
+       * ⚠️ 写入 `true` 时宿主会**立刻尝试跑一轮**（今天已跑过则由执行体内部拦住）：
+       * 否则用户今天打开开关要等到明天才有动作，看起来像没生效。返回值里的
+       * `running` 会立刻为 `true`，界面据此显示「进行中」。
+       */
+      case 'usage.autoCheckin': {
+        const req = payload as RpcUsageAutoCheckinRequest
+        if (req.enabled === undefined) {
+          const value: RpcUsageAutoCheckinResponse = { autoCheckin: autoCheckin.state() }
+          return { ok: true, value }
+        }
+        if (typeof req.enabled !== 'boolean') {
+          return {
+            ok: false,
+            error: {
+              code: 'bad-request',
+              message: `enabled 必须是布尔值（收到：${JSON.stringify(req.enabled)}）`,
+            },
+          }
+        }
+        const value: RpcUsageAutoCheckinResponse = { autoCheckin: await autoCheckin.setEnabled(req.enabled) }
         return { ok: true, value }
       }
 

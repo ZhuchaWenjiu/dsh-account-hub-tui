@@ -100,6 +100,15 @@ function harness(options: {
     },
     listAccounts: () => state.accounts,
     readPreference: () => { calls.preference += 1; return state.preference },
+    /**
+     * 「每日首次启动自动签到」的实时状态（顺带回传给弹窗右上角的状态灯）。
+     *
+     * ⚠️ 它是**必填**依赖（装配层永远能提供），故这里给一个固定桩而不是让它可选 ——
+     * 可选会让「忘了接线」表现为「状态灯永远是关闭」，静默降级。
+     */
+    readAutoCheckin: () => ({
+      enabled: false, lastDate: '', ranToday: false, running: false, lastResult: '',
+    }),
     now: options.now,
     // 用例显式指定 TTL，避免受环境变量影响
     ttlMs: 1_000,

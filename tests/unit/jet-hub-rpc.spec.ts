@@ -1692,13 +1692,45 @@ describe('积分端点的 provider 能力边界', () => {
     expect(result.error?.message).toBe('unsupported provider: unknownprovider')
   })
 
-  it.each(CREDITS_METHODS)('%s 不会把 CodeBuddy 系一并误拒', async (method) => {
+  /**
+   * ⚠️ **本用例 2026-10-02 被拆分过**，读之前先看这段理由，别以为是「把守卫改松了」。
+   *
+   * 原用例对**三个**方法都断言 `buddy` 与 `workbuddy` 都被接受（ok:true），
+   * 目的是防止「把 CodeBuddy 系一并误拒」—— 历史上确实有过只认 `buddy`、
+   * 于是国际版连**余额**都查不出来的缺陷。
+   *
+   * 但那条断言对 `credits.claimAll` 不成立：WorkBuddy 国际版**没有签到端点**
+   * （证据：README「WorkBuddy 国际版后端没有签到接口，故其面板不显示」、
+   * AGENTS.md 的能力表 `workbuddy → ✗（国际版后端无签到接口）`、客户端
+   * `credits-capabilities.js` 的 `workbuddy: { balance: true, dailyCheckin: false }`，
+   * 其注释写明国际版内核里只有 `get-dosage-notify` 用量通知）。
+   * 原先「接受」只是因为**测试用空账号池**，替身下不会真的发请求 ——
+   * 真实账号下它会用国际版凭据去发国内版的签到请求，必然失败。
+   *
+   * 触发这次修正的是「每日首次启动自动签到」（`src/auto-checkin.ts`）：它
+   * 不维护第二份能力名单，只按 `claimAll` 返回的信封判跳过，所以宿主端必须
+   * 对不支持的渠道**显式表态**。⇒ 拆成下面两条，**禁止一刀切**的意图完整保留：
+   * `credits.status` / `credits.balances` 仍要求两者都被接受。
+   */
+  it.each(['credits.status', 'credits.balances'])('%s 不会把 CodeBuddy 系一并误拒', async (method) => {
     const call = registerCreditsEndpoints()
     // 两个 Buddy 系产品都能通过 provider 校验，走到 listAccounts（替身返回空）。
     for (const provider of ['buddy', 'workbuddy']) {
       const result = await call(method, { provider })
       expect(result.ok, `${method}/${provider}`).toBe(true)
     }
+  })
+
+  it('credits.claimAll 接受 buddy，但对 workbuddy 给出**明确**的「不支持每日签到」', async () => {
+    const call = registerCreditsEndpoints()
+    // CodeBuddy 中国版照旧被接受（它有签到端点）
+    const buddyResult = await call('credits.claimAll', { provider: 'buddy' })
+    expect(buddyResult.ok, 'claimAll/buddy').toBe(true)
+    // 国际版：拒绝，但**必须是可读的能力原因**，不是泛化的「provider 没注册」
+    const result = await call('credits.claimAll', { provider: 'workbuddy' })
+    expect(result.ok).toBe(false)
+    expect(result.error?.message).toContain('WorkBuddy 国际版不支持每日签到')
+    expect(result.error?.message, '不能退化成 unsupported provider').not.toContain('unsupported provider')
   })
 
   /**
