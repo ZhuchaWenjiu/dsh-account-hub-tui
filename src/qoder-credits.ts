@@ -231,6 +231,15 @@ function readString(source: unknown, key: string): string | undefined {
  * 负值一律 clamp 到 0：服务端在超额扣费/计量回滚下可能下发负值，
  * 原样透出会让卡片显示「-12.5 积分」。
  */
+/**
+ * 「套餐额度」这个包的**固定名**（本仓库自己合成的名字，服务端不下发）。
+ *
+ * ⚠️ 导出它是为了让「用量徽标」的套餐判定（`src/badge-subscription.ts`）与这里
+ * **共用同一个字面量**：判定靠的是包名精确等于它，两处各写一份字符串会在将来
+ * 改名时静默失配（表现为徽标永远不显示 Qoder 的订阅额度）。
+ */
+export const QODER_PLAN_PACKAGE = '套餐额度'
+
 function toPackage(
   name: string,
   quota: unknown,
@@ -314,7 +323,7 @@ export async function fetchQoderCreditBalance(
 
   const packages: CreditPackage[] = []
   // 顺序即展示顺序：套餐额度 → 赠送/资源包 → 专用资源包。
-  const userQuota = toPackage('套餐额度', (usage as Record<string, unknown>).userQuota)
+  const userQuota = toPackage(QODER_PLAN_PACKAGE, (usage as Record<string, unknown>).userQuota)
   if (userQuota !== undefined) packages.push(userQuota)
   const addOnQuota = toPackage('资源包', (usage as Record<string, unknown>).addOnQuota)
   if (addOnQuota !== undefined) packages.push(addOnQuota)

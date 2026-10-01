@@ -175,10 +175,19 @@ import type {
   RpcCaptchaCarrierUrlResponse,
   RpcCaptchaContributeRequest,
   RpcCaptchaContributeResponse,
+  RpcUsageBadgeRequest,
+  RpcUsageBadgeResponse,
+  RpcUsageBadgePreferenceRequest,
+  RpcUsageBadgePreferenceResponse,
   ProviderStatus,
 
   ProviderAccountStatus,
 } from './types.js'
+import {
+  BADGE_PREFERENCES,
+  createBadgePreferenceStore,
+} from './badge-preferences.js'
+import { createUsageBadge, type BadgeRpcResult } from './usage-badge.js'
 
 /** Jet Hub RPC API 路径 */
 export const JET_HUB_API_PATH = '/api/jet-hub'
@@ -849,6 +858,39 @@ function registerJetHubEndpoints(
    */
   const pendingSmsMsgid = new Map<string, { phone: string; msgid: string }>()
 
+  /**
+   * 用量徽标的显示偏好（`$DSH_HOME/jet-hub/ui-preferences.json`）。
+   *
+   * ⚠️ 与账号池**分开**的独立文档：`state.json` 是整体替换语义，同机另一条工作区
+   * 里的旧版本代码整体重写它时不会带上不认识的键 —— 理由与后果见
+   * `badge-preferences.ts` 的文件头。
+   */
+  const badgePreferences = createBadgePreferenceStore(ctx)
+
+  /**
+   * 用量徽标读数服务（宿主侧 TTL 缓存 + 只保留启用账号 + 附加订阅读数）。
+   *
+   * ⚠️ **取数直接复用内部 `handleMethod`**，不另写 provider 分派：
+   * `credits.balances` 的 12 条分支（含 codearts 的「Token 计费账户」文案、
+   * zcode 的逐桶折算等）是唯一口径，复制一份必然漂移。
+   * 第三个参数是 `AbortSignal` 且在当前实现里未被使用，故这里传 `undefined`
+   *（该形参是下划线命名 = 有意未用）。
+   *
+   * ⚠️ 订阅窗口**只对 Cline** 存在（能力矩阵里的 `subscriptionQuota`）—— 这个
+   * 「哪个渠道有窗口」的判断留在装配层，`usage-badge.ts` 因此不认识任何具体渠道。
+   */
+  const usageBadge = createUsageBadge({
+    collectBalances: (provider) =>
+      handleMethod('credits.balances', { provider }) as Promise<BadgeRpcResult<RpcCreditsBalancesResponse>>,
+    collectQuota: (provider) =>
+      provider === CLINE.id
+        ? handleMethod('cline.quota', { provider }) as Promise<BadgeRpcResult<RpcClineQuotaResponse>>
+        : undefined,
+    listAccounts: (provider) => pool.listAccountsByProvider(provider),
+    readPreference: () => badgePreferences.load(),
+    warn: (message) => ctx.logger?.warn?.(message),
+  })
+
   connection.fetch.register({
     path: JET_HUB_API_PATH,
     methods: ['POST'],
@@ -1097,7 +1139,7 @@ function registerJetHubEndpoints(
   }
 
   /** 分发端点方法到对应的处理器 */
-  async function handleMethod(method: string, payload: unknown, _signal: AbortSignal): Promise<unknown> {
+  async function handleMethod(method: string, payload: unknown, _signal?: AbortSignal): Promise<unknown> {
     switch (method) {
       case 'account.list': {
         const req = payload as RpcListAccountsRequest
@@ -3326,6 +3368,66 @@ function registerJetHubEndpoints(
           accounts: state.accounts.length,
           withoutExpiry: state.accounts.filter((entry) => entry.expiresAt === undefined).length,
         }
+        return { ok: true, value }
+      }
+
+      /**
+       * 用量徽标读数（会话输入区、模型选择器旁那枚）。
+       *
+       * ## 与 `credits.balances` 的关系
+       *
+       * 读数是**同一份**（本分支内部直接复用 `credits.balances` 的实现，见
+       * `usageBadge` 的装配注释），差别只有三处：
+       * 1. 只返回**启用**账号，并给出 `disabledCount`（停用账号不进合计）；
+       * 2. 多带一份订阅读数（窗口 / 套餐），判定表在 `src/badge-subscription.ts`；
+       * 3. 带**宿主侧 TTL 缓存**（`cached` 标出来）—— 徽标按分钟轮询，而余额是
+       *    逐账号顺序打上游的（`collectCreditBalances` 的「顺序查询，避免并发
+       *    触发风控」），不缓存会让上游请求数随轮询线性放大。
+       *
+       * ⚠️ 未知 provider 的 `bad-request` 由内层 `credits.balances` 给出（那里
+       * 已有 12 条分派与 `unsupported provider` 的统一文案），本分支**原样透传**，
+       * 不另立一份 provider 名单 —— 两份名单必然漂移。
+       *
+       * ⚠️ `force: true` = 绕过缓存（手动刷新、签到之后）。
+       */
+      case 'usage.badge': {
+        const req = payload as RpcUsageBadgeRequest
+        const provider = typeof req.provider === 'string' ? req.provider.trim() : ''
+        if (provider.length === 0) {
+          return { ok: false, error: { code: 'bad-request', message: 'provider 不能为空' } }
+        }
+        const value = await usageBadge.read(provider, req.force === true ? { force: true } : {})
+        // `read()` 返回的就是本端点的响应信封（`{ ok, value|error }`），直接透传。
+        return value
+      }
+
+      /**
+       * 用量徽标的显示偏好（读 / 写，**全局一个**，不分渠道）。
+       *
+       * ⚠️ `preference` 省略时**只读**（徽标首次渲染与设置面板初始化都用它）；
+       * 给出时必须是 `auto` / `subscription` / `credits` 之一。
+       *
+       * ⚠️ 非法值**拒绝**而不是静默回落：回落会让「设置没生效」看起来像
+       * 「保存成功」（用户改完刷新，界面仍按旧口径显示，且没有任何提示）。
+       * 磁盘脏数据的容错在 `sanitizeBadgePreference`（那条路径面对的不是用户输入）。
+       */
+      case 'usage.badgePreference': {
+        const req = payload as RpcUsageBadgePreferenceRequest
+        if (req.preference === undefined) {
+          const value: RpcUsageBadgePreferenceResponse = { preference: badgePreferences.load() }
+          return { ok: true, value }
+        }
+        if (!(BADGE_PREFERENCES as readonly unknown[]).includes(req.preference)) {
+          return {
+            ok: false,
+            error: {
+              code: 'bad-request',
+              message: `preference 必须是 ${BADGE_PREFERENCES.join(' / ')} 之一（收到：${JSON.stringify(req.preference)}）`,
+            },
+          }
+        }
+        await badgePreferences.save(req.preference)
+        const value: RpcUsageBadgePreferenceResponse = { preference: badgePreferences.load() }
         return { ok: true, value }
       }
 
