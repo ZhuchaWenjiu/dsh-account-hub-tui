@@ -160,7 +160,7 @@ describe('badgeView：模式与文案', () => {
     accounts: [{ accountId: 'a', nickname: 'a', plan: { name: 'Free Plan Subscription', remaining: 300, total: 500, unit: 'credits' } }],
   }
 
-  it('auto：有窗口显示窗口（与参考实现同款文案）', () => {
+  it('auto：有窗口显示窗口（文案含窗口名与百分比）', () => {
     const view = badgeView({ providerLabel: 'Cline', preference: 'auto', subscription: windows, accounts: [row('a', [pkg('Cline 账户余额', 5)])] })
     expect(view.mode).toBe('windows')
     expect(view.text).toBe('Cline · 5 小时 6% · 本周 2%')

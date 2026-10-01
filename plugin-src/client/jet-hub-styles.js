@@ -477,8 +477,8 @@ const STYLES = `
 .dim-jh-zcLink { color: var(--dsw-alias-link); word-break: break-all; }
 
 /* ── 用量徽标（会话输入区，模型选择器旁） ────────────────────────────────
-   位置与展开方向取自参考实现 dsh-cline-pass：折叠态是一枚紧凑按钮，
-   浮层用 position:absolute + bottom:calc(100% + 8px) 向上展开。
+   折叠态是一枚紧凑按钮，浮层用 position:absolute + bottom:calc(100% + 8px)
+   向上展开（贴着输入区上沿，不遮挡输入框）。
    ⚠ 输入区（RlGAzG_root / dock / trailing / standardControls）没有
    overflow:hidden（只有文本域 .RlGAzG_scroll 是 overflow-y:auto），故浮层
    不会被裁剪 —— 若将来上游给这些容器加上裁剪，这里要改成固定定位 + 锚点换算。

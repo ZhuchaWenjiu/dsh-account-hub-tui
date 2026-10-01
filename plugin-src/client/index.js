@@ -80,7 +80,7 @@ export function apply(ctx) {
    *
    * 该槽是 **list + 会话作用域**（`dsh-client-ui-conversation` 声明），渲染位置
    * 是 composer 的 `standardControls` 里、`conversation.input.model` **之前**，
-   * 故徽标天然落在模型选择器左侧（与参考实现 `dsh-cline-pass` 同位置）。
+   * 故徽标天然落在模型选择器左侧。
    * `inject` 回调收到 `sessionId`，用它取**该会话**的模型目录。
    *
    * ## ⚠️ 为什么是 `inject`（惰性）而不是在 `apply` 里直接注册
