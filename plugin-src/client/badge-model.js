@@ -146,8 +146,14 @@ export function planGroupsOf(rows) {
  * @param input.preference - 显示偏好（脏值会被归一化）。
  * @param input.subscription - 宿主给的订阅读数（可能缺席）。
  * @param input.accounts - 宿主给的逐账号余额（**仅启用账号**）。
+ * @param input.loading - **首次读数还没回来**（`true` 时显示「读取中…」）。
+ *   ⚠️ 这个入参是必需的，不是装饰：缺了它，首屏会拿空数组算出 `empty` 模式，
+ *   于是徽标在读数到达前显示「未配置启用账号」——把「还没读到」说成「没有账号」，
+ *   用户会以为账号丢了（真实报障，2026-10-02）。
+ * @param input.failed - **首次读数失败且无任何数据**（显示「用量不可用」而不是
+ *   「未配置启用账号」）：两种情况用户要做的下一步完全不同。
  * @returns `{ mode, text, tone, groups, planGroups, windows, failedCount, okCount, failureReason }`
- *   - `mode`：`'windows' | 'plan' | 'credits' | 'empty'`（**回落之后**的实际模式）；
+ *   - `mode`：`'loading' | 'windows' | 'plan' | 'credits' | 'empty'`（**回落之后**的实际模式）；
  *   - `tone`：`'ok' | 'warn' | 'error' | 'muted'`（徽标圆点用）。
  */
 export function badgeView(input) {
@@ -155,6 +161,27 @@ export function badgeView(input) {
   const preference = normalizeBadgePreference(input?.preference);
   const accounts = Array.isArray(input?.accounts) ? input.accounts : [];
   const subscription = input?.subscription;
+  const loading = input?.loading === true;
+  const failed = input?.failed === true;
+
+  /** 空/加载状态的统一返回（保持与成功路径同一组键，调用方不必做形状判断）。 */
+  const placeholder = (mode, text, tone) => ({
+    mode,
+    preference,
+    text,
+    tone,
+    groups: [],
+    planGroups: [],
+    windows: [],
+    failedCount: 0,
+    okCount: 0,
+    failureReason: '',
+  });
+
+  // 首屏：读数还没到 → 明确的「读取中…」，**不要**说成「未配置启用账号」。
+  if (loading) return placeholder('loading', `${providerLabel} · 读取中…`, 'muted');
+  // 首次读数就失败（且没有任何有效数据）→ 「用量不可用」，与「没有账号」区分开。
+  if (failed && accounts.length === 0) return placeholder('empty', `${providerLabel} · 用量不可用`, 'error');
 
   const { groups, failedCount, okCount } = creditGroupsOf(accounts);
   /**

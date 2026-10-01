@@ -110,17 +110,31 @@ function UsageBadgeActive(props) {
     let alive = true;
     let inFlight = false;
     /**
-     * 读一次。`manual === true` = 用户点刷新/签到后：**绕过宿主 TTL**，
-     * 并显示按钮忙碌态（自动轮询不显示，避免界面每分钟闪一下）。
+     * 读一次。三种调用形态（**语义不同，不要合并**）：
+     *
+     * | 形态 | force | 隐藏页 | 用途 |
+     * |---|---|---|---|
+     * | `load()` | ✗ | **不跳过** | 挂载（含切渠道后）：走宿主缓存，**有缓存就立刻出数** |
+     * | `load({ poll: true })` | ✗ | 跳过 | 60s 轮询与「切回前台」 |
+     * | `load({ force: true })` | ✓ | 不跳过 | 用户点「刷新」/ 签到之后：必须拿最新 |
+     *
+     * ⚠️ 挂载时**不 force** 是用户报障的修复（2026-10-02「反应有点慢」）：
+     * force 会绕过宿主 120s 缓存，于是每次挂载都要重新逐账号打上游（顺序
+     * HTTP，几个账号就是几秒），首屏只能一直空着。走缓存后，同一渠道 120s 内
+     * 的第二次挂载（切回来、新开会话）**立刻**出数。
+     *
+     * ⚠️ 挂载也不做「隐藏页跳过」：那是为**轮询**设计的节流，若挂载也跳过，
+     * 后台标签页里新建的会话会一直停在「读取中…」。
      */
-    const load = async (manual) => {
+    const load = async (options = {}) => {
       if (inFlight) return;
-      // 隐藏的标签页跳过轮询（值不值得为一个没人看的数字保持请求）。
-      if (manual !== true && typeof document !== 'undefined' && document.visibilityState === 'hidden') return;
+      const force = options.force === true;
+      // 隐藏的标签页跳过**轮询**（值不值得为一个没人看的数字保持请求）。
+      if (options.poll === true && typeof document !== 'undefined' && document.visibilityState === 'hidden') return;
       inFlight = true;
-      if (manual === true) setBusy(true);
+      if (force) setBusy(true);
       try {
-        const value = await readBadge(provider, manual === true ? { force: true } : {});
+        const value = await readBadge(provider, force ? { force: true } : {});
         if (!alive) return;
         // 响应里带回了 provider：并发/切渠道时只认领属于自己的那一份读数。
         if (value?.provider !== undefined && value.provider !== provider) return;
@@ -131,13 +145,13 @@ function UsageBadgeActive(props) {
         if (alive) setFailed(true);
       } finally {
         inFlight = false;
-        if (alive && manual === true) setBusy(false);
+        if (alive && force) setBusy(false);
       }
     };
-    read.current = () => { void load(true); };
-    void load(true);
-    const timer = setInterval(() => { void load(false); }, BADGE_POLL_MS);
-    const onVisible = () => { if (document.visibilityState === 'visible') void load(false); };
+    read.current = () => { void load({ force: true }); };
+    void load();
+    const timer = setInterval(() => { void load({ poll: true }); }, BADGE_POLL_MS);
+    const onVisible = () => { if (document.visibilityState === 'visible') void load({ poll: true }); };
     document.addEventListener('visibilitychange', onVisible);
     return () => {
       alive = false;
@@ -164,11 +178,20 @@ function UsageBadgeActive(props) {
 
   const value = snapshot?.value;
   const effectivePreference = preference ?? value?.preference ?? 'auto';
+  /**
+   * 「首次读数还没到」与「首次读数就失败」都要**显式**告诉展示层。
+   *
+   * ⚠️ 不能靠「账号列表为空」推断：那会把「还没读到」显示成「未配置启用账号」
+   *（用户报障，2026-10-02）。`snapshot === null` 才代表没有任何数据，
+   * 有数据时刷新失败要保留旧数字（不降级成空态）。
+   */
   const view = badgeView({
     providerLabel: label,
     preference: effectivePreference,
     subscription: value?.subscription,
     accounts: value?.accounts ?? [],
+    loading: snapshot === null && !failed,
+    failed: failed && snapshot === null,
   });
 
   /** 切换显示偏好：本地先生效，宿主写入失败时提示并回滚下一次渲染。 */
@@ -243,6 +266,14 @@ function UsageBadgeActive(props) {
     if (failed && snapshot === null) {
       children.push(React.createElement('div', { key: 'fail', className: 'dim-jh-badgeFail', role: 'alert' },
         '用量不可用（可点「刷新」重试）'));
+      return React.createElement('div', { className: 'dim-jh-badgePop' }, children);
+    }
+
+    // ⚠️ 首屏读数还没到时**不要**渲染下面几个区：它们会拿空账号列表说出
+    // 「该渠道还没有账号」，把「还没读到」说成「没有账号」（用户报障）。
+    if (snapshot === null) {
+      children.push(React.createElement('div', { key: 'loading', className: 'dim-jh-badgeNote' },
+        '正在读取用量…（首次要逐账号查询，可能要几秒）'));
       return React.createElement('div', { className: 'dim-jh-badgePop' }, children);
     }
 
@@ -352,7 +383,14 @@ function UsageBadgeActive(props) {
     ]);
   }
 
-  /** 一键签到（能力表允许的渠道才渲染）。 */
+  /**
+   * 一键签到（**只签当前渠道**，且能力表允许的渠道才渲染）。
+   *
+   * ⚠️ 作用范围必须写在按钮上（用户 2026-10-02 问过「是针对当前供应商还是所有」）：
+   * 这里调的是 `credits.claimAll({ provider })`，**只签当前渠道的全部账号**，
+   * 不会碰其它渠道。想一次签完所有渠道请用 Jet Hub 设置页页头的「一键签到」
+   *（那里遍历 `checkinProviders()`）。文案说清范围，用户才不会以为漏签了。
+   */
   function renderClaim() {
     return React.createElement('div', { key: 'claim', className: 'dim-jh-badgeSection' }, [
       React.createElement('button', {
@@ -360,9 +398,9 @@ function UsageBadgeActive(props) {
         type: 'button',
         className: 'dim-jh-badgeAction',
         disabled: claiming,
-        title: '每日签到领取积分（各渠道接口不同，结果按渠道如实回报）',
+        title: `只签到当前渠道（${label}）的全部账号；其它渠道请在 Jet Hub 设置页页头「一键签到」批量领取`,
         onClick: () => { void onClaim(); },
-      }, claiming ? '领取中…' : '一键签到'),
+      }, claiming ? '领取中…' : `一键签到（仅 ${label}）`),
       notice === '' ? null : React.createElement('div', { key: 'notice', className: 'dim-jh-badgeNote' }, notice),
     ]);
   }

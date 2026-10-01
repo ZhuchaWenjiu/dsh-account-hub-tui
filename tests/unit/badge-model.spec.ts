@@ -269,6 +269,38 @@ describe('badgeView：色调', () => {
   })
 })
 
+describe('badgeView：首屏状态（真实报障的回归）', () => {
+  it('首次读数还没到 → 「读取中…」，**不是**「未配置启用账号」', () => {
+    // 报障（2026-10-02）：徽标一开始显示「未配置启用账号」，其实只是还没读到。
+    const view = badgeView({ providerLabel: 'CodeBuddy', preference: 'auto', subscription: undefined, accounts: [], loading: true })
+    expect(view.mode).toBe('loading')
+    expect(view.text).toBe('CodeBuddy · 读取中…')
+    expect(view.tone).toBe('muted')
+    expect(view.groups).toEqual([])
+  })
+
+  it('首次读数就失败 → 「用量不可用」，与「没有账号」区分开', () => {
+    const view = badgeView({ providerLabel: 'CodeBuddy', preference: 'auto', subscription: undefined, accounts: [], failed: true })
+    expect(view.mode).toBe('empty')
+    expect(view.text).toBe('CodeBuddy · 用量不可用')
+    expect(view.tone).toBe('error')
+  })
+
+  it('有数据时刷新失败**不降级**成空态（保留旧读数）', () => {
+    // 组件只在 `snapshot === null` 时传 loading/failed；有数据时必须照常显示读数。
+    const view = badgeView({
+      providerLabel: 'CodeBuddy',
+      preference: 'auto',
+      subscription: undefined,
+      accounts: [row('a', [pkg('Bonus Pack', 100)])],
+      loading: false,
+      failed: false,
+    })
+    expect(view.mode).toBe('credits')
+    expect(view.text).toBe('CodeBuddy · 合计 100 积分')
+  })
+})
+
 describe('formatUpdatedAt', () => {
   it('含日期与秒（宿主是长生命周期进程，只有时钟会让昨天的读数看起来像刚刚）', () => {
     const at = new Date(2026, 9, 1, 16, 39, 32).getTime()

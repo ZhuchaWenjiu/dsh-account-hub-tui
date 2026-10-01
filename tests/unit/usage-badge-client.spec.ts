@@ -96,8 +96,26 @@ describe('用量徽标：渲染门控与轮询', () => {
     expect(badge).toMatch(/React\.useEffect\(\(\) => \{\s*setSnapshot\(null\)/)
   })
 
-  it('刷新按钮绕过宿主缓存（force）', () => {
-    expect(badge).toContain("await readBadge(provider, manual === true ? { force: true } : {})")
+  it('三类读取语义分明：挂载走缓存 / 轮询跳过隐藏页 / 刷新才 force', () => {
+    // 挂载（含切渠道后）：不 force、不跳过 —— 走宿主缓存，有缓存就立刻出数
+    expect(badge).toMatch(/read\.current = \(\) => \{ void load\(\{ force: true \}\); \};\s*\n\s*void load\(\);/)
+    // 轮询与「切回前台」带 poll 标记（只有它们跳过隐藏页）
+    expect(badge).toContain('void load({ poll: true })')
+    expect(badge).toContain("if (options.poll === true && typeof document !== 'undefined' && document.visibilityState === 'hidden') return;")
+    // 请求本身：只有 force 形态才带 { force: true }
+    expect(badge).toContain('await readBadge(provider, force ? { force: true } : {});')
+    // ⚠️ 挂载**不得**再写成 force（用户报障「反应有点慢」的根因：每次挂载都
+    // 绕过宿主 120s 缓存，逐账号重打上游）
+    expect(badge).not.toContain('void load(true)')
+  })
+
+  it('首屏状态显式传给展示层（不能靠「账号列表为空」推断）', () => {
+    expect(badge).toMatch(/loading: snapshot === null && !failed/)
+    expect(badge).toMatch(/failed: failed && snapshot === null/)
+  })
+
+  it('首屏读数未到时不渲染明细区（否则会说成「该渠道还没有账号」）', () => {
+    expect(badge).toContain("children.push(React.createElement('div', { key: 'loading', className: 'dim-jh-badgeNote' }")
   })
 
   it('客户端**不**直接调 credits.balances（那是逐账号打上游的端点）', () => {
@@ -113,6 +131,14 @@ describe('用量徽标：签到与显示偏好', () => {
 
   it('签到按钮由能力表门控（WorkBuddy 国际版 / Cline 不渲染）', () => {
     expect(badge).toContain('if (supportsDailyCheckin(provider)) children.push(renderClaim());')
+  })
+
+  it('签到**只签当前渠道**，且范围写在按钮上（用户 2026-10-02 问过）', () => {
+    // 载荷带 provider ⇒ 只作用于当前渠道；不遍历 checkinProviders()
+    expect(badge).toMatch(/claimCredits\(provider\)/)
+    expect(codeOf(badge)).not.toContain('checkinProviders')
+    expect(badge).toContain('一键签到（仅 ')
+    expect(badge).toMatch(/只签到当前渠道/)
   })
 
   it('签到成功后强制重读（否则要等下一轮轮询才看到新数字）', () => {
