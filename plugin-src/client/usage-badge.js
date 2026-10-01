@@ -445,11 +445,12 @@ function UsageBadgeActive(props) {
           ? [React.createElement('div', { key: 'empty', className: 'dim-jh-badgeNote' },
             account?.ok === true ? '该账号没有额度窗口' : (account?.error || '订阅额度不可用'))]
           /**
-           * ⚠️ 窗口行外包一层 `.dim-jh-badgeWins`：它才是 **grid 容器**，整块用
-           * `justify-content: center` 水平居中（用户 2026-10-02：「额度显示那块
-           * 文字左右居中对齐」）。每行用 `display: contents` 把四个单元格交给
-           * 这个 grid —— 这样**既居中又保持各列对齐**（各自居中的话，行与行之间
-           * 的进度条会因倒计时文字长短而错位）。
+           * ⚠️ 窗口行外包一层 `.dim-jh-badgeWins`：它才是 **grid 容器**，四条列宽由
+           * CSS 定义（标签 max-content / 进度条 minmax(60px,1fr) / 百分比 max-content /
+           * 倒计时固定 100px 右对齐）。每行用 `display: contents` 把四个单元格交给
+           * 这个 grid，于是**三行共享同一套列**——这是用户 2026-10-02 明确的口径：
+           * 「像两边对齐，但进度条要一样长，文字部分左右分别对齐」。
+           * （先前试过「整块居中 + 固定 64px 条」，被否掉：那样两侧不对齐。）
            */
           : [React.createElement('div', { key: 'wins', className: 'dim-jh-badgeWins' },
             windows.map(([type, windowLabel, win]) => {

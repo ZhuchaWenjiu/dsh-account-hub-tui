@@ -249,14 +249,23 @@ describe('用量徽标：弹窗的紧凑布局（信息一项不少）', () => {
     expect(badge).toContain('formatQuotaPercent(percent)')
   })
 
-  it('额度块整块水平居中，且各列仍对齐（grid + display:contents）', () => {
-    // 用户 2026-10-02：「额度显示那块文字左右居中对齐」
+  it('额度块「两侧对齐 + 进度条等长 + 文字左右分别对齐」（grid + display:contents）', () => {
+    // 用户 2026-10-02 附截图明确口径：「应该是像两边对齐，但是进度条要一样长，
+    // 文字部分左右分别对齐」——早先的「整块居中」实现被否掉。
     expect(badge).toContain("className: 'dim-jh-badgeWins'")
     expect(styles).toMatch(/\.dim-jh-badgeWins \{[^}]*display: grid/)
-    expect(styles).toMatch(/\.dim-jh-badgeWins \{[^}]*justify-content: center/)
-    // ⚠️ 进度条列必须是固定宽：改成 flex:1 会吃掉全部余量，居中就看不出来
-    expect(styles).toMatch(/\.dim-jh-badgeWins \{[^}]*grid-template-columns: max-content 64px max-content max-content/)
-    // 每行 display:contents 交给 grid ⇒ 居中与列对齐同时成立
+    // ⚠️ 四列共享列宽：标签 max-content（按最宽那个对齐 ⇒ 三行进度条起点一致）
+    // + 进度条 minmax(60px,1fr)（吃掉余量 ⇒ 等长）+ 百分比 max-content
+    // + 倒计时固定 100px（贴右边缘）
+    expect(styles).toMatch(/\.dim-jh-badgeWins \{[^}]*grid-template-columns: max-content minmax\(60px, 1fr\) max-content 100px/)
+    // 不得再出现整块居中（会破坏两侧对齐）——⚠️ 只能在该**规则块内**判：
+    // styles 是整个样式文件（含设置页），别处合法的 justify-content 会被误伤。
+    const winsRule = styles.slice(styles.indexOf('.dim-jh-badgeWins {'), styles.indexOf('}', styles.indexOf('.dim-jh-badgeWins {')))
+    expect(winsRule).not.toContain('justify-content')
+    // 文字左 / 右分别对齐
+    expect(styles).toMatch(/\.dim-jh-badgeWinLabel \{[^}]*text-align: left/)
+    expect(styles).toMatch(/\.dim-jh-badgeWinReset \{[^}]*text-align: right/)
+    // 每行 display:contents 交给共享 grid ⇒ 等长与列对齐同时成立
     expect(styles).toMatch(/\.dim-jh-badgeWin \{[^}]*display: contents/)
   })
 

@@ -531,15 +531,18 @@ const STYLES = `
 .dim-jh-badgeRowName { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .dim-jh-badgeRowNote { font-size: 10px; line-height: 14px; color: var(--dsw-alias-label-tertiary); }
 /* 窗口：**一行**放下 名称 / 进度条 / 百分比 / 重置倒计时。
-   ⚠️ 整块用 grid 居中（justify-content: center + width: fit-content），
-   每行 display: contents 把四个单元格交给这个 grid —— **既居中又保持列对齐**
-   （若改成每行各自居中，行与行之间的进度条会因倒计时文字长短而错位）。
-   ⚠️ 进度条列固定 64px（居中后不能再用 flex:1，否则它会吃掉全部余量、看起来没居中）。 */
-.dim-jh-badgeWins { display: grid; grid-template-columns: max-content 64px max-content max-content; justify-content: center; align-items: center; gap: 4px 6px; width: fit-content; max-width: 100%; margin: 0 auto; }
+   ⚠️ 用户 2026-10-02 明确口径（附截图）：「像两边对齐，但进度条要一样长，文字部分
+   左右分别对齐」⇒ 用**共享列宽的 grid**（不是整块居中、也不是每行各自 flex）：
+   - 列 1 max-content：标签统一按最宽那个对齐，**靠左**，于是三行进度条起点也一致；
+   - 列 2 minmax(60px, 1fr)：进度条吃掉剩余宽度 ⇒ 三行**等长**且自适应；
+   - 列 3 max-content：百分比紧跟在条后；
+   - 列 4 固定 100px + text-align: right：倒计时**贴右边缘**，各行对齐。
+   （早先试过「整块居中 + 固定 64px 条」——被否掉：那样两侧不对齐。） */
+.dim-jh-badgeWins { display: grid; grid-template-columns: max-content minmax(60px, 1fr) max-content 100px; align-items: center; gap: 4px 6px; }
 .dim-jh-badgeWin { display: contents; }
-.dim-jh-badgeWinLabel { font-size: 10.5px; color: var(--dsw-alias-label-secondary); text-align: right; white-space: nowrap; }
+.dim-jh-badgeWinLabel { font-size: 10.5px; color: var(--dsw-alias-label-secondary); text-align: left; white-space: nowrap; }
 .dim-jh-badgeWin .dim-jh-quotaBar { height: 3px; }
-.dim-jh-badgeWinReset { max-width: 108px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 10px; color: var(--dsw-alias-label-tertiary); }
+.dim-jh-badgeWinReset { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 10px; color: var(--dsw-alias-label-tertiary); text-align: right; }
 .dim-jh-badgeValue { flex: none; font-size: 11px; font-weight: 600; font-variant-numeric: tabular-nums; }
 .dim-jh-badgeValue[data-tone="warn"] { color: var(--dsw-alias-state-warn-primary); font-weight: 500; }
 .dim-jh-badgeNote { font-size: 10px; line-height: 14px; color: var(--dsw-alias-label-tertiary); }
