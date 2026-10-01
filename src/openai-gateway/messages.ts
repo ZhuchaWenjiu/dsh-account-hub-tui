@@ -40,6 +40,11 @@ export interface OpenAiChatRequest {
   tool_choice?: unknown
 }
 
+export function normalizeMaxTokens(value: number | undefined, provider: string, model: string): number | undefined {
+  if (value === undefined) return undefined
+  if (provider === 'codearts' && /^deepseek-v4-(flash|pro)$/.test(model)) return Math.min(value, 65536)
+  return value
+}
 export function normalizeReasoningEffort(
   requested: unknown,
   modelInfo: unknown,
@@ -175,7 +180,7 @@ function tokenValue(value: unknown, name: string): number | undefined {
   return value
 }
 
-export function toGenerateOptions(body: OpenAiChatRequest, signal: AbortSignal, reasoningEffortOverride?: string): GenerateOptions {
+export function toGenerateOptions(body: OpenAiChatRequest, signal: AbortSignal, reasoningEffortOverride?: string, maxTokensOverride?: number): GenerateOptions {
   const { provider, model } = parseModelRoute(body.model)
   if (!Array.isArray(body.messages) || body.messages.length === 0) {
     throw new OpenAiGatewayError('messages must be a non-empty array')
@@ -183,9 +188,9 @@ export function toGenerateOptions(body: OpenAiChatRequest, signal: AbortSignal, 
   if (body.tool_choice !== undefined && body.tool_choice !== 'auto' && body.tool_choice !== 'none') {
     throw new OpenAiGatewayError('only tool_choice auto and none are supported')
   }
-  const maxTokens = body.max_completion_tokens !== undefined
+  const maxTokens = maxTokensOverride ?? (body.max_completion_tokens !== undefined
     ? tokenValue(body.max_completion_tokens, 'max_completion_tokens')
-    : tokenValue(body.max_tokens, 'max_tokens')
+    : tokenValue(body.max_tokens, 'max_tokens'))
   const stop = body.stop === undefined
     ? undefined
     : typeof body.stop === 'string' ? [body.stop]

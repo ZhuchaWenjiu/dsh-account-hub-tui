@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import { ReasoningEffortId } from '@deepseek-ai/dsh-llm'
-import { parseModelRoute, toGenerateOptions, OpenAiGatewayError, normalizeReasoningEffort } from '../../src/openai-gateway/messages.js'
+import { parseModelRoute, toGenerateOptions, OpenAiGatewayError, normalizeReasoningEffort, normalizeMaxTokens } from '../../src/openai-gateway/messages.js'
 
 describe('OpenAI gateway request conversion', () => {
   it('parses a namespaced model route', () => {
@@ -47,6 +47,10 @@ describe('OpenAI gateway request conversion', () => {
     expect(normalizeReasoningEffort('high', info)).toBe('on')
     expect(normalizeReasoningEffort('none', info)).toBe('off')
     expect(normalizeReasoningEffort('off', info)).toBe('off')
+  })
+  it('clamps CodeArts output tokens to its verified upstream limit', () => {
+    expect(normalizeMaxTokens(128000, 'codearts', 'deepseek-v4-flash')).toBe(65536)
+    expect(normalizeMaxTokens(32000, 'codearts', 'deepseek-v4-flash')).toBe(32000)
   })
   it('maps CodeArts generic levels even when legacy runtime omits reasoning metadata', () => {
     expect(normalizeReasoningEffort('high', undefined, 'codearts', 'deepseek-v4-flash')).toBe('on')
