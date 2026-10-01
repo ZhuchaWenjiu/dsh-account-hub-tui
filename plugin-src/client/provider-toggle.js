@@ -113,3 +113,71 @@ export function summarizeProviderToggle(enabled, res) {
   parts.push(accounts > 0 ? `已停用 ${accounts} 个账号` : '没有账号需要停用');
   return parts.join('，');
 }
+
+/**
+ * 「供应商开关」弹窗的行数据：已打开在前、已关闭在后，每行自带开关呈现状态。
+ *
+ * ## 为什么单独抽出来
+ *
+ * 弹窗要渲染的既不是「供应商定义」也不是「状态表」，而是两者的**拼接结果**：
+ * 顺序（分组）、勾选态、禁用态与原因、影响面计数。留在组件里就等于把判定
+ * 写回 UI —— 本模块的存在前提正是「判定不落在渲染层」（见文件头）。
+ *
+ * ## 三条必须保住的口径
+ *
+ * - **顺序与分组直接复用 {@link groupProviders}**：与左侧 rail 用的是同一份
+ *   判据，两处不可能出现「左侧说它关了、弹窗里它还是开的」。
+ * - **勾选态与禁用态直接复用 {@link providerSwitchState}**：包括那条容易漏的
+ *   「`models.total === 0` ⇒ 禁用并给出原因」—— 没有模型可关时服务端会拒绝
+ *   关闭动作，让用户点得动只会得到一句错误提示。
+ * - **计数原样带出，不在这里格式化**：文案属于渲染层，判据属于本模块。
+ *   拿不到状态时给 `null` 而不是 `{total:0}` —— 二者含义不同：
+ *   「不知道」与「确实是 0 个」在界面上必须区别对待（前者显示 `—`）。
+ *
+ * @param {Array<{ id: string, label?: string }>} providers 供应商定义（顺序即组内顺序）
+ * @param {Record<string, object> | null} statuses provider id → `provider.status` 条目
+ * @returns {Array<{ id: string, label: string, checked: boolean, disabled: boolean,
+ *   reason: string | null, models: {total?: number, disabled?: number} | null,
+ *   accounts: {total?: number, enabled?: number} | null }>}
+ */
+export function providerSwitchRows(providers, statuses) {
+  const { open, closed } = groupProviders(providers, statuses);
+  /** @param {{ id: string, label?: string }} provider */
+  const toRow = (provider) => {
+    const id = provider?.id;
+    const status = statuses && typeof statuses === 'object' ? statuses[id] : undefined;
+    const sw = providerSwitchState(status);
+    return {
+      id,
+      label: provider?.label || id,
+      checked: sw.checked,
+      disabled: sw.disabled,
+      reason: sw.reason,
+      models: status?.models ?? null,
+      accounts: status?.accounts ?? null,
+    };
+  };
+  // 已打开在前：与 rail 的分组顺序一致，用户在两处看到的是同一个排列。
+  return [...open.map(toRow), ...closed.map(toRow)];
+}
+
+/**
+ * 供应商开关的计数摘要（页头按钮的 tooltip 与弹窗副标题共用）。
+ *
+ * `statuses` 为 null（尚未读到 / 读取失败）时三个计数都是 0 —— 调用方据此
+ * **不显示计数**，而不是显示「0 / 0」让用户以为一个供应商都没有。
+ *
+ * @param {Array<{ id: string }>} providers
+ * @param {Record<string, object> | null} statuses
+ * @returns {{ open: number, closed: number, total: number, known: boolean }}
+ */
+export function providerToggleSummary(providers, statuses) {
+  const list = Array.isArray(providers) ? providers : [];
+  const { open, closed } = groupProviders(list, statuses);
+  return {
+    open: open.length,
+    closed: closed.length,
+    total: list.length,
+    known: statuses !== null && statuses !== undefined && typeof statuses === 'object',
+  };
+}

@@ -4,24 +4,39 @@
 
 const STYLES = `
 .dim-jh-page { display: flex; flex-direction: column; height: 100%; }
-.dim-jh-header { display: flex; align-items: center; justify-content: space-between; padding: 16px 24px; border-bottom: 1px solid var(--dsw-alias-border-default, #e5e5e5); }
-.dim-jh-brand { display: flex; flex-direction: column; }
+.dim-jh-header { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 16px 24px; border-bottom: 1px solid var(--dsw-alias-border-default, #e5e5e5); }
+/* ⚠️ min-width: 0 是「按钮排成一排」的关键：brand 是 flex 列，默认
+   min-width: auto 意味着它**不肯让出固有宽度** —— 页头按钮从 3 个增到 4 个
+   （新增「供应商」开关入口）之后，右侧按钮组被挤到换行，「关闭」掉到第二行。
+   让 brand 可收缩，空间优先留给操作按钮。 */
+.dim-jh-brand { display: flex; flex-direction: column; min-width: 0; }
 .dim-jh-brandName { font-size: 18px; font-weight: 600; color: var(--dsw-alias-label-primary, #1a1a1a); }
-.dim-jh-brandDesc { font-size: 13px; color: var(--dsw-alias-label-secondary, #555); margin: 2px 0 0; }
+/* 副标题改单行省略号：它只是说明文字，让位给操作按钮比保全整句重要
+   （原先它会被折成两行，反而把页头撑高）。 */
+.dim-jh-brandDesc { font-size: 13px; color: var(--dsw-alias-label-secondary, #555); margin: 2px 0 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 
 /* 布局：对齐 dsh-im 的两栏 */
 .dim-jh-layout { display: flex; flex: 1; overflow: hidden; }
 
 /* 左侧导航：align dsh-im .dim-rail */
-/* ⚠️ 宽度 243px（原 200px）是**实测反推**的结果，不是随手取的：
-   行内新增 34px 的开关 + 8px 间距后，200px 时标签可用宽度只剩 77px，
-   6/8 行会出现省略号（最长一行超宽 64px）；243px 时标签可用 120px，
-   仅 3 行轻微超宽（-3 / -4 / -21px），且**列表总高不变**（384px）。
-   实测方法与数据见工作区 jet-hub-provider-toggle-notes.md。 */
-.dim-jh-rail { width: 243px; border-right: 1px solid var(--dsw-alias-border-default, #e5e5e5); padding: 8px; overflow-y: auto; display: grid; align-content: start; gap: 8px; }
+/* ⚠️ 宽度 228px 是「尽量给右侧让位」与「最长行不出省略号」的交点。算式（含滚动条）：
+     可用文字宽 = W − 12(rail padding 6×2) − 2(按钮边框) − 20(按钮 padding 10×2)
+                     − 30(图标) − 8(图标间距) − 15(Windows 经典滚动条) = W − 85
+     W = 228 ⇒ 可用 **143px**，刚好装得下最长行 WorkBuddy (国际版) —— 它实测要 141px
+     （!25 的实测表：200px + 行尾开关时标签只剩 77px、该行超宽 64px ⇒ 77 + 64 = 141）。
+   与 !25 的 243px 相比省出 15px，再加上开关移走后消失的那条 8px 空列
+   ⇒ 右侧账号区净得约 23px。**再往回收就会截断最长行**（用户已报过一次
+   「workbuddy国际版有省略号」），要更窄只能改短 label —— 但那会与
+   RaccoonProduct / QODER_CN 等 displayName 的跨文件一致性断言冲突，故未做。
+   ⚠️ 测量本身的三条坑（inline 元素 clientWidth 恒 0 会得到假阴性、不能靠行高判折行、
+   滚动条吃掉约 15px）见工作区 jet-hub-provider-toggle-notes.md。 */
+.dim-jh-rail { width: 228px; border-right: 1px solid var(--dsw-alias-border-default, #e5e5e5); padding: 6px; overflow-y: auto; display: grid; align-content: start; gap: 8px; }
 
 /* 每个 provider 按钮：align dsh-im .dim-channel */
-.dim-jh-provider { width: 100%; min-height: 48px; display: grid; grid-template-columns: 30px minmax(0, 1fr); align-items: center; gap: 10px; padding: 8px 12px; border: 1px solid var(--dsw-alias-border-l2, #eef0f3); border-radius: 14px; color: inherit; background: var(--dsw-alias-bg-layer-3, #fff); box-shadow: 0 2px 8px rgb(31 35 41 / 3%); font: inherit; text-align: left; cursor: pointer; transition: border-color .16s ease, background .16s ease, box-shadow .16s ease; }
+/* padding 与图标间距比 !25 各收窄 2px（12→10、10→8）：这两处是**纯开销**，
+   省下的每一像素都直接变成标签可用宽度，比加宽 rail 划算 —— 正是靠这 4px
+   才把「不截断」所需的 rail 宽度从 232px 压到 228px。 */
+.dim-jh-provider { width: 100%; min-height: 48px; display: grid; grid-template-columns: 30px minmax(0, 1fr); align-items: center; gap: 8px; padding: 8px 10px; border: 1px solid var(--dsw-alias-border-l2, #eef0f3); border-radius: 14px; color: inherit; background: var(--dsw-alias-bg-layer-3, #fff); box-shadow: 0 2px 8px rgb(31 35 41 / 3%); font: inherit; text-align: left; cursor: pointer; transition: border-color .16s ease, background .16s ease, box-shadow .16s ease; }
 .dim-jh-provider:hover { border-color: color-mix(in srgb, #1677ff 25%, var(--dsw-alias-border-l2, #eef0f3)); background: color-mix(in srgb, #1677ff 2%, var(--dsw-alias-bg-layer-3, #fff)); box-shadow: 0 5px 16px rgb(31 35 41 / 5%); }
 .dim-jh-provider[aria-selected="true"] { border-color: color-mix(in srgb, #1677ff 43%, var(--dsw-alias-border-l2, #dfe1e5)); color: #1677ff; background: color-mix(in srgb, #1677ff 12%, var(--dsw-alias-bg-layer-3, #fff)); box-shadow: 0 3px 12px rgb(51 112 255 / 7%); }
 .dim-jh-provider:focus-visible { outline: none; border-color: color-mix(in srgb, #1677ff 72%, var(--dsw-alias-border-l2, #dfe1e5)); box-shadow: 0 0 0 1px color-mix(in srgb, #1677ff 24%, transparent) inset, 0 3px 12px rgb(51 112 255 / 7%); }
@@ -57,11 +72,14 @@ const STYLES = `
 .dim-jh-railGroup { display: grid; gap: 8px; }
 .dim-jh-railGroup + .dim-jh-railGroup { margin-top: 10px; }
 .dim-jh-railGroupTitle { padding: 2px 4px 0; font-size: 12px; line-height: 16px; font-weight: 600; color: var(--dsw-alias-label-tertiary, #8f959e); }
-/* 每行：左侧选择按钮 + 右侧开关。
-   ⚠️ 首列必须是 minmax(0, 1fr)：grid 项的 min-width 默认是 auto，会让长供应商名
-   把行撑宽、把行尾的开关挤出 rail（与模型行那次「开关不可见」的缺陷同型）。
-   开关自身保持 flex: none（它是目标控件，绝不参与收缩）。 */
-.dim-jh-providerRow { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 8px; }
+/* 每行：只有一个选择按钮（开关已搬到页头的「供应商开关」弹窗）。
+   ⚠️ 列宽仍写 minmax(0, 1fr) 而不是 1fr：grid 项的 min-width 默认 auto，
+   长供应商名会把行撑宽、撑出 rail（与模型行那次「开关不可见」的缺陷同型）。
+   ⚠️ **不要再留第二列**：!25 时代这里是 minmax(0, 1fr) auto 给行尾开关用；
+   开关移走后那一列虽为 0 宽，**8px 的列间距却照样计入**，于是在卡片右侧
+   留下一条看着像「rail 没铺满」的空白。用户报障原话：
+   「去掉开关后右边有片空白，要省略让右边的账号池区域显示更宽」。 */
+.dim-jh-providerRow { display: grid; grid-template-columns: minmax(0, 1fr); }
 .dim-jh-providerRow .dim-jh-provider { min-width: 0; }
 
 /* 右侧面板 */
@@ -153,7 +171,10 @@ const STYLES = `
 /* 面板标题下方的操作按钮组（显示列表 / 刷新积分 / 一键领取积分 / 重测所有 / 重置所有 / 新建账号）。
    允许换行：按钮数量随 provider 变化（CodeBuddy 有「一键领取积分」，其他没有），
    固定单行在窄面板下必然放不下。 */
-.dim-jh-headerActions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; max-width: 100%; }
+/* flex: none：按钮组不参与收缩 —— 配合 brand 的 min-width: 0，页头空间先给操作按钮。
+   ⚠️ 仍**保留** flex-wrap: wrap：窗口极窄到 brand 已经缩到底时，
+   让按钮换行远好过溢出到窗口外点不到。正常宽度下这一组必然排成一排。 */
+.dim-jh-headerActions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; flex: none; }
 
 /* 上一次「重测 / 重置」的结果提示 */
 .dim-jh-probeNotice { margin-bottom: 12px; padding: 10px 12px; border-radius: 10px; border: 1px solid var(--dsw-alias-border-l2, #eef0f3); background: var(--dsw-alias-bg-layer-2, #f7f8fa); font-size: 12px; line-height: 18px; color: var(--dsw-alias-label-secondary, #646a73); }

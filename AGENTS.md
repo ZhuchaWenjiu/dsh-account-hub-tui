@@ -764,6 +764,12 @@ allowBuilds 判定，不换 commit 会得到假的"成功"）：
   `cline-models-dev.ts` 时实测到，`lib/cline-modalities.*` 四个文件仍在，
   并随文件拷贝式安装一起进了 profile）。**删改源文件后手动清一次 `lib/`**
   （或整目录重建），否则残留模块虽无人 import 却会一直跟着发布。
+  ⚠️ **`plugin-src/client/jet-hub-styles.js` 里的 `STYLES` 是模板字符串 ——
+  CSS 注释内绝不能出现反引号**。用它给属性名加强调（`` `min-width: 0` ``）会
+  **提前闭合模板**，esbuild 报 `Expected ";" but found "min"` 并把指针指到注释那一行，
+  看起来像 CSS 写错了，实际是 JS 语法问题（2026-10-01 改页头样式时踩过，
+  一次引入 6 对）。注释里要强调就直接裸写 `min-width: 0`。
+  改完这个文件**必须跑一次 `pnpm build:client`** —— 单测只读源码文本，不会因此失败。
 - **测试**：Vitest（单元测试 + E2E 端到端测试）
   - `pnpm test` — 单元测试（快速，无网络，全部 mock）
   - `pnpm test:e2e:*` — 端到端测试，按 provider 分列（如 `test:e2e:codearts`、`test:e2e:buddy`、`test:e2e:workbuddy-claim`）；**均有闸门，默认全部跳过**，详见 `tests/e2e/README.md`
@@ -6626,7 +6632,7 @@ ZCode **不可续期**（凭据是静态的、没有 refresh 端点），所以�
 ③ **不要**用 `replaceAll`（那是 Jet Hub 的导入路径，语义不同；
 我第一版用它导致 3 条用例假失败）。
 
-## 供应商级一键开关（左侧 rail 分组 + 行尾开关）
+## 供应商级一键开关（左侧 rail 分组 + 页头弹窗开关）
 
 **需求**：「因该提供左侧供应商的一键开关，开关逻辑和账号的开关逻辑一致（但是如果不关闭
 模型就不关闭供应商），应该分组显示打开和关闭的供应商」。
@@ -6671,16 +6677,55 @@ ZCode **不可续期**（凭据是静态的、没有 refresh 端点），所以�
 用户按「已关闭」的预期却仍能选到它。前端把这种情形表现为**开关禁用**并给出原因
 （`providerSwitchState` 的 `reason`），而不是让用户点下去只得到一句错误提示。
 
-### ⚠️ rail 里开关**绝不能嵌进 `<button role="tab">`**
+### ⚠️ 开关**不在**左侧行尾（2026-10-01 用户要求搬到页头弹窗）
 
-结构上必须是**兄弟节点**（`.dim-jh-providerRow` 是 grid，首列按钮、末列开关）：
+!25 最初的形态是把开关挂在左侧每个供应商行的右侧。用户随后要求改：
+「提供商开关是直接显示在 provider 右侧的，把它单独抽出来到 Jet Hub 上面的一个按钮里，
+点开始列表和开关，可以选择关闭，**和模型列表中那套打开/关闭按钮的显示逻辑一样**」。
 
-1. 交互元素嵌套在 HTML 里是非法的；
-2. 本项目有过同类真实缺陷 —— 在 `<label>` 里插入第二个 checkbox 后，点行内文字会
-   激活**第一个**可标记控件，导致既有交互失效（见 `model-filter.js` 的记载）。
+现在的形态：页头 `dim-jh-headerActions` 里的**「供应商开关」按钮** → 点开
+`ProviderSwitchPanel` 弹窗（一个供应商一行、行尾一个开关）。
 
-行容器**不挂 onClick**：点击只属于那个 button，开关由 `onChange` 处理。
-`tests/unit/provider-toggle.spec.ts` 用源码级断言锁死这个结构。
+**为什么这个改法是对的**：关闭一个供应商是**破坏性批量操作**（一次改动几十个模型 +
+全部账号），把它挂在承担导航的窄栏行尾，等于让误点代价最高的控件离高频无害动作
+（选要看哪个供应商）最近。搬进弹窗后必须"点进去 → 看清影响面 → 再决定"。
+
+⚠️ **搬走的是控件，不是判据**：`providerSwitchState`（三形态）与
+`groupProviders`（分组）原样复用，新增的 `providerSwitchRows` /
+`providerToggleSummary`（`plugin-src/client/provider-toggle.js`）只是把
+「定义 × 状态表」拼成行数据与计数 —— **判定仍然只在纯逻辑层一处**。
+弹窗与左侧 rail 读的是同一份 `provider.status`，故不可能出现
+「左侧说它关了、弹窗里它还是开的」。
+
+⚠️ **弹窗行的约束换了一套**：行容器是 `<label>` 且**内部只能有 1 个 checkbox**
+（与 `ModelToggle` 同因：插入第二个 checkbox 会让「点行内文字」激活第一个可标记控件）。
+原先那条「开关必须是 `<button role="tab">` 的兄弟节点」随开关一起失效 ——
+现在左侧行里**只有一个 button**，`provider-toggle.spec.ts` 改为断言这一点
+（行内不得出现 `React.createElement('input'`）。
+
+⚠️ **rail 宽度 243px 是当时的遗留**：那张实测表里 243px 是为了**容纳行尾开关**
+（无开关时 200px 就够）。开关搬走后左侧已有约 40px 富余，收窄回 200px 属独立的
+视觉决策，本次**没做**（样式断言 `.dim-jh-rail { width: 243px; }` 仍在，
+改宽度时要一起改）。
+
+### 弹窗与模型列表弹窗共用同一套结构与类名（用户明确要求）
+
+`ProviderSwitchPanel` 复用 `dim-jh-modalOverlay--top` / `dim-jh-modalHead`
+（标题 + 计数 + 刷新 + 完成）/ `dim-jh-modalHint` / `dim-jh-modalBody` /
+`dim-jh-modelList` / `dim-jh-modelRow` / `dim-jh-modelInfo` / `dim-jh-modelName` /
+`dim-jh-modelId` / `dim-jh-switch`，并沿用 ESC 与点遮罩关闭、
+**关闭即不挂载**（避免常驻一份开关列表）。**没有为它新写一条样式规则**。
+
+两个容易做错的细节：
+
+- `data-disabled` 在模型列表里的语义是「**这一项已被关闭**」（整行淡出），
+  这里保持一致：`row.checked ? 'false' : 'true'`。「这行点不动」由 `input` 的
+  `disabled` 表达，**两件事不能混成一个属性**。
+- **busy 只锁被点的那一行**，不锁整表（与 `ModelListPanel` 的 `busyIds` 同取向）。
+- ⚠️ 状态没读回来时**不显示计数**：`providerToggleSummary` 的 `known: false`
+  让界面显示「正在读取状态…」/「状态读取失败」，而不是「已打开 0、已关闭 0」——
+  后者会被读成「一个供应商都没有」。为此 `JetHubPage` 新增了 `providerStatusFailed`，
+  用来区分「还没回来」与「回来是失败」（`providerStatuses === null` 一个值担不起两义）。
 
 ### ⚠️ `.dim-jh-providerLabel` 曾是「已定义但从未被应用」的死样式
 
@@ -6714,9 +6759,11 @@ rail 宽度：实测（无头 Edge + 真实源码 STYLES，rail 高 446px、纵�
 ### 状态读取失败时退化为不分组（不阻断主功能）
 
 `provider.status` 失败时把状态置为 `null`，rail **按 `PROVIDERS` 原顺序平铺、不分组**，
-并在页头提示一句。⚠️ 此时所有开关都被 `providerSwitchState(undefined)` 判为**禁用** ——
-状态未知时让用户点一个状态不明的开关比禁用更糟。**绝不**因为左侧这个装饰性功能而让
-整个设置页白屏。
+并在页头提示一句。⚠️ 此时**弹窗里的**所有开关都被 `providerSwitchState(undefined)`
+判为**禁用**（`reason: '状态尚未读取'`）—— 状态未知时让用户点一个状态不明的开关比
+禁用更糟。**绝不**因为左侧这个装饰性功能而让整个设置页白屏。
+⚠️ 但「`null` 一个值」担不起「加载中」与「读取失败」两义 —— 弹窗计数需要分开显示，
+故另有 `providerStatusFailed`（见上一节末条）。
 
 ### 右侧账号面板：只重新加载，不改逻辑
 
@@ -6726,8 +6773,12 @@ rail 宽度：实测（无头 Edge + 真实源码 STYLES，rail 高 446px、纵�
 
 ### 回归用例
 
-- `tests/unit/provider-toggle.spec.ts` —— 纯逻辑（分组 / 三形态 / 结果文案）+ 源码级守卫
-  （开关与 button 是兄弟、行容器无 onClick、开关受控、分组标题带计数、样式约束）。
+- `tests/unit/provider-toggle.spec.ts` —— 纯逻辑（分组 / 三形态 / 结果文案 /
+  **弹窗行数据 `providerSwitchRows`** / **计数 `providerToggleSummary`**）+ 源码级守卫
+  （⚠️ **左侧行内不得出现 `input`**、页头按钮点开弹窗且关闭即不挂载、
+  弹窗行是 `<label>` + **恰好一个** checkbox、弹窗与模型列表共用同一套类名、
+  `data-disabled` 只表达「已关闭」、状态没读回来不显示计数、分组标题带计数、样式约束）。
+  ⚠️ 源码级断言**不能跨行**：本仓库源文件是 CRLF，`'a\nb'` 形式的字面量匹配不上。
 - `tests/unit/jet-hub-rpc.spec.ts` —— `provider.status` 的 `closed` 判据（含「只关一部分」
   与「空目录」两条边界）、`provider.setEnabled` 的写入顺序 / 不落盘 / 广播 / 参数校验。
 - `tests/unit/account-pool.spec.ts` —— `setAccountsEnabled` 的 provider 隔离、幂等不落盘、

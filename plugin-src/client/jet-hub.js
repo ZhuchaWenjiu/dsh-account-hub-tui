@@ -31,7 +31,8 @@ import {
 } from './model-filter.js';
 import {
   groupProviders,
-  providerSwitchState,
+  providerSwitchRows,
+  providerToggleSummary,
   summarizeProviderToggle,
 } from './provider-toggle.js';
 import {
@@ -215,24 +216,29 @@ const ZCODE_ICON = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAA
 const PROVIDERS = Object.freeze([
   { id: 'codearts', label: 'CodeArts (华为云)', icon: CODEARTS_ICON, logoClass: 'codearts' },
   { id: 'buddy', label: 'CodeBuddy (腾讯)', icon: CODEBUDDY_ICON, logoClass: 'buddy' },
+  // ⚠️ 这几条 label 是**最长行**，直接决定 rail 要多宽才不会出省略号
+  // （WorkBuddy 国际版这条实测要 141px）。改长度前先看 `jet-hub-styles.js`
+  // 里 .dim-jh-rail 的算式；且 raccoon 那条与 `RaccoonProduct.displayName`
+  // 有跨文件一致性断言（`raccoon-client-panel.spec.ts`），不能只改一处。
   { id: 'workbuddy', label: 'WorkBuddy (国际版)', icon: WORKBUDDY_ICON, logoClass: 'workbuddy' },
   { id: 'lobsterai', label: 'LobsterAI (有道)', icon: LOBSTERAI_ICON, logoClass: 'lobsterai' },
   { id: 'qoder', label: 'Qoder', icon: QODER_ICON, logoClass: 'qoder' },
   // ⚠️ label 用『Qoder (中国版)』而非『Qoder CN』——与 `QODER_CN.displayName`
-  // 保持一致；长度也刻意控制在不会触发换行的范围内（Raccoon 那条报障过）。
+  // 保持一致；长度受上面那条算式约束。
   { id: 'qodercn', label: 'Qoder (中国版)', icon: QODERCN_ICON, logoClass: 'qodercn' },
   { id: 'trae', label: 'TRAE (字节)', icon: TRAE_ICON, logoClass: 'trae' },
   { id: 'cline', label: 'Cline', icon: CLINE_ICON, logoClass: 'cline' },
   { id: 'loomy', label: 'Loomy (讯飞)', icon: LOOMY_ICON, logoClass: 'loomy' },
   // ⚠️ 用『Raccoon (商汤)』而非『Raccoon Work (商汤)』—— 后者在 provider 列表里
-  // **触发换行**（用户报障）。与 `RaccoonProduct.displayName` 保持一致。
+  // **触发换行**（用户报障）。与 `RaccoonProduct.displayName` 保持一致，
+  // 且这条一致性由 `raccoon-client-panel.spec.ts` 锁死。
   { id: 'raccoon', label: 'Raccoon (商汤)', icon: RACCOON_ICON, logoClass: 'raccoon' },
   { id: 'minimax', label: 'MiniMax Code', icon: MINIMAX_ICON, logoClass: 'minimax' },
   /**
    * ZCode（智谱）—— 第十个 provider。
    *
    * ⚠️ 用『ZCode (智谱)』，与 `ZCODE.displayName` 保持一致；长度也刻意
-   * 控制在不会触发换行的范围内（Raccoon 那条用户报障过）。
+   * 控制在不会触发换行/省略号的范围内（见上面 workbuddy 那条的算式）。
    *
    * ⚠️ 它走**标准两步式登录**（与 codearts / qoder / trae 同型）：
    * 后端立刻返回官方授权 URL（`https://bigmodel.cn/login?appId=zcode…`），
@@ -2942,6 +2948,126 @@ function readFileAsText(file) {
   });
 }
 
+/**
+ * 供应商一行的影响面摘要（模型数 / 账号数）。
+ *
+ * ⚠️ 「读不到」与「确实是 0」必须区分：状态未返回时显示 `状态尚未读取`，
+ * 而不是 `模型 0（已关 0）` —— 后者会让用户以为这个供应商没有模型，
+ * 而实际上只是那一次 `provider.status` 还没回来（或失败了）。
+ */
+function providerRowSummary(row) {
+  if (row.models === null && row.accounts === null) return '状态尚未读取';
+  const models = row.models
+    ? `模型 ${row.models.total ?? 0}（已关 ${row.models.disabled ?? 0}）`
+    : '模型 —';
+  const accounts = row.accounts
+    ? `账号 ${row.accounts.total ?? 0}（启用 ${row.accounts.enabled ?? 0}）`
+    : '账号 —';
+  return `${models} · ${accounts}`;
+}
+
+/**
+ * 「供应商开关」弹窗：页头按钮点开，一个供应商一行、行尾一个开关。
+ *
+ * ## 为什么从左侧导航里搬出来
+ *
+ * 原先开关直接挂在左侧每个供应商行的右侧（!25 的形态）。那是个**破坏性批量操作**
+ * （一次改动几十个模型 + 全部账号），却和「选择要看哪个供应商」这个高频无害动作
+ * 挤在同一行里：既容易误点，也让左侧那条本应承担导航的窄栏长出了控件。
+ * 搬进弹窗后，开关与「显示列表」里的模型开关是同一种东西 —— 点进去、看清影响面、
+ * 再决定，误点的可能性归零。
+ *
+ * ## 显示逻辑与模型列表弹窗保持一致（用户明确要求）
+ *
+ * 复用同一套结构与类名，而不是另起一套：
+ * - 骨架：`dim-jh-modalOverlay--top` + `dim-jh-modalHead`（标题 / 计数 / 刷新 / 完成）
+ *   + `dim-jh-modalHint` + `dim-jh-modalBody` + `dim-jh-modelList`；
+ * - 行：`dim-jh-modelRow`（`data-disabled` 表示**该供应商已关闭** → 整行淡出，
+ *   与模型列表里「已关闭的模型」同一语义）+ `dim-jh-modelInfo` / `dim-jh-modelName`
+ *   / `dim-jh-modelId`（这里放影响面摘要）+ `dim-jh-switch`；
+ * - 排序：已打开在前、已关闭在后（`providerSwitchRows`，与左侧分组同一判据）；
+ * - ESC 与点遮罩关闭。
+ *
+ * ⚠️ 行容器是 `<label>` 且**内部只能有这 1 个 checkbox** —— 与 `ModelToggle` 同一条
+ * 约束（见其注释：插入第二个 checkbox 会让「点行内文字」激活错的那个控件）。
+ *
+ * 本组件**不持有数据**：状态、busy 集合与切换动作全部由 `JetHubPage` 传入。
+ * 供应商状态是服务端推导出来的（模型黑名单），本地再存一份必然分叉。
+ */
+function ProviderSwitchPanel({ providers, statuses, statusFailed, busyIds, onToggle, onReload, onClose }) {
+  // ESC 关闭：挂在 document 上而不是弹窗上 —— 焦点可能落在任意一个开关上，
+  // 只监听弹窗自身的 keydown 会漏掉这些按键（与 ModelListPanel 同因）。
+  React.useEffect(() => {
+    const onKeyDown = (event) => { if (event.key === 'Escape') onClose(); };
+    document.addEventListener('keydown', onKeyDown);
+    return () => document.removeEventListener('keydown', onKeyDown);
+  }, [onClose]);
+
+  const rows = providerSwitchRows(providers, statuses);
+  const summary = providerToggleSummary(providers, statuses);
+  const countText = summary.known
+    ? `共 ${summary.total} 个，已打开 ${summary.open}，已关闭 ${summary.closed}`
+    : (statusFailed ? '状态读取失败' : '正在读取状态…');
+
+  return React.createElement('div', {
+    // `--top`：顶部锚定。行数固定但窗口高度会变，垂直居中会让弹窗上下跳动
+    // （与模型列表同款，见 jet-hub-styles.js 中该修饰类的说明）。
+    className: 'dim-jh-modalOverlay dim-jh-modalOverlay--top',
+    onClick: (event) => { if (event.target === event.currentTarget) onClose(); },
+  },
+  React.createElement('div', {
+    className: 'dim-jh-modal',
+    role: 'dialog',
+    'aria-modal': 'true',
+    'aria-label': '供应商开关',
+  },
+  React.createElement('div', { className: 'dim-jh-modalHead' },
+    React.createElement('div', { className: 'dim-jh-modalTitle' },
+      React.createElement('strong', null, '供应商开关'),
+      React.createElement('span', { className: 'dim-jh-modelPanelCount' }, countText)),
+    React.createElement('div', { className: 'dim-jh-modelPanelActions' },
+      React.createElement('button', {
+        className: 'dim-jh-btn',
+        title: '重新读取各供应商的模型数与账号数。',
+        onClick: () => void onReload(),
+      }, '刷新'),
+      React.createElement('button', {
+        className: 'dim-jh-btn',
+        'data-kind': 'primary',
+        onClick: onClose,
+      }, '完成'))),
+  React.createElement('p', { className: 'dim-jh-modalHint' },
+    '关闭一个供应商 = 关闭它的全部模型（从对话框的模型选择里移除）并停用它的全部账号；'
+    + '打开则恢复。关闭前会再确认一次。没有可关闭模型的供应商会被禁用（服务端也会拒绝）。'),
+  React.createElement('div', { className: 'dim-jh-modalBody' },
+    React.createElement('div', { className: 'dim-jh-modelList' },
+      rows.map(row => {
+        const busy = busyIds.has(row.id);
+        const action = row.checked ? '关闭' : '打开';
+        return React.createElement('label', {
+          key: row.id,
+          className: 'dim-jh-modelRow',
+          // 与模型列表同语义：`data-disabled` 表示**这一项已被关闭**（整行淡出），
+          // 不是「这行点不动」—— 点不动由下面 input 的 disabled 表达。
+          'data-disabled': row.checked ? 'false' : 'true',
+          title: row.disabled ? row.reason : `${action}「${row.label}」：${action}它的全部模型并${row.checked ? '停用' : '启用'}全部账号`,
+        },
+        React.createElement('span', { className: 'dim-jh-modelInfo' },
+          React.createElement('strong', { className: 'dim-jh-modelName' }, row.label),
+          React.createElement('code', { className: 'dim-jh-modelId' }, providerRowSummary(row))),
+        React.createElement('input', {
+          type: 'checkbox',
+          className: 'dim-jh-switch',
+          role: 'switch',
+          checked: row.checked,
+          // busy 只锁被点的那一行：状态是服务端推导的，锁整表会让用户以为全挂了。
+          disabled: row.disabled || busy,
+          'aria-label': `${action} ${row.label}`,
+          onChange: () => void onToggle(row.id, !row.checked),
+        }));
+      })))));
+}
+
 export function JetHubPage({ close, rpcCall }) {
   const [selected, setSelected] = React.useState(PROVIDERS[0].id);
   // 每次切换 provider 时递增版号，强制重新挂载 ProviderPanel 触发 loadAccounts
@@ -2950,12 +3076,27 @@ export function JetHubPage({ close, rpcCall }) {
   const [checkinBusy, setCheckinBusy] = React.useState(false);
   const [checkinNotice, setCheckinNotice] = React.useState(null);
   /**
-   * 供应商级状态（provider id → ProviderStatus），driving 左侧分组与一键开关。
+   * 供应商级状态（provider id → ProviderStatus），driving 左侧分组与页头弹窗里的开关。
    *
-   * `null` = 尚未读取成功（分组退化为不分组平铺，开关全部禁用）——
+   * `null` = 尚未读取成功（分组退化为不分组平铺，弹窗里的开关全部禁用）——
    * 与「读取到空对象」区分：后者说明服务端确实什么都没返回，也按未读取处理。
    */
   const [providerStatuses, setProviderStatuses] = React.useState(null);
+  /**
+   * 供应商状态**读取失败**（区别于「还没读回来」）。
+   *
+   * `providerStatuses === null` 同时承载「加载中」与「失败」两种情况，界面上
+   * 必须分开说：加载中提示「正在读取状态…」是准确的，失败时再这么说就成了
+   * 误导（用户会一直等）。失败信息由页头那条 notice 与弹窗计数共同承担。
+   */
+  const [providerStatusFailed, setProviderStatusFailed] = React.useState(false);
+  /**
+   * 「供应商开关」弹窗的展开状态。
+   *
+   * 与「显示列表」同款取舍：**关闭时不挂载**，避免每次进入设置页都为它做一次
+   * 无谓的渲染；状态本身由页面级 `providerStatuses` 提供，不额外发请求。
+   */
+  const [showProviderSwitches, setShowProviderSwitches] = React.useState(false);
   /** 正在提交的供应商 id 集合：只禁用被点的那一个开关。 */
   const [providerBusy, setProviderBusy] = React.useState(() => new Set());
   /**
@@ -2983,10 +3124,12 @@ export function JetHubPage({ close, rpcCall }) {
       const res = await rpcCall('provider.status', { providers: PROVIDERS.map(p => p.id) });
       if (!mounted.current) return;
       setProviderStatuses(res?.statuses || {});
+      setProviderStatusFailed(false);
     } catch (caught) {
       console.error('[jet-hub] load provider statuses failed:', caught);
       if (!mounted.current) return;
       setProviderStatuses(null);
+      setProviderStatusFailed(true);
       setProviderNotice({
         tone: 'warn',
         text: `供应商开关状态读取失败（${caught?.message || '未知错误'}），已按原顺序显示供应商；账号管理不受影响。`,
@@ -3014,7 +3157,7 @@ export function JetHubPage({ close, rpcCall }) {
    * 三个要点：
    * 1. **关闭前必须确认**：这是会改动多个模型与账号的批量操作，静默执行不可接受。
    *    文案带上已读取到的计数，让用户知道影响面。
-   * 2. **失败时保留 rail 原状态**：不乐观更新 —— 供应商状态是推导出来的
+   * 2. **失败时保留弹窗里的原状态**：不乐观更新 —— 供应商状态是推导出来的
    *    （由模型黑名单），本地猜测容易与服务端不一致；成功后重新拉状态即可。
    * 3. **成功后递增版号**：该 provider 的账号启用状态刚在服务端被改过，
    *    右侧账号面板必须重新加载才能与左侧一致（用户已确认允许这一处刷新）。
@@ -3160,28 +3303,30 @@ export function JetHubPage({ close, rpcCall }) {
   };
 
   /**
-   * 单个供应商行：`<button role="tab">`（选择面板）+ 行尾开关。
+   * 单个供应商行：只有一个 `<button role="tab">`（选择面板）。
    *
-   * ⚠️ **开关是 button 的兄弟节点，绝不嵌进 button 内**：
-   * ① 交互元素嵌套在 HTML 里是非法的（浏览器行为未定义）；
-   * ② 本项目有过同类真实缺陷 —— 在 `<label>` 里插入第二个 checkbox 后，
-   *    点行内文字会激活第一个可标记控件，导致「点模型名切换可见性」失效
-   *    （见 `model-filter.js` 的记载）。这里是同一类风险，故结构上直接隔开。
+   * ⚠️ 这里**不再有开关**。!25 曾把开关直接挂在行尾，但那是一个破坏性批量操作
+   * （一次改动几十个模型 + 全部账号），和「选择要看哪个供应商」这个高频无害动作
+   * 挤在同一行里既容易误点，也让本应承担导航的窄栏长出了控件。现在它整体搬到
+   * 页头的「供应商开关」弹窗里（见 `ProviderSwitchPanel`）。
    *
-   * 行容器**不挂 onClick**：点击行为只属于那个 button，开关则由 onChange 处理。
+   * 分组仍保留在这里 —— 它是**纯展示**（告诉你哪些已被关闭），不含任何操作；
+   * 行上也不再挂 onClick 之外的交互，原「开关必须是 button 兄弟节点」那条约束
+   * 随开关一起消失（弹窗里的行是 `<label>` + 单个 checkbox，另有一套约束）。
    */
   const renderProviderRow = (p) => {
-    const status = providerStatuses?.[p.id];
-    const sw = providerSwitchState(status);
-    const busy = providerBusy.has(p.id);
-    const on = sw.checked;
+    const closed = providerStatuses?.[p.id]?.closed === true;
     return React.createElement('div', { className: 'dim-jh-providerRow', key: p.id, 'data-provider': p.id },
       React.createElement('button', {
         type: 'button',
         role: 'tab',
         className: 'dim-jh-provider',
         'aria-selected': p.id === selected,
-        title: p.label,
+        // 标题带上关闭状态：行本身已经没有开关，用户得知道去哪儿打开它。
+        // ⚠️ 按钮名是「供应商」（页头），文案要与它一致，否则用户找不到。
+        title: closed
+          ? `${p.label}（已关闭，可在页头「供应商」按钮里打开）`
+          : p.label,
         onClick: () => selectProvider(p.id),
       },
       React.createElement(ProviderLogo, { provider: p.id }),
@@ -3191,19 +3336,7 @@ export function JetHubPage({ close, rpcCall }) {
       // 只有 WorkBuddy 一行超宽 21px），且列表总高不变（384px）；若不加，行高会
       // 从 48px 被顶到 58px、总高 424px。这是一处左侧的可见变化，已在交付说明中注明。
       React.createElement('span', { className: 'dim-jh-providerLabel' },
-        React.createElement('strong', null, p.label))),
-      React.createElement('input', {
-        type: 'checkbox',
-        className: 'dim-jh-switch',
-        role: 'switch',
-        checked: on,
-        disabled: busy || sw.disabled,
-        title: sw.disabled
-          ? sw.reason
-          : (on ? `关闭「${p.label}」：关闭它的全部模型并停用全部账号` : `打开「${p.label}」：打开它的全部模型并启用全部账号`),
-        'aria-label': `${on ? '关闭' : '打开'} ${p.label}`,
-        onChange: () => void toggleProvider(p.id, !on),
-      }));
+        React.createElement('strong', null, p.label))));
   };
 
   /**
@@ -3212,10 +3345,11 @@ export function JetHubPage({ close, rpcCall }) {
    * 两种形态：
    * - **已读取到状态**：分「已打开 / 已关闭」两组，各带计数；
    * - **未读取到**（首次加载中 / 请求失败）：按 `PROVIDERS` 原顺序平铺、不分组。
-   *   此时所有开关都被 `providerSwitchState(undefined)` 判为禁用 —— 状态未知时
-   *   让用户点一个状态不明的开关比禁用更糟。
+   *   分组只是**展示**，读不到状态时宁可不分组，也不要把用户以为「供应商被关掉了」
+   *   —— 与 `groupProviders` 那条「状态缺失一律归入已打开」是同一个取向。
    *
-   * 分组只是**展示分组**，不改变用户的认知顺序：组内保持 `PROVIDERS` 声明顺序。
+   * 行上**没有开关**（已搬到页头的 `ProviderSwitchPanel`），故这里不再关心
+   * 禁用态：那套判据（`models.total === 0` ⇒ 禁用并给出原因）现在只在弹窗里用。
    */
   const renderRail = () => {
     if (providerStatuses === null) {
@@ -3231,12 +3365,35 @@ export function JetHubPage({ close, rpcCall }) {
     ];
   };
 
+  /**
+   * 页头按钮上的计数（tooltip 用）。
+   *
+   * 状态没读回来时**不显示计数** —— 报「已打开 0、已关闭 0」会让用户以为
+   * 一个供应商都没有，而真实原因只是那一次 `provider.status` 还没回来。
+   */
+  const providerSummary = providerToggleSummary(PROVIDERS, providerStatuses);
+
   return React.createElement('section', { className: 'dim-jh-page', 'aria-label': 'Jet Hub Provider 设置' },
     React.createElement('header', { className: 'dim-jh-header' },
       React.createElement('div', { className: 'dim-jh-brand' },
         React.createElement('strong', { className: 'dim-jh-brandName' }, 'Jet Hub'),
         React.createElement('p', { className: 'dim-jh-brandDesc' }, 'Provider 凭据管理与多账号支持')),
       React.createElement('div', { className: 'dim-jh-headerActions' },
+        // 「供应商开关」在页头，而不是左侧每个供应商行尾（!25 的原形态）：
+        // 它是破坏性批量操作，与「选择看哪个供应商」这个高频无害动作分开摆放，
+        // 误点的可能性归零，也让左侧窄栏回到纯导航。见 `ProviderSwitchPanel`。
+        // ⚠️ 按钮文字只写「供应商」（不是「供应商开关」）：页头四个按钮要排成
+        // 一排，5 个字会把「关闭」挤到第二行 —— 完整语义由 tooltip 与弹窗标题承担。
+        React.createElement('button', {
+          className: 'dim-jh-btn',
+          title: (providerSummary.known
+            ? '供应商开关：逐个打开/关闭（已打开 ' + providerSummary.open + '、已关闭 ' + providerSummary.closed + '）。'
+            : '供应商开关：逐个打开/关闭。')
+            + '关闭一个供应商 = 关闭它的全部模型并停用它的全部账号。',
+          'aria-haspopup': 'dialog',
+          'aria-expanded': showProviderSwitches ? 'true' : 'false',
+          onClick: () => setShowProviderSwitches(true),
+        }, '供应商'),
         // 一键签到在备份/恢复**左侧**（需求指定位置）
         React.createElement('button', {
           className: 'dim-jh-btn',
@@ -3295,5 +3452,18 @@ export function JetHubPage({ close, rpcCall }) {
             provider: p.id,
             rpcCall,
           })
-        : null))));
+        : null))),
+    // 「供应商开关」以 modal 渲染：它是覆盖层，放在布局之后只是组件树的书写顺序
+    // （与账号面板里的模型列表同款做法）。关闭即不挂载，避免常驻一份开关列表。
+    showProviderSwitches
+      ? React.createElement(ProviderSwitchPanel, {
+          providers: PROVIDERS,
+          statuses: providerStatuses,
+          statusFailed: providerStatusFailed,
+          busyIds: providerBusy,
+          onToggle: toggleProvider,
+          onReload: loadProviderStatuses,
+          onClose: () => setShowProviderSwitches(false),
+        })
+      : null);
 }
