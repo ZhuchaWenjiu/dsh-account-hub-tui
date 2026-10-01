@@ -59,6 +59,18 @@ import {
 export const BADGE_POLL_MS = 60_000;
 
 /**
+ * 签到结果摘要的**自动消失**时长。
+ *
+ * 用户报障（2026-10-02）：「签到后下方显示的文字久久都不消失」—— 摘要原先会一直
+ * 留在弹窗里，直到下一次签到或切换渠道才被替换，等于常驻噪音。
+ *
+ * 两档而不是一档：成功摘要一眼扫完即可；**警告与「需要你操作」的提示**（凭证失效、
+ * 「请先用官方客户端登录一次」之类）要留出阅读与照做的时间，故给 20 秒。
+ */
+export const CLAIM_NOTICE_MS = 8_000;
+export const CLAIM_NOTICE_WARN_MS = 20_000;
+
+/**
  * 徽标本体：只做门控，真正的工作在 {@link UsageBadgeActive}。
  *
  * ⚠️ 用 `useSyncExternalStore` 订阅模型目录（与参考实现同款）：目录快照变化
@@ -182,6 +194,20 @@ function UsageBadgeActive(props) {
       document.removeEventListener('keydown', onKey);
     };
   }, [open]);
+
+  /**
+   * 签到摘要**自动消失**（用户报障 2026-10-02：「签到后下方显示的文字久久都不消失」）。
+   *
+   * ⚠️ 计时器必须随 `claimNotice` 的每次变化重建并 `clearTimeout`：否则「连续两次
+   * 签到」时，第一次那支计时器会把第二次的摘要提前清掉（表现为「刚签完就消失」）。
+   * ⚠️ 依赖里不能放 `open`：关掉弹窗后摘要仍应按时消失，而不是等下次打开时还在。
+   */
+  React.useEffect(() => {
+    if (claimNotice === null) return undefined;
+    const ms = claimNotice.tone === 'warn' ? CLAIM_NOTICE_WARN_MS : CLAIM_NOTICE_MS;
+    const timer = setTimeout(() => setClaimNotice(null), ms);
+    return () => clearTimeout(timer);
+  }, [claimNotice]);
 
   const value = snapshot?.value;
   const effectivePreference = preference ?? value?.preference ?? 'auto';
@@ -418,27 +444,35 @@ function UsageBadgeActive(props) {
         ...(windows.length === 0
           ? [React.createElement('div', { key: 'empty', className: 'dim-jh-badgeNote' },
             account?.ok === true ? '该账号没有额度窗口' : (account?.error || '订阅额度不可用'))]
-          : windows.map(([type, windowLabel, win]) => {
-            const percent = quotaPercentValue(win?.percentUsed);
-            const left = quotaResetsIn(win?.resetsAt);
-            // **一行**放下四样：名称 / 进度条 / 百分比 / 重置倒计时（用户要求更小巧）。
-            // ⚠️ 倒计时允许被省略号截断（窄窗时最后一点空间给它），完整文本在 title 里
-            // —— 这是唯一「可能看不见」的信息，故必须留 title 兜底。
-            return React.createElement('div', { key: type, className: 'dim-jh-badgeWin' }, [
-              React.createElement('span', { key: 'l', className: 'dim-jh-badgeWinLabel' }, windowLabel),
-              React.createElement('div', { key: 'bar', className: 'dim-jh-quotaBar' },
-                React.createElement('div', {
-                  key: 'fill',
-                  className: 'dim-jh-quotaBarFill',
-                  'data-tone': quotaTone(percent),
-                  style: { width: `${percent}%` },
-                })),
-              React.createElement('span', { key: 'v', className: 'dim-jh-badgeValue' }, formatQuotaPercent(percent)),
-              left === ''
-                ? null
-                : React.createElement('span', { key: 'r', className: 'dim-jh-badgeWinReset', title: left }, left),
-            ]);
-          })),
+          /**
+           * ⚠️ 窗口行外包一层 `.dim-jh-badgeWins`：它才是 **grid 容器**，整块用
+           * `justify-content: center` 水平居中（用户 2026-10-02：「额度显示那块
+           * 文字左右居中对齐」）。每行用 `display: contents` 把四个单元格交给
+           * 这个 grid —— 这样**既居中又保持各列对齐**（各自居中的话，行与行之间
+           * 的进度条会因倒计时文字长短而错位）。
+           */
+          : [React.createElement('div', { key: 'wins', className: 'dim-jh-badgeWins' },
+            windows.map(([type, windowLabel, win]) => {
+              const percent = quotaPercentValue(win?.percentUsed);
+              const left = quotaResetsIn(win?.resetsAt);
+              // **一行**放下四样：名称 / 进度条 / 百分比 / 重置倒计时（用户要求更小巧）。
+              // ⚠️ 倒计时允许被省略号截断（窄窗时最后一点空间给它），完整文本在 title 里
+              // —— 这是唯一「可能看不见」的信息，故必须留 title 兜底。
+              return React.createElement('div', { key: type, className: 'dim-jh-badgeWin' }, [
+                React.createElement('span', { key: 'l', className: 'dim-jh-badgeWinLabel' }, windowLabel),
+                React.createElement('div', { key: 'bar', className: 'dim-jh-quotaBar' },
+                  React.createElement('div', {
+                    key: 'fill',
+                    className: 'dim-jh-quotaBarFill',
+                    'data-tone': quotaTone(percent),
+                    style: { width: `${percent}%` },
+                  })),
+                React.createElement('span', { key: 'v', className: 'dim-jh-badgeValue' }, formatQuotaPercent(percent)),
+                left === ''
+                  ? null
+                  : React.createElement('span', { key: 'r', className: 'dim-jh-badgeWinReset', title: left }, left),
+              ]);
+            }))]),
       ]);
     }
 

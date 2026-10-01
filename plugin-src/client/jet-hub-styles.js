@@ -483,12 +483,14 @@ const STYLES = `
    overflow:hidden（只有文本域 .RlGAzG_scroll 是 overflow-y:auto），故浮层
    不会被裁剪 —— 若将来上游给这些容器加上裁剪，这里要改成固定定位 + 锚点换算。
 
-   浮层尺寸口径（用户 2026-10-02：「小巧、美观，但信息不能缺失」→ 二次反馈
-   「不够小巧和精致」后再次收紧）：
+   浮层尺寸口径（用户 2026-10-02：「小巧、美观，但信息不能缺失」→「不够小巧和精致」
+   →「额度那块文字居中 + 浅色模式下按钮和线条太不明显」三轮迭代后定稿）：
    - 宽 **280px**、正文字号 10–11px、节间距 7px、进度条 3px；
    - **每个订阅窗口只占一行**：名称 / 进度条 / 百分比 / 重置倒计时；
-   - 控件去线条：刷新键默认无边框无底色，签到按钮无边框，只在 hover 时加权；
-   - 阴影改**双层**（近处一层极淡 + 远处一层扩散），比单层大阴影更精致。
+   - 订阅额度那块用 grid **整块水平居中**（justify-content: center），列仍对齐；
+   - 按钮与分隔线一律用**主题描边**（--dsw-alias-border-l2，全不透明）——
+     试过「去线条」，浅色模式下按钮和分区线会看不见，用户明确反馈后撤回；
+   - 阴影双层（近处极淡 + 远处扩散），比单层大阴影更精致。
    信息项一项未减（渠道名、更新时间与缓存标记、偏好三态、窗口百分比与倒计时、
    套餐名称与到期与账号数、逐账号余额与分桶、停用/失败计数、两个签到按钮）。 */
 .dim-jh-badge { position: relative; display: flex; align-items: center; flex: none; }
@@ -505,18 +507,22 @@ const STYLES = `
 .dim-jh-badgeHead { display: flex; align-items: center; gap: 5px; padding-bottom: 7px; }
 .dim-jh-badgeTitle { flex: none; max-width: 118px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11.5px; font-weight: 600; color: var(--dsw-alias-label-primary); }
 .dim-jh-badgeAt { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 10px; color: var(--dsw-alias-label-tertiary); font-variant-numeric: tabular-nums; }
-/* 刷新：默认**无边框无底色**（降低视觉重量），hover 才浮起；文字说明放 title/aria-label */
-.dim-jh-badgeRefresh { flex: none; width: 20px; height: 20px; display: grid; place-items: center; border: .5px solid transparent; border-radius: 6px; background: transparent; color: var(--dsw-alias-label-tertiary); font: inherit; font-size: 12px; line-height: 1; cursor: pointer; transition: color .15s ease, background .15s ease, border-color .15s ease; }
-.dim-jh-badgeRefresh:hover:not(:disabled) { border-color: var(--dsw-alias-border-l2); background: var(--dsw-alias-bg-layer-2); color: var(--dsw-alias-label-primary); }
+/* 刷新：默认**无边框无底色**（降低视觉重量），hover 才浮起；文字说明放 title/aria-label
+   ⚠️ 2026-10-02 用户反馈「浅色模式下按钮和线条不太明显」：这里从「完全透明」
+   改回**主题描边 + layer-2 底**（浅色下 layer-2 与弹窗底色太接近，靠描边才立得住）。 */
+.dim-jh-badgeRefresh { flex: none; width: 20px; height: 20px; display: grid; place-items: center; border: .5px solid var(--dsw-alias-border-l2); border-radius: 6px; background: var(--dsw-alias-bg-layer-2); color: var(--dsw-alias-label-secondary); font: inherit; font-size: 12px; line-height: 1; cursor: pointer; transition: color .15s ease, background .15s ease, border-color .15s ease; }
+.dim-jh-badgeRefresh:hover:not(:disabled) { border-color: color-mix(in srgb, #1677ff 45%, var(--dsw-alias-border-l2)); background: var(--dsw-alias-bg-layer-3); color: var(--dsw-alias-brand-primary); }
 .dim-jh-badgeRefresh:disabled { opacity: .5; cursor: default; }
 /* 偏好：分段控件（未选中透明、选中浮起），比三个独立胶囊更紧凑整齐 */
-.dim-jh-badgePref { display: flex; gap: 2px; padding: 2px; border-radius: 7px; background: var(--dsw-alias-bg-layer-2); }
+.dim-jh-badgePref { display: flex; gap: 2px; padding: 2px; border: .5px solid var(--dsw-alias-border-l2); border-radius: 7px; background: var(--dsw-alias-bg-layer-2); }
 .dim-jh-badgePrefBtn { flex: 1; min-width: 0; padding: 2px; border: 0; border-radius: 5px; background: transparent; color: var(--dsw-alias-label-secondary); font: inherit; font-size: 10px; line-height: 1.5; white-space: nowrap; cursor: pointer; transition: background .15s ease, color .15s ease; }
 .dim-jh-badgePrefBtn:hover { color: var(--dsw-alias-label-primary); }
-.dim-jh-badgePrefBtn[aria-pressed="true"] { background: var(--dsw-alias-bg-layer-1); color: var(--dsw-alias-brand-primary); font-weight: 600; box-shadow: 0 1px 2px rgba(0, 0, 0, .06); }
+/* 选中项自带描边：浅色下只靠白色底与底色区分太弱 */
+.dim-jh-badgePrefBtn[aria-pressed="true"] { border: .5px solid color-mix(in srgb, var(--dsw-alias-brand-primary) 45%, var(--dsw-alias-border-l2)); background: var(--dsw-alias-bg-layer-1); color: var(--dsw-alias-brand-primary); font-weight: 600; box-shadow: 0 1px 2px rgba(0, 0, 0, .06); }
 /* 分区：细分隔线分组，间距 5px（比 4px 多 1px 呼吸：账号备注是 10px 灰字，
-   紧贴下一个账号名会读成同一块；再大就不「小巧」了） */
-.dim-jh-badgeSection { display: flex; flex-direction: column; gap: 5px; margin-top: 7px; padding-top: 7px; border-top: .5px solid color-mix(in srgb, var(--dsw-alias-border-l2) 75%, transparent); }
+   紧贴下一个账号名会读成同一块；再大就不「小巧」了）
+   ⚠️ 分隔线用**全不透明**的 border-l2：此前用 color-mix 降到 75%，浅色下几乎看不见。 */
+.dim-jh-badgeSection { display: flex; flex-direction: column; gap: 5px; margin-top: 7px; padding-top: 7px; border-top: .5px solid var(--dsw-alias-border-l2); }
 .dim-jh-badgeSectionTitle { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; font-size: 10px; font-weight: 600; letter-spacing: .02em; color: var(--dsw-alias-label-tertiary); }
 .dim-jh-badgeSectionSum { font-weight: 600; color: var(--dsw-alias-label-primary); font-variant-numeric: tabular-nums; }
 .dim-jh-badgeRow { display: flex; flex-direction: column; gap: 1px; }
@@ -524,19 +530,25 @@ const STYLES = `
 .dim-jh-badgeRowHead { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; font-size: 11px; color: var(--dsw-alias-label-primary); }
 .dim-jh-badgeRowName { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .dim-jh-badgeRowNote { font-size: 10px; line-height: 14px; color: var(--dsw-alias-label-tertiary); }
-/* 窗口：**一行**放下 名称 / 进度条 / 百分比 / 重置倒计时 */
-.dim-jh-badgeWin { display: flex; align-items: center; gap: 6px; }
-.dim-jh-badgeWinLabel { flex: none; font-size: 10.5px; color: var(--dsw-alias-label-secondary); }
-.dim-jh-badgeWin .dim-jh-quotaBar { flex: 1; min-width: 36px; height: 3px; }
-.dim-jh-badgeWinReset { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 10px; color: var(--dsw-alias-label-tertiary); }
+/* 窗口：**一行**放下 名称 / 进度条 / 百分比 / 重置倒计时。
+   ⚠️ 整块用 grid 居中（justify-content: center + width: fit-content），
+   每行 display: contents 把四个单元格交给这个 grid —— **既居中又保持列对齐**
+   （若改成每行各自居中，行与行之间的进度条会因倒计时文字长短而错位）。
+   ⚠️ 进度条列固定 64px（居中后不能再用 flex:1，否则它会吃掉全部余量、看起来没居中）。 */
+.dim-jh-badgeWins { display: grid; grid-template-columns: max-content 64px max-content max-content; justify-content: center; align-items: center; gap: 4px 6px; width: fit-content; max-width: 100%; margin: 0 auto; }
+.dim-jh-badgeWin { display: contents; }
+.dim-jh-badgeWinLabel { font-size: 10.5px; color: var(--dsw-alias-label-secondary); text-align: right; white-space: nowrap; }
+.dim-jh-badgeWin .dim-jh-quotaBar { height: 3px; }
+.dim-jh-badgeWinReset { max-width: 108px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 10px; color: var(--dsw-alias-label-tertiary); }
 .dim-jh-badgeValue { flex: none; font-size: 11px; font-weight: 600; font-variant-numeric: tabular-nums; }
 .dim-jh-badgeValue[data-tone="warn"] { color: var(--dsw-alias-state-warn-primary); font-weight: 500; }
 .dim-jh-badgeNote { font-size: 10px; line-height: 14px; color: var(--dsw-alias-label-tertiary); }
-/* 签到：两个按钮并排、等分（本渠道按钮在不支持签到时不渲染，另一个占满整行） */
+/* 签到：两个按钮并排、等分（本渠道按钮在不支持签到时不渲染，另一个占满整行）
+   ⚠️ 保留 .5px 主题描边：浅色下 layer-2 底与弹窗底色几乎同色，无描边就看不出是按钮。 */
 .dim-jh-badgeClaim { gap: 5px; }
 .dim-jh-badgeClaimRow { display: flex; gap: 5px; }
-.dim-jh-badgeAction { flex: 1; min-width: 0; padding: 3px 7px; border: 0; border-radius: 7px; background: var(--dsw-alias-bg-layer-2); color: var(--dsw-alias-label-primary); font: inherit; font-size: 10.5px; line-height: 1.5; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; cursor: pointer; transition: background .15s ease, color .15s ease; }
-.dim-jh-badgeAction:hover:not(:disabled) { background: color-mix(in srgb, #1677ff 10%, var(--dsw-alias-bg-layer-2)); color: var(--dsw-alias-brand-primary); }
+.dim-jh-badgeAction { flex: 1; min-width: 0; padding: 3px 7px; border: .5px solid var(--dsw-alias-border-l2); border-radius: 7px; background: var(--dsw-alias-bg-layer-2); color: var(--dsw-alias-label-primary); font: inherit; font-size: 10.5px; line-height: 1.5; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; cursor: pointer; transition: background .15s ease, color .15s ease, border-color .15s ease; }
+.dim-jh-badgeAction:hover:not(:disabled) { border-color: color-mix(in srgb, #1677ff 45%, var(--dsw-alias-border-l2)); background: color-mix(in srgb, #1677ff 10%, var(--dsw-alias-bg-layer-2)); color: var(--dsw-alias-brand-primary); }
 .dim-jh-badgeAction:disabled { opacity: .55; cursor: default; }
 .dim-jh-badgeNotice { font-size: 10px; line-height: 14px; color: var(--dsw-alias-label-secondary); }
 .dim-jh-badgeNotice[data-tone="warn"] { color: var(--dsw-alias-state-warn-primary); }

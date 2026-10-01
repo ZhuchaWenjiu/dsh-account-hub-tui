@@ -199,6 +199,18 @@ describe('用量徽标：签到（本渠道 + 全部渠道）', () => {
     expect(badge).toMatch(/tone: summary\.failed > 0 \|\| notes\.length > 0 \? 'warn' : 'ok'/)
   })
 
+  it('签到摘要**自动消失**（用户报障「文字久久都不消失」）', () => {
+    // 两档时长：成功 8s / 警告与需操作提示 20s
+    expect(badge).toContain('export const CLAIM_NOTICE_MS = 8_000;')
+    expect(badge).toContain('export const CLAIM_NOTICE_WARN_MS = 20_000;')
+    expect(badge).toMatch(/const ms = claimNotice\.tone === 'warn' \? CLAIM_NOTICE_WARN_MS : CLAIM_NOTICE_MS;/)
+    expect(badge).toMatch(/setTimeout\(\(\) => setClaimNotice\(null\), ms\)/)
+    // ⚠️ 必须清计时器：否则连续两次签到时，第一支计时器会把第二次的摘要提前清掉
+    expect(badge).toMatch(/return \(\) => clearTimeout\(timer\);/)
+    // ⚠️ 计时的依赖只能是 claimNotice：关掉弹窗后摘要也要按时消失
+    expect(badge).toMatch(/\}, \[claimNotice\]\);/)
+  })
+
   it('三态偏好开关写宿主（本地先生效，失败回滚）', () => {
     expect(badge).toContain('BADGE_PREFERENCES.map')
     expect(badge).toContain("'aria-pressed': effectivePreference === item")
@@ -230,11 +242,35 @@ describe('用量徽标：弹窗的紧凑布局（信息一项不少）', () => {
     expect(badge).toContain("className: 'dim-jh-badgeWinReset'")
     // ⚠️ 倒计时允许被省略号截断，故必须留 title 兜底（这是唯一可能看不见的信息）
     expect(badge).toMatch(/className: 'dim-jh-badgeWinReset', title: left/)
-    expect(styles).toMatch(/\.dim-jh-badgeWin \{[^}]*display: flex/)
+    expect(styles).toMatch(/\.dim-jh-badgeWin \{[^}]*display: contents/)
     expect(styles).toMatch(/\.dim-jh-badgeWin \.dim-jh-quotaBar \{[^}]*height: 3px/)
     // ⚠️ 倒计时与百分比都必须可见（不能只藏在 tooltip 里）
     expect(badge).toContain('quotaResetsIn(win?.resetsAt)')
     expect(badge).toContain('formatQuotaPercent(percent)')
+  })
+
+  it('额度块整块水平居中，且各列仍对齐（grid + display:contents）', () => {
+    // 用户 2026-10-02：「额度显示那块文字左右居中对齐」
+    expect(badge).toContain("className: 'dim-jh-badgeWins'")
+    expect(styles).toMatch(/\.dim-jh-badgeWins \{[^}]*display: grid/)
+    expect(styles).toMatch(/\.dim-jh-badgeWins \{[^}]*justify-content: center/)
+    // ⚠️ 进度条列必须是固定宽：改成 flex:1 会吃掉全部余量，居中就看不出来
+    expect(styles).toMatch(/\.dim-jh-badgeWins \{[^}]*grid-template-columns: max-content 64px max-content max-content/)
+    // 每行 display:contents 交给 grid ⇒ 居中与列对齐同时成立
+    expect(styles).toMatch(/\.dim-jh-badgeWin \{[^}]*display: contents/)
+  })
+
+  it('浅色模式下按钮与线条可见（用主题描边，取消上一轮的「去线条」）', () => {
+    // 用户 2026-10-02：「浅色模式下按钮和线条不太明显」
+    // 刷新键与签到按钮都要有主题描边（浅色下 layer-2 与弹窗底色几乎同色）
+    expect(styles).toMatch(/\.dim-jh-badgeRefresh \{[^}]*border: \.5px solid var\(--dsw-alias-border-l2\)/)
+    expect(styles).toMatch(/\.dim-jh-badgeAction \{[^}]*border: \.5px solid var\(--dsw-alias-border-l2\)/)
+    // 分段控件容器与选中项也要有描边
+    expect(styles).toMatch(/\.dim-jh-badgePref \{[^}]*border: \.5px solid var\(--dsw-alias-border-l2\)/)
+    expect(styles).toMatch(/\.dim-jh-badgePrefBtn\[aria-pressed="true"\] \{[^}]*border: \.5px solid/)
+    // 分区线用**全不透明**的 border-l2（此前降到 75%，浅色下几乎看不见）
+    expect(styles).toMatch(/\.dim-jh-badgeSection \{[^}]*border-top: \.5px solid var\(--dsw-alias-border-l2\);/)
+    expect(styles).not.toContain('color-mix(in srgb, var(--dsw-alias-border-l2) 75%, transparent)')
   })
 
   it('账号行：名字与数值同一行、备注小字，合计并入节标题', () => {
@@ -251,14 +287,8 @@ describe('用量徽标：弹窗的紧凑布局（信息一项不少）', () => {
     expect(badge).not.toContain("'显示偏好'")
   })
 
-  it('浮层收窄到 280px、进度条 3px、控件去线条（更小巧精致）', () => {
+  it('浮层收窄到 280px、进度条 3px、双层柔和阴影', () => {
     expect(styles).toMatch(/\.dim-jh-badgePop \{[^}]*width: 280px/)
-    expect(styles).toMatch(/\.dim-jh-badgeSection \{[^}]*border-top: \.5px solid/)
-    // 刷新键默认无边框无底色，hover 才浮起
-    expect(styles).toMatch(/\.dim-jh-badgeRefresh \{[^}]*border: \.5px solid transparent/)
-    expect(styles).toMatch(/\.dim-jh-badgeRefresh \{[^}]*background: transparent/)
-    // 签到按钮同样无边框（避免弹窗里到处是框线）
-    expect(styles).toMatch(/\.dim-jh-badgeAction \{[^}]*border: 0/)
     // 双层柔和阴影
     expect(styles).toMatch(/\.dim-jh-badgePop \{[^}]*box-shadow: 0 1px 2px[^}]*0 8px 24px/)
   })
