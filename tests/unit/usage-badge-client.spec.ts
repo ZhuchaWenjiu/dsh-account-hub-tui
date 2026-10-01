@@ -152,6 +152,13 @@ describe('用量徽标：签到（本渠道 + 全部渠道）', () => {
     expect(badge).toContain('只签到当前渠道（${label}）的全部账号')
   })
 
+  it('本渠道没有签到接口时明说原因（用户报障「单渠道签到哪里去了」）', () => {
+    // Cline / WorkBuddy 国际版 / Raccoon 打开弹窗只看到「全部渠道签到」，
+    // 必须有一句说明，否则用户以为按钮丢了。
+    expect(badge).toContain('该渠道没有签到接口，签到请用「全部渠道签到」')
+    expect(badge).toMatch(/canClaimCurrent\s*\n\s*\? null\s*\n\s*: React\.createElement\('div', \{ key: 'nocount'/)
+  })
+
   it('「全部渠道签到」串行遍历能力表推导出的渠道集合（不新增后端端点）', () => {
     // 用户 2026-10-02 选 B：弹窗里同时提供「仅本渠道」与「全部渠道」
     expect(badge).toContain('const providers = checkinProviders();')

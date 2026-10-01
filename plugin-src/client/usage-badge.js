@@ -547,6 +547,18 @@ function UsageBadgeActive(props) {
           ? (claimProgress === null ? '签到中…' : `签到中 ${claimProgress.done}/${claimProgress.total}…`)
           : '全部渠道签到'),
       ]),
+      /**
+       * 本渠道没有签到接口时**明说原因**。
+       *
+       * ⚠️ 用户 2026-10-02 报障：「单渠道签到哪里去了」—— 他在 Cline 上打开弹窗只看到
+       * 「全部渠道签到」，以为按钮丢了。真相是能力表里 `dailyCheckin: false`
+       * （WorkBuddy 国际版 / Cline / Raccoon 后端没有签到接口，Raccoon 的每日积分由
+       * 服务端自动发放）。少了这一句，用户只能靠猜。
+       */
+      canClaimCurrent
+        ? null
+        : React.createElement('div', { key: 'nocount', className: 'dim-jh-badgeNote' },
+          '该渠道没有签到接口，签到请用「全部渠道签到」'),
       claimNotice === null
         ? null
         : React.createElement('div', {
