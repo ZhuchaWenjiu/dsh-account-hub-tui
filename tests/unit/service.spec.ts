@@ -53,25 +53,54 @@ function newService(ctx: Context, options: { fetcher?: typeof fetch } = {}): Cod
   return service
 }
 
+/** 账号池替身上记录回写补丁的私有键（测试专用，service 不读它）。 */
+const PATCHES = '__patches'
+
 /**
- * 账号池替身：只实现 service 用到的两个方法
- * （`listAccountsByProvider` 给 refreshModels 取凭据、`listAccounts` 给 refreshAll）。
+ * 账号池替身：只实现 service 用到的几个方法
+ * （`listAccountsByProvider` 给 refreshModels 取凭据、`listAccounts` 给 refreshAll，
+ * `updateAccount` 则把每次回写记下来，供「有没有自愈」「有没有误标 false」断言）。
  */
-function makePool(entries: Array<{ id: string; credentialRef: string; refreshable?: boolean }>) {
+function makePool(entries: Array<{
+  id: string
+  credentialRef: string
+  refreshable?: boolean
+  expiresAt?: number
+  enabled?: boolean
+}> = []) {
   const accounts = entries.map(e => ({
     id: e.id,
     provider: 'codearts',
     nickname: e.id,
-    enabled: true,
+    enabled: e.enabled ?? true,
     credentialRef: e.credentialRef,
     createdAt: 0,
     refreshable: e.refreshable ?? true,
+    ...(e.expiresAt === undefined ? {} : { expiresAt: e.expiresAt }),
   }))
-  return {
+  const patches: Array<{ id: string; patch: Record<string, unknown> }> = []
+  const pool = {
     listAccountsByProvider: () => accounts,
     listAccounts: async () => accounts,
-    updateAccount: vi.fn(async () => {}),
-  } as never
+    findAccountIdByCredential: async () => '',
+    updateAccount: vi.fn(async (id: string, patch: Record<string, unknown>) => {
+      patches.push({ id, patch })
+      const target = accounts.find(a => a.id === id)
+      if (target !== undefined) Object.assign(target, patch)
+    }),
+    [PATCHES]: patches,
+  }
+  return pool as never
+}
+
+/** 读取池替身记录的全部回写补丁。 */
+function patchesOf(pool: never): Array<{ id: string; patch: Record<string, unknown> }> {
+  return (pool as unknown as { [PATCHES]?: Array<{ id: string, patch: Record<string, unknown> }> })[PATCHES] ?? []
+}
+
+/** 某账号被写过的 patch 序列（按时间顺序）。 */
+function patchesFor(pool: never, id: string): Array<Record<string, unknown>> {
+  return patchesOf(pool).filter(p => p.id === id).map(p => p.patch)
 }
 
 /** 永不打真实网络的 stub fetch：即使定时器意外触发，刷新也只走 mock。 */
@@ -295,5 +324,171 @@ describe('CodeArtsAuth refreshModels', () => {
       { id: 'ca-2', credentialRef: 'CODEARTS_ACCOUNT_2' },
     ]))
     expect(fetcher).toHaveBeenCalled()
+  })
+})
+
+/**
+ * ## `refreshAll` 的调度判据：读**凭据**，不读账号池里那个可能陈旧的标记
+ *
+ * 用户报障（2026-10-02）：Jet Hub 里两个 codearts 账号 401 未认证，
+ * 「自动续期没有工作吗？重启也还是 401」。
+ *
+ * 本机取证（`~/.dsh/jet-hub/state.json` + `~/.dsh/.credentials.yaml`）：
+ * 池里这两条账号的 `refreshable` 都是 **false**，而凭据本体**完好** ——
+ * refresh_token 还有 18 天寿命，`code_verifier` 与 `dpop_private_key_jwk` 都在；
+ * 凭据的 `expires_at` 停在 12 小时前那一次成功续期上，此后再没被写过。
+ *
+ * 旧实现第一行 `if (!entry.refreshable) continue` 让这个布尔成了**单向门**：
+ * 任何一次把它写成 false 的事件（并发重放把 refresh_token 烧掉、
+ * DPoP 校验没过被误判成终态、某轮凭据暂时读不到……）都会让该账号
+ * 从此**永不进入续期循环** —— 定时的那轮跳过、启动首轮也跳过，
+ * 于是「重启也没用」。而凭据明明还能用。
+ *
+ * 现在的口径：`refreshable` 是**凭据材料的镜像**，每轮由凭据对账得出。
+ */
+describe('CodeArtsAuth refreshAll：以凭据为准的自愈', () => {
+  /** 未来某时刻的 ISO 时间（用作未过期的 expires_at）。 */
+  const futureIso = (hours: number): string => new Date(Date.now() + hours * 3_600_000).toISOString()
+  /** 一份「续期材料齐全」的凭据（可被覆盖个别字段）。 */
+  async function seedCredential(
+    credentials: { set(ref: string, value: string): Promise<void> },
+    refName: string,
+    overrides: Record<string, unknown> = {},
+  ): Promise<void> {
+    const { privateKeyJwk } = await generateDpopKeyPair()
+    await credentials.set(refName, JSON.stringify({
+      access_key_id: 'AK', secret_access_key: 'SK', security_token: 'ST',
+      expires_at: '2026-08-14T12:00:00Z',
+      refresh_token: 'RT', code_verifier: 'VERIFIER', dpop_private_key_jwk: privateKeyJwk,
+      ...overrides,
+    }))
+  }
+  /** 一次成功的续期响应（新 AK + 新 refresh_token + 未来 2 小时过期）。 */
+  const tokenResponse = (): unknown => ({
+    credentials: {
+      access_key_id: 'AK2', secret_access_key: 'SK2', security_token: 'ST2',
+      expiration: futureIso(2),
+    },
+    refresh_token: 'RT2',
+  })
+
+  it('⚠️ 池里被误标 refreshable:false 而凭据齐全时，照样续期并把标记改回 true（自愈）', async () => {
+    const { ctx, credentials } = makeContext()
+    await seedCredential(credentials, 'CODEARTS_ACCOUNT_1')
+    const pool = makePool([{ id: 'ca-1', credentialRef: 'CODEARTS_ACCOUNT_1', refreshable: false }])
+    mockedExchangeRefreshToken.mockResolvedValue(tokenResponse() as never)
+    const service = newService(ctx)
+    await service.refreshAll(pool)
+
+    expect(mockedExchangeRefreshToken).toHaveBeenCalledTimes(1)
+    const stored = JSON.parse((await credentials.resolve('CODEARTS_ACCOUNT_1'))!.value) as Record<string, string>
+    expect(stored.refresh_token).toBe('RT2')
+    // 自愈只允许**一次**回写（由有效期对账顺带完成），且必须是 true。
+    const refreshablePatches = patchesFor(pool, 'ca-1').filter(p => 'refreshable' in p)
+    expect(refreshablePatches).toHaveLength(1)
+    expect(refreshablePatches[0]).toEqual({ refreshable: true, expiresAt: expect.any(Number) })
+  })
+
+  it('凭据真的缺材料时才标不可续期（缺 DPoP 私钥 → 不发请求）', async () => {
+    const { ctx, credentials } = makeContext()
+    await seedCredential(credentials, 'CODEARTS_ACCOUNT_1', { dpop_private_key_jwk: undefined })
+    const pool = makePool([{ id: 'ca-1', credentialRef: 'CODEARTS_ACCOUNT_1', refreshable: true }])
+    const service = newService(ctx)
+    await service.refreshAll(pool)
+
+    expect(mockedExchangeRefreshToken).not.toHaveBeenCalled()
+    expect(patchesFor(pool, 'ca-1')).toContainEqual({ refreshable: false })
+  })
+
+  it('已标 false 且凭据确实缺材料时不重复写盘（定时器每 30 分钟一轮）', async () => {
+    const { ctx, credentials } = makeContext()
+    await seedCredential(credentials, 'CODEARTS_ACCOUNT_1', { refresh_token: undefined })
+    const pool = makePool([{ id: 'ca-1', credentialRef: 'CODEARTS_ACCOUNT_1', refreshable: false }])
+    const service = newService(ctx)
+    await service.refreshAll(pool)
+
+    expect(patchesOf(pool)).toEqual([])
+  })
+
+  it('⚠️ 续期被拒但凭据已被他处换新（并发重放）→ 不按终态作废，改用最新凭据对账', async () => {
+    const { ctx, credentials } = makeContext()
+    await seedCredential(credentials, 'CODEARTS_ACCOUNT_1')
+    const pool = makePool([{ id: 'ca-1', credentialRef: 'CODEARTS_ACCOUNT_1', refreshable: true }])
+    // 模拟：另一个 DSH 实例（dsh web + desktop 同时跑）在我们发请求期间续期成功，
+    // 于是服务端对我们手上这份**旧的** refresh_token 回 invalid_grant。
+    mockedExchangeRefreshToken.mockImplementation(async () => {
+      await seedCredential(credentials, 'CODEARTS_ACCOUNT_1', {
+        access_key_id: 'AK-OTHER', expires_at: futureIso(2), refresh_token: 'RT-FRESH',
+      })
+      throw new RefreshTokenExpiredError('CodeArts token request failed: 400 {"error":"invalid_grant"}')
+    })
+    const service = newService(ctx)
+    await service.refreshAll(pool)
+
+    expect(patchesFor(pool, 'ca-1').some(p => p.refreshable === false)).toBe(false)
+    // 对账用的是他处那份**新**凭据的有效期，不是我们那份已过期的。
+    const expiryPatch = patchesFor(pool, 'ca-1').find(p => 'expiresAt' in p)
+    expect(expiryPatch).toBeDefined()
+    expect(Date.parse(futureIso(2)) - (expiryPatch!.expiresAt as number)).toBeLessThan(60_000)
+  })
+
+  it('refresh_token 真失效（凭据未被换过）→ 标不可续期并提示重新登录', async () => {
+    const { ctx, credentials } = makeContext()
+    await seedCredential(credentials, 'CODEARTS_ACCOUNT_1')
+    const pool = makePool([{ id: 'ca-1', credentialRef: 'CODEARTS_ACCOUNT_1', refreshable: true }])
+    mockedExchangeRefreshToken.mockRejectedValue(
+      new RefreshTokenExpiredError('CodeArts token request failed: 400 {"error":"invalid_grant"}'),
+    )
+    const service = newService(ctx)
+    await service.refreshAll(pool)
+
+    expect(patchesFor(pool, 'ca-1')).toContainEqual({ refreshable: false })
+    // 凭据不能被这次失败改动（旧实现若在此写盘会把好凭据覆盖成残缺值）。
+    const stored = JSON.parse((await credentials.resolve('CODEARTS_ACCOUNT_1'))!.value) as Record<string, string>
+    expect(stored.refresh_token).toBe('RT')
+  })
+
+  it('单个账号终态失败不得中断其余账号的续期', async () => {
+    const { ctx, credentials } = makeContext()
+    await seedCredential(credentials, 'CODEARTS_ACCOUNT_1')
+    await seedCredential(credentials, 'CODEARTS_ACCOUNT_2', { refresh_token: 'RT-B' })
+    const pool = makePool([
+      { id: 'ca-1', credentialRef: 'CODEARTS_ACCOUNT_1', refreshable: true },
+      { id: 'ca-2', credentialRef: 'CODEARTS_ACCOUNT_2', refreshable: true },
+    ])
+    mockedExchangeRefreshToken.mockImplementation((...args: unknown[]) => {
+      if (args[0] === 'RT') {
+        return Promise.reject(new RefreshTokenExpiredError('CodeArts token request failed: 400 invalid_grant'))
+      }
+      return Promise.resolve(tokenResponse() as never)
+    })
+    const service = newService(ctx)
+    await service.refreshAll(pool)
+
+    const stored2 = JSON.parse((await credentials.resolve('CODEARTS_ACCOUNT_2'))!.value) as Record<string, string>
+    expect(stored2.refresh_token).toBe('RT2')
+  })
+
+  it('⚠️ 同一凭据的并发续期必须串行：第二次看到已续好就不再消费 refresh_token', async () => {
+    const { ctx, credentials } = makeContext()
+    await seedCredential(credentials, 'CODEARTS_ACCOUNT_1')
+    let calls = 0
+    mockedExchangeRefreshToken.mockImplementation(async () => {
+      calls += 1
+      // 让两个并发请求真正重叠（队列未生效时两者都会走到这里）。
+      await new Promise(resolve => setTimeout(resolve, 10))
+      return tokenResponse() as never
+    })
+    const service = newService(ctx)
+    // DSH 会并发发起多条模型请求（主回复 + 标题生成 + 压缩），每条都可能独立
+    // 走到按需续期；CodeArts 的 access_token 只有 2 小时，撞过期窗口时就是并发。
+    await Promise.all([
+      service.refreshAccountCredential('CODEARTS_ACCOUNT_1'),
+      service.refreshAccountCredential('CODEARTS_ACCOUNT_1'),
+    ])
+
+    expect(calls).toBe(1)
+    const stored = JSON.parse((await credentials.resolve('CODEARTS_ACCOUNT_1'))!.value) as Record<string, string>
+    expect(stored.refresh_token).toBe('RT2')
   })
 })

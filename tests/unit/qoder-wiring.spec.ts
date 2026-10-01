@@ -52,12 +52,16 @@ describe('Qoder 宿主侧接线（src/index.ts）', () => {
     expect(index, 'qoder 适配器须登记进映射').toContain('qoder: qoderAdapter')
   })
 
-  it('续期调度只看 refreshable，不看 enabled（AGENTS.md 强制约定）', () => {
+  it('续期调度不看 enabled（AGENTS.md 强制约定）', () => {
     // 真实缺陷：写成 `a.refreshable && a.enabled` 后，所有账号被停用时
     // 续期定时器根本不启动，凭据一路过期到 refresh_token 失效。
+    // ⚠️ 原先这里还**正向**断言 `accounts.some(a => a.refreshable)` 必须存在 ——
+    // 2026-10-02 那道启动门已改为「池里有账号就武装」（见 AGENTS.md
+    // 「账号池的 `refreshable` 只是凭据材料的镜像」）：拿一个可能被误标的布尔
+    // 决定「要不要启动修误标的机制」是循环依赖。本用例只保留真正的契约。
     const code = codeOnly(index)
-    expect(code).toContain('accounts.some(a => a.refreshable)')
     expect(code).not.toContain('a.refreshable && a.enabled')
+    expect(code).not.toMatch(/some\(\s*a\s*=>\s*a\.enabled\s*\)/)
   })
 
   it('账号池 provider 实参用 QODER.id 而非字面量', () => {
@@ -187,10 +191,11 @@ describe('QoderCN 宿主侧接线（src/index.ts）', () => {
     )
   })
 
-  it('续期调度只看 refreshable，不看 enabled（对 CN 同样成立）', () => {
+  it('续期调度不看 enabled（对 CN 同样成立）', () => {
+    // 断言对象是同一份 `src/index.ts` 的启动门，理由见国际版那条用例的注释。
     const code = codeOnly(index)
-    expect(code).toContain('accounts.some(a => a.refreshable)')
     expect(code).not.toContain('a.refreshable && a.enabled')
+    expect(code).not.toMatch(/some\(\s*a\s*=>\s*a\.enabled\s*\)/)
   })
 })
 

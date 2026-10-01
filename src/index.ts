@@ -1259,12 +1259,20 @@ const zcodeAdapter = registerZcodeLlm(ctx, {
     }
   }
 
-  // 启动时如果有任何可续期账号，安排定期续期。
+  // 启动时只要账号池非空，就安排首轮续期 + 定期续期。
   //
-  // ⚠️ 判据只看 `refreshable`，**不看 `enabled`**：停用只影响账号池的自动
-  // 选号，不该让凭据停止续期。早期这里写成 `a.refreshable && a.enabled`，
-  // 于是「所有账号都被停用」时续期定时器**根本不启动**，凭据一路过期到
-  // refresh_token 失效，用户重新启用后只能重新登录（真实缺陷）。
+  // ⚠️ 判据是「**池里有账号**」，不是「有 `refreshable` 的账号」（2026-10-02 修订）。
+  // 原先写成 `accounts.some(a => a.refreshable)`，于是这个定时器**是否武装**
+  // 取决于那批可能已经被误标成 false 的布尔 —— 而它存在的意义恰恰是去修正误标。
+  // 本次事故实测：36 条账号只剩 3 条 `true`（raccoon / minimax / cline 各一），
+  // 只要那三条被删或被同样误标，**codearts 的自愈与启动首轮会一起消失**，
+  // 且日志里一个字都不会有。各家 `refreshAll` 内部本来就按凭据材料 / 是否过期
+  // 过滤（`loomy` 只探已过期的、其余看 `refreshableOf(credential)`），
+  // 所以放宽这里的判据最多多一次本地遍历，不会白发请求。
+  //
+  // ⚠️ 仍然**不看 `enabled`**（AGENTS.md 既有铁律）：停用只影响自动选号，
+  // 不该让凭据停止续期。早期写成 `a.refreshable && a.enabled`，于是
+  // 「所有账号都被停用」时续期定时器根本不启动，凭据一路烂到 refresh_token 失效。
   //
   // ⚠️ **必须立刻先跑一轮**（issue !IKIRTT 的主缺陷）：早先这里只有
   // `setInterval`，第一次处理要等满一个周期。短寿命 provider（cline 1 小时、
@@ -1274,8 +1282,7 @@ const zcodeAdapter = registerZcodeLlm(ctx, {
   // 只对「距过期不足 1 小时」的账号发续期请求，其余只做一次本地对账 ——
   // 既补上了首轮，又不会在启动时打出几十个无谓请求。
   pool.listAllAccounts().then(accounts => {
-    const hasRefreshable = accounts.some(a => a.refreshable)
-    if (!hasRefreshable) return
+    if (accounts.length === 0) return
     void refreshAllCredentials()
     const refreshTimer = setInterval(() => void refreshAllCredentials(), REFRESH_INTERVAL_MS)
     refreshTimer.unref?.()

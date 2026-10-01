@@ -83,11 +83,30 @@ describe('requestToken / exchangeAuthorizationCode', () => {
       .rejects.toBeInstanceOf(RefreshTokenExpiredError)
   })
 
-  it('throws RefreshTokenExpiredError on error_code InvalidDPoPHeader', async () => {
+  it('⚠️ error_code InvalidDPoPHeader 归为**可重试**，不是 refresh_token 失效', async () => {
+    // 旧实现把 InvalidDPoPHeader 也当终态（理由写的是「避免每 10 分钟无限重试」），
+    // 真实代价却是一个**材料完好**的账号被永久标成「不可续期」：
+    // 用户报障「两个 codearts 账号 401、自动续期没工作、重启也还是 401」，
+    // 取证时凭据里的 refresh_token 还剩 18 天寿命、code_verifier 与 DPoP 私钥都在。
+    // DPoP proof 没过校验说的是「这一次证明不合格」（时钟偏差让 iat 落窗外、
+    // proof 被判重放、网关抖动），与「refresh_token 还能不能用」无关 ——
+    // 归为可重试最多是 10 分钟后再发一个 HTTP 请求，远比作废一个账号便宜。
     const fetcher = vi.fn(async () =>
       new Response(JSON.stringify({
         error: 'invalid_dpop', error_code: 'InvalidDPoPHeader', error_msg: 'DPoP proof invalid',
       }), { status: 400 }))
+    const pair = await generateDpopKeyPair()
+    await expect(exchangeRefreshToken('RT', 'VERIFIER', pair, fetcher as unknown as typeof fetch))
+      .rejects.toThrow(/InvalidDPoPHeader|failed/)
+    const caught = await exchangeRefreshToken('RT', 'VERIFIER', pair, fetcher as unknown as typeof fetch)
+      .then(() => undefined, (error: unknown) => error as Error)
+    expect(caught).toBeInstanceOf(Error)
+    expect(caught).not.toBeInstanceOf(RefreshTokenExpiredError)
+  })
+
+  it('error_code ExpiredRefreshToken 仍是终态（refresh_token 真失效）', async () => {
+    const fetcher = vi.fn(async () =>
+      new Response(JSON.stringify({ error_code: 'ExpiredRefreshToken', error_msg: 'gone' }), { status: 400 }))
     const pair = await generateDpopKeyPair()
     await expect(exchangeRefreshToken('RT', 'VERIFIER', pair, fetcher as unknown as typeof fetch))
       .rejects.toBeInstanceOf(RefreshTokenExpiredError)

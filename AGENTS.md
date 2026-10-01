@@ -915,6 +915,10 @@ console.log('0.3.0-rc.1 must be false:', s.satisfies('0.3.0-rc.1', R, { includeP
 
 `refreshAll()` 与 `src/index.ts` 的续期调度器**只按 `refreshable` 过滤，不看 `enabled`**。
 
+⚠️ **「不看 `enabled`」这条仍然有效；「按 `refreshable` 过滤」这条已被推翻**
+（2026-10-02，见下文「账号池的 `refreshable` 只是凭据材料的镜像」）：
+那个布尔当过滤条件用会把一次瞬时失败固化成单向门，账号从此永不自愈。
+
 停用只应影响「账号池的自动选号」，与「凭据是否需要保持新鲜」无关 ——
 停用账号同样会出现在 Jet Hub 里并参与积分领取。
 
@@ -1005,6 +1009,98 @@ console.log('0.3.0-rc.1 must be false:', s.satisfies('0.3.0-rc.1', R, { includeP
 `tests/unit/refresh-bootstrap-wiring.spec.ts`（19 条：启动首轮排在定时器前、
 十个 provider 都在表里、九个 auth 的 `refreshAccountCredential` 都带
 pool/accountId 且真调共享回写、RPC 与 `createPoolRefresh` 都传 id）。
+
+### ⚠️ 账号池的 `refreshable` 只是**凭据材料的镜像**，绝不能当续期门禁
+
+**真实缺陷**（用户报障 2026-10-02）：「我们插件的 codearts 账号池出现 2 个 401 未认证，
+自动续期没有工作吗？重启也还是 401」。
+
+本机取证（只读 `~/.dsh/jet-hub/state.json` + `~/.dsh/.credentials.yaml`）：
+
+| 事实 | 值 |
+|---|---|
+| 两个 codearts 账号在池里 | `refreshable: **false**`（9-25 的快照里同两条还是 `true`）|
+| 凭据本体 | **完好**：`refresh_token` 还剩 18 天寿命（到 10-18）、`code_verifier` 64 位、`dpop_private_key_jwk` 都在 |
+| 凭据的 `expires_at` | 停在 12 小时前那次成功续期上，此后**再没被写过** |
+| 整个池 | 36 条里 **33 条** `refreshable:false`（loomy 4 + zcode 2 是诚实的 false）|
+
+⇒ 旧实现 `refreshAll()` 第一行 `if (!entry.refreshable) continue` 把这个布尔变成了
+**单向门**：任何一次把它写成 false 的事件之后，该账号**永不进入续期循环** ——
+定时那轮跳过它、启动首轮也跳过它，于是「自动续期没工作、重启也没用」，
+而凭据明明还能用。**这正是上一节「只按 `refreshable` 过滤」那条约定的代价**，
+该约定已被本节修订，见下文。
+
+**三条已落地的规则**（`src/service.ts` 的 `CodeArtsAuth.refreshAll`）：
+
+1. **调度判据读凭据，不读池值**。`isCodeArtsRefreshable(credential)`
+   （`refresh_token` + `code_verifier` + `dpop_private_key_jwk` 三样齐全）
+   才是「能不能续」的权威；池里的 `refreshable` 是**每轮由凭据对账出来的结果**，
+   不是「曾被服务端拒绝过」的案底。误标会在下一轮自动改回 true（自愈）。
+   只有**凭据确实缺材料 / ref 下没有凭据**才写 `false`，且写前先比现值
+   （`if (entry.refreshable)`）—— 定时器每 30 分钟一轮，别重复整体落盘。
+   ⚠️ 读凭据只是**本地存储访问**，不花网络也不花模型额度 ——
+   拿它当门禁来「省请求」是**错省**，省下的是自愈能力。
+2. **判终态前先重读凭据**：续期被拒（`invalid_grant`）时，先看磁盘上那份
+   `refresh_token` 是否**已经不等于**本次用来续期的那一份。并发下服务端烧掉的是
+   **旧的**一份，而磁盘上此刻躺着一份**新的、可用的**凭据 —— 那是「他处已续成功」，
+   不是「本账号不可续期」。少了这层判据，一次交错就把好账号永久标死。
+   命中时改用**最新凭据**对账（`syncAccountExpiry`），不发终态标记。
+3. **`InvalidDPoPHeader` 不算 refresh_token 失效**（`src/oauth.ts` 的 `requestToken`）。
+   旧判据把它与 `invalid_grant` 并列为终态，注释写的理由是「避免每 10 分钟无限重试」，
+   实际代价是一个**材料完好**的账号被标死、用户只能重新登录。DPoP proof 没过校验
+   说的是「**这一次**证明不合格」（时钟偏差让 `iat` 落在窗口外 / proof 被判重放 /
+   网关抖动），与「refresh_token 还能不能用」无关；归为可重试的代价只是 10 分钟后再发
+   一个 HTTP 请求。终态只留 `invalid_grant` 与 `ExpiredRefreshToken`。
+
+4. **调度器的武装门也不能读 `refreshable`**（`src/index.ts`）：原先是
+   `accounts.some(a => a.refreshable)` 才武装定时器 —— 用**可能被误标的字段**
+   决定「要不要启动修误标的机制」是循环依赖。本次事故实测 36 条账号只剩
+   3 条 `true`（raccoon / minimax / cline 各一），再少三条，
+   **codearts 的自愈与启动首轮会一起消失且日志零字**。现改为「池里有账号就武装」；
+   各家 `refreshAll` 内部本就按凭据材料 / 是否过期过滤，放宽这里最多多一次本地遍历，
+   不会白发请求。⚠️ 仍然**不看 `enabled`**（上一条铁律未变）。
+
+**为什么会被标死：三条续期入口并发消费同一份 `refresh_token`。**
+
+① `src/index.ts` 每 30 分钟（含启动首轮）的 `refreshAll`；
+② 推理路径的按需续期（`llm-adapter.ts` 的「过期预判」与「401 兜底」，
+   而 DSH 本身会**并发**发多条请求：主回复 + 标题生成 + 上下文压缩）；
+③ Jet Hub 账号卡片的「刷新」按钮（`account.refresh`）。
+华为 STS 在签发新凭据时**旧的那一份 refresh_token 即失效**，
+并发下必然「1 个成功、其余 `invalid_grant`」，而失败方把它读成「账号不能续期」。
+
+⇒ 已加 **per-`credentialRef` 的 `SerialQueue`**（`CodeArtsAuth.refreshQueues`）：
+三条入口在同一进程内必然串行，且**锁内重读**凭据 —— 仍在有效期内就直接对账返回，
+不再发第二次请求（少烧一次 token）。
+⚠️ **该锁只在单进程内有效**：同一台机器上 dsh web 与 desktop 两个实例各自持锁，
+跨进程互踩只能靠上面第 2 条兜 —— **两处都得有，少一个就会复发**。
+（用户环境实测就是 web + desktop 两个 profile 都装了本插件。）
+
+**可观测性**：真终态时日志带上**服务端原文**（`…；服务端原文：CodeArts token request failed: 400 {…}`），
+且同一 ref 同一原因**只告警一次**（`terminalWarned`）—— 真失效时用户要做的是重新登录，
+每 30 分钟重复同一行只会把有用信息埋掉。
+
+⚠️ **本条修订「续期不得按 `enabled` 过滤」一节里的说法**：那句
+「`refreshAll()` 只按 `refreshable` 过滤」现已不成立 —— `refreshable` **不再是过滤条件**，
+而是被对账的字段。「不看 `enabled`」这条**仍然有效**（停用账号照旧要续）。
+
+⚠️ **其余八个 provider 仍有同一个单向门**：buddy / workbuddy / lobsterai / qoder /
+qodercn / trae / cline / minimax 的 `refreshAll` 第一行都还是
+`if (!entry.refreshable) continue`，而取证时它们的账号**同样**大面积被标 false
+（buddy 4/4、lobsterai 4/4、trae 4/4、qoder 5/5、qodercn 3/3、workbuddy 5/5 ——
+凭据里 `refresh_token` 全都在）。本次只修了用户报障的 codearts；
+推广时**三条规则要一起带**（读凭据对账、判终态前重读、per-ref 串行），
+只搬第一条会继续误标。
+
+测试：`tests/unit/service.spec.ts` 的「CodeArtsAuth refreshAll：以凭据为准的自愈」
+（7 条：误标后自愈且**只回写一次**、缺材料才标 false、已 false 不重复写盘、
+并发重放不误标且用最新凭据对账、真终态照标 false 且不损坏凭据、
+单账号失败不中断其余、同一 ref 并发续期只发一次请求）+
+`tests/unit/oauth.spec.ts`（`InvalidDPoPHeader` 归可重试、`ExpiredRefreshToken` 仍终态）。
+⚠️ 已做**反向验证**：加回 `if (!entry.refreshable) continue` → 自愈用例变红；
+队列改 `new SerialQueue({ enabled: false })` → 并发串行用例变红（实测 2 次请求）；
+去掉「判终态前重读」→ 并发重放用例变红；把 `InvalidDPoPHeader` 加回终态判据 →
+oauth 用例变红。四条各自独立锁死，**别把它们当同义反复删掉**。
 ⚠️ 已做**反向验证**：去掉 lead 过滤 + 去掉「一致不写盘」→ 7 条变红；
 去掉启动首轮 + 去掉 cline 回写 → 3 条变红（含行为用例「刷新后池内
 `expiresAt` 指向未来」，非同义反复）。

@@ -65,13 +65,19 @@ describe('续期调度器：启动必须先跑一轮', () => {
     expect(bootstrap, '启动首轮必须排在武装定时器之前').toBeLessThan(timer)
   })
 
-  it('判据只看 refreshable，不看 enabled（AGENTS.md 既有铁律）', () => {
+  it('启动判据既不看 `enabled`，也不看 `refreshable`（被误标的布尔不能决定调度器是否武装）', () => {
+    // `indexSource` 已经过 `codeOnly` 处理（见文件头），注释里的字面量不参与断言。
     const gate = indexSource.slice(
       indexSource.indexOf('listAllAccounts()'),
       indexSource.indexOf('setInterval(() => void refreshAllCredentials()'),
     )
-    expect(gate).toContain('a => a.refreshable')
+    // 2026-10-02 修订：原先这里是 `accounts.some(a => a.refreshable)`。
+    // 本次事故实测 36 条账号只剩 3 条 `true`（raccoon / minimax / cline 各一）——
+    // 再少三条，整个续期调度器（含 codearts 的自愈与启动首轮）就**永不武装**，
+    // 而且日志里一个字都不会有。「用可能被误标的字段决定要不要修误标」是循环依赖。
+    expect(gate).not.toMatch(/\.refreshable/)
     expect(gate).not.toMatch(/enabled/)
+    expect(gate).toMatch(/accounts\.length\s*===\s*0/)
   })
 
   it('listAllAccounts 的链上有 .catch（否则存储异常会让定时器永不武装且无痕）', () => {
