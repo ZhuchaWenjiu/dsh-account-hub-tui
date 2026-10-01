@@ -154,46 +154,56 @@ describe('serializeMinimaxMessages', () => {
   })
 
   it('⚠️ assistant 的 tool-call → tool_use，且 arguments 解析成**对象**', () => {
+    // ⚠️ 补上配对的 tool_result：真实历史里 tool_use 必与结果成对，
+    // 孤立调用会被 `resolveToolPairing` 当孤儿剔除（全仓五个适配器同口径）。
     const out = serializeMinimaxMessages([
       msg('assistant', [
         { type: 'tool-call', id: 'call_1', name: 'get_weather', arguments: '{"city":"北京"}' },
       ]),
+      msg('user', [
+        { type: 'tool-result', toolCallId: 'call_1', content: [{ type: 'text', text: '晴' }] },
+      ]),
     ])
-    expect(out).toEqual([{
+    expect(out[0]).toEqual({
       role: 'assistant',
       content: [{ type: 'tool_use', id: 'call_1', name: 'get_weather', input: { city: '北京' } }],
-    }])
+    })
   })
 
   it('⚠️ tool-result → user 消息里的 tool_result 块（Anthropic **没有** role:tool）', () => {
     const out = serializeMinimaxMessages([
+      msg('assistant', [{ type: 'tool-call', id: 'call_1', name: 'w', arguments: '{}' }]),
       msg('user', [
         { type: 'tool-result', toolCallId: 'call_1', content: [{ type: 'text', text: '晴 25℃' }] },
       ]),
     ])
-    expect(out).toEqual([{
+    expect(out[1]).toEqual({
       role: 'user',
       content: [{
         type: 'tool_result',
         tool_use_id: 'call_1',
         content: [{ type: 'text', text: '晴 25℃' }],
       }],
-    }])
+    })
     expect(JSON.stringify(out)).not.toContain('"role":"tool"')
   })
 
   it('tool-result 的 isError 透传为 is_error', () => {
     const out = serializeMinimaxMessages([
+      msg('assistant', [{ type: 'tool-call', id: 'c1', name: 'x', arguments: '{}' }]),
       msg('user', [
         { type: 'tool-result', toolCallId: 'c1', content: [], isError: true },
       ]),
     ])
-    expect((out[0]?.content as Record<string, unknown>[])[0]?.is_error).toBe(true)
+    expect((out[1]?.content as Record<string, unknown>[])[0]?.is_error).toBe(true)
   })
 
   it('⚠️ 工具调用参数是残缺 JSON 时退化 {}（不编造，也不丢块）', () => {
     const out = serializeMinimaxMessages([
       msg('assistant', [{ type: 'tool-call', id: 'c1', name: 'x', arguments: '{"a":' }]),
+      msg('user', [
+        { type: 'tool-result', toolCallId: 'c1', content: [{ type: 'text', text: 'ok' }] },
+      ]),
     ])
     const block = (out[0]?.content as Record<string, unknown>[])[0]
     expect(block?.type).toBe('tool_use')
@@ -274,17 +284,20 @@ describe('serializeMinimaxMessages', () => {
   it('工具结果里的图片也内联（否则「工具返回截图」会丢图）', () => {
     const images = new Map([['a1', { mediaType: 'image/png', data: 'Q' }]])
     const out = serializeMinimaxMessages(
-      [msg('user', [{
-        type: 'tool-result',
-        toolCallId: 'c1',
-        content: [
-          { type: 'text', text: '截图如下' },
-          { type: 'image', attachment: { attachmentId: 'a1' } as never },
-        ],
-      }])],
+      [
+        msg('assistant', [{ type: 'tool-call', id: 'c1', name: 'shot', arguments: '{}' }]),
+        msg('user', [{
+          type: 'tool-result',
+          toolCallId: 'c1',
+          content: [
+            { type: 'text', text: '截图如下' },
+            { type: 'image', attachment: { attachmentId: 'a1' } as never },
+          ],
+        }]),
+      ],
       images,
     )
-    const inner = (out[0]?.content as Record<string, unknown>[])[0]?.content as unknown[]
+    const inner = (out[1]?.content as Record<string, unknown>[])[0]?.content as unknown[]
     expect(inner).toEqual([
       { type: 'text', text: '截图如下' },
       { type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'Q' } },
@@ -294,18 +307,249 @@ describe('serializeMinimaxMessages', () => {
   it('⚠️ 工具结果里的图片读不到时**跳过**（不为一个附件让整轮失败）', () => {
     // 与「消息体里的图片读不到就抛错」有意区别对待：后者是用户**显式**意图。
     const out = serializeMinimaxMessages(
-      [msg('user', [{
-        type: 'tool-result',
-        toolCallId: 'c1',
-        content: [
-          { type: 'text', text: '有价值的结果' },
-          { type: 'image', attachment: { attachmentId: 'missing' } as never },
-        ],
-      }])],
+      [
+        msg('assistant', [{ type: 'tool-call', id: 'c1', name: 'shot', arguments: '{}' }]),
+        msg('user', [{
+          type: 'tool-result',
+          toolCallId: 'c1',
+          content: [
+            { type: 'text', text: '有价值的结果' },
+            { type: 'image', attachment: { attachmentId: 'missing' } as never },
+          ],
+        }]),
+      ],
       new Map(),
     )
-    const inner = (out[0]?.content as Record<string, unknown>[])[0]?.content as unknown[]
+    const inner = (out[1]?.content as Record<string, unknown>[])[0]?.content as unknown[]
     expect(inner).toEqual([{ type: 'text', text: '有价值的结果' }])
+  })
+})
+
+/**
+ * ⚠️⚠️ harness 的**一等 `role:'tool'` 消息**形状（真实缺陷，2026-10-01 由会话
+ * `session-871fdf61` 定位：
+ * `400 invalid_request_error ... tool call result does not follow tool call (2013)`）。
+ *
+ * ## 证据（会话日志 `~/.dsh/sessions/--D-jet-code-js-dsh-codearts--/session-871fdf61/…`
+ *
+ * `tool/result` 记录的形状是 `"role":"tool"`，且 `toolCallId` 在**顶层**：
+ * ```json
+ * {"type":"tool/result","data":{"message":{"role":"tool",
+ *   "source":{"kind":"tool","callId":"call_1f9c…"},
+ *   "toolCallId":"call_1f9c…","content":[…],"isError":false}}}
+ * ```
+ * 且**同一 step 的多个工具调用产生连续多条 tool 消息**（seq 21、22 两条，
+ * 属于 assistant 的同一批 tool_use）。
+ *
+ * ## ⚠️ 这套形状与 dsh 版本号无关
+ *
+ * 它自 0.1.7 引入，但 **0.2.0-rc.2 实测仍在用**（全量会话日志 34,659 条
+ * tool/result 无一例外是 `role:'tool'` + 顶层 `toolCallId`）。本组用例
+ * **按形状**构造，不按版本号 —— 升级 dsh 不会让它们失效。
+ *
+ * ## 缺陷后果（两重，都致命）
+ *
+ * 1. `block.type === 'tool-result'` 判据**恒不命中**
+ *    （没有这种内容块）⇒ 工具输出被当普通 user 文本下发，
+ *    `tool_use_id` 关联丢失 ⇒ 服务端报 2013。
+ * 2. 修复 (1) 后若不把同批结果**合并并紧跟其 assistant**，仍会报 2013
+ *    （逐条下发 ⇒ 多条连续 user；跨 assistant 累积 ⇒ 锚点错位）。
+ */
+describe('serializeMinimaxMessages —— 一等 tool 消息（2013 回归）', () => {
+  /** 真实形状：role:'tool' + 顶层 toolCallId。 */
+  const toolMsg = (callId: string, text: string, extra: Record<string, unknown> = {}): Message =>
+    ({ role: 'tool', toolCallId: callId, content: [{ type: 'text', text }], isError: false, ...extra } as unknown as Message)
+
+  const assistantCalls = (ids: string[]): Message =>
+    msg('assistant', ids.map((id) => ({ type: 'tool-call', id, name: 'read', arguments: '{}' })))
+
+  it('⚠️⚠️ role:tool 消息被序列化为 user 的 tool_result 块（不丢 tool_use_id）', () => {
+    const out = serializeMinimaxMessages([assistantCalls(['c1']), toolMsg('c1', '文件内容')])
+    expect(out).toEqual([
+      { role: 'assistant', content: [{ type: 'tool_use', id: 'c1', name: 'read', input: {} }] },
+      { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'c1', content: [{ type: 'text', text: '文件内容' }] }] },
+    ])
+    // ⚠️ Anthropic **没有** role:'tool'，wire 上绝不能出现
+    expect(JSON.stringify(out)).not.toContain('"role":"tool"')
+  })
+
+  it('⚠️⚠️ 同批多个工具结果**合并进同一条 user 消息**（否则 2013）', () => {
+    // 真实形态：assistant 一次发两个 tool_use → harness 落**两条** tool 消息。
+    // Anthropic 要求同批 tool_result 合进紧跟其后的**那一条** user 消息。
+    const out = serializeMinimaxMessages([
+      assistantCalls(['c1', 'c2']),
+      toolMsg('c1', 'A'),
+      toolMsg('c2', 'B'),
+    ])
+    expect(out).toHaveLength(2)
+    expect(out[0]?.role).toBe('assistant')
+    expect(out[1]?.role).toBe('user')
+    expect(out[1]?.content).toEqual([
+      { type: 'tool_result', tool_use_id: 'c1', content: [{ type: 'text', text: 'A' }] },
+      { type: 'tool_result', tool_use_id: 'c2', content: [{ type: 'text', text: 'B' }] },
+    ])
+  })
+
+  it('⚠️⚠️ 一批工具结果 + 紧随其后的用户文本：工具结果**在先**、文本在后', () => {
+    // ⚠️ 这条才真正区分「合并」与「逐条下发」两种实现：
+    // 工具结果必须先于同一条 user 消息里的正文下发（否则用户那句话会插在
+    // tool_result 之前，把配对打断 → 2013）。
+    const out = serializeMinimaxMessages([
+      assistantCalls(['c1']),
+      toolMsg('c1', 'A'),
+      msg('user', [{ type: 'text', text: '接着说' }]),
+    ])
+    expect(out.map((m) => m.role)).toEqual(['assistant', 'user', 'user'])
+    expect(out[1]?.content).toEqual([
+      { type: 'tool_result', tool_use_id: 'c1', content: [{ type: 'text', text: 'A' }] },
+    ])
+    expect(out[2]?.content).toEqual([{ type: 'text', text: '接着说' }])
+  })
+
+  it('⚠️⚠️ 同一条消息里既有 tool-result 又有正文：结果被**拆到 assistant 之后**', () => {
+    // ⚠️ 这是唯一能观测「冲刷」逻辑的形态：只有它让该消息的 `content` 非空，
+    // 走到 else 分支。若不冲刷，tool_result 会留在同一条 user 消息的**末尾**，
+    // 而它前面是正文文本 ⇒ 配对被打断 ⇒ 2013。
+    const out = serializeMinimaxMessages([
+      assistantCalls(['c1']),
+      msg('user', [
+        { type: 'tool-result', toolCallId: 'c1', content: [{ type: 'text', text: 'A' }] },
+        { type: 'text', text: '接着说' },
+      ]),
+    ])
+    expect(out.map((m) => m.role)).toEqual(['assistant', 'user', 'user'])
+    expect(out[1]?.content).toEqual([
+      { type: 'tool_result', tool_use_id: 'c1', content: [{ type: 'text', text: 'A' }] },
+    ])
+    expect(out[2]?.content).toEqual([{ type: 'text', text: '接着说' }])
+  })
+
+  it('⚠️⚠️ 末尾的工具结果也要下发（模型刚跑完工具、之后无新消息）', () => {
+    // 漏掉它 = 留下无 tool_result 的 tool_use ⇒ 2013。
+    const out = serializeMinimaxMessages([assistantCalls(['c1']), toolMsg('c1', 'A')])
+    expect(out).toHaveLength(2)
+    expect(out[1]?.role).toBe('user')
+  })
+
+  it('⚠️ 工具消息里没有 text 时不产出空内容消息（内容数组为空的整条丢弃）', () => {
+    const out = serializeMinimaxMessages([assistantCalls(['c1']), toolMsg('c1', '')])
+    // 空结果的 tool_result 仍要保留（否则变成孤儿 tool_use → 2013）
+    expect(out).toHaveLength(2)
+    expect((out[1]?.content as Record<string, unknown>[])[0]?.type).toBe('tool_result')
+  })
+
+  it('⚠️⚠️ 孤儿 tool_result（无对应 tool_use）被剔除（否则服务端 400）', () => {
+    // 与 resolveToolPairing 同一口径：无法配对的结果不得下发。
+    const out = serializeMinimaxMessages([toolMsg('ghost', '孤儿结果')])
+    expect(out).toEqual([])
+  })
+
+  it('⚠️⚠️ 缺结果的 tool_use 也被剔除（不能留下无 tool_result 的 tool_use）', () => {
+    const out = serializeMinimaxMessages([assistantCalls(['c1', 'c2']), toolMsg('c1', 'A')])
+    // c2 无结果 ⇒ 该批 tool_calls 全部剔除（同 resolveToolPairing 的 all() 口径）
+    expect(out).toEqual([])
+  })
+
+  it('⚠️ 空 name 的 tool-call 被剔除（否则上游 400，同 resolveToolPairing）', () => {
+    const out = serializeMinimaxMessages([
+      msg('assistant', [{ type: 'tool-call', id: 'c1', name: '', arguments: '{}' }]),
+      toolMsg('c1', 'A'),
+    ])
+    expect(out).toEqual([])
+  })
+
+  it('⚠️ tool 消息插在 user 文本之后仍与 assistant(tool_use) 相邻（文本不打断配对）', () => {
+    // harness 形态：assistant(tool_use) → tool 消息。其后才是下一个 user 文本。
+    const out = serializeMinimaxMessages([
+      msg('user', [{ type: 'text', text: '问题' }]),
+      assistantCalls(['c1']),
+      toolMsg('c1', '答案'),
+    ])
+    expect(out.map((m) => m.role)).toEqual(['user', 'assistant', 'user'])
+  })
+
+  it('⚠️ 归一化只看**形状**、不看版本号：将来 dsh 升级到 0.3+ 仍必须生效', () => {
+    // ⚠️ 这条是**防版本号误导**的回归锁：曾因注释写「0.1.7」让人以为
+    // 「升到 0.2.0 就不相关了」而想删掉归一化。实测 0.2.0-rc.2 仍是
+    // `role:'tool'` 形状（34,659 条日志无例外），而判据是形状不是版本。
+    // ⇒ 用一个**刻意不像任何已知版本**的 role 值证明：我们认的是「非
+    // assistant/system 且无正文内容」这一形状特征本身。
+    const odd = [
+      { role: 'tool', toolCallId: 'c1', content: [{ type: 'text', text: 'A' }] },
+    ] as unknown as Message[]
+    const out = serializeMinimaxMessages([assistantCalls(['c1']), ...odd])
+    expect(out[1]?.content).toEqual([
+      { type: 'tool_result', tool_use_id: 'c1', content: [{ type: 'text', text: 'A' }] },
+    ])
+  })
+
+  it('⚠️ developer 消息被丢弃（只承载工具增删元数据，不是对话内容）', () => {
+    const out = serializeMinimaxMessages([
+      { role: 'developer', content: [{ type: 'tool-addition', toolName: 'read' }] } as unknown as Message,
+      msg('user', [{ type: 'text', text: 'hi' }]),
+    ])
+    expect(out).toEqual([{ role: 'user', content: [{ type: 'text', text: 'hi' }] }])
+  })
+
+  it('⚠️ 旧形状（user 内嵌 tool-result 块）行为**逐字节不变**', () => {
+    // 归一化层对 legacy 输入是零成本透传，既有断言必须继续成立。
+    const out = serializeMinimaxMessages([
+      assistantCalls(['c1', 'c2']),
+      msg('user', [
+        { type: 'tool-result', toolCallId: 'c1', content: [{ type: 'text', text: 'A' }] },
+        { type: 'tool-result', toolCallId: 'c2', content: [{ type: 'text', text: 'B' }] },
+      ]),
+    ])
+    expect(out[1]?.content).toEqual([
+      { type: 'tool_result', tool_use_id: 'c1', content: [{ type: 'text', text: 'A' }] },
+      { type: 'tool_result', tool_use_id: 'c2', content: [{ type: 'text', text: 'B' }] },
+    ])
+  })
+
+  it('⚠️⚠️⚠️ **跨 assistant 边界不累积**（真实会话重放定位的 2013 根因）', () => {
+    // 真实形态（会话 `session-871fdf61` 逐步重放得到）：
+    //   assistant A: [text, tool_use a1, a2, a3]   ← 第一批调用
+    //   tool a1 / tool a2 / tool a3                ← 三条独立 tool 消息
+    //   assistant B: [text, tool_use b1, b2, b3]   ← 第二批调用
+    //   tool b1 / b2 / b3
+    //
+    // ⚠️ 若工具结果跨 assistant 边界累积（第一版实现的缺陷），输出会变成
+    //   assistant A / assistant B / user(A+B 全部结果)
+    // ⇒ A 的 tool_result 前面是 B 的 assistant ⇒ 服务端 2013。
+    // 正确形态必须是 **一批配一批**。
+    const out = serializeMinimaxMessages([
+      assistantCalls(['a1', 'a2', 'a3']),
+      toolMsg('a1', 'r1'),
+      toolMsg('a2', 'r2'),
+      toolMsg('a3', 'r3'),
+      assistantCalls(['b1', 'b2', 'b3']),
+      toolMsg('b1', 's1'),
+      toolMsg('b2', 's2'),
+      toolMsg('b3', 's3'),
+    ])
+    expect(out.map((m) => m.role)).toEqual(['assistant', 'user', 'assistant', 'user'])
+
+    // 第一批结果紧跟第一批 assistant，且不含第二批的 id
+    const firstResults = (out[1]?.content as Record<string, unknown>[]).map((b) => b.tool_use_id)
+    expect(firstResults).toEqual(['a1', 'a2', 'a3'])
+    // 第二批同理
+    const secondResults = (out[3]?.content as Record<string, unknown>[]).map((b) => b.tool_use_id)
+    expect(secondResults).toEqual(['b1', 'b2', 'b3'])
+
+    // 通用不变量：每条 tool_result 的 id 必须在**紧邻前一条** assistant 里出现
+    for (let i = 0; i < out.length; i++) {
+      const m = out[i] as { role: string; content: Array<Record<string, unknown>> }
+      const results = m.content.filter((b) => b.type === 'tool_result')
+      if (results.length === 0) continue
+      const prev = out[i - 1] as { role: string; content: Array<Record<string, unknown>> }
+      expect(prev.role).toBe('assistant')
+      const useIds = new Set(
+        prev.content.filter((b) => b.type === 'tool_use').map((b) => String(b.id)),
+      )
+      for (const r of results) {
+        expect(useIds.has(String(r.tool_use_id))).toBe(true)
+      }
+    }
   })
 })
 

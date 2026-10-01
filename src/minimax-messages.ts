@@ -63,6 +63,8 @@ import type {
   TokenUsage,
 } from '@deepseek-ai/dsh-llm'
 import { ToolCallId } from '@deepseek-ai/dsh-llm'
+import { normalizeHarnessMessages } from './message-shape.js'
+import { resolveToolPairing } from './sse.js'
 
 /**
  * 构造 Anthropic Messages 请求体。
@@ -185,15 +187,85 @@ export function serializeMinimaxMessages(
   messages: readonly Message[],
   images?: ReadonlyMap<string, MinimaxInlineImage>,
 ): Array<Record<string, unknown>> {
+  // ⚠️⚠️ 步骤 1：归一化「一等 tool 消息」形状（**本 provider 曾因此整轮 400**）。
+  //
+  // harness 把工具结果作为**独立的 `role:'tool'` 消息**下发（`toolCallId` 在
+  // **顶层**），而**没有** `tool-result` 内容块 —— 于是下面
+  // `block.type === 'tool-result'` 的判据恒不命中（`normalizeHarnessMessages`
+  // 会把它降级回「user 消息内嵌 tool-result 块」的旧形状）。
+  //
+  // ⚠️ **别被版本号误导**（2026-10-01 实测纠正）：这套形状自 dsh 0.1.7 引入，
+  // 但 **0.2.0-rc.2 仍然如此** —— 全量会话日志 34,659 条 tool/result 无一例外
+  // 都是 `role:'tool'` + 顶层 `toolCallId`，`developer` 消息也仍在。
+  // 判据是**形状**（`message.role === 'tool'`）而非版本号（`message-shape.ts`
+  // 开头即写明「探测用形状而非版本号」）—— 升级 dsh 不会让这个归一化失效。
+  //
+  // 漏掉这一步的真实后果（2026-10-01 会话 `session-871fdf61` 报障）：
+  // `400 invalid_request_error ... tool call result does not follow tool call (2013)`。
+  // ⚠️ 旧形状输入是**零成本透传**（连数组身份都不变），故既有行为逐字节不变。
+  //
+  // ⚠️ 入参签名保持 `readonly Message[]`（对外纯函数 API 不变），但归一化层吃的
+  // 是**宽松**的 `{role; content?}[]` —— `Message` 没有索引签名，直接传会报 TS2352。
+  // 既有五个适配器（llm-adapter / openai-compat / buddy / lobsterai / trae）把
+  // 入参声明成宽松结构来规避；本函数是对外导出的纯函数，改签名会波及调用方，
+  // 故在此做一次**单向放宽**（内容原样透传，归一化不改数据）。
+  const normalized = normalizeHarnessMessages(
+    messages as unknown as readonly { role: string; content?: unknown }[],
+  ) as unknown as readonly Message[]
+
+  // ⚠️ 步骤 2：剔除无法配对的 tool_use / tool_result（与五个既有适配器同口径）。
+  //
+  // Anthropic 与 OpenAI 一样拒绝孤儿：没有 tool_result 的 tool_use、指向不存在
+  // tool_use 的 tool_result，都会被服务端拒。共用 `resolveToolPairing` 是为了
+  // **一个口径**——它在内部也会先做同一套形状归一化，且已处理「空 name 的
+  // tool-call 无条件 400」这个既有教训。
+  const { keepCallIds, keepResultIds } = resolveToolPairing(normalized)
+
   const out: Array<Record<string, unknown>> = []
-  for (const message of messages) {
+  /**
+   * ⚠️ 待发的 assistant 消息（等它的工具结果到齐后**成对**提交）。
+   *
+   * Anthropic 协议要求：同批 `tool_result` 必须**合并进紧跟 assistant(tool_use)
+   * 的那一条 user 消息**。harness 把**每个**工具调用落成**一条独立**的 tool 消息
+   * （真实会话 `session-871fdf61` 一次 tool_use 批次对应 1~3 条），逐条下发会产出
+   * **多条连续 user 消息** ⇒ 第二条前面是 user 而非 assistant ⇒ 2013。
+   *
+   * ⚠️⚠️ **不得跨 assistant 边界累积**（真实缺陷，第一版实现的错误）：
+   * 那样会变成 `assistant A / assistant B / user(A+B 的结果)`，
+   * A 的结果前面是 B 的 assistant ⇒ **同样** 2013。
+   */
+  let pendingAssistant: Record<string, unknown> | undefined
+  let pendingToolResults: Array<Record<string, unknown>> = []
+  /**
+   * 把「待发 assistant + 已累积的工具结果」**成对**提交。
+   *
+   * ⚠️ 结果为空时**仍要提交 assistant** —— 那是模型只回了正文的历史消息。
+   * ⚠️ 提交后 assistant 置空：它的结果已经配对完毕，不会再累积更多。
+   */
+  const commitPending = (): void => {
+    if (pendingAssistant === undefined && pendingToolResults.length === 0) return
+    if (pendingAssistant !== undefined) out.push(pendingAssistant)
+    if (pendingToolResults.length > 0) {
+      out.push({ role: 'user', content: pendingToolResults })
+      pendingToolResults = []
+    }
+    pendingAssistant = undefined
+  }
+
+  for (const message of normalized) {
     // ⚠️ system 角色不可能出现在这里（DSH 把它放在 options.system），
     // 但真出现时按 user 处理会让模型把它当用户指令 —— 故显式跳过。
+    // ⚠️ `developer`（只承载工具增删元数据的角色）由归一化层一并丢弃。
     if (message.role === 'system') continue
 
     const content: Array<Record<string, unknown>> = []
+    /** 本条消息的**全部**块数（用于判定「纯工具结果消息」）。 */
+    let blocks = 0
     for (const block of message.content) {
+      blocks++
       if (block.type === 'tool-call') {
+        // ⚠️ 孤儿/空名调用不产出 tool_use（否则下游 tool_result 变孤儿 → 400）。
+        if (!keepCallIds.has(String(block.id))) continue
         content.push({
           type: 'tool_use',
           id: block.id,
@@ -204,7 +276,9 @@ export function serializeMinimaxMessages(
         continue
       }
       if (block.type === 'tool-result') {
-        content.push({
+        // ⚠️ 孤儿结果不下发（服务端同样 400）。
+        if (!keepResultIds.has(String(block.toolCallId))) continue
+        pendingToolResults.push({
           type: 'tool_result',
           tool_use_id: block.toolCallId,
           // ⚠️ 工具结果内的图片也要内联（否则「工具返回截图」的场景会丢图）。
@@ -247,11 +321,37 @@ export function serializeMinimaxMessages(
       content.push({ type: 'text', text })
     }
 
-    if (content.length === 0) continue
-    // ⚠️ 工具结果所在的 user 消息**保持 user 角色**（Anthropic 约定），
-    // 不能因为「它其实是工具输出」而改角色或丢掉。
-    out.push({ role: message.role === 'assistant' ? 'assistant' : 'user', content })
+    // ⚠️⚠️ **成对提交即配对关系（真实缺陷，2026-10-01 由真实会话重放定位）**。
+    //
+    // Anthropic 要求：`tool_result` 必须**紧跟产生它的那一条** assistant(tool_use)。
+    // harness 侧形态是「一条 assistant（带 N 个 tool_use）+ N 条独立 tool 消息」。
+    // 三种错误形态都会报 2013：
+    //   ① 逐条下发 → N 条连续 user，第二条前面是 user；
+    //   ② assistant 立即下发、结果攒到下一轮 → `assistant A / assistant B / user(A+B 结果)`；
+    //   ③ 纯 reasoning 的空 assistant 被丢弃 → 其后结果失去锚点。
+    //
+    // ⇒ **assistant 与它的结果一起提交**：assistant 先进待发区，遇到它的结果
+    // （或任何非工具消息）时，才把「assistant + 累积结果」成对 push。
+    // 这样既合并了同批（不产生连续 user），也不跨 assistant 边界。
+    const isPureToolMessage = message.role !== 'assistant'
+      && content.length === 0
+      && blocks > 0
+    if (isPureToolMessage) continue
+
+    if (message.role === 'assistant') {
+      // ⚠️⚠️ 上一批若还没发出（assistant A 的结果已到齐但 A 本身待发），
+      // 先把 A + A 的结果成对发出，再把当前 assistant 转入待发区。
+      commitPending()
+      if (content.length === 0) continue
+      pendingAssistant = { role: 'assistant', content }
+      continue
+    }
+    // user 消息：先把待发的 assistant 连同已累积的结果成对发出，再发正文。
+    commitPending()
+    if (content.length > 0) out.push({ role: 'user', content })
   }
+  // ⚠️ 收尾：末尾的待发 assistant 与结果都要提交（否则留下无结果的 tool_use → 2013）。
+  commitPending()
   return out
 }
 
