@@ -234,6 +234,37 @@ export interface ZcodeCredential {
   coding_plan_key_bigmodel?: string
   /** 展示用标签（脱敏手机号 / 用户名 / 设备码）。 */
   account_label?: string
+  /**
+   * 账号名（用户在智谱侧的用户名，如 `mylzscy4`）。
+   *
+   * ## 为什么与 `account_label` 分开存
+   *
+   * 两者**来源不同**，且 `account_label` 是**兜底链**的产物：
+   *
+   * | 字段 | 来源 | 形态 |
+   * |---|---|---|
+   * | `account_name` | `user_info.displayName` / `username` / `rawProfile.name` | 真实用户名 |
+   * | `account_label` | 官方登录的 `data.user.name`，否则 `id:`/`设备…` 兜底 | 可能是占位串 |
+   *
+   * 官方客户端写的 `user_info` 里用户名键叫 **`displayName`**（不是 `name`），
+   * 故 `labelFromUserInfo` 的 `name` 分支取不到它、只能落到 `id:xxxxxx` 兜底 ——
+   * 那是**识别信息很弱**的占位（末 6 位数字）。故另存一份真名供 UI 展示。
+   */
+  account_name?: string
+  /**
+   * 脱敏手机号（`159****0100`）。
+   *
+   * ## ⚠ 它是**从 17 位 `user_id` 前 11 位派生**的，不是独立字段
+   *
+   * 实测（扫遍 `~/.zcode/v2/*.json`、解两个 JWT 的 payload）：上游**没有**
+   * 任何下发手机号的字段 —— `user_info` 只有 `{id, username, displayName,
+   * rawProfile}`，`zcodejwttoken` 与 `oauth:bigmodel:access_token` 的 payload
+   * 也都只有那 17 位 id。而 `id` 的**前 11 位**恰好是合法手机号
+   * （`15951790100` 通过 `/^1[3-9]\d{9}$/`）⇒ 智谱把手机号编进了 id 前缀。
+   *
+   * 因此：**取不到合法前缀时不设该字段**（宁可不显示，也不猜）。
+   */
+  phone?: string
   /** 客户端版本，随请求头下发。 */
   app_version?: string
   /**
@@ -296,6 +327,83 @@ export function labelFromUserInfo(raw: string | undefined): string | undefined {
     // userInfo 不是 JSON —— 忽略。
   }
   return undefined
+}
+
+/** 手机号：11 位、以 1 开头、第 2 位 3-9（中国大陆移动号段）。 */
+const PHONE_RE = /^1[3-9]\d{9}$/
+
+/**
+ * 从 17 位 `user_id` 派生脱敏手机号，取不到返回 `undefined`。
+ *
+ * ## ⚠ 为什么要「派生」而不是「读取」
+ *
+ * 上游**不下发**手机号字段。实测：
+ *
+ * - `user_info` 的顶层键只有 `{id, username, displayName, rawProfile}`；
+ * - `zcodejwttoken` 的 payload 只有 `{user_id, token_version, sub, iat}`；
+ * - `oauth:bigmodel:access_token` 的 payload 只有 `{user_type, user_channel,
+ *   user_id, user_key, customer_id, username}`；
+ * - 扫遍 `~/.zcode/v2/{credentials,provider_config,telemetry-state,
+ *   onboarding-record}.json`，**唯一**命中 11 位手机号形状的字符串就是
+ *   `user_info.id` 的**前 11 位**（`onboarding-record.json` 的
+ *   `decisions[0].userId` 是同一个 17 位值）。
+ *
+ * ⇒ 智谱把手机号编进了 `user_id` 的前缀。故这里取前 11 位校验后脱敏；
+ * **校验不过就不显示**（有些账号的 id 前缀并非手机号，不能硬套）。
+ */
+export function phoneFromUserId(userId: string | undefined): string | undefined {
+  if (typeof userId !== 'string' || userId.length < 11) return undefined
+  const head = userId.slice(0, 11)
+  if (!PHONE_RE.test(head)) return undefined
+  return `${head.slice(0, 3)}****${head.slice(-4)}`
+}
+
+/**
+ * 从 `userInfo` 里取账号名与手机号。
+ *
+ * ## 账号名的取值顺序（三条来源必须都认）
+ *
+ * | 顺序 | 键 | 谁写的 |
+ * |---|---|---|
+ * | ① | `displayName` | 官方客户端的 `oauth:bigmodel:user_info`（实测用户名在这里） |
+ * | ② | `username` | 同上（与 `displayName` 同值） |
+ * | ③ | `rawProfile.name` | 官方客户端的嵌套副本 |
+ *
+ * ⚠ **刻意不取 `name` 顶层键** —— 那是 `labelFromUserInfo` 的判据，两处若用同一
+ * 判据就没必要分开存了；且本机 `user_info` 根本没有顶层 `name`。
+ *
+ * ⚠ 与 `labelFromUserInfo` **并存**而不是替换它：后者被
+ * `tests/unit/zcode.spec.ts:143-148` 逐字断言，且仍作为 `account_label` 的兜底。
+ */
+export function identityFromUserInfo(raw: string | undefined): {
+  accountName?: string
+  phone?: string
+} {
+  if (raw === undefined) return {}
+  try {
+    const info = JSON.parse(raw) as Record<string, unknown>
+    const rawProfile = (typeof info['rawProfile'] === 'object' && info['rawProfile'] !== null)
+      ? info['rawProfile'] as Record<string, unknown>
+      : {}
+    let accountName: string | undefined
+    for (const value of [info['displayName'], info['username'], rawProfile['name']]) {
+      if (typeof value === 'string' && value.trim().length > 0) {
+        const text = value.trim()
+        accountName = text.length > 24 ? text.slice(0, 24) : text
+        break
+      }
+    }
+    // 17 位 id 优先，其次嵌套的 rawProfile.user_id（两者实测同值）。
+    const id = info['id'] ?? rawProfile['user_id']
+    const phone = phoneFromUserId(typeof id === 'string' ? id : undefined)
+    return {
+      ...(accountName !== undefined ? { accountName } : {}),
+      ...(phone !== undefined ? { phone } : {}),
+    }
+  } catch {
+    // userInfo 不是 JSON —— 忽略。
+    return {}
+  }
 }
 
 /** `telemetry-state.json` 的候选位置（与凭据同目录，故同形）。 */
@@ -388,6 +496,8 @@ export function readZcodeCredential(
   if (deviceMid === undefined) return undefined
 
   const userInfo = pickCredential(table, KEY_FRAGMENTS.userInfo, env)
+  const identity = identityFromUserInfo(userInfo)
+  const userId = readUserIdFromUserInfo(userInfo)
   return {
     zcode_jwt: jwt,
     device_mid: deviceMid,
@@ -395,10 +505,41 @@ export function readZcodeCredential(
     coding_plan_key_zai: pickCredential(table, KEY_FRAGMENTS.codingPlanZai, env),
     coding_plan_key_bigmodel: pickCredential(table, KEY_FRAGMENTS.codingPlanBigmodel, env),
     account_label: labelFromUserInfo(userInfo) ?? `设备${deviceMid.slice(0, 8)}`,
+    /**
+     * ⚠ **这里曾经漏了 `user_id`**（真实缺口）：`user_info.id` / 其嵌套的
+     * `rawProfile.user_id` 就是服务端下发的那 17 位账号标识，与插件登录路径
+     * 写进 `user_id` 的是**同一个值**。
+     *
+     * 缺了它，「读官方客户端凭据」这条路的账号**无法参与去重** ——
+     * `findAccountIdByIdentityField` 遇到没有 `user_id` 的条目会**跳过**
+     * （见 `src/account-pool.ts:569`「缺失该字段 ⇒ 无法判断，跳过」），
+     * 表现为：装了官方客户端并登录过，再点「添加账号」仍会多出一条重复账号。
+     */
+    ...(userId !== undefined ? { user_id: userId } : {}),
+    ...(identity.accountName !== undefined ? { account_name: identity.accountName } : {}),
+    ...(identity.phone !== undefined ? { phone: identity.phone } : {}),
     app_version: detectZcodeAppVersion(),
     // 标记来源，便于 UI 与排查区分「插件登录」与「读官方客户端」。
     source: 'ide',
   }
+}
+
+/** 从 `userInfo` 取那 17 位账号标识（顶层 `id`，回退 `rawProfile.user_id`）。 */export function readUserIdFromUserInfo(raw: string | undefined): string | undefined {
+  if (raw === undefined) return undefined
+  try {
+    const info = JSON.parse(raw) as Record<string, unknown>
+    for (const value of [info['id'], info['userId']]) {
+      if (typeof value === 'string' && value.trim().length > 0) return value.trim()
+    }
+    const rawProfile = info['rawProfile']
+    if (typeof rawProfile === 'object' && rawProfile !== null) {
+      const nested = (rawProfile as Record<string, unknown>)['user_id']
+      if (typeof nested === 'string' && nested.trim().length > 0) return nested.trim()
+    }
+  } catch {
+    // userInfo 不是 JSON —— 忽略。
+  }
+  return undefined
 }
 
 /**

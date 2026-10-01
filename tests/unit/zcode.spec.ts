@@ -14,8 +14,11 @@ import {
   credentialFileCandidates,
   decryptCredentialValue,
   deriveCredentialKey,
+  identityFromUserInfo,
   labelFromUserInfo,
+  phoneFromUserId,
   readRawCredentials,
+  readUserIdFromUserInfo,
   readZcodeCredential,
 } from '../../src/zcode.js'
 import {
@@ -157,6 +160,76 @@ describe('ZCode 凭据解密（AES-256-GCM）', () => {
     } finally {
       rmSync(dir, { recursive: true, force: true })
     }
+  })
+})
+
+// ─────────────────── 账号身份（账号名 / 手机号 / user_id） ───────────────────
+
+describe('ZCode 账号身份派生', () => {
+  /** 实测的本机 `user_info` 形状（17 位 id + displayName/username/rawProfile）。 */
+  const REAL_USER_INFO = JSON.stringify({
+    id: '15951790100986814',
+    username: 'mylzscy4',
+    displayName: 'mylzscy4',
+    rawProfile: {
+      user_id: '15951790100986814',
+      email: '',
+      avatar: '',
+      name: 'mylzscy4',
+      zcodeProfileSchemaVersion: 2,
+    },
+  })
+
+  it('★ 手机号由 17 位 id 的前 11 位派生（上游不下发手机号字段）', () => {
+    // 依据：扫遍 ~/.zcode/v2/*.json 后，唯一命中 11 位手机号形状的就是这个前缀。
+    expect(phoneFromUserId('15951790100986814')).toBe('159****0100')
+  })
+
+  it('前缀不是合法手机号时不设 phone（宁可不显示，也不猜）', () => {
+    // 前 11 位是 '88888888888'（不满足 /^1[3-9]/）⇒ 必须放弃。
+    expect(phoneFromUserId('88888888888999888')).toBeUndefined()
+    // 以 1 开头但第 2 位是 2 ⇒ 同样不是手机号。
+    expect(phoneFromUserId('12888888888999888')).toBeUndefined()
+    // 太短 ⇒ 无法取前 11 位。
+    expect(phoneFromUserId('12345')).toBeUndefined()
+    expect(phoneFromUserId(undefined)).toBeUndefined()
+  })
+
+  it('★ 账号名取 displayName（不是 name —— 顶层没有 name 键）', () => {
+    // ⚠ 这正是不复用 labelFromUserInfo 的原因：它查 `name`/`nickname`，
+    //   而官方的键名叫 `displayName`，于是它会落到 `id:986814` 这种弱占位。
+    expect(identityFromUserInfo(REAL_USER_INFO)).toEqual({
+      accountName: 'mylzscy4',
+      phone: '159****0100',
+    })
+    expect(labelFromUserInfo(REAL_USER_INFO)).toBe('id:986814')
+  })
+
+  it('账号名依次回退 username → rawProfile.name', () => {
+    expect(identityFromUserInfo(JSON.stringify({ username: 'u-name' })).accountName)
+      .toBe('u-name')
+    expect(identityFromUserInfo(JSON.stringify({ rawProfile: { name: 'nested' } })).accountName)
+      .toBe('nested')
+  })
+
+  it('user_info 解不开 / 为空时不抛错，返回空对象', () => {
+    expect(identityFromUserInfo(undefined)).toEqual({})
+    expect(identityFromUserInfo('not-json')).toEqual({})
+    expect(identityFromUserInfo('{}')).toEqual({})
+  })
+
+  it('★ readUserIdFromUserInfo 取顶层 id，回退 rawProfile.user_id', () => {
+    expect(readUserIdFromUserInfo(REAL_USER_INFO)).toBe('15951790100986814')
+    expect(readUserIdFromUserInfo(JSON.stringify({ rawProfile: { user_id: 'nested-id' } })))
+      .toBe('nested-id')
+    expect(readUserIdFromUserInfo('not-json')).toBeUndefined()
+    expect(readUserIdFromUserInfo(undefined)).toBeUndefined()
+  })
+
+  it('手机号脱敏成 前3 + **** + 后4（不泄露中间 4 位）', () => {
+    const phone = phoneFromUserId('13800138000123456')
+    expect(phone).toBe('138****8000')
+    expect(phone).not.toContain('0138')
   })
 })
 

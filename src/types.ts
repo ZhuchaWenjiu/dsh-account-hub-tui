@@ -80,6 +80,28 @@ export interface ProviderAccountStatus extends ProviderAccountEntry {
   refreshError?: string
   /** 来源（env/file 等） */
   source?: string
+  /**
+   * 账号名（用户名，如 `mylzscy4`）。
+   *
+   * ## 为什么不在 `ProviderAccountEntry` 上
+   *
+   * 账号池（`jet-hub/state.json`）的条目**不存**这个值 —— 它只在**凭据**里
+   * （`user_info.displayName`）。本字段是 `account.list` 在返回前**现从该账号
+   * 自己的 credential ref 里读出来**的派生值，故属于「状态」而非「存储」。
+   *
+   * 为什么不写回池：凭据可能被用户在别处更新（换账号名）、且池的
+   * `sanitizeAccounts`（`src/jet-hub-store.ts:173-191`）只保留
+   * `id`/`provider`/`credentialRef` 三个字段，写进去也会被丢掉。
+   */
+  accountName?: string
+  /**
+   * 脱敏手机号（`159****0100`）。
+   *
+   * ⚠ 由 17 位 `user_id` 前 11 位**派生**（上游不下发手机号字段），
+   * 取不到合法前缀时**不设该字段** —— 宁可不显示，也不猜。详见
+   * `src/zcode.ts` 的 `phoneFromUserId`。
+   */
+  phone?: string
 }
 
 /** Jet Hub 在 ctx.settings 中的 schema */
@@ -130,6 +152,19 @@ export interface RpcCreateAccountResponse {
    * 行为必须逐字节不变。
    */
   loginMode?: 'url' | 'sms'
+  /**
+   * 本次「添加账号」**没有新建条目**，而是复用了池里已有的账号。
+   *
+   * ## 为什么需要这个字段（用户报障 ⑯）
+   *
+   * 「账号应该读取有效的本地账号凭证，而不是点了添加就多一个」——
+   * 当本机已有可用凭据（官方客户端写的）时，`account.create` 不再新起 OAuth，
+   * 而是复用/修复已有条目。此时 `loginUrl` 为**空串**（没有可打开的页面）。
+   *
+   * ⚠ 前端**必须**先看这个字段再判空：只看 `loginUrl` 为空会把它当成
+   * 「后端没返回登录地址」而报错，把一次成功操作显示成失败。
+   */
+  reused?: boolean
 }
 
 export interface RpcPollLoginRequest {

@@ -36,6 +36,7 @@ import type { CheckinStatus } from './credits.js'
 import type { ClaimOutcome } from './credits.js'
 import {
   isUsableZcodeCredential,
+  phoneFromUserId,
   readZcodeCredential,
   type ZcodeCredential,
 } from './zcode.js'
@@ -272,6 +273,149 @@ export class ZcodeAuth extends Service {
   }
 
   /**
+   * 读**本机官方客户端**那份凭据（纯磁盘读取，不经账号池）。
+   *
+   * 供 ⑯「添加账号先复用本机已有账号」使用 —— 与 `current()` 的区别：
+   * `current()` 会**先读池**，池里任意一个可用账号都会让它短路，拿不到「磁盘上
+   * 官方客户端当前登录的是谁」。这里要的正是后者。
+   *
+   * 返回 `undefined` = 本机没有可用的官方凭据（用户没装客户端，或没登录过）。
+   */
+  async localCredential(): Promise<ZcodeCredential | undefined> {
+    try {
+      const credential = this.readCredential()
+      return credential !== undefined && isUsableZcodeCredential(credential) ? credential : undefined
+    } catch (error) {
+      this.lastError = error instanceof Error ? error.message : String(error)
+      return undefined
+    }
+  }
+
+  /**
+   * 池里**缺凭据**的 zcode 账号中，挑第一个把本机官方凭据收编进去（最多一个）。
+   *
+   * ## 用途（⑯「点一次多一条」）
+   *
+   * `account.create` 在新建条目前先调它：若池里已经躺着一条**从未写入凭据**的
+   * 孤儿条目（用户上一次登录被进程重启打断的产物），就把本机凭据补进去复用，
+   * **而不是再加一条** —— 这正是用户报的「点了添加就多一个」。
+   *
+   * ## ⚠ 为什么只收编**一个**
+   *
+   * 孤儿条目可能有**多条**（每次被打断的登录留一条），但它们都**没有凭据**，
+   * 我们无从判断它们各自身份 —— 全填上同一份凭据会变成多条重复账号，各自
+   * 消耗同一份额度。只修第一条，其余交给用户用卡片上的「删除」按钮清理。
+   *
+   * 安全性由 {@link adoptOfficialCredential} 的**闸②**保证：若这份凭据的
+   * `user_id` 已被别的条目持有，则拒绝写入（防止跨账号覆盖）。
+   *
+   * @returns 被收编的账号 id；没有可收编的目标或闸②拦下则 `undefined`。
+   */
+  async adoptIntoOrphanAccount(pool: AccountPool): Promise<string | undefined> {
+    let candidates: readonly { id: string; credentialRef: string; nickname: string }[]
+    try {
+      candidates = pool.listAccountsByProvider(this.product.id)
+    } catch {
+      return undefined
+    }
+    for (const entry of candidates) {
+      // 只挑**真的**没有可用凭据的条目（能解析出凭据的条目绝不动）。
+      const own = await this.readCredentialFromRef(entry.credentialRef as CredentialRef)
+      if (own !== undefined) continue
+      const adopted = await this.adoptOfficialCredential(entry.credentialRef, pool)
+      if (adopted === undefined) continue
+      // 回填昵称，让卡片上显示账号名而不是 `zcode-xxxxxxxx`。
+      const label = adopted.account_name ?? adopted.account_label
+      if (typeof label === 'string' && label.trim().length > 0) {
+        await pool.updateAccount(entry.id, { nickname: `ZCode ${label.trim()}` }).catch(() => {})
+      }
+      return entry.id
+    }
+    return undefined
+  }
+
+  /**
+   * 把**本机官方客户端凭据**收编进指定账号的 ref（自愈 / 复用）。
+   *
+   * ## 解决的三个真实问题
+   *
+   * 1. **⑦「凭据未配置」**：用户点了「添加账号」，但后台登录 promise 被进程重启
+   *    打断 —— 条目已建、凭据从未写入（`startLogin` 的
+   *    `await this.ctx.credentials.set(...)` 没跑到）。此后该账号永远读不到凭据：
+   *    `refreshAll` 只探过期账号、适配器 `refresh` 又要求先能选到号，
+   *    互为前提、**无法自愈**。
+   * 2. **⑯ 点一次多一条**：本机明明已有一份可用凭据（官方客户端写的），
+   *    仍要新起一轮 OAuth、新建一条占位记录。
+   * 3. **`ide` 凭据无法去重**：见 `readZcodeCredential` 里补 `user_id` 的注释。
+   *
+   * ## ⚠⚠ 防「跨账号覆盖」的两道闸（这是本方法最重要的约束）
+   *
+   * `src/zcode-auth.ts` 记录过一个**真实的数据破坏缺陷**：旧 `refreshAll` 拿
+   * `current()`（= 池里第一个可用账号）去覆盖**每一个** ref，30 分钟一轮的定时器
+   * 会把账号 A 的凭据铺满整个池，抹掉其余账号。故本方法只在**两道闸都过**时才写：
+   *
+   * - 闸①：目标 ref **自己解析不出**凭据（`readCredentialFromRef` 为 `undefined`）。
+   *   能解析出就**原样返回**，绝不覆盖 —— 这是 `refreshAccountCredential` 的同款判据。
+   * - 闸②：本机凭据的 `user_id` **没有被池里其它账号持有**
+   *   （`findAccountIdByIdentityField` 查不到，或查到的就是目标自己）。
+   *   否则说明这份凭据是**别的账号**的，写进去就是重犯覆盖缺陷。
+   *
+   * ## 为什么读 `readCredential()` 而不是 `current()`
+   *
+   * `current()` 会**先读池**（`readStoredCredential` → `readCredentialFromPool`）
+   * —— 那正是「A 的凭据」的来源。本方法要的是**磁盘上官方客户端那一份**，
+   * 只有 `readCredential()` 是纯磁盘读取（`readZcodeCredential`），故用它。
+   *
+   * @param refName - 目标账号的 credential ref 名。
+   * @param pool - 账号池（用于闸②的身份比对）。
+   * @returns 写入的凭据；任一闸不过则返回 `undefined`（调用方照旧走登录流程）。
+   */
+  async adoptOfficialCredential(
+    refName: string,
+    pool?: AccountPool,
+  ): Promise<ZcodeCredential | undefined> {
+    const ref = refName as CredentialRef
+    // 闸①：该 ref 自己已有可用凭据 ⇒ 什么都不做（绝不覆盖）。
+    const own = await this.readCredentialFromRef(ref)
+    if (own !== undefined) return undefined
+
+    // 读**磁盘上**的官方客户端凭据（不经账号池，见上面的说明）。
+    let official: ZcodeCredential | undefined
+    try {
+      official = this.readCredential()
+    } catch (error) {
+      this.lastError = error instanceof Error ? error.message : String(error)
+      return undefined
+    }
+    if (official === undefined || !isUsableZcodeCredential(official)) return undefined
+
+    // 闸②：这份凭据的账号没被别的条目占用。
+    const userId = official.user_id
+    if (pool !== undefined && typeof userId === 'string' && userId.length > 0) {
+      const holder = await pool.findAccountIdByIdentityField(this.product.id, 'user_id', userId)
+      if (holder.length > 0 && holder !== this.accountIdOf(refName, pool)) {
+        this.lastError = `本机官方凭据属于账号 ${holder}，不写入 ${refName}（防止跨账号覆盖）`
+        return undefined
+      }
+    }
+
+    await this.ctx.credentials.set(ref, JSON.stringify(official))
+    return official
+  }
+
+  /** 由 ref 名反查它对应的账号 id（闸②用来放行「凭据就是自己的」这种情形）。 */
+  private accountIdOf(refName: string, pool: AccountPool): string | undefined {
+    try {
+      for (const entry of pool.listAccountsByProvider(this.product.id)) {
+        if (entry.credentialRef === refName) return entry.id
+      }
+    } catch {
+      // 池异常 ⇒ 当作查不到（更保守：闸② 会拦住写入）。
+    }
+    return undefined
+  }
+
+  /**
    * 取账号池。
    *
    * ⚠ 用 `ctx.get` 而非构造注入：本服务可能在**账号池注册之前**被构造
@@ -396,6 +540,20 @@ export class ZcodeAuth extends Service {
         ...loginResult.userId.length > 0 ? { user_id: loginResult.userId } : {},
         bigmodel_access_token: loginResult.bigmodelAccessToken,
         account_label: loginResult.displayName,
+        /**
+         * 账号名与脱敏手机号（供账号卡片展示，见 `src/zcode.ts` 的字段注释）。
+         *
+         * ⚠ 手机号是**从 `userId` 前 11 位派生**的（上游不下发手机号字段）；
+         * 取不到合法前缀时 `phoneFromUserId` 返回 `undefined`，故这里要判断后再塞，
+         * 否则会给凭据写进一个 `phone: undefined` 的键（JSON 序列化后消失，
+         * 但内存对象里会带着，徒增困惑）。
+         */
+        ...loginResult.displayName.length > 0
+          ? { account_name: loginResult.displayName }
+          : {},
+        ...(phoneFromUserId(loginResult.userId) !== undefined
+          ? { phone: phoneFromUserId(loginResult.userId) }
+          : {}),
         app_version: options.appVersion ?? this.product.appVersionFallback,
         source: 'plugin',
       }
