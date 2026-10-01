@@ -18,6 +18,17 @@ import {
 
 export const CHAT_API_BASE = 'https://snap-access.cn-north-4.myhuaweicloud.com/api/v2'
 export const PROVIDER = 'codearts'
+/**
+ * 「该账号没有 benefit（免费额度）包」的稳定失败码。
+ *
+ * CodeArts 对**积分制**账户（体验版等，没有 benefit 免费额度包）会以
+ * HTTP 200 + SSE `InferHub.4004.200 benefit not found` 拒绝带
+ * `maas_type: benefit` 的请求，而同一个模型不带该头可以正常出流（实测
+ * 2026-10-01，deepseek-v4.1-flash）。`stream()` 命中该码后去掉该头重试一次。
+ */
+const BENEFIT_NOT_FOUND_CODE = 'BENEFIT_NOT_FOUND'
+/** CodeArts 在账号没有 benefit 包时下发的事件 error_code。 */
+const CODEARTS_BENEFIT_NOT_FOUND_ERROR_CODE = 'InferHub.4004.200'
 
 // DeepSeek V4（CodeArts Agent 模型列表新增，UI 标注"每日 1000 万免费 Tokens"福利）：
 //
@@ -962,6 +973,9 @@ export class CodeArtsAdapter extends LlmAdapter {
     // 鉴权失败（APIG.0602 / 401 / 403）后已刷新过凭据：避免死循环，
     // 同一次 stream() 调用最多 refresh 一次。
     let authRefreshed = false
+    // 该账号不带 benefit 包时去掉 `maas_type: benefit` 头重试一次：
+    // 只试一次，避免与真实失败互相掩盖。
+    let benefitHeaderDropped = false
     // 因限流已尝试过的账号 id：保证每个账号只试一次，试完才判定"全部受限"。
     const rateLimitTried = new Set<string>()
     if (currentAccountId) rateLimitTried.add(currentAccountId)
@@ -979,7 +993,7 @@ export class CodeArtsAdapter extends LlmAdapter {
       // deepseek-v4.1-flash 等其它 benefit 模型调用失败（用户报障：
       // 发消息后报 Insufficient Balance / QUOTA —— 缺该头时后端按非 benefit
       // 通道处理该模型）。实证见 CODEARTS_BENEFIT_FALLBACK 注释。
-      const extraSignedHeaders = isBenefitModel ? { maas_type: 'benefit' } : undefined
+      const extraSignedHeaders = isBenefitModel && !benefitHeaderDropped ? { maas_type: 'benefit' } : undefined
       const signed = await signRequestHuawei(
         credential.access_key_id,
         credential.secret_access_key,
@@ -1013,8 +1027,20 @@ export class CodeArtsAdapter extends LlmAdapter {
           yield* this.consumeSse(response, options)
           break
         } catch (error) {
-          if (!(error instanceof SseQueueRetryError)) throw error
-          // 落入下方排队重试
+          if (error instanceof SseQueueRetryError) {
+            // 落入下方排队重试
+          } else if (
+            error instanceof LlmError
+            && error.code === BENEFIT_NOT_FOUND_CODE
+            && isBenefitModel
+            && !benefitHeaderDropped
+          ) {
+            // 该账号没有 benefit 包：去掉 maas_type 头重试一次
+            benefitHeaderDropped = true
+            continue
+          } else {
+            throw error
+          }
         }
       } else {
         const errorText = await response.text().catch(() => '')
@@ -1394,6 +1420,10 @@ export class CodeArtsAdapter extends LlmAdapter {
               : data.error_code
             if (isSseQueueErrorCode(data.error_code)) {
               throw new SseQueueRetryError(data.error_code, message)
+            }
+            if (data.error_code === CODEARTS_BENEFIT_NOT_FOUND_ERROR_CODE) {
+              // 账号没有 benefit 包（积分制账户）：交给 stream() 去掉该头重试
+              throw new LlmError(`codearts: ${message}`, BENEFIT_NOT_FOUND_CODE, { status: 200 })
             }
             throw new LlmError(`codearts: ${message}`, 'INVALID_REQUEST', { status: 200 })
           }
