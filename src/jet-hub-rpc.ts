@@ -35,6 +35,8 @@ import type { RaccoonAuth } from './raccoon-auth.js'
 import type { ZcodeAuth } from './zcode-auth.js'
 import { ZCODE } from './zcode-product.js'
 import type { ZcodeCredential } from './zcode.js'
+import { phoneFromUserId, isUsableZcodeCredential } from './zcode.js'
+import type { ZcodeBalanceResult } from './zcode-upstream.js'
 import type { RaccoonCredential } from './raccoon.js'
 import type { StartedRaccoonLoginFlow } from './raccoon-login-page.js'
 import { MINIMAX } from './minimax-product.js'
@@ -174,6 +176,8 @@ import type {
   RpcCaptchaContributeRequest,
   RpcCaptchaContributeResponse,
   ProviderStatus,
+
+  ProviderAccountStatus,
 } from './types.js'
 
 /** Jet Hub RPC API 路径 */
@@ -963,13 +967,142 @@ function registerJetHubEndpoints(
     },
   })
 
+  /**
+   * 给 `account.list` 的返回项补上**只存在于凭据里**的展示字段（账号名 / 手机号）。
+   *
+   * ## 为什么只能在 RPC 层补
+   *
+   * 账号池（`jet-hub/state.json`）的条目只有 `id`/`provider`/`nickname`/
+   * `credentialRef` 等字段，**没有**账号名与手机号 —— 它们在**凭据**里
+   * （`user_info.displayName` 与由 17 位 `user_id` 派生的手机号）。
+   * 且 `sanitizeAccounts`（`src/jet-hub-store.ts:173-191`）只保留三个字段，
+   * 写回池也会被丢掉。故每次列表时从**各账号自己的 ref** 现读。
+   *
+   * ## ⚠ 只对 zcode 做，且逐条独立失败
+   *
+   * - 只认 `zcode`：其余 11 个 provider 的凭证形状不同，通读一遍纯属浪费
+   *   （`account.list` 是进面板就发的热路径）。
+   * - 单条解析失败**不影响整行**：拿不到就不补字段，绝不让账号列表整体失败
+   *   （列表可用性远比这两个展示字段重要）。
+   *
+   * ## 取值顺序：先信凭据里已存的，再现场派生
+   *
+   * 新凭据由 `readZcodeCredential` / `startLogin` 直接写入 `account_name` /
+   * `phone`；**旧凭据**（本次改动之前登录的）没有这两个字段，故现场兜底：
+   * 手机号从 `user_id` 派生、账号名回退到**不像占位串**的 `account_label`。
+   */
+  async function enrichAccountIdentity(
+    accounts: readonly ProviderAccountStatus[],
+    provider: string,
+  ): Promise<ProviderAccountStatus[]> {
+    if (provider !== ZCODE.id) return [...accounts]
+    const out: ProviderAccountStatus[] = []
+    for (const account of accounts) {
+      try {
+        const resolved = await ctx.credentials.resolve(credentialRef(account.credentialRef))
+        if (!resolved) { out.push(account); continue }
+        const credential = JSON.parse(resolved.value) as ZcodeCredential
+        const accountName = typeof credential.account_name === 'string'
+          && credential.account_name.trim().length > 0
+          ? credential.account_name.trim()
+          // 旧凭据没有 account_name：只有 `account_label` 不是占位串时才能当名字用。
+          // `id:xxxxxx` 与 `设备xxxxxxxx` 都是兜底产物，展示它们等于没展示。
+          : (typeof credential.account_label === 'string'
+            && credential.account_label.trim().length > 0
+            && !/^id:/.test(credential.account_label)
+            && !/^设备/.test(credential.account_label)
+            ? credential.account_label.trim()
+            : undefined)
+        const phone = typeof credential.phone === 'string' && credential.phone.trim().length > 0
+          ? credential.phone.trim()
+          : phoneFromUserId(credential.user_id)
+        out.push({
+          ...account,
+          ...(accountName !== undefined ? { accountName } : {}),
+          ...(phone !== undefined ? { phone } : {}),
+        })
+      } catch {
+        // 凭据损坏/未配置：保留原条目（这些账号在卡片上会由额度那一栏报错说明）。
+        out.push(account)
+      }
+    }
+    return out
+  }
+
+  /**
+   * 把上游余额**逐桶**映射成 `CreditBalance`。
+   *
+   * ## 为什么必须逐桶（而不是只取首桶）
+   *
+   * `CreditBalance` 的形状是 `{total, packages[], expiredTotal?}` 这类**积分包**
+   * 结构，而 ZCode 是「按模型分的 token 额度池」。上游一个 resource bucket
+   * = 一个模型一段额度，故**一个桶一个包**。
+   *
+   * ⚠ 旧实现只取 `buckets[0]`（经 `result.planName`）拼**一个**包，但
+   * `balance.total` 用的是 `result.remaining`（**全桶汇总**）—— 多桶账号下
+   * 那个包的数字比它自己的 `totalUnits` 还大，自相矛盾，且其余模型的额度
+   * 被**静默丢掉**，用户看不出「GLM-5.3 与 GLM-5.3-Flash 各剩多少」。
+   *
+   * ## 空桶的兜底
+   *
+   * 上游可能一个桶都不给（实测企业版之外仍有账号只有 0 桶）。此时**不能**返回
+   * 空 `packages`（前端会显示成「没有额度」而不是「查不到」），故给一个具名占位包，
+   * 让 UI 至少能显示「0 / 0」并带上 `result.planName`。
+   */
+  function buildZcodeBalance(result: ZcodeBalanceResult): CreditBalance {
+    const packages: CreditBalance['packages'] = result.buckets.map((bucket) => {
+      const remaining = bucket.availableUnits ?? bucket.remainingUnits ?? 0
+      const total = bucket.totalUnits ?? 0
+      return {
+        name: bucket.showName ?? result.planName ?? 'ZCode 免费额度',
+        // ⚠ 单位是 **token**（不是 credit）—— 如实标注，
+        // 避免用户以为 ZCode 有 1 亿积分。
+        unit: 'token',
+        remaining,
+        total,
+        used: Math.max(0, total - remaining),
+        active: true,
+        // ZCode 的额度按日刷新（`period: 'one_time'` 的活动包到点失效），
+        // 故周期起止都留空，只用 `expiredTime` 给到期时刻。
+        cycleStartTime: '',
+        cycleEndTime: '',
+        expiredTime: bucket.expiresAt !== undefined
+          ? new Date(bucket.expiresAt * 1000).toISOString()
+          : (result.expiresAt !== undefined ? new Date(result.expiresAt * 1000).toISOString() : ''),
+      }
+    })
+    if (packages.length === 0) {
+      packages.push({
+        name: result.planName ?? 'ZCode 免费额度',
+        unit: 'token',
+        remaining: result.remaining,
+        total: result.total,
+        used: Math.max(0, result.total - result.remaining),
+        active: true,
+        cycleStartTime: '',
+        cycleEndTime: '',
+        expiredTime: result.expiresAt !== undefined
+          ? new Date(result.expiresAt * 1000).toISOString()
+          : '',
+      })
+    }
+    return {
+      // 仍是**全桶汇总**，与 `packages` 逐项之和一致（`fetchZcodeBalance` 的
+      // `:251-260` 就是这么累加的）。
+      total: result.remaining,
+      // ZCode 不在同一响应里区分「已失效包」，故为 0。
+      expiredTotal: 0,
+      packages,
+    }
+  }
+
   /** 分发端点方法到对应的处理器 */
   async function handleMethod(method: string, payload: unknown, _signal: AbortSignal): Promise<unknown> {
     switch (method) {
       case 'account.list': {
         const req = payload as RpcListAccountsRequest
         const accounts = await pool.listAccounts(req.provider)
-        return { ok: true, value: { accounts } }
+        return { ok: true, value: { accounts: await enrichAccountIdentity(accounts, req.provider) } }
       }
 
       case 'account.create': {
@@ -1390,6 +1523,41 @@ function registerJetHubEndpoints(
            * 若用户**已经**装并登录了官方客户端，则不必点这个按钮 ——
            * `refreshAll` / 首次加载时会自动把官方凭据固化进来。
            */
+          /**
+           * ★★ **先复用本机已有账号，不要「点一次多一条」**（用户报障 ⑯）。
+           *
+           * ## 报障原文
+           *
+           * 「然后账号应该读取有效的本地账号凭证，而不是点了添加就多一个，
+           * 还没有删除账号的按钮」
+           *
+           * ## 两道复用（都**不新起** OAuth，故点下去不会多出条目）
+           *
+           * ① **孤儿条目修复**：池里有「条目在、凭据从未写入」的账号
+           *    （上一次登录被进程重启打断的产物）⇒ 把本机官方凭据补进去
+           *    并回填昵称，直接返回该条目。这同时治好了 ⑦「凭据未配置」。
+           * ② **同一账号已在池里**：本机官方凭据的 `user_id` 已属于某个条目
+           *    ⇒ 什么都不用做，如实告知「已存在」并返回它的 id —— 不建新条目、
+           *    不弹浏览器（否则用户会以为是新账号，实际会多出一条重复记录）。
+           *
+           * ⚠ 「本机有没有官方凭据」是**必要条件**：没装客户端、或没登录过时
+           * 两者都跳过，照旧走下面的 OAuth 流程（那是「装完即用」的保证）。
+           */
+          const orphanId = await zcode.adoptIntoOrphanAccount(pool).catch(() => undefined)
+          if (orphanId !== undefined) {
+            // `loginUrl` 用**空串**而不是 undefined：与 `loginMode: 'sms'` 的既有约定
+            // 一致（「没有可打开的 URL」），前端据 `reused` 分支处理。
+            return { ok: true, value: { accountId: orphanId, loginUrl: '', reused: true } }
+          }
+          const local = await zcode.localCredential()
+          if (local !== undefined && typeof local.user_id === 'string' && local.user_id.length > 0) {
+            const holder = await pool.findAccountIdByIdentityField(
+              ZCODE.id, 'user_id', local.user_id,
+            )
+            if (holder.length > 0) {
+              return { ok: true, value: { accountId: holder, loginUrl: '', reused: true } }
+            }
+          }
           const started = await zcode.startLogin({ refName })
           // 先登记占位条目（无凭据），使前端 `login.poll` 能立即看到该账号；
           // 登录成功后再回填昵称。失败则删除占位条目。
@@ -1609,10 +1777,24 @@ function registerJetHubEndpoints(
         const accounts = await pool.listAllAccounts()
         const entry = accounts.find((a) => a.id === req.accountId)
         if (!entry) return { ok: true, value: { done: false } }
-        // 检查凭据是否已实际写入（占位条目没有凭据）
+        // 检查凭据是否已实际写入（占位条目没有凭据）。
+        //
+        // ⚠ **不能只判「resolve 出了非空字符串」**（审查发现）：占位条目被
+        //   `credentials.set` 写入过一段**残缺 JSON** 时（例如只有 `zcode_jwt`、
+        //   没有 `device_mid`），`resolve` 照样返回字符串，UI 就会弹「账号已添加」
+        //   而实际上该账号一发请求就 `凭据无效`。这里对 zcode 追加**形状校验**。
         const ref = credentialRef(entry.credentialRef)
         const resolved = await ctx.credentials.resolve(ref)
         if (!resolved) return { ok: true, value: { done: false } }
+        if (entry.provider === ZCODE.id) {
+          let parsed: unknown
+          try {
+            parsed = JSON.parse(resolved.value)
+          } catch {
+            return { ok: true, value: { done: false } }
+          }
+          if (!isUsableZcodeCredential(parsed)) return { ok: true, value: { done: false } }
+        }
         return { ok: true, value: { done: true, success: true } }
       }
 
@@ -2544,32 +2726,23 @@ function registerJetHubEndpoints(
               /**
                * ⚠ `CreditBalance` 的形状是 `{total, packages[], expiredTotal?}`
                * 这类**积分包**结构，而 ZCode 是「按日的 token 额度池」。
-               * 两者结构不同，故这里用**一个包**如实映射：
-               * `total` 填剩余额度、包名用上游的 `show_name`（模型名）。
-               * 这样 UI 能显示数值与来源，且不伪装成多包积分账户。
+               * 两者结构不同，故**逐桶**如实映射 —— 上游一个 resource bucket
+               * 就是一个包，包名用 `show_name`（实测是模型名，如
+               * `GLM-5.3-Flash`）。
+               *
+               * ## ⚠⚠ 这里曾经只映射 `buckets[0]`（真实缺陷）
+               *
+               * 旧实现只取 `result.planName`（= `buckets[0]?.showName`）拼**一个**
+               * 包 —— 多桶账号的其余额度被**静默丢掉**，UI 上看起来只有
+               * 一个模型的额度。而 `result.remaining` / `total` 却是**全桶汇总**，
+               * 于是那一个包的数字比它自己的 `totalUnits` 还大，自相矛盾。
+               *
+               * 实测（本机账号）上游只回一个桶（`GLM-5.3-Flash`），
+               * 但**不能按「只有一个桶」来写** —— 那正是把缺陷固化成契约；
+               * 且用户要看的恰恰是「GLM-5.3 与 GLM-5.3-Flash 各自剩多少」，
+               * 前端需要按模型逐行渲染、缺桶的模型显示占位。
                */
-              balance: {
-                total: result.remaining,
-                // ZCode 不在同一响应里区分「已失效包」，故为 0。
-                expiredTotal: 0,
-                packages: [{
-                  name: result.planName ?? 'ZCode 免费额度',
-                  // ⚠ 单位是 **token**（不是 credit）—— 如实标注，
-                  // 避免用户以为 ZCode 有 1 亿积分。
-                  unit: 'token',
-                  remaining: result.remaining,
-                  total: result.total,
-                  used: Math.max(0, result.total - result.remaining),
-                  active: true,
-                  // ZCode 的额度按日刷新（`period: 'one_time'` 的活动包到点失效），
-                  // 故周期起止都留空，只用 `expiredTime` 给到期时刻。
-                  cycleStartTime: '',
-                  cycleEndTime: '',
-                  expiredTime: result.expiresAt !== undefined
-                    ? new Date(result.expiresAt * 1000).toISOString()
-                    : '',
-                }],
-              },
+              balance: buildZcodeBalance(result),
             })
           }
           return { ok: true, value: { accounts: values } satisfies RpcCreditsBalancesResponse }

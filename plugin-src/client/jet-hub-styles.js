@@ -299,6 +299,7 @@ const STYLES = `
 /* 弹窗底部动作区：右对齐（生成/确认按钮） */
 .dim-jh-modalActions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 14px; }
 
+
 /* ── Cline「订阅额度」弹窗（官方额度窗口 + 请求记录）── */
 /* 账号翻页器:⚠️ **一次只看一个账号**(参考实现同款,多账号全铺开会让
    额度卡与记录表都极长);额度窗口与请求记录**共享同一个索引**。
@@ -372,6 +373,109 @@ const STYLES = `
    很长,继承 td 的 nowrap + hidden 会把表格撑出横向滚动(参考实现的原坑)。 */
 .dim-jh-quotaTable tr[data-error="true"] td { color: var(--dsw-alias-state-error-primary, #d93025); }
 .dim-jh-quotaTable td.dim-jh-quotaError { font-size: 11.5px; line-height: 1.5; white-space: normal; overflow: visible; text-overflow: clip; word-break: break-word; }
+
+/*
+ * ── 官方「模型卡片 → 编辑」内的 ZCode 账号区（前缀 dim-jh-zc） ──
+ *
+ * ⚠ 本区**刻意不复用** .dim-jh-accountCard / .dim-jh-btn / .dim-jh-accountTop 等类：
+ * 那些类同时被 Jet Hub 设置页使用（见 jet-hub.js 的 ProviderPanel），改它们会连带
+ * 改掉设置页的观感。用户报障的是「编辑卡片里这块风格突兀」，故这里整套重画。
+ *
+ * 重画依据是官方 dsh-client-ui-settings-models 的编辑卡片（实测计算样式）：
+ *   分组    = 上细线 .5px var(--dsw-alias-border-l2) + padding-top 10px
+ *             （官方 .zGbnIq_customized / .zGbnIq_modelCatalog 都是这个组合）
+ *   折叠行  = 12px/500、secondary 色、padding 2px 4px、margin-left -4px、radius 6px、
+ *             chevron 用 5x5 + 1.5px 右/下边框再旋转 45 度（官方 .zGbnIq_customizedSummary）
+ *   按钮    = 高 28px、padding 0 10px、radius 14px、12px/400、边框 .5px border-l3
+ *             （官方 .zGbnIq_secondaryButton / .zGbnIq_linkButton）
+ *   主按钮  = 底色 button-primary-fill + 前景 label-primary-foreground（官方保存键同款）
+ *
+ * 颜色一律走 --dsw-alias-* 令牌，**不再出现自定义蓝 #1677ff** —— 用户要求
+ * 「颜色和官方默认颜色一样」，而官方这套里根本没有那个蓝。
+ *
+ * ⚠ 本文件整体是 JS 模板字符串，注释里**不能出现反引号**（会提前终止字符串）。
+ */
+.dim-jh-zcSection { border-top: .5px solid var(--dsw-alias-border-l2); padding-top: 10px; }
+/*
+ * 隐藏本 route 自己维护、用户改不得的官方字段（见 zcode-card.js 文件头 ⑦）。
+ *
+ * 为什么需要：官方 ProviderEditor 对 pi-ai 卡片**无条件**渲染「API 密钥」与「API 地址」，
+ * 没有 props 能关掉。而 zcode-free 的 baseURL 指向插件每次启动自起的本地桥（端口每次都变）、
+ * 密钥是占位串，二者都由 src/pi-ai-mirror.ts 重写 —— 用户在这里改只会把桥打断。
+ *
+ * ⚠ display:none 而不是 visibility:hidden：后者仍占位，会留下两块空白。
+ * ⚠ 用属性选择器（标记由 zcode-card.js 打），不做文本匹配 —— CSS 没法按文本选元素。
+ * ⚠ 本文件整体是 JS 模板字符串，注释里**不能出现反引号**（会提前终止字符串）。
+ */
+[data-jet-hub-hidden] { display: none !important; }
+.dim-jh-zcSummary { display: flex; align-items: center; gap: 6px; box-sizing: border-box; width: 100%; margin-left: -4px; padding: 2px 4px; border-radius: 6px; font-size: 12px; line-height: 18px; font-weight: 500; color: var(--dsw-alias-label-secondary); cursor: pointer; list-style: none; }
+.dim-jh-zcSummary::-webkit-details-marker { display: none; }
+/* 折叠箭头：右/下边框各 1.5px 的 5x5 方块旋转 -45 度即 ▸；展开态（details[open]）转 45 度即 ▾ */
+.dim-jh-zcSummary::before { content: ""; flex: none; width: 5px; height: 5px; border-bottom: 1.5px solid; border-right: 1.5px solid; transition: transform .12s; transform: rotate(-45deg) translate(-1px, -1px); }
+.dim-jh-zcSection[open] > .dim-jh-zcSummary::before { transform: rotate(45deg) translate(-1px, -1px); }
+.dim-jh-zcSummary:hover { color: var(--dsw-alias-label-primary); }
+.dim-jh-zcSummary:focus-visible { outline: none; box-shadow: 0 0 0 2px var(--dsw-alias-border-l3); }
+/* 折叠行右侧的次要说明：官方 .zGbnIq_modelCatalogMeta 就是这个规格（12px/400 tertiary） */
+.dim-jh-zcCount { flex: none; white-space: nowrap; font-size: 12px; line-height: 18px; font-weight: 400; color: var(--dsw-alias-label-tertiary); }
+.dim-jh-zcBody { display: flex; flex-direction: column; gap: 12px; padding-top: 12px; }
+
+/* 单账号：官方 .zGbnIq_modelEntry 的规格（border .5px border-l4 + radius 10px + padding 6px） */
+.dim-jh-zcAccount { display: flex; flex-direction: column; gap: 3px; padding: 6px 10px; border: .5px solid var(--dsw-alias-border-l4); border-radius: 10px; }
+.dim-jh-zcAccountTop { display: flex; align-items: center; gap: 8px; }
+/* 状态点：官方 rowHead 的绿点同款色（state-success-primary），停用取 state-idle-primary 灰 */
+.dim-jh-zcDot { flex: none; width: 6px; height: 6px; border-radius: 50%; background: var(--dsw-alias-state-idle-primary); }
+.dim-jh-zcDot[data-on="true"] { background: var(--dsw-alias-state-success-primary); }
+.dim-jh-zcName { flex: 1 1 auto; min-width: 0; overflow: hidden; font-size: 12px; line-height: 18px; font-weight: 500; color: var(--dsw-alias-label-primary); text-overflow: ellipsis; white-space: nowrap; }
+/* 状态标签：走官方「自定义」那种**中性灰**胶囊，不用绿色 —— 绿色是突兀感的主要来源 */
+.dim-jh-zcTag { flex: none; padding: 1px 8px; border-radius: 999px; font-size: 11px; line-height: 17px; font-weight: 400; color: var(--dsw-alias-label-secondary); background: var(--dsw-alias-interactive-bg-hover-solid); }
+
+.dim-jh-zcMeta { display: grid; gap: 2px; margin: 0; }
+.dim-jh-zcMetaRow { display: grid; grid-template-columns: 48px minmax(0, 1fr); align-items: baseline; gap: 8px; }
+.dim-jh-zcMetaRow dt { font-size: 12px; line-height: 18px; color: var(--dsw-alias-label-tertiary); }
+.dim-jh-zcMetaRow dd { min-width: 0; margin: 0; overflow: hidden; font-size: 12px; line-height: 18px; color: var(--dsw-alias-label-secondary); text-overflow: ellipsis; white-space: nowrap; }
+.dim-jh-zcMetaRow dd[data-tone="warn"] { color: var(--dsw-alias-state-warn-label); }
+.dim-jh-zcMetaRow dd[data-tone="muted"] { color: var(--dsw-alias-label-tertiary); }
+/* 额度数值：覆盖 metaRow 的单行截断（要的是数值 + 次要说明并排） */
+.dim-jh-zcMetaRow dd.dim-jh-zcCreditValue { display: flex; flex-direction: row; align-items: baseline; gap: 6px; overflow: visible; }
+.dim-jh-zcCreditTotal { font-size: 12px; line-height: 18px; font-weight: 500; color: var(--dsw-alias-label-primary); font-variant-numeric: tabular-nums; }
+/* 折叠行右侧整组（账号数 + 号池总额度）：margin-left auto 把它推到最右。
+ * ⚠ 需要 .dim-jh-zcSummary 从 fit-content 改为 100% 宽才有「右边」可言（见下）。 */
+.dim-jh-zcSummaryRight { display: flex; align-items: baseline; gap: 8px; margin-left: auto; }
+/* 号池两模型的总额度（折叠态可见，故用 secondary 而不是 tertiary —— tertiary 太淡） */
+.dim-jh-zcPoolTotals { font-size: 12px; line-height: 18px; font-weight: 400; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; color: var(--dsw-alias-label-secondary); font-variant-numeric: tabular-nums; }
+/* 手机号：等宽数字，弱于账号名 */
+.dim-jh-zcPhone { flex: none; font-size: 11px; line-height: 17px; color: var(--dsw-alias-label-tertiary); font-variant-numeric: tabular-nums; }
+/* 逐模型额度：dd 里放多行，故要覆盖 metaRow 的单行 nowrap（与 .dim-jh-zcCreditValue 同理） */
+.dim-jh-zcMetaRow dd.dim-jh-zcCreditList { display: flex; flex-direction: column; gap: 1px; overflow: visible; white-space: normal; }
+.dim-jh-zcCreditModel { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; }
+.dim-jh-zcCreditModelName { min-width: 0; overflow: hidden; font-size: 12px; line-height: 18px; color: var(--dsw-alias-label-tertiary); text-overflow: ellipsis; white-space: nowrap; }
+.dim-jh-zcCreditModelValue { flex: none; font-size: 12px; line-height: 18px; font-weight: 500; color: var(--dsw-alias-label-primary); font-variant-numeric: tabular-nums; }
+/* 未下发该模型额度时的占位（比 0 弱：0 是「已用光」，未下发是「查不到」） */
+.dim-jh-zcCreditModelValue[data-tone="muted"] { font-weight: 400; color: var(--dsw-alias-label-tertiary); }
+.dim-jh-zcCreditModelValue[data-tone="warn"] { font-weight: 400; color: var(--dsw-alias-state-warn-label); }
+/* 小号次按钮（账号行里的「删除」）—— 与 .dim-jh-zcBtn 同族，只是更矮更窄 */
+.dim-jh-zcBtn[data-size="sm"] { height: 22px; padding: 0 8px; border-radius: 11px; font-size: 11px; line-height: 16px; }
+/* 账号行内的操作条（目前只有「删除」）：右对齐，与额度行留一点间距 */
+.dim-jh-zcAccountActions { display: flex; justify-content: flex-end; gap: 6px; }
+
+.dim-jh-zcActions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 8px; }
+.dim-jh-zcBtn { box-sizing: border-box; display: inline-flex; align-items: center; justify-content: center; gap: 4px; height: 28px; padding: 0 10px; border: .5px solid var(--dsw-alias-border-l3); border-radius: 14px; background: 0 0; color: var(--dsw-alias-label-primary); font-size: 12px; line-height: 18px; font-weight: 400; white-space: nowrap; cursor: pointer; transition: background .15s ease, border-color .15s ease; }
+.dim-jh-zcBtn:hover:not(:disabled) { background: var(--dsw-alias-interactive-bg-hover-solid); }
+.dim-jh-zcBtn[data-kind="primary"] { border-color: var(--dsw-alias-button-primary-fill); background: var(--dsw-alias-button-primary-fill); color: var(--dsw-alias-label-primary-foreground); }
+.dim-jh-zcBtn[data-kind="primary"]:hover:not(:disabled) { border-color: var(--dsw-alias-button-primary-hover); background: var(--dsw-alias-button-primary-hover); }
+.dim-jh-zcBtn:focus-visible { outline: none; box-shadow: 0 0 0 2px var(--dsw-alias-border-l3); }
+.dim-jh-zcBtn:disabled { opacity: .4; cursor: default; }
+
+.dim-jh-zcEmpty { padding: 2px 0; font-size: 12px; line-height: 18px; color: var(--dsw-alias-label-tertiary); }
+.dim-jh-zcEmpty p { margin: 0 0 4px; }
+/* 结果提示：**刻意留在折叠区外**（见 zcode-card.js），故自带下间距 */
+.dim-jh-zcNotice { margin-top: 10px; padding: 8px 10px; border: .5px solid var(--dsw-alias-border-l2); border-radius: 10px; background: var(--dsw-alias-bg-layer-2); font-size: 12px; line-height: 18px; color: var(--dsw-alias-label-secondary); }
+.dim-jh-zcNotice[data-tone="ok"] { background: var(--dsw-alias-state-success-tertiary); }
+.dim-jh-zcNotice[data-tone="warn"] { color: var(--dsw-alias-state-warn-label); background: var(--dsw-alias-state-warn-tertiary); }
+.dim-jh-zcNotice[data-tone="error"] { color: var(--dsw-alias-state-error-primary); background: var(--dsw-alias-interactive-bg-hover-danger); }
+.dim-jh-zcNotice ul { margin: 4px 0 0; padding-left: 18px; }
+.dim-jh-zcLink { color: var(--dsw-alias-link); word-break: break-all; }
+
 `
 
 let injected = false

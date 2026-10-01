@@ -23,6 +23,7 @@ import { describe, expect, it, vi } from 'vitest'
 import { fetchZcodeModels } from '../../src/zcode-upstream.js'
 import { ZcodeAuth } from '../../src/zcode-auth.js'
 import { ZcodeAdapter } from '../../src/zcode-adapter.js'
+import type { ZcodeRemoteModel } from '../../src/zcode-adapter.js'
 import { ZCODE } from '../../src/zcode-product.js'
 
 /** 上游 `client/configs` 的真实响应形状（实测 2026-09-29）。 */
@@ -333,5 +334,60 @@ describe('思考档位下发为 output_config.effort（协议名是上游给的�
   it('★ 模型不认识的档位不下发（避免整个请求被拒）', async () => {
     const body = await captureBody('xhigh') // 上游只给 low/high/max
     expect(body.output_config).toBeUndefined()
+  })
+})
+
+/**
+ * ⚠ **目录缓存不得被兜底表污染**（全仓同型缺陷，2026-08 起长期存在）。
+ *
+ * 原实现 `this.remoteModels = fallback; return fallback` 把兜底表当成「已加载」
+ * 记下 ⇒ 一次瞬时失败就让它**整个进程生命周期**都只剩兜底模型：用户看不到自己的
+ * 模型（ZCode 的远端目录才带正确窗口/输出上限与档位），且无从触发重试
+ * （`if (this.remoteModels !== undefined) return` 永远短路），只能重启 DSH。
+ * 同批修好的还有 loomy / minimax / raccoon。
+ *
+ * 另见 `tests/unit/remote-catalog-gate.spec.ts`（并发去重 + 失败冷却）。
+ */
+describe('ZcodeAdapter 目录缓存语义（★ 兜底表不进缓存）', () => {
+  function makeEager(fetchRemoteModels: () => Promise<ZcodeRemoteModel[]>): ZcodeAdapter {
+    return new ZcodeAdapter({
+      credentialRef: 'R' as never,
+      resolveCredential: async () => CRED,
+      refresh: async () => {},
+      mintCaptcha: async () => 'p',
+      fetchImpl: (async () => new Response('', { status: 200 })) as never,
+      fetchRemoteModels,
+    })
+  }
+
+  it('★ 远端抛错时不把兜底表写进 remoteModels', async () => {
+    const adapter = makeEager(async () => { throw new Error('network down') })
+    expect((await adapter.listModels('zcode')).length).toBeGreaterThan(0)
+    expect((adapter as unknown as { remoteModels: unknown }).remoteModels).toBeUndefined()
+  })
+
+  it('★ 远端返回空目录时不落缓存，且只拉一次（不被每个模型的 resolveModel 放大）', async () => {
+    let calls = 0
+    const adapter = makeEager(async () => { calls += 1; return [] })
+    expect((await adapter.listModels('zcode')).length).toBeGreaterThan(0)
+    expect((await adapter.listModels('zcode')).length).toBeGreaterThan(0)
+    await adapter.resolveModel('zcode', 'GLM-5.3-Flash')
+    expect(calls).toBe(1)
+    expect((adapter as unknown as { remoteModels: unknown }).remoteModels).toBeUndefined()
+  })
+
+  it('远端成功时缓存生效（不破坏既有「成功即缓存」约定）', async () => {
+    let calls = 0
+    const adapter = makeEager(async () => {
+      calls += 1
+      return [{
+        id: 'GLM-5.3-Flash', name: 'GLM-5.3-Flash', contextWindow: 1_000_000,
+        maxTokens: 128_000, supportsImage: true,
+        reasoningLevels: ['low', 'high', 'max'], defaultReasoningLevel: 'max',
+      }]
+    })
+    await adapter.listModels('zcode')
+    await adapter.listModels('zcode')
+    expect(calls).toBe(1)
   })
 })

@@ -77,6 +77,13 @@ export class AccountPool {
   private permanentLockCache: PermanentLockMap = {}
   /** 是否已完成首次载入。 */
   private loaded = false
+  /**
+   * 状态文档落盘的**串行链**（见 {@link queueStoreSave}）。
+   *
+   * ⚠ 它必须存在：内层重新读一次快照只能保证「读→改」这半原子，而
+   * `store.save()` 本身是异步的，两个写者的 `save` 可以乱序完成。
+   */
+  private storeChain: Promise<void> = Promise.resolve()
   /** 锁定表的独立后端（权威落盘点）。 */
   private readonly lockStore: PermanentLockStore
 
@@ -134,6 +141,56 @@ export class AccountPool {
   }
 
   /**
+   * 串行化状态文档的落盘，并在**轮到本次时**重新取一次快照。
+   *
+   * ## 为什么 `removeAccount` 里的重读不够（真实缺陷，审查发现）
+   *
+   * `await this.writeAccounts(this.readAccounts().filter(...))` 只保证了
+   * 「读 → 改」之间没有 `await`（内存那半确实原子），但
+   * {@link writeAccounts} 内部的 `await this.store.save(...)` 是**异步**的
+   * （`SettingsStore.save` → `await this.scope.replace(...)`）。两个写者各自的
+   * `save` 可以**乱序完成**：后完成者带着它更早的快照覆盖磁盘 ⇒ 磁盘与
+   * `this.cache` 分叉。实测形态（探针复现真实 IO 交错）：
+   *
+   * - 并发 `removeAccount('a')` / `removeAccount('b')`（先发起的后完成）：
+   *   `cache=["keep"]` 而 `disk=["b","keep"]` ⇒ **已删除的账号在磁盘上复活**，
+   *   下次进程启动它又回来；
+   * - `removeAccount('victim')` 与 `addAccount(added)` 交错：
+   *   `cache=["added","keep"]` 而 `disk=["keep"]` ⇒ **新增账号被静默丢失**。
+   *
+   * ⚠ 仅 `SettingsStore` 这类**异步** `replace` 后端中招；`FileStore.save` 是
+   * 同步的 `writeFileSync` + `renameSync`（见 `src/jet-hub-store.ts`），整段
+   * RMW 本来就原子、免疫此竞态。故不能靠「换个后端」绕过，只能在
+   * `AccountPool` 这一层把写排队。
+   *
+   * ## 做法
+   *
+   * 把本次写挂到 {@link storeChain} 尾部，**在轮到它执行时**才从进程内权威副本
+   * 取快照，于是「取快照」与「写磁盘」之间隔着前面所有已排队的写。磁盘上因此
+   * 永远是「最后一次排队的写」的内容，与 `this.cache` / `this.modelCache` 收敛。
+   *
+   * ⚠ 三条数据**必须取自同一时刻**：账号、黑名单、锁定镜像字段共用一次快照，
+   * 否则会出现「同一份文档里两个字段自相矛盾」（与 {@link lockFields} 的约定一致）。
+   *
+   * ⚠ 失败**照常向调用方抛出**（与改造前的 `writeAccounts` 一致：登录成功后落盘
+   * 失败必须让 `account.create` 报错，不能静默假装成功）。同时用一条
+   * `.catch()` 派生量更新 {@link storeChain}，让**链本身不被一次失败打断**
+   * ——否则后续所有写都会跟着拒绝，账号池进入永不落盘状态。
+   */
+  private queueStoreSave(): Promise<void> {
+    if (this.store.kind === 'memory') return Promise.resolve()
+    const next = this.storeChain.then(async () => {
+      await this.store.save({
+        accounts: this.cache,
+        disabledModels: this.modelCache,
+        ...this.lockFields(),
+      })
+    })
+    this.storeChain = next.catch(() => {})
+    return next
+  }
+
+  /**
    * 持久化账号列表（同时更新进程内权威副本）。
    *
    * **必须连同黑名单一起写回**：两种后端都是整体写入，
@@ -146,11 +203,7 @@ export class AccountPool {
       this.ctx.logger?.warn?.('[jet-hub] 无持久化后端，账号变更未落盘')
       return
     }
-    await this.store.save({
-      accounts,
-      disabledModels: this.modelCache,
-      ...this.lockFields(),
-    })
+    await this.queueStoreSave()
   }
 
   /**
@@ -342,12 +395,9 @@ export class AccountPool {
       this.ctx.logger?.warn?.('[jet-hub] 无持久化后端，模型黑名单变更未落盘')
       return
     }
-    // 与 writeAccounts 对称：整体写入必须携带账号列表，否则会被清空。
-    await this.store.save({
-      accounts: this.cache,
-      disabledModels,
-      ...this.lockFields(),
-    })
+    // 与 writeAccounts 对称：整体写入必须携带账号列表，否则会被清空 ——
+    // 快照由 queueStoreSave 在轮到本次时统一取（三份数据同源）。
+    await this.queueStoreSave()
   }
 
   /**
@@ -415,15 +465,14 @@ export class AccountPool {
       await this.lockStore.save({ ...this.permanentLockCache })
     }
     if (this.store.kind === 'memory') return
-    try {
-      await this.store.save({
-        accounts: this.cache,
-        disabledModels: this.modelCache,
-        ...this.lockFields(),
-      })
-    } catch (error) {
-      this.ctx.logger?.warn?.(`[jet-hub] 锁定镜像字段写入失败（独立文档已保存，不影响本侧选号）: ${String(error)}`)
-    }
+    // 走同一条写队列，避免与账号/黑名单的写乱序覆盖（见 {@link queueStoreSave}）。
+    // ⚠ 这里**必须吞掉**异常（与改造前一致）：镜像写失败只让另一条工作区的面板
+    // 显示旧值，不该让面板上的「锁定」按钮报错 —— 权威文档已经落好了。
+    await this.queueStoreSave().catch(error => {
+      this.ctx.logger?.warn?.(
+        `[jet-hub] 锁定镜像字段写入失败（独立文档已保存，不影响本侧选号）: ${String(error)}`,
+      )
+    })
   }
 
   /** 锁定表的当前快照（备份导出用；权威来自独立文档）。 */
@@ -518,13 +567,17 @@ export class AccountPool {
 
   /** 删除账号（同时清理凭据） */
   async removeAccount(id: string): Promise<void> {
-    const accounts = this.readAccounts()
-    const entry = accounts.find(a => a.id === id)
+    const entry = this.readAccounts().find(a => a.id === id)
     if (!entry) return
     try {
       await this.ctx.credentials.unset(credentialRef(entry.credentialRef))
     } catch { /* 凭据可能已被删除 */ }
-    await this.writeAccounts(accounts.filter(a => a.id !== id))
+    // ⚠ **必须重新读一次**（真实缺陷，审查发现）：`credentials.unset` 会挂起若干
+    // 微任务/IO，期间并发的 `addAccount` 已经把新条目写进 `this.cache` 与磁盘。
+    // 若此时拿 `await` **之前**的快照做 filter 再整体写回，那个新账号会被静默丢失
+    // —— 而 `account.create`（登录成功即 addAccount）与 `account.delete` 天然可并发。
+    // 重新读之后到 `writeAccounts` 之间没有 `await`，因而这一段是原子的。
+    await this.writeAccounts(this.readAccounts().filter(a => a.id !== id))
   }
 
   /**

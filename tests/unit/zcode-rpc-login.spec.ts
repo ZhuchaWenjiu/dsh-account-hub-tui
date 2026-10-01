@@ -393,6 +393,83 @@ describe('ZCode Jet Hub 登录接入', () => {
     expect(bogus.error?.message).toMatch(/unknown provider/)
   })
 
+  /**
+   * ⚠ **`login.poll` 必须做形状校验**（审查发现）。
+   *
+   * 原判据只是「`ctx.credentials.resolve(ref)` 返回了非空字符串」。占位条目被
+   * 写入一段**残缺 JSON**（例如只有 `zcode_jwt`、没有 `device_mid`）时它照样
+   * 命中 ⇒ 前端弹「账号已添加」，而该账号一发请求就报凭据无效。
+   */
+  it('★ login.poll 对残缺凭据（缺 device_mid）不得报 done', async () => {
+    const { ctx, credentials, handler } = makeCtx()
+    const pool = new AccountPool(ctx)
+    const zcode = new ZcodeAuth(ctx, { fetchImpl: (async () => new Response('{}')) as never })
+    registerJetHubRpc(
+      ctx, pool,
+      {} as never, {} as never, {} as never, {} as never, {} as never,
+      {} as never, {} as never, {} as never, {} as never, {} as never,
+      {} as never, zcode as never, undefined,
+    )
+    const h = handler()!
+    const call = async (method: string, payload: unknown) => {
+      const res = await h(new Request('http://localhost/api/jet-hub', {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ type: 'client-request', rpcId: 'r1', method: 'jet-hub', payload: { method, payload } }),
+      }))
+      return (await res.json() as { result: { ok: boolean; value?: { done?: boolean } } }).result
+    }
+
+    // 清掉可能的孤儿收编路径：直接手工造一个条目 + 残缺凭据。
+    await pool.addAccount({
+      id: 'zcode-broken',
+      provider: ZCODE.id,
+      nickname: 'broken',
+      enabled: true,
+      credentialRef: 'ZCODE_ACCOUNT_BROKEN',
+      createdAt: Date.now(),
+      refreshable: false,
+    })
+    await credentials.set('ZCODE_ACCOUNT_BROKEN', JSON.stringify({ zcode_jwt: 'jwt-only' }))
+
+    const polled = await call('login.poll', { accountId: 'zcode-broken', provider: ZCODE.id })
+    expect(polled.ok).toBe(true)
+    expect(polled.value?.done).not.toBe(true)
+  })
+
+  it('★ login.poll 对完全合法的凭据仍报 done（不误伤）', async () => {
+    const { ctx, credentials, handler } = makeCtx()
+    const pool = new AccountPool(ctx)
+    const zcode = new ZcodeAuth(ctx, { fetchImpl: (async () => new Response('{}')) as never })
+    registerJetHubRpc(
+      ctx, pool,
+      {} as never, {} as never, {} as never, {} as never, {} as never,
+      {} as never, {} as never, {} as never, {} as never, {} as never,
+      {} as never, zcode as never, undefined,
+    )
+    const h = handler()!
+    const call = async (method: string, payload: unknown) => {
+      const res = await h(new Request('http://localhost/api/jet-hub', {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ type: 'client-request', rpcId: 'r1', method: 'jet-hub', payload: { method, payload } }),
+      }))
+      return (await res.json() as { result: { ok: boolean; value?: { done?: boolean } } }).result
+    }
+    await pool.addAccount({
+      id: 'zcode-ok',
+      provider: ZCODE.id,
+      nickname: 'ok',
+      enabled: true,
+      credentialRef: 'ZCODE_ACCOUNT_OK',
+      createdAt: Date.now(),
+      refreshable: false,
+    })
+    await credentials.set('ZCODE_ACCOUNT_OK', JSON.stringify({
+      zcode_jwt: 'a.b.c', device_mid: 'mid-ok', user_id: 'u-ok',
+    }))
+    const polled = await call('login.poll', { accountId: 'zcode-ok', provider: ZCODE.id })
+    expect(polled.value?.done).toBe(true)
+  })
+
   it('位置参数顺序：zcode 必须排在 raccoon 之后（缺一个就错位）', () => {
     // 源码级断言：防止将来加 provider 时把 zcode 的顺序改乱。
     const source = readFileSync(

@@ -32,11 +32,15 @@ import type { CredentialRef } from '@deepseek-ai/dsh-credentials'
 import { LlmAdapter, LlmError, ReasoningEffortId } from '@deepseek-ai/dsh-llm'
 import type { GenerateOptions, LlmModelInfo, LlmProviderInfo, LlmResolvedModelInfo, StreamChunk } from '@deepseek-ai/dsh-llm'
 import { AccountPool, providerCatalogVisible } from './account-pool.js'
+import { RemoteCatalogGate } from './remote-catalog-gate.js'
+import { settingsNamespaceFor } from './settings-compat.js'
 import { isClineExpired, clineHeaders, type ClineCredential } from './cline.js'
 import {
   clineDisplayName,
+  hasClineRemoteModels,
   loadClineModels,
   type ClineModel,
+  type ClineRemoteModels,
 } from './cline-models.js'
 import {
   CLINE,
@@ -197,7 +201,18 @@ export interface ClineAdapterOptions {
    *
    * 默认走 `loadClineModels`（两次远端请求）。注入后单测可完全离线。
    */
-  loadModels?: (options: { credential?: ClineCredential }) => Promise<{ models: ClineModel[]; warnings: string[] }>
+  loadModels?: (options: { credential?: ClineCredential }) => Promise<{
+    models: ClineModel[]
+    warnings: string[]
+    /**
+     * 远端原始结果（判「这次到底拿到目录没有」用）。
+     *
+     * ⚠ 注入式加载器（单测）可以不传：此时退回用 `models.length > 0` 判断，
+     * 而默认的 `loadClineModels` **一定**会传（因为 `models` 里永远并着兜底表，
+     * 用长度判断是死代码 —— 见 `hasClineRemoteModels` 的注释）。
+     */
+    remote?: ClineRemoteModels
+  }>
   /**
    * models.dev 目录加载器覆盖（测试用）。
    *
@@ -232,6 +247,15 @@ export class ClineAdapter extends LlmAdapter {
   private modelsDevLoading: Promise<void> | undefined
   /** models.dev 加载器。 */
   private readonly loadModelsDev: () => Promise<Map<string, ClineModelsDevEntry>>
+
+  /**
+   * 目录加载闸门：并发去重 + 失败/空结果冷却。
+   *
+   * 此前这里只有 in-flight 去重（`private loading`），失败后立刻允许重试 ⇒
+   * `buildModelCatalog` 的「每模型一次 resolveModel」会把一次失败放大成 N 次。
+   * 详见 `src/remote-catalog-gate.ts` 的实测依据。
+   */
+  private readonly catalogGate = new RemoteCatalogGate()
 
   constructor(private readonly options: ClineAdapterOptions) {
     super()
@@ -286,11 +310,7 @@ export class ClineAdapter extends LlmAdapter {
    */
   private async ensureRemoteModels(): Promise<void> {
     if (this.remoteModels !== undefined) return
-    if (this.loading !== undefined) {
-      await this.loading
-      return
-    }
-    this.loading = (async () => {
+    await this.catalogGate.run(async () => {
       try {
         // 目录加载路径**没有**目标模型（它要一次列出全部模型），故不传 modelId：
         // 空串在 `getAvailableAccount` 里是「不按模型过滤」的合法语义，正是这里要的。
@@ -300,15 +320,22 @@ export class ClineAdapter extends LlmAdapter {
             ...opts.credential === undefined ? {} : { credential: opts.credential },
             fetcher: this.fetchImpl,
           }))
-        const { models, warnings } = await load({
+        const { models, warnings, remote } = await load({
           ...credential === undefined ? {} : { credential },
         })
+        // ⚠ **不能**用 `models.length === 0` 判断「没拿到目录」：`mergeClineModels`
+        // 会无条件把兜底表并进 `models`（展示需要），实测两个端点全挂时它仍是 5 条
+        // ⇒ 旧判据是死代码，冷却永不触发、兜底被永久当成远端结果缓存。
+        const gotRemote = remote !== undefined
+          ? hasClineRemoteModels(remote)
+          : models.length > 0
+        let merged = models
         if (models.length > 0) {
           // ⚠️ **models.dev 是目录的第三个来源**（补缺的模型 + 可读名 + 上下文
           // 窗口 + 图片能力），必须在这里合并 —— 合并进目录后，
           // `inputModalitiesFor` 只看目录条目就够了（见其注释）。
           // 它失败不影响目录本身（只记日志）。
-          this.remoteModels = applyModelsDevCatalog(models, await this.ensureModelsDev())
+          merged = applyModelsDevCatalog(models, await this.ensureModelsDev())
         }
         // 目录部分失败时留下日志：静默降级会让用户看到「少了模型」却无从排查
         // （两个端点独立容错，故这里只记 warning 不抛错）。
@@ -316,15 +343,17 @@ export class ClineAdapter extends LlmAdapter {
           // eslint-disable-next-line no-console
           console.warn(`[cline] 模型目录来源失败：${warning}`)
         }
+        if (!gotRemote) return false
+        this.remoteModels = merged
+        return true
+        return true
       } catch (error) {
         // 拉取失败保持未定义，后续 listModels/resolveModel 仍回退静态兜底表。
         // eslint-disable-next-line no-console
         console.warn(`[cline] 模型目录拉取失败：${error instanceof Error ? error.message : String(error)}`)
-      } finally {
-        this.loading = undefined
+        return false
       }
-    })()
-    await this.loading
+    })
   }
 
   /**

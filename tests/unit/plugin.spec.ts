@@ -9,6 +9,8 @@ import { CodeArtsAuth } from '../../src/service.js'
 import { BuddyAuth } from '../../src/buddy-auth.js'
 import { LobsteraiAuth } from '../../src/lobsterai-auth.js'
 import { TraeAuth } from '../../src/trae-auth.js'
+import { ZcodeAuth } from '../../src/zcode-auth.js'
+import { MinimaxAuth } from '../../src/minimax-auth.js'
 import { WORKBUDDY } from '../../src/product.js'
 import { LOBSTERAI } from '../../src/lobsterai-product.js'
 import { TRAE } from '../../src/trae-product.js'
@@ -59,6 +61,8 @@ class FakeLlm {
   readonly configurableProviders: Array<{ provider: string; displayName?: string; settingsNs?: string }> = []
   /** `registerAdapter` 注册的路由名，供 provider 路由断言使用。 */
   readonly registeredProviders: string[] = []
+  /** 路由名 → 适配器实例（供目录接线的**真接线**断言使用）。 */
+  readonly adapterByProvider = new Map<string, unknown>()
   registerConfigurableProviders(
     entries: Array<{ provider: string; displayName?: string; settingsNs?: string }>,
   ): { replace: () => void } {
@@ -68,9 +72,10 @@ class FakeLlm {
     }
     return { replace: () => {} }
   }
-  registerAdapter(providers: string[], _adapter: unknown): { replace: () => void } {
+  registerAdapter(providers: string[], adapter: unknown): { replace: () => void } {
     this.adapters.push(...providers)
     this.registeredProviders.push(...providers)
+    for (const provider of providers) this.adapterByProvider.set(provider, adapter)
     return { replace: () => {} }
   }
 }
@@ -563,6 +568,144 @@ describe('模型设置页：不声明可配置 provider', () => {
       'trae', 'cline', 'loomy', 'raccoon', 'minimax', 'zcode',
     ]) {
       expect(llm.registeredProviders, provider).toContain(provider)
+
+      }
+    })
+  })
+
+/**
+ * ★ **目录接线的真接线回归**（审查指出：这两处修复此前**没有任何测试**）。
+ *
+ * 两个修复点的形态完全一样 —— 它们都是「`index.ts` 里把 A 换成了 B」：
+ *
+ * | 修复 | 换成了 | 换错的后果 |
+ * |---|---|---|
+ * | 三处 `fetchRemoteModels` | `…Only()` | 远端失败时回吐兜底表 ⇒ 兜底表被当成远端目录永久缓存（首屏很久才出模型、之后只剩兜底模型） |
+ * | zcode 的 `refresh` | `refreshAll(pool)` | 旧写法 `current()` + `getAvailableAccount()` 会「把 A 的凭据写进 B 的 ref」⇒ 30 分钟一轮串掉整池 |
+ *
+ * ⚠ 此前 `zcode-wiring.spec.ts` 只测 `refreshAll` **方法本身**、
+ * `minimax-auth.spec.ts` 只测 `fetchRemoteModelsOnly` **方法本身**；把
+ * `index.ts` 的接线改回旧写法时全量 3658 个用例**零红**。下面几条直接
+ * 从 `apply()` 建出来的真适配器上取回调，因而能抓住接线本身。
+ */
+describe('★ 目录接线的真接线（fetchRemoteModels 指向哪个方法）', () => {
+  /** 写一份形状合法的 zcode 凭据到默认 ref，让 `ZcodeAuth.current()` 能就绪。 */
+  function seedZcodeCredential(ctx: Context): void {
+    const credentials = (ctx as unknown as {
+      credentials: { set(ref: string, value: string): Promise<void> }
+    }).credentials
+    void credentials.set(
+      'ZCODE_CREDENTIAL',
+      JSON.stringify({ zcode_jwt: 'h.p.s', device_mid: 'mid-1' }),
+    )
+  }
+
+  /**
+   * ★ **直接观测接线接到了哪个方法**（而不是旁敲侧击看返回值的条数）。
+   *
+   * ## 为什么不能用「返回值是不是兜底表」当判据
+   *
+   * ① `zcode-adapter` 在「远端拿不到」时**本来就应该**回落静态兜底表 ——
+   * 那是展示需要，不是缺陷；② 闸门有 30 秒冷却，第一次失败后的第二次调用
+   * 根本不会重拉。两条叠加 ⇒ 从返回值上无法区分「接线错了」与「这是设计行为」。
+   *
+   * ## 判据
+   *
+   * 适配器侧那条回调是 `() => zcode.fetchRemoteModelsOnly()`（每次调用时**才**
+   * 解析方法）⇒ 在原型上包一层就能看见它到底调了哪个方法：
+   * - 修复后 ⇒ 记录到 `fetchRemoteModelsOnly`；
+   * - 退回旧写法（`zcode.fetchModels()`）⇒ 记录到 `fetchModels` ⇒ **本条变红**。
+   *
+   * ⚠ 这正是审查指出的「变异后 3658 个用例零红」的那处缺口。
+   */
+  it('★ zcode 的 fetchRemoteModels 必须接到 fetchRemoteModelsOnly（不得退回 fetchModels）', async () => {
+    /** 远端一律立刻失败：本用例不关心结果，只要过程快。 */
+    const originalFetch = globalThis.fetch
+    globalThis.fetch = (async () => { throw new Error('network down') }) as unknown as typeof fetch
+
+    const calls: string[] = []
+    const proto = ZcodeAuth.prototype as unknown as Record<string, (...args: never[]) => unknown>
+    const originalOnly = proto['fetchRemoteModelsOnly']
+    const originalAll = proto['fetchModels']
+    proto['fetchRemoteModelsOnly'] = function (this: unknown, ...args: never[]) {
+      calls.push('fetchRemoteModelsOnly')
+      return originalOnly.apply(this, args)
+    }
+    proto['fetchModels'] = function (this: unknown, ...args: never[]) {
+      calls.push('fetchModels')
+      return originalAll.apply(this, args)
+    }
+
+    const previousFlag = process.env.DSH_HIDE_MODELS_WITHOUT_ACCOUNT
+    process.env.DSH_HIDE_MODELS_WITHOUT_ACCOUNT = 'false'
+    try {
+      const { ctx, llm } = makeContext()
+      apply(ctx)
+      seedZcodeCredential(ctx)
+
+      const zcode = llm.adapterByProvider.get('zcode') as {
+        listModels(provider: string): Promise<readonly { id: string }[]>
+      }
+      await zcode.listModels('zcode')
+
+      /**
+       * ★ 关键断言：必须命中 `…Only`，且**绝不**命中 `fetchModels`。
+       *
+       * 退回旧写法时 `calls` 会变成 `['fetchModels']` ⇒ 本条红。
+       */
+      expect(calls, '适配器的远端目录回调必须走 fetchRemoteModelsOnly').toContain('fetchRemoteModelsOnly')
+      expect(calls, '不得退回 fetchModels（那会让兜底表被当成远端目录永久缓存）')
+        .not.toContain('fetchModels')
+    } finally {
+      proto['fetchRemoteModelsOnly'] = originalOnly
+      proto['fetchModels'] = originalAll
+      if (previousFlag === undefined) delete process.env.DSH_HIDE_MODELS_WITHOUT_ACCOUNT
+      else process.env.DSH_HIDE_MODELS_WITHOUT_ACCOUNT = previousFlag
+      globalThis.fetch = originalFetch
+    }
+  })
+
+  /**
+   * ★ 同一个判据在 minimax 上（三处 `…Only` 中的另一处）。
+   *
+   * `minimax-adapter` 的接线是 `() => minimax.fetchRemoteModelsOnly(pool)` ——
+   * 同样在每次调用时解析方法，故原型包装一样有效。
+   */
+  it('★ minimax 的 fetchRemoteModels 必须接到 fetchRemoteModelsOnly', async () => {
+    const originalFetch = globalThis.fetch
+    globalThis.fetch = (async () => { throw new Error('network down') }) as unknown as typeof fetch
+
+    const calls: string[] = []
+    const proto = MinimaxAuth.prototype as unknown as Record<string, (...args: never[]) => unknown>
+    const originalOnly = proto['fetchRemoteModelsOnly']
+    const originalAll = proto['fetchModels']
+    proto['fetchRemoteModelsOnly'] = function (this: unknown, ...args: never[]) {
+      calls.push('fetchRemoteModelsOnly')
+      return originalOnly.apply(this, args)
+    }
+    proto['fetchModels'] = function (this: unknown, ...args: never[]) {
+      calls.push('fetchModels')
+      return originalAll.apply(this, args)
+    }
+
+    const previousFlag = process.env.DSH_HIDE_MODELS_WITHOUT_ACCOUNT
+    process.env.DSH_HIDE_MODELS_WITHOUT_ACCOUNT = 'false'
+    try {
+      const { ctx, llm } = makeContext()
+      apply(ctx)
+      const minimax = llm.adapterByProvider.get('minimax') as {
+        listModels(provider: string): Promise<readonly { id: string }[]>
+      }
+      await minimax.listModels('minimax')
+
+      expect(calls, 'minimax 的远端目录回调必须走 fetchRemoteModelsOnly').toContain('fetchRemoteModelsOnly')
+      expect(calls, '不得退回 fetchModels').not.toContain('fetchModels')
+    } finally {
+      proto['fetchRemoteModelsOnly'] = originalOnly
+      proto['fetchModels'] = originalAll
+      if (previousFlag === undefined) delete process.env.DSH_HIDE_MODELS_WITHOUT_ACCOUNT
+      else process.env.DSH_HIDE_MODELS_WITHOUT_ACCOUNT = previousFlag
+      globalThis.fetch = originalFetch
     }
   })
 })

@@ -7,6 +7,8 @@ import {
 import type { GenerateOptions, LlmModelInfo, LlmProviderInfo, LlmResolvedModelInfo, StreamChunk } from '@deepseek-ai/dsh-llm'
 import { ReasoningEffortId, ToolCallId } from '@deepseek-ai/dsh-llm'
 import { AccountPool, providerCatalogVisible } from './account-pool.js'
+import { RemoteCatalogGate } from './remote-catalog-gate.js'
+import { settingsNamespaceFor } from './settings-compat.js'
 import { isCodeArtsBenefitModel } from './models.js'
 import { normalizeHarnessMessages } from './message-shape.js'
 import { signRequestHuawei } from './sign.js'
@@ -778,17 +780,30 @@ export class CodeArtsAdapter extends LlmAdapter {
   private remoteModels: Array<{ id: string; name: string }> | undefined
 
   /**
+   * 目录加载闸门：并发去重 + 失败冷却。
+   *
+   * ⚠ **不能省**：DSH 的 `buildModelCatalog` 对每个 provider `await listModels()`
+   * 后再对每个模型 `await resolveModelInfo()`，两处都会走到这里。原实现失败
+   * 直接返回（不落缓存）⇒ 一次网络故障被放大成「每模型重试一次」，每次顶着
+   * 10s 超时（`src/models.ts:55 FETCH_TIMEOUT_MS`），首屏因此长时间空转。
+   */
+  private readonly catalogGate = new RemoteCatalogGate()
+
+  /**
    * 懒加载远端模型目录。resolveModel 可能先于 listModels 被调用
    * （如直接进入会话），此时同样触发远端拉取。
    */
   private async ensureRemoteModels(): Promise<void> {
-    if (this.remoteModels !== undefined || this.options.fetchRemoteModels === undefined) return
-    try {
-      const models = await this.options.fetchRemoteModels()
-      if (models.length > 0) this.remoteModels = models
-    } catch {
-      // 拉取失败保持未定义，后续 listModels/resolveModel 仍回退静态列表
-    }
+    const fetchRemote = this.options.fetchRemoteModels
+    if (this.remoteModels !== undefined || fetchRemote === undefined) return
+    await this.catalogGate.run(async () => {
+      const models = await fetchRemote()
+      // 空目录同样算「没拿到」：既不应落缓存（否则再也拉不回来），
+      // 也不应立刻重试（否则每个模型都打一次空请求）。
+      if (models.length === 0) return false
+      this.remoteModels = models
+      return true
+    })
   }
 
   /**

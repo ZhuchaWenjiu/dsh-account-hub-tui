@@ -22,6 +22,8 @@ import type {
   GenerateOptions, LlmModelInfo, LlmProviderInfo, LlmResolvedModelInfo, StreamChunk,
 } from '@deepseek-ai/dsh-llm'
 import { AccountPool, providerCatalogVisible } from './account-pool.js'
+import { RemoteCatalogGate } from './remote-catalog-gate.js'
+import { settingsNamespaceFor } from './settings-compat.js'
 import {
   isLoomyChatModel,
   isLoomyExpired,
@@ -230,6 +232,8 @@ export class LoomyAdapter extends LlmAdapter {
   private readonly fallbackIndex: ReadonlyMap<string, LoomyFallbackModel>
   /** 远端模型缓存（含展示名与能力）；未拉取时为 undefined。 */
   private remoteModels: LoomyRemoteModel[] | undefined
+  /** 目录加载闸门：并发去重 + 失败/空结果冷却（见 `remote-catalog-gate.ts`）。 */
+  private readonly catalogGate = new RemoteCatalogGate()
 
   constructor(private readonly options: LoomyAdapterOptions) {
     super()
@@ -257,23 +261,28 @@ export class LoomyAdapter extends LlmAdapter {
     return source.map((model) => ({ id: model.id, name: model.name }))
   }
 
-  /** 取（并缓存）远端模型目录；失败时回退兜底表。 */
+  /**
+   * 取远端模型目录；**失败时不把兜底表写进缓存**。
+   *
+   * ⚠ 原实现是 `this.remoteModels = fallback; return fallback` —— 把兜底表当成
+   * 「已加载」记下，于是一次瞬时失败会让该 provider **整个进程生命周期**都只剩
+   * 兜底模型（用户看不到自己的模型，且无从触发重试，只能重启）。
+   * 改为：只缓存**真实远端目录**，兜底表每次现算（纯本地、零成本），
+   * 并用 {@link RemoteCatalogGate} 的冷却挡住「每模型重试一次」的放大。
+   */
   private async loadModels(): Promise<LoomyRemoteModel[]> {
     if (this.remoteModels !== undefined) return this.remoteModels
-    if (this.options.fetchRemoteModels !== undefined) {
-      try {
-        const fetched = await this.options.fetchRemoteModels()
-        if (fetched.length > 0) {
-          this.remoteModels = fetched
-          return fetched
-        }
-      } catch {
-        // 远端失败静默回退兜底表：模型目录是展示信息，不该让整个 provider 报错。
-      }
+    const fetchRemote = this.options.fetchRemoteModels
+    if (fetchRemote !== undefined) {
+      await this.catalogGate.run(async () => {
+        const fetched = await fetchRemote()
+        if (fetched.length === 0) return false
+        this.remoteModels = fetched
+        return true
+      })
+      if (this.remoteModels !== undefined) return this.remoteModels
     }
-    const fallback = this.product.fallbackModels.map(fallbackToRemote)
-    this.remoteModels = fallback
-    return fallback
+    return this.product.fallbackModels.map(fallbackToRemote)
   }
 
   private inputModalitiesFor(model: LoomyRemoteModel | undefined): readonly ('text' | 'image')[] {

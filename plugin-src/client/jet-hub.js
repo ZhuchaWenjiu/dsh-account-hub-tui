@@ -1788,6 +1788,19 @@ function ProviderPanel({ provider, rpcCall }) {
    * 闭包里的 accounts 还是初始空数组。ref 保证读到的是最新值。
    */
   const accountsRef = React.useRef([]);
+  /**
+   * 登录轮询定时器句柄。
+   *
+   * ⚠ **真实缺陷**（2026-10-01，与 `zcode-card.js` 同型）：原实现把句柄存成
+   * `createAccount` 的**局部变量**，于是
+   * ① `setInterval` 只在「轮询成功」分支里 `clearInterval`，超时用的是另一个
+   *    `setTimeout(() => clearInterval(pollTimer), 300000)` —— 组件在这 5 分钟内
+   *    卸载（切页/关设置）时**两个定时器都还活着**，每次 tick 都会对已卸载组件
+   *    setState 并继续打 `login.poll`；
+   * ② `finally { setCreating(false) }` 无条件释放，用户连点两次会起**两串轮询**。
+   * 存进 ref 后可在卸载清理里一并清掉，并用它做重入闸门。
+   */
+  const pollRef = React.useRef(0);
 
   const loadAccounts = React.useCallback(async () => {
     setPhase('loading');
@@ -1880,7 +1893,11 @@ function ProviderPanel({ provider, rpcCall }) {
     // 只有支持余额查询的 provider 才在挂载时拉积分（loadCredits 内部也有一道
     // 门控，这里提前判掉是为了连 loading 状态都不翻）。
     if (canLoadCredits) void loadCredits();
-    return () => { mounted.current = false; };
+    return () => {
+      mounted.current = false;
+      // 卸载时必须掐掉未结束的登录轮询（否则它会在 5 分钟里持续打 RPC）
+      if (pollRef.current !== 0) { clearInterval(pollRef.current); pollRef.current = 0; }
+    };
     // loadCredits 依赖 accounts，但这里只想在挂载/provider 变化时各跑一次；
     // 账号刷新后由操作方显式再调 loadCredits（见 claimCredits）。
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -2061,7 +2078,22 @@ function ProviderPanel({ provider, rpcCall }) {
     }
   };
 
+  /**
+   * 停表 + 收尾：清掉轮询句柄，并在**组件仍挂载**时释放 busy。
+   *
+   * 所有结束路径（成功 / 超时 / 卸载）都必须走这里，否则 busy 会永久卡住或
+   * 句柄泄漏（与 `zcode-card.js` 的 `stopPoll` 同语义）。
+   */
+  const stopPoll = () => {
+    if (pollRef.current !== 0) { clearInterval(pollRef.current); pollRef.current = 0; }
+    if (mounted.current) setCreating(false);
+  };
+
   const createAccount = async () => {
+    // ⚠ 已有一轮登录在跑时直接忽略（真实缺陷）：`creating` 在返回 loginUrl 后
+    // 会被 `finally` 无条件释放，按钮随即恢复可点，再点一次会叠加第二个轮询 +
+    // 宿主再插一条占位账号。以轮询句柄作为重入闸门，比 UI 的 disabled 更可靠。
+    if (pollRef.current !== 0) return;
     setCreating(true);
     let accountId = '';
     let loginUrl = '';
@@ -2071,6 +2103,17 @@ function ProviderPanel({ provider, rpcCall }) {
       console.log('[jet-hub] account.create response =', res);
       accountId = res.accountId;
       loginUrl = res.loginUrl;
+      // ⚠ **`reused` 分支必判**（与 `zcode-card.js` 一致）：本机已有可用凭据时
+      // 后端**不新建条目、不返回 loginUrl**（用户报障「点了添加就多一个」的修复），
+      // 返回的是 `{reused:true, loginUrl:''}`。若只看 `loginUrl` 为空就报
+      // 「后端未返回登录地址」，会把一次成功操作显示成失败。
+      if (res.reused) {
+        setLoginUrlForManual(null);
+        await loadAccounts();
+        // 复用提示借用 probeNotice 区块渲染（本面板没有独立的 create 提示位）。
+        setProbeNotice({ tone: 'ok', text: '已复用本机已有的账号凭据，未新建账号。', details: [] });
+        return;
+      }
       // ⚠️ Loomy 也走这条**统一的「弹窗 + 轮询」路径**：它的 `loginUrl`
       // 指向**本地服务器**上的微信扫码页（内联二维码 + 首次绑手机号表单），
       // 与 codearts / lobsterai / qoder / trae / cline 的体验一致。
@@ -2100,19 +2143,30 @@ function ProviderPanel({ provider, rpcCall }) {
           // 'error' 阶段渲染，设了也看不见；提示由下面的 loginUrlForManual 区块负责。
           setLoginUrlForManual(loginUrl);
         }
-        // 轮询等待登录完成
-        const pollTimer = setInterval(async () => {
+        // 轮询等待登录完成。
+        // ⚠ 超时**不用**另起的 `setTimeout`，而是记 deadline 在轮询里判：这样全场只有
+        //   一个句柄（pollRef），卸载清理与超时都不会漏掉第二个定时器。
+        // ⚠ `reused` 分支必判（与 `zcode-card.js` 一致）：本机已有可用凭据时后端
+        //   **不新建条目、不返回 loginUrl**；只看 `loginUrl` 为空就报错会把一次
+        //   成功操作显示成失败（后端 `account.create` 返回 `{reused:true, loginUrl:''}`）。
+        const deadline = Date.now() + 300000;
+        pollRef.current = setInterval(async () => {
+          if (!mounted.current) { stopPoll(); return; }
+          if (Date.now() > deadline) {
+            if (loginWindow && !loginWindow.closed) loginWindow.close();
+            stopPoll();
+            return;
+          }
           try {
             const pollRes = await rpcCall('login.poll', { accountId, provider });
-            if (pollRes.done) {
-              clearInterval(pollTimer);
-              if (loginWindow && !loginWindow.closed) loginWindow.close();
-              setLoginUrlForManual(null);
-              await loadAccounts();
-            }
+            if (!mounted.current) return;
+            if (!pollRes?.done) return;
+            if (loginWindow && !loginWindow.closed) loginWindow.close();
+            setLoginUrlForManual(null);
+            await loadAccounts();
+            stopPoll();
           } catch { /* 继续轮询 */ }
         }, 1000);
-        setTimeout(() => { clearInterval(pollTimer); }, 300000);
       } else {
         setError('后端未返回登录地址（loginUrl 为空）。');
         setPhase('error');
@@ -2122,7 +2176,9 @@ function ProviderPanel({ provider, rpcCall }) {
       setError('新建账号失败：' + (caught?.message || '未知错误'));
       setPhase('error');
     } finally {
-      setCreating(false);
+      // ⚠ 只在**没有**轮询在跑时释放「新建中」。登录未完成期间按钮必须保持禁用，
+      // 否则用户再点一次就是「叠加第二个轮询 + 宿主再插一条占位账号」的缺陷。
+      if (pollRef.current === 0) setCreating(false);
     }
   };
 

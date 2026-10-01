@@ -30,6 +30,8 @@ import {
 import { ToolCallId } from '@deepseek-ai/dsh-llm'
 import type { GenerateOptions, LlmModelInfo, LlmProviderInfo, LlmResolvedModelInfo, StreamChunk } from '@deepseek-ai/dsh-llm'
 import { AccountPool, providerCatalogVisible } from './account-pool.js'
+import { RemoteCatalogGate } from './remote-catalog-gate.js'
+import { settingsNamespaceFor } from './settings-compat.js'
 import { parseRateLimitError } from './llm-adapter.js'
 import {
   LOBSTERAI_CHAT_PATH,
@@ -705,6 +707,11 @@ export class LobsteraiAdapter extends LlmAdapter {
   private readonly fetchImpl: typeof fetch
   /** 动态模型缓存（首次 listModels 成功后填充）。 */
   private remoteModels: LobsteraiRemoteModel[] | undefined
+  /**
+   * 目录加载闸门：并发去重 + 失败/空结果冷却。
+   * 依据见 `src/remote-catalog-gate.ts`（首屏「加载模型巨长」的实测归因）。
+   */
+  private readonly catalogGate = new RemoteCatalogGate()
   /** 远端下发的模型元数据（id → 条目），listModels/resolveModel 共用。 */
   private remoteMeta: ReadonlyMap<string, LobsteraiRemoteModel> = new Map()
   /** 产品级兜底模型索引（`product.fallbackModels` 的 id → 条目）。 */
@@ -739,16 +746,16 @@ export class LobsteraiAdapter extends LlmAdapter {
    * 被调用（如直接从历史会话进入），此时同样需要触发一次拉取。
    */
   private async ensureRemoteModels(): Promise<void> {
-    if (this.remoteModels !== undefined || this.options.fetchRemoteModels === undefined) return
-    try {
-      const models = await this.options.fetchRemoteModels()
-      if (models.length > 0) {
-        this.remoteModels = models
-        this.remoteMeta = new Map(models.map((model) => [model.id, model]))
-      }
-    } catch {
-      // 远端不可用：回退兜底目录（由 staticFallbackModels 提供）。
-    }
+    const fetchRemote = this.options.fetchRemoteModels
+    if (this.remoteModels !== undefined || fetchRemote === undefined) return
+    // 闸门：并发去重 + 失败/空结果冷却（依据见 src/remote-catalog-gate.ts）。
+    await this.catalogGate.run(async () => {
+      const models = await fetchRemote()
+      if (models.length === 0) return false
+      this.remoteModels = models
+      this.remoteMeta = new Map(models.map((model) => [model.id, model]))
+      return true
+    })
   }
 
   /**

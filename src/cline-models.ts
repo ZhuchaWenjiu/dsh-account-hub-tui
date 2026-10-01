@@ -320,7 +320,18 @@ export async function fetchClineRemoteModels(
 export async function loadClineModels(
   product: ClineProduct,
   options: { credential?: ClineCredential; fetcher?: typeof fetch; signal?: AbortSignal } = {},
-): Promise<{ models: ClineModel[]; warnings: string[] }> {
+): Promise<{ models: ClineModel[]; warnings: string[]; remote: ClineRemoteModels }> {
   const remote = await fetchClineRemoteModels(product, options)
-  return { models: mergeClineModels(product, remote), warnings: remote.warnings }
+  return { models: mergeClineModels(product, remote), warnings: remote.warnings, remote }
+}
+
+/**
+ * 这次是否**真的拿到了远端条目**。
+ *
+ * ⚠ 不能用 `models.length === 0` 判断：{@link mergeClineModels} 会**无条件**
+ * 把兜底表并进结果（这是展示需要），实测两个端点全挂时 `models.length` 仍是 5。
+ * 用长度判「没拿到目录」是死代码，冷却永不触发 ⇒ 兜底被当成远端结果永久缓存。
+ */
+export function hasClineRemoteModels(remote: ClineRemoteModels): boolean {
+  return remote.freeIds.length + remote.remoteIds.length + remote.entries.length > 0
 }

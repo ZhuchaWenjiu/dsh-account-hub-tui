@@ -466,6 +466,52 @@ describe('providerInfo / prepareCall / registerMinimaxLlm', () => {
   })
 })
 
+/**
+ * ⚠ **目录缓存不得被兜底表污染**（全仓同型缺陷，2026-08 起长期存在）。
+ *
+ * 原实现 `this.remoteModels = fallback; return fallback` 把兜底表当成「已加载」
+ * 记下 ⇒ 一次瞬时失败就让它**整个进程生命周期**都只剩兜底模型：用户看不到自己的
+ * 模型，且无从触发重试（`if (this.remoteModels !== undefined) return` 永远短路），
+ * 只能重启 DSH。同批修好的还有 loomy / raccoon / zcode。
+ *
+ * 另见 `tests/unit/remote-catalog-gate.spec.ts`（并发去重 + 失败冷却）。
+ */
+describe('MinimaxAdapter 目录缓存语义（★ 兜底表不进缓存）', () => {
+  function makeEager(fetchRemoteModels: () => Promise<readonly MinimaxModelEntry[]>): MinimaxAdapter {
+    return new MinimaxAdapter({
+      credentialRef: 'MINIMAX_ACCESS_TOKEN' as never,
+      resolveCredential: async () => undefined,
+      refresh: async () => {},
+      fetchRemoteModels,
+      product: MINIMAX,
+    })
+  }
+
+  it('★ 远端抛错时不把兜底表写进 remoteModels', async () => {
+    const adapter = makeEager(async () => { throw new Error('network down') })
+    expect((await adapter.listModels('minimax')).length).toBeGreaterThan(0)
+    expect((adapter as unknown as { remoteModels: unknown }).remoteModels).toBeUndefined()
+  })
+
+  it('★ 远端返回空目录时不落缓存，且只拉一次（不被每个模型的 resolveModel 放大）', async () => {
+    let calls = 0
+    const adapter = makeEager(async () => { calls += 1; return [] })
+    expect((await adapter.listModels('minimax')).length).toBeGreaterThan(0)
+    expect((await adapter.listModels('minimax')).length).toBeGreaterThan(0)
+    await adapter.resolveModel('minimax', M31!.id)
+    expect(calls).toBe(1)
+    expect((adapter as unknown as { remoteModels: unknown }).remoteModels).toBeUndefined()
+  })
+
+  it('远端成功时缓存生效（不破坏既有「成功即缓存」约定）', async () => {
+    let calls = 0
+    const adapter = makeEager(async () => { calls += 1; return [M31!] })
+    await adapter.listModels('minimax')
+    await adapter.listModels('minimax')
+    expect(calls).toBe(1)
+  })
+})
+
 /*
  * ⚠️ 2026-09-29：原本这里有一条「stream() 抛 UNSUPPORTED_CONTENT」的用例，
  * 它锁的是**推理未实现**这个临时状态。推理已实现（真实请求验证通过），
