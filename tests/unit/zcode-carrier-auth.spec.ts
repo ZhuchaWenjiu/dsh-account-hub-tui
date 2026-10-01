@@ -224,28 +224,47 @@ function makeWired(options: {
   let inFlight = 0
   let maxInFlight = 0
   let lastSignal: AbortSignal | undefined
-  ;(auth as unknown as { captchaBrowser: unknown }).captchaBrowser = {
-    mintWithOutcome: async (
-      _config: unknown,
-      // ⚠ 名字**不能**叫 `options`：外层 `makeWired(options)` 会被遮住（本文件踩过一次）
-      mintOptions?: { signal?: AbortSignal },
-    ) => {
-      chromiumCalls += 1
-      lastSignal = mintOptions?.signal
-      inFlight += 1
-      maxInFlight = Math.max(maxInFlight, inFlight)
-      // 让并发调用真的有时间重叠（串行队列绕过时这里会看到 >1）；0 = 不留 timer
-      const sleepMs = options.mintSleepMs ?? 5
-      if (sleepMs > 0) await new Promise((r) => setTimeout(r, sleepMs))
-      inFlight -= 1
-      if (options.chromiumThrows === true) {
-        throw new Error('zcode: captcha 产出处于冷却中（连续 3 次失败）')
-      }
-      return { param: fakeParam(`chromium-${String(chromiumCalls)}`), interactive: false }
-    },
-    mint: async () => 'unused',
-    dispose: () => {},
+
+  /**
+   * ⚠ **把浏览器桩装回 `auth.captchaBrowser`**。
+   *
+   * ## 为什么需要是可重复的（2026-10-02 的真实行为变化）
+   *
+   * `claimDailyWith` 的 `finally` 现在会调 `closeChromium()` ——
+   * 把 `auth.captchaBrowser` **置空**（用户报障：领取完 chromium 留在任务栏闪烁）。
+   *
+   * ⇒ 每次 `claimDaily()` 之后，那个桩就被丢掉了。若不重新装回去，
+   * 下一次落到 chromium 腿时 `captchaBrowser ??= new ZcodeCaptchaBrowser()`
+   * 会建一个**真实浏览器**（本文件在单测里绝不允许）——表现为
+   * `chromiumCalls()` 不再增长（实测：期望 `+1` 得到 `+0`）。
+   *
+   * 故装桩动作抽成函数，**每次领取后都要重装**。
+   */
+  const installBrowserStub = (): void => {
+    ;(auth as unknown as { captchaBrowser: unknown }).captchaBrowser = {
+      mintWithOutcome: async (
+        _config: unknown,
+        // ⚠ 名字**不能**叫 `options`：外层 `makeWired(options)` 会被遮住（本文件踩过一次）
+        mintOptions?: { signal?: AbortSignal },
+      ) => {
+        chromiumCalls += 1
+        lastSignal = mintOptions?.signal
+        inFlight += 1
+        maxInFlight = Math.max(maxInFlight, inFlight)
+        // 让并发调用真的有时间重叠（串行队列绕过时这里会看到 >1）；0 = 不留 timer
+        const sleepMs = options.mintSleepMs ?? 5
+        if (sleepMs > 0) await new Promise((r) => setTimeout(r, sleepMs))
+        inFlight -= 1
+        if (options.chromiumThrows === true) {
+          throw new Error('zcode: captcha 产出处于冷却中（连续 3 次失败）')
+        }
+        return { param: fakeParam(`chromium-${String(chromiumCalls)}`), interactive: false }
+      },
+      mint: async () => 'unused',
+      dispose: () => {},
+    }
   }
+  installBrowserStub()
 
   const headers: Array<string | undefined> = []
   const demandAtSend: boolean[] = []
@@ -303,6 +322,16 @@ function makeWired(options: {
     maxInFlight: () => maxInFlight,
     lastChromiumSignal: () => lastSignal,
     contribute,
+    /**
+     * ⚠ **每次 `claimDaily()` 之后都要调它**（本文件里凡是在领取后再断言
+     * chromium 行为的用例）。
+     *
+     * 原因：`claimDailyWith` 的 `finally` 会 `closeChromium()` 把
+     * `auth.captchaBrowser` 置空（用户报障：领取完 chromium 留在任务栏闪烁）。
+     * 不重装桩，下一次落到 chromium 腿就会建**真实浏览器**（单测里绝不允许），
+     * 且 `chromiumCalls()` 不再增长 —— 表现为「期望 +1 得到 +0」的假失败。
+     */
+    reinstallBrowser: installBrowserStub,
     /** 领取时逐 plan 用掉的 param（`makeClaimFetch` 记的）。 */
     claimParams: claimSeen.params,
     /** 领取时逐 plan 的需求位快照（窗口内恒为真）。 */
@@ -619,6 +648,13 @@ describe('★ 评审 C4：claim 撞上 3007 ⇒ 当次换注入链重发 + 记�
     const chromiumBefore = wired.chromiumCalls()
     const parked = wired.contribute('must-not-be-used-after-disable')
     const injectedAfter = vi.fn(async () => fakeParam('injected-after-disable'))
+    /**
+     * ⚠ **必须先重装浏览器桩**：上面的 `claimDaily()` 已在 `finally` 里
+     * `closeChromium()`（用户报障：领取完 chromium 留在任务栏闪烁），桩随之被丢弃。
+     * 不重装就会建真实浏览器，`chromiumCalls()` 也不再增长
+     * （实测表现为「期望 +1 得到 +0」的假失败）。
+     */
+    wired.reinstallBrowser()
     const after = await wired.auth.claimDaily(injectedAfter)
     expect(after[0].kind).toBe('claimed')
     expect(wired.claimParams[2]).not.toBe(parked)

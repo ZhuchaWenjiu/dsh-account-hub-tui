@@ -1223,6 +1223,24 @@ export class ZcodeAuth extends Service {
       // ⚠ 领取窗口结束即清位。**漏掉这一行是最坏形态**：需求位是进程级的，
       //   client 只要看到它就一直产（成功冷却 25s 一轮），而没人消费 ⇒ 白烧设备级配额。
       setCaptchaDemand(false)
+      /**
+       * ★ **领取结束即关掉外挂 chromium**（用户报障 2026-10-02）。
+       *
+       * > 领取完 chromium 还是留存在任务栏，图标还会闪烁。
+       *
+       * 放在 `finally` 是**刻意**的：领取**失败**时同样要关 ——
+       * 否则「领取失败」会额外留下一个占 200–400MB、还会在任务栏闪烁的进程，
+       * 用户下次看到的仍是同一个抱怨。
+       *
+       * ⚠ **只在这里关**（即只覆盖领取流程）。推理路径
+       * （{@link mintCaptchaParam} → 注入的 `zcode.mintCaptchaParam`）**不关** ——
+       * 那时 captcha 是推理真的需要（被 `3007` 拒后补产），关掉会让紧接着的
+       * 重发再冷启动一次。用户的原始要求就是这么分的：
+       * 「如果不是领取积分还请求了 captcha 则再打开不关，领取积分完毕就关」。
+       *
+       * ⚠ 关闭**幂等**，且不碰 `carrierPageServer` / 需求位（与 chromium 无关）。
+       */
+      this.closeChromium()
     }
   }
 
@@ -1439,6 +1457,69 @@ export class ZcodeAuth extends Service {
     setCaptchaDemand(false)
     this.carrierPageServer?.stop()
     this.carrierPageServer = undefined
+  }
+
+  /**
+   * ★ **关掉外挂 chromium** —— 只由**领取积分**流程在收尾时调用。
+   *
+   * ## 为什么需要（用户报障 2026-10-02）
+   *
+   * > 领取完 chromium 还是留存在任务栏，图标还会闪烁。
+   *
+   * 根因：`captchaBrowser` 一旦惰性创建就**只**在 `stop()`（插件卸载）里销毁 ——
+   * 而领取是**低频写操作**（一天一次）。于是那个 chromium 进程
+   * （约 200–400MB）会**一直留着**，它的窗口也就一直挂在任务栏上。
+   *
+   * ## ⚠⚠ 谁在 web / desktop 下真的会开 chromium（用户 2026-10-02 更正）
+   *
+   * > desktop 环境索要积分也走不到要开 chromium，所以不用开
+   *
+   * 核对 `mintClaimCaptcha()` 的判据后确认属实：
+   *
+   * ```js
+   * if (!this.internalCarrierAvailable() || !captchaDemand())
+   *   return { param: await injected(), source: 'chromium' }   // ← 这里才开
+   * return await this.carrier.mint()                            // ← desktop 走这条
+   * ```
+   *
+   * `internalCarrierAvailable()` = `internalCarrierEnabled && supplied > 0` ——
+   * desktop 有内部载体的贡献 ⇒ `true` ⇒ **走载体链，不开 chromium**。
+   *
+   * | 环境 | 领取时走哪条 | 会开 chromium 吗 |
+   * |---|---|---|
+   * | **desktop**（有内部载体贡献） | `carrier.mint()` | **不会** |
+   * | **web**（无人贡献需求位） | 注入链 → `mintWithChromium` | **会**（就是本方法要收的尾） |
+   *
+   * ⇒ 本方法在 desktop 下是**空操作**（`captchaBrowser === undefined`
+   * 直接 return），故对 desktop 行为**逐字不变**；它只为 web 版收尾。
+   *
+   * ## 判据是「哪个流程在用」，不是「浏览器是否本次新建」
+   *
+   * | 流程 | 是否要 captcha | 收尾动作 |
+   * |---|---|---|
+   * | **领取积分**（`claimDaily*`） | 始终要（上游校验前置于 plan 校验） | ★ **关闭** |
+   * | 推理（`mintCaptchaParam`） | 通常不要；被 `3007` 拒时才补产 | **不关**（那次确实用了） |
+   *
+   * ⚠ 两条路用的是**同一个** `captchaBrowser` 实例（`index.ts` 注入给适配器的
+   * `mintCaptchaParam` 最终也落到 `this.captchaBrowser`，见其注释
+   * 「整个插件共用一台」），所以**不能**在这里判断"浏览器是否本次新建" ——
+   * 必须由**调用方**决定。这也是不做成"自动闲置关闭"的原因：
+   * 那会在推理正需要它时把浏览器拿走。
+   *
+   * ⚠ **可以再次启动**：`dispose()` 会把 `ready` 置 false、`profileDir` 置空，
+   * 下一次走 `captchaBrowser ??= new …` 重新冷启动（约 3.7 秒）。
+   * 这是**刻意的取舍**（用户明确选择「用完即关」）：宁可多付一次启动，
+   * 也不要留一个会闪烁的常驻窗口。
+   *
+   * ⚠ **幂等**：浏览器本来就不存在时是空操作（不抛错、不新建）。
+   */
+  closeChromium(): void {
+    // 池里的 param 由该浏览器产出，浏览器一关它们就不可用 ⇒ 一起清掉。
+    this.captchaPool?.clear()
+    this.captchaPool = undefined
+    if (this.captchaBrowser === undefined) return
+    this.captchaBrowser.dispose()
+    this.captchaBrowser = undefined
   }
 }
 
