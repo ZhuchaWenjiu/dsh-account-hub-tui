@@ -72,6 +72,32 @@ export interface ProviderAccountEntry {
    * 缺省/0 = 使用凭据原始 `device_id`，既有账号行为完全不变。
    */
   traeCheckinDeviceGeneration?: number
+  /**
+   * **opencode** 账号的出口代理（空/缺省 = 直连）。
+   *
+   * ⚠️ 代理是**账号维度**的：一个 NAT 后的多台 PC 共享同一出口 IP，而
+   * OpenCode Zen 的匿名通道按**出口 IP** 限流、认证通道按**账号**限流，
+   * 故「让各账号真正分开」只能给各账号各配一条出口。
+   *
+   * 空串是合法值（= 用户显式清除了代理，回到「与其它无代理账号共享本机
+   * 出口」），**不可**用 falsy 判据把它与「未设置」混为一谈 ——
+   * 那会让面板上的「清除代理」点了没反应。
+   */
+  opencodeProxy?: string
+  /**
+   * **opencode** 账号的指纹代次（见 `src/opencode.ts` 的 `deriveProjectId`）。
+   *
+   * 只存**整数代次**而非指纹本体：project id 由 `(api_key, generation)`
+   * 唯一决定，用户点「轮换」时 +1 即可整体换一份新 project id，
+   * 无需让调用方拼哈希（与 `traeCheckinDeviceGeneration` 同款取舍）。
+   *
+   * ⚠️ 接线层必须**以本字段为权威**重新派生 project id（`max(本字段,
+   * 凭据内代次)`），不能直接透传凭据里的 `fingerprint` ——
+   * 否则代次涨了而 project id 不变，且不报错，是最难排查的一类静默失效。
+   *
+   * 缺省/0 = 用凭据里派生的初始指纹。
+   */
+  opencodeFingerprintGeneration?: number
 }
 
 /** 账号详细状态（返回给 Client 展示） */

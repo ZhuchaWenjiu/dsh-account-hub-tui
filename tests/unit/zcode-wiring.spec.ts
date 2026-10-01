@@ -347,8 +347,11 @@ describe('ZCode 客户端接入（缺口 3 / 4 / 5）', () => {
     // 也确认没把既有的挤掉。
     expect(ids).toContain('codearts')
     expect(ids).toContain('raccoon')
-    // ⚠️ 2026-09-30 合并 master 后 minimax 也接入了 —— 11 → 12。
-    expect(ids).toHaveLength(12)
+    // ⚠️ 计数会随 provider 增删变化（2026-09-30 加 minimax：11 → 12；
+    // 2026-10-01 加 opencode：12 → 13）。
+    // ⚠️ 这个断言的价值是「**别把既有 provider 挤掉**」，所以它同时断言
+    // 上面的具体 id；若将来再加 provider，记得同步这里。
+    expect(ids).toHaveLength(13)
   })
 
   it('展示名与产品配置一致（避免两处漂移）', () => {

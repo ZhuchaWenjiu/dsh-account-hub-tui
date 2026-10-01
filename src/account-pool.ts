@@ -931,6 +931,74 @@ export class AccountPool {
   }
 
   /**
+   * 设置/清除某 opencode 账号的出口代理。
+   *
+   * ⚠️ **空串是合法输入**（用户显式清除代理 → 回到「与其它无代理账号共享
+   * 本机出口」），故这里**不能**用 `if (!proxy) return` 早退，否则「清除」
+   * 按钮点了会静默无效。清除时**删键**而不是写空串，避免下游把空串误当成
+   * 「配了一个空地址」。
+   *
+   * 与 `updateModelRateLimit` 同款：在**最新快照**上做局部合并后整体写回，
+   * 避免与并发的账号操作互相覆盖。
+   */
+  async setOpencodeProxy(accountId: string, proxy: string): Promise<void> {
+    const accounts = this.readAccounts()
+    const idx = accounts.findIndex(a => a.id === accountId)
+    if (idx === -1) {
+      this.ctx.logger?.warn?.(
+        `[jet-hub] setOpencodeProxy: 账号 ${accountId} 不在账号列表中`,
+      )
+      return
+    }
+    const next = [...accounts]
+    const entry = { ...next[idx]! }
+    if (proxy.trim().length === 0) delete entry.opencodeProxy
+    else entry.opencodeProxy = proxy
+    next[idx] = entry
+    await this.writeAccounts(next)
+    this.ctx.logger?.info?.(
+      `[jet-hub] 账号 ${accountId} 代理 → ${proxy.trim().length === 0 ? '直连' : proxy}`,
+    )
+  }
+
+  /** 读取某 opencode 账号的代理（未设置时为空串）。 */
+  opencodeProxyFor(accountId: string): string {
+    const entry = this.readAccounts().find(a => a.id === accountId)
+    return entry?.opencodeProxy ?? ''
+  }
+
+  /**
+   * 记录 opencode 指纹轮换代次。
+   *
+   * ⚠️ 只接受**比现值更大**的代次：乱序/重复回调把代次写回小值会让用户
+   * 以为已轮换、实际指纹没换（TRAE 同款判据，见 `updateTraeCheckinDeviceGeneration`）。
+   */
+  async updateOpencodeFingerprintGeneration(accountId: string, generation: number): Promise<void> {
+    if (!Number.isFinite(generation) || generation <= 0) return
+    const accounts = this.readAccounts()
+    const idx = accounts.findIndex(a => a.id === accountId)
+    if (idx === -1) {
+      this.ctx.logger?.warn?.(
+        `[jet-hub] updateOpencodeFingerprintGeneration: 账号 ${accountId} 不在账号列表中`,
+      )
+      return
+    }
+    const current = accounts[idx]!.opencodeFingerprintGeneration ?? 0
+    if (generation <= current) return
+    const next = [...accounts]
+    next[idx] = { ...next[idx]!, opencodeFingerprintGeneration: generation }
+    await this.writeAccounts(next)
+    this.ctx.logger?.info?.(`[jet-hub] 账号 ${accountId} 指纹代次 → ${generation}`)
+  }
+
+  /** 读取 opencode 指纹代次（未设置时为 0）。 */
+  opencodeFingerprintGenerationFor(accountId: string): number {
+    const entry = this.readAccounts().find(a => a.id === accountId)
+    const value = entry?.opencodeFingerprintGeneration
+    return typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : 0
+  }
+
+  /**
    * 读取当前完整状态快照（账号列表 + 模型黑名单 + Loomy 镜像字段）。
    *
    * 供备份导出使用：返回的副本与进程内权威副本解耦，调用方修改返回值
