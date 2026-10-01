@@ -324,6 +324,14 @@ export function apply(ctx: Context): void {
     /** 报错文案里的产品名（用户要知道去哪个面板解锁）。 */
     displayName: string
     modelId?: string
+    /**
+     * 本次请求的模型是否**免费**（消耗 0 积分），由调用方用
+     * `BuddyAdapter.isFreeModel()` 判定后传入。
+     *
+     * ⚠️ 必须是**已确认**的免费：`true` 会跳过余额分档（即不受永久积分锁定约束），
+     * 误判成免费会让付费模型绕开锁定、真烧掉永久积分。故调用方只在确定时传 true。
+     */
+    isFreeModel?: boolean
   }): Promise<{ credential?: BuddyCredential; tried: Set<string> }> => {
     const tried = new Set<string>()
     const candidates = pool
@@ -338,6 +346,23 @@ export function apply(ctx: Context): void {
         return resetAt === undefined || resetAt === 0 || Date.now() >= resetAt
       })
       .map(a => ({ id: a.id, credentialRef: a.credentialRef }))
+
+    // 免费模型（消耗 0 积分）不受「锁定永久积分」约束：锁定要保护的是
+    // 「别把永久积分烧掉」，而免费模型既不扣临时积分也不扣永久积分，
+    // 却被那道门一并拦下，报出「账号有余额却没有可用账号」的矛盾错误（真实报障）。
+    //
+    // 这里**只按候选顺序取凭据**，不做余额分档 —— 免费模型没有「该烧哪个包」
+    // 的选择问题，余额查询因此完全不必要（也顺带省掉一次网络请求）。
+    // 限流过滤仍然生效（上面的 filter），不会因免费而绕开模型级限流标记。
+    if (options.isFreeModel === true) {
+      for (const candidate of candidates) {
+        const credential = await resolveBuddyCredentialByRef(candidate.credentialRef)
+        if (credential !== undefined) return { credential, tried }
+        tried.add(candidate.id)
+      }
+      // 免费模型下若凭据全坏，仍落到下面的常规路径，以复用既有的错误语义
+      // （凭据问题应报「凭据不可用」，而不是被误报成「额度已用尽」）。
+    }
 
     const allowPermanent = !pool.permanentLocked(options.product.id)
 
@@ -381,6 +406,9 @@ export function apply(ctx: Context): void {
         selector: buddyBalanceSelector,
         displayName: 'CodeBuddy',
         modelId,
+        // 免费模型跳过「锁定 + 临期积分」这道门（判据见 BuddyAdapter.isFreeModel）。
+        // `buddyAdapter` 在此处是自引用：闭包只在注册完成后才执行，故无 TDZ 问题。
+        isFreeModel: await buddyAdapter.isFreeModel(modelId),
       })
       if (picked.credential) return picked.credential
       // 回退到账号池的既有选择（凭据损坏的账号已被 tried 排除），最后才退单凭据 ref。
@@ -429,6 +457,10 @@ export function apply(ctx: Context): void {
         selector: workbuddyBalanceSelector,
         displayName: 'WorkBuddy',
         modelId,
+        // 免费模型跳过「锁定 + 临期积分」这道门（判据见 BuddyAdapter.isFreeModel）。
+        // 用户报障「账户可用却提示没有可用账号」正是缺了这一条：免费模型不扣积分，
+        // 却被永久积分锁定拦下。
+        isFreeModel: await workbuddyAdapter.isFreeModel(modelId),
       })
       if (picked.credential) return picked.credential
       // ⚠️ `modelId` 透传：否则模型级限流标记被忽略（详见 buddy 处说明）。
