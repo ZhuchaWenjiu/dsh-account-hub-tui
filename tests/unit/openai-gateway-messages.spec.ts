@@ -52,6 +52,12 @@ describe('OpenAI gateway request conversion', () => {
     expect(normalizeMaxTokens(128000, 'codearts', 'deepseek-v4-flash')).toBe(65536)
     expect(normalizeMaxTokens(32000, 'codearts', 'deepseek-v4-flash')).toBe(32000)
   })
+  it('clamps GLM-5.2 output budget without changing unrelated models', () => {
+    expect(normalizeMaxTokens(128000, 'codearts', 'GLM-5.2')).toBe(65536)
+    expect(normalizeMaxTokens(32000, 'codearts', 'GLM-5.2')).toBe(32000)
+    expect(normalizeMaxTokens(128000, 'qoder', 'qfmodel')).toBe(128000)
+  })
+
   it('maps CodeArts generic levels even when legacy runtime omits reasoning metadata', () => {
     expect(normalizeReasoningEffort('high', undefined, 'codearts', 'deepseek-v4-flash')).toBe('on')
     expect(normalizeReasoningEffort('max', undefined, 'codearts', 'deepseek-v4-flash')).toBe('on')

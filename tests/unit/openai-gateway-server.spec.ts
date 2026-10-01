@@ -69,6 +69,33 @@ describe('OpenAI gateway HTTP server', () => {
     }
   })
 
+  it('passes a safe GLM-5.2 output budget to the DSH runtime', async () => {
+    const port = await freePort()
+    let actualMaxTokens: number | undefined
+    const captureLlm = {
+      ...llm,
+      resolveModelInfo: async () => ({ provider: 'codearts', id: 'GLM-5.2', name: 'GLM-5.2' }),
+      stream: (options: { maxTokens?: number; signal?: AbortSignal }) => {
+        actualMaxTokens = options.maxTokens
+        return responseStream(options.signal)
+      },
+    }
+    const gateway = createOpenAiGateway({ llm: captureLlm, env: { DSH_OPENAI_GATEWAY_PORT: String(port), DSH_OPENAI_GATEWAY_API_KEY: 'test-key' } })
+    await gateway.start()
+    try {
+      const result = await call(port, '/v1/chat/completions', {
+        method: 'POST', key: 'test-key', body: {
+          model: 'codearts/GLM-5.2', messages: [{ role: 'user', content: 'hello' }],
+          max_tokens: 128000, reasoning_effort: 'high', stream: false,
+        },
+      })
+      expect(result.status).toBe(200)
+      expect(actualMaxTokens).toBe(65536)
+    } finally {
+      await gateway.close()
+    }
+  })
+
   it('returns streaming SSE and aborts on client cancellation', async () => {
     let aborted = false
     const abortingLlm = {
