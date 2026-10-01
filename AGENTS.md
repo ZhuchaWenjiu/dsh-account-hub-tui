@@ -5294,24 +5294,38 @@ pnpm test:e2e:minimax-chat   # ⚠️ 发推理（真实适配器；默认 M2.7�
 可能轮换 `refresh_token`，若我们刷一次却不写回客户端文件，用户的客户端登录态
 就会被弄坏。实测过期 token 打只读端点返回 **HTTP 401 `invalid access token`**。
 
-### 10. ⚠️ `registerJetHubRpc` 的位置参数陷阱（**第 4 次复发**）
+### 10. ⚠️ `registerJetHubRpc` 的位置参数陷阱（**第 5 次复发**）
 
-`registerJetHubRpc` 是长**位置**参数列表（11 个 auth + `modelAdapters`）。
+`registerJetHubRpc` 是长**位置**参数列表（**12 个 auth** + `modelAdapters`，
+顺序：`codearts, buddy, workbuddy, lobsterai, qoder, qoderCn, trae, cline,
+loomy, raccoon, minimax, zcode`）。
 新增 provider 时**必须**在 `tests/unit/jet-hub-rpc.spec.ts` 的调用点补占位，
 否则 `modelAdapters` 会**错位**落到最后一个 auth 形参上。
 
-**已复发四次**：加 Loomy、加 Raccoon、加 QoderCN、**加 MiniMax**（本次）。
-测试注释里逐字预言过这个坑。本次症状：`jet-hub-rpc.spec.ts` 的
-「关闭的模型仍显示带倍率的展示名」**确定性失败**，而
-`git diff` 显示**没碰** `model.list` 相关代码。
+**已复发五次**：加 Loomy、加 Raccoon、加 QoderCN、加 MiniMax、**加 ZCode
+（2026-09-30 合并上游时一次插了两个 provider，第 5 次）**。
+测试注释里逐字预言过这个坑。
 
-⚠️ **排查教训（值得复用）**：一条看起来「与本次改动无关」的失败，
-**不要**先假设是抖动 —— 用 `git stash push -u` 回到基线跑同一文件：
-基线 3/3 通过、恢复后必失败 ⇒ **确证是自己引入的**。
+⚠️⚠️ **第 5 次的关键差别：这是「合并」引发的，`git` 全程不报冲突。**
+上游把 `minimax` / `zcode` 插在 `raccoon` 之后，`jet-hub-rpc.spec.ts` 的
+`provider.status` 那处调用点没跟上 → `modelAdapters` 落到 `minimax` 形参上、
+真正的位置收到 `undefined` → 实现退化成套黑名单的 `ctx.llm.listModels()`。
+症状与第 4 次**同型但报错位置不同**：三条用例断言
+`{ total, disabled }` 时实际拿到 **`{ total: 0, disabled: 0 }`**
+（不是渲染问题，是**目录读不到**）。
+⇒ **合并任何新增 provider 的上游改动后，必须重跑 `jet-hub-rpc.spec.ts` 的
+`provider.status` 组，不能以「git 没报冲突」判定合并没有语义问题。**
+排查脚本可离线复查全部调用点的实参对齐（剥注释后逐个数形参，
+本机实践：Windows 下别用内联 `node -e`，PowerShell 会吃掉引号/反引号，
+写成 `.mjs` 文件再跑）。
 
 ⚠️ **另一个格式陷阱**：`registerJetHubRpc` 的**调用**必须保持**单行**
-（`... raccoon, minimax, modelAdapters)`）。拆成多行（哪怕只加尾随逗号）
+（`... raccoon, minimax, zcode, modelAdapters)`）。拆成多行（哪怕只加尾随逗号）
 会让 `qoder-wiring.spec.ts` / `raccoon-wiring.spec.ts` 的正则失配而失败。
+
+⚠️ **根治方向**（尚未做）：把它改成**具名参数对象**（`{ auth: {...}, modelAdapters }`）。
+已复发五次说明「靠注释提醒补占位」不足以防住 —— 但那是独立重构，
+需要同时改 `src/index.ts` 与全部测试调用点，不要顺手做。
 
 ## ⚠️ ZCode（智谱）provider：「卡住 + 停止按钮无效」的两个根因（真实缺陷，2026-09-29）
 
@@ -5971,3 +5985,128 @@ ZCode **不可续期**（凭据是静态的、没有 refresh 端点），所以�
 ③ **不要**用 `replaceAll`（那是 Jet Hub 的导入路径，语义不同；
 我第一版用它导致 3 条用例假失败）。
 
+## 供应商级一键开关（左侧 rail 分组 + 行尾开关）
+
+**需求**：「因该提供左侧供应商的一键开关，开关逻辑和账号的开关逻辑一致（但是如果不关闭
+模型就不关闭供应商），应该分组显示打开和关闭的供应商」。
+
+### 语义（用户逐项确认）
+
+| 决策 | 取值 |
+|---|---|
+| 关闭某供应商 | **关闭它的全部模型** + **停用它的全部账号** |
+| 「已关闭」判据 | **该供应商的全部模型都已关闭**（不新增持久化字段，由模型黑名单推导） |
+| 重新打开 | 清空该供应商的模型黑名单 + **启用它的全部账号** |
+| 右侧账号面板 | **保持既有逻辑不变**；仅在其后重新加载一次列表（见下） |
+
+⚠️ **没有新增任何持久化字段**：`state.json` 仍只有 `accounts` 与 `disabledModels`。
+供应商的开关状态是**推导值**（`closed = total > 0 && disabled === total`），故无迁移、
+无一致性维护成本。代价是「手动单独打开某个模型」会让该供应商回到「已打开」——
+这正是判据的字面含义。
+
+### 端点：`provider.status`（读）+ `provider.setEnabled`（写）
+
+- `provider.status` 一次返回**全部**供应商的状态。⚠️ 全程只用**同步内存副本**：
+  目录取 `modelAdapters[id].listAllModels()`（同步；不触发远端拉取），账号取
+  `pool.listAccountsByProvider()`（同步读内存）。
+  **不得**改用 `pool.listAccounts()` —— 它逐账号调 `credentials.describe()`（异步 IO），
+  8 个供应商会把设置页首屏拖慢，而我们**只需要计数**。
+- ⚠️ `listAllModels()` **不带 `disabled` 字段**，必须另取 `pool.listDisabledModels(id)`
+  按 id 计数。
+- ⚠️ 适配器缺失（外部/旧适配器）时 `total = 0`、`closed = false`：保守判为「未关闭」，
+  让用户可以尝试操作，而不是误报成已关闭。
+
+### ⚠️ 关闭方向的顺序不可颠倒：先关模型，再停账号
+
+「是否已关闭」的判据是**模型是否全关**。先关模型可保证即使随后停账号失败，状态判定
+依然自洽（该供应商确实已关闭），用户重试一次即可补齐账号。反过来先停账号、再关模型，
+中途失败会留下「账号全停用但模型仍可见」的中间态 —— 用户在对话框里还能选到它的模型，
+却没有任何可用账号。`tests/unit/jet-hub-rpc.spec.ts` 有专项用例锁死写入顺序。
+
+### ⚠️「不关闭模型就不关闭供应商」
+
+关闭方向必须拿到模型目录；**读失败**或**目录为空**时**整个操作失败、不落盘、不广播**。
+绝不能「关不掉模型就只停账号」—— 那会让供应商显示成已关闭而模型其实还在，
+用户按「已关闭」的预期却仍能选到它。前端把这种情形表现为**开关禁用**并给出原因
+（`providerSwitchState` 的 `reason`），而不是让用户点下去只得到一句错误提示。
+
+### ⚠️ rail 里开关**绝不能嵌进 `<button role="tab">`**
+
+结构上必须是**兄弟节点**（`.dim-jh-providerRow` 是 grid，首列按钮、末列开关）：
+
+1. 交互元素嵌套在 HTML 里是非法的；
+2. 本项目有过同类真实缺陷 —— 在 `<label>` 里插入第二个 checkbox 后，点行内文字会
+   激活**第一个**可标记控件，导致既有交互失效（见 `model-filter.js` 的记载）。
+
+行容器**不挂 onClick**：点击只属于那个 button，开关由 `onChange` 处理。
+`tests/unit/provider-toggle.spec.ts` 用源码级断言锁死这个结构。
+
+### ⚠️ `.dim-jh-providerLabel` 曾是「已定义但从未被应用」的死样式
+
+真实代码渲染的是 `<span><strong>{label}</strong></span>`（span **没有** className），
+于是长供应商名一直在**折行**（用户最初的截图里「WorkBuddy (国际 / 版)」就是两行）。
+该类（含 `min-width: 0` 与 `strong` 的 `nowrap + ellipsis`）在样式表里早已存在却无人使用。
+
+本次**启用**它，把折行改为单行省略号。这是左侧的一处**可见变化**，故用实测数据定了
+rail 宽度：实测（无头 Edge + 真实源码 STYLES，rail 高 446px、纵向滚动条出现时）
+
+| 方案 | rail 宽 | 标签可用 | 结果 | 列表总高 |
+|---|---|---|---|---|
+| 现状（无开关、真实标记） | 200px | 119px | 4 行折成 2 行，无截断 | 384px |
+| 行尾开关 + 省略号类 | 200px | 77px | **6/8 行超宽**（最多 -64px） | 384px |
+| 行尾开关 + 省略号类 | 236px | 113px | 3/8 行超宽 | 384px |
+| **行尾开关 + 省略号类** | **243px** | **120px** | **3/8 行超宽（-3 / -4 / -21px）** | 384px |
+| 行尾开关，**不启用**省略号类 | 243px | 120px | 4 行折成 2 行 | **424px**（行高 48→58px） |
+
+故取 243px：与现状几乎逐像素持平，且列表总高不变。
+
+⚠️ **测量方法上的两个坑（都踩过）**：
+- **inline 元素的 `clientWidth` 恒为 0**，用 `scrollWidth - clientWidth` 判截断会得到
+  「没有截断」的**假阴性**。要用 `Range.getBoundingClientRect().width` 取文本真实宽度，
+  与父容器 `clientWidth` 比较。
+- **不能靠行高判断折行**：2 行 × 20px = 40px 仍小于 `.dim-jh-provider` 的 `min-height: 48px`，
+  行高恒为 48px，折行被完全掩盖。要用 `Range.getClientRects().length`。
+- **纵向滚动条会再吃掉约 15px** 标签宽度（Windows 经典滚动条），是否出现取决于 rail 高度
+  （即用户窗口高度）。测量必须同时报告「纵向滚动条 = 有/无」，否则同一宽度两次测得不同
+  标签宽度会被误读成测量错误。
+
+### 状态读取失败时退化为不分组（不阻断主功能）
+
+`provider.status` 失败时把状态置为 `null`，rail **按 `PROVIDERS` 原顺序平铺、不分组**，
+并在页头提示一句。⚠️ 此时所有开关都被 `providerSwitchState(undefined)` 判为**禁用** ——
+状态未知时让用户点一个状态不明的开关比禁用更糟。**绝不**因为左侧这个装饰性功能而让
+整个设置页白屏。
+
+### 右侧账号面板：只重新加载，不改逻辑
+
+供应商开关会改掉账号的 `enabled`，故提交成功后递增 `version` 让 `ProviderPanel` 重挂载
+并重新拉一次账号列表（用户已确认接受这一处刷新）。**除此外右侧一律不动**：不新增字段、
+不改按钮、不改积分行、不改拖拽排序、不改账号级 `toggleAccount` 联动。
+
+### 回归用例
+
+- `tests/unit/provider-toggle.spec.ts` —— 纯逻辑（分组 / 三形态 / 结果文案）+ 源码级守卫
+  （开关与 button 是兄弟、行容器无 onClick、开关受控、分组标题带计数、样式约束）。
+- `tests/unit/jet-hub-rpc.spec.ts` —— `provider.status` 的 `closed` 判据（含「只关一部分」
+  与「空目录」两条边界）、`provider.setEnabled` 的写入顺序 / 不落盘 / 广播 / 参数校验。
+- `tests/unit/account-pool.spec.ts` —— `setAccountsEnabled` 的 provider 隔离、幂等不落盘、
+  不破坏黑名单、写前 `ensureLoaded`、跨实例读回。
+- ⚠️ **反向验证 5 组**（证明用例非同义反复）：`closed` 改判据 → 1 条失败；空目录仍落盘 →
+  1 条失败；写入顺序颠倒 → **4 条失败**；去掉「无模型即禁用」→ 3 条失败；去掉分组计数 →
+  1 条失败。
+- ⚠️ **测试替身必须补齐 `credentialRef`**：`sanitizeAccounts` 会把缺该字段的账号**整条丢弃**，
+  于是「停用全部账号」返回 0、用例假失败（本次踩过）。
+- ⚠️ **追加测试段时要确认落在哪个 `describe` 作用域**：本次一度把新段落追加进
+  `TRAE 签到设备轮换代次` 的 describe 内，引用了该作用域不存在的工厂，8 条用例全部
+  ReferenceError。新增段落应显式写明它所属的顶层 describe。
+
+### 安装闸门（用户要求：确保不影响客户端启动才安装）
+
+`verify-client-boot.mjs`（工作区根目录）是安装前的**强制闸门**，任一失败即拒绝安装：
+
+1. **语法层**：`node --check` 每个产物 js。
+2. **加载层（冒烟）**：无头 Edge 注入 `window.__ModuleLoader__`，捕获
+   `load({id, factory})` → 断言 id；以 stub react 执行 `factory` → 断言导出
+   `apply` / `inject`；再调 `apply(fakeCtx)` → 断言注册了 `settings.section` 且未抛错。
+   这一步直接验证「插件能加载并注册设置页」，是 tsc 与单测都覆盖不到的一层。
+3. **产物层**：新能力在、旧能力未被破坏、源码与部署产物哈希一致。

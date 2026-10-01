@@ -546,6 +546,72 @@ export interface RpcModelSetAllDisabledRequest {
 /** RPC: 批量打开/关闭响应（回传写入后的完整黑名单，与单条端点同结构） */
 export type RpcModelSetAllDisabledResponse = RpcModelSetDisabledResponse
 
+/**
+ * 单个供应商的汇总状态（Jet Hub 左侧导航的分组与一键开关据此渲染）。
+ *
+ * 存在的意义：左侧要一次拿到**全部**供应商的状态才能分组，若逐个供应商调
+ * `account.list` + `model.list`，8 个供应商就是 16 次往返，且每次都要走
+ * 异步的凭据解析。这里一次返回，且服务端全程只用**同步的内存副本**。
+ */
+export interface ProviderStatus {
+  /** 模型计数：total 为**不套黑名单**的全量目录条数，disabled 为其中已关闭的条数。 */
+  models: { total: number; disabled: number }
+  /** 账号计数：enabled 为其中处于启用状态的条数。 */
+  accounts: { total: number; enabled: number }
+  /**
+   * 该供应商是否**已关闭**。
+   *
+   * 判据：`models.total > 0 && models.disabled === models.total` ——
+   * **全部模型都已关闭**才算关闭。两条边界都不能省：
+   * - `total > 0`：没有任何可用模型时**不算**「已关闭」（没有模型可关，
+   *   就不该说它被关闭了），此时前端把开关置为不可用；
+   * - `disabled === total`：只要还剩一个打开的模型，该供应商就仍是「已打开」。
+   *
+   * ⚠️ 与前端 `allModelsDisabled(models)`（`plugin-src/client/account-model-link.js`）
+   * 的判据**语义同源、形态不同**：那个函数看的是模型**条目数组**，这里看的是计数。
+   * 两者必须同步修改，否则「左侧说已关闭、账号联动说没全关」会自相矛盾。
+   */
+  closed: boolean
+}
+
+/** RPC: 读取多个供应商的汇总状态请求 */
+export interface RpcProviderStatusRequest {
+  /** 要查询的 provider id 列表（Jet Hub 一次性传全部 8 个）。 */
+  providers: string[]
+}
+
+/** RPC: 读取多个供应商的汇总状态响应 */
+export interface RpcProviderStatusResponse {
+  /** provider id → 状态。请求里未识别的 id 不出现在结果中。 */
+  statuses: Record<string, ProviderStatus>
+}
+
+/**
+ * RPC: 供应商级一键开关请求。
+ *
+ * 语义（用户已确认）：
+ * - `enabled: false`（关闭）= **先关掉它的全部模型，再停用它的全部账号**；
+ * - `enabled: true`（打开）= 清空它的模型黑名单，并启用它的全部账号。
+ *
+ * `enabled` **没有默认值**：缺失或非布尔一律拒绝。与
+ * {@link RpcModelSetAllDisabledRequest} 同理 —— 默认成 `true` 会静默打开
+ * 用户特意关闭的供应商，默认成 `false` 则反向静默关闭，两个方向都难察觉。
+ */
+export interface RpcProviderSetEnabledRequest {
+  provider: string
+  enabled: boolean
+}
+
+/** RPC: 供应商级一键开关响应（回传实际变更数，供前端给出准确提示）。 */
+export interface RpcProviderSetEnabledResponse {
+  provider: string
+  enabled: boolean
+  /** 实际被写入黑名单的模型数（关闭方向）或清空的条目数（打开方向）。 */
+  models: number
+  /** 实际被改变的账号数（已是目标状态的账号不计入）。 */
+  accounts: number
+}
+
 /** 存储在 CODEARTS_ACCESS_TOKEN 下的归一化临时凭据。 */
 export interface CodeArtsCredential {
   access_key_id: string

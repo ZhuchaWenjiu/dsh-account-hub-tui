@@ -1727,3 +1727,410 @@ describe('account.reorder 端点', () => {
     expect(orderInStore()).toEqual(['b2', 'c1', 'b1'])
   })
 })
+
+/**
+ * 供应商级一键开关：`provider.status`（读）与 `provider.setEnabled`（写）。
+ *
+ * 这套用例的重点是几条**不能被"改动"破坏的不变式**：
+ * 1. 关闭方向必须**先关模型、再停账号**（顺序反了会留下「账号全停但模型可见」的中间态）；
+ * 2. 目录读失败或目录为空时**整个操作失败、不落盘、不广播**（「不关闭模型就不关闭供应商」）；
+ * 3. 两个方向都必须广播 `llm/adapters-updated`（否则对话框选择器要重启才更新）；
+ * 4. `enabled` 非布尔一律拒绝（不猜默认值）。
+ */
+describe('provider.status / provider.setEnabled 端点', () => {
+  type Handler = (request: Request) => Promise<Response>
+
+  function setup(options: {
+    /** `listAllModels()` 的返回值（不套黑名单的全量目录）；省略则模拟「适配器缺失」。 */
+    catalog?: Array<{ id: string; name: string }>
+    /** 初始黑名单。 */
+    disabledModels?: Record<string, Record<string, boolean>>
+    /** 初始账号（只用到 provider / enabled）。 */
+    accounts?: Array<{ id: string; provider: string; enabled: boolean }>
+    /** 省略 llm 服务，验证「目录读不出来」的降级路径。 */
+    withoutLlm?: boolean
+    /** 让 llm.listModels 抛错。 */
+    listModelsError?: string
+    /** 让 `ctx.emit` 抛错，验证「广播失败不反噬已落盘的开关」。 */
+    emitThrows?: boolean
+    /** 是否提供适配器（false = 模拟外部/旧适配器，只有 llm 可用）。 */
+    withAdapter?: boolean
+  } = {}) {
+    let stored: Record<string, unknown> = {
+      // ⚠️ 账号条目必须补齐 `credentialRef`（非空）与 `createdAt`/`refreshable`：
+      // `sanitizeAccounts` 会把缺 `credentialRef` 的条目**整条丢弃**，于是
+      // 「停用全部账号」会返回 0、用例假失败。这个替身曾因此踩过一次。
+      accounts: (options.accounts ?? []).map((a, i) => ({
+        nickname: a.id,
+        credentialRef: `${a.provider.toUpperCase()}_ACCOUNT_T${i + 1}`,
+        createdAt: Date.now(),
+        refreshable: true,
+        ...a,
+      })),
+      ...options.disabledModels !== undefined ? { disabledModels: options.disabledModels } : {},
+    }
+    let handler: Handler | undefined
+    const emitted: string[] = []
+    /** 记录每次写入的顺序，用于断言「先关模型、后停账号」。 */
+    const writeOrder: string[] = []
+
+    const pool = new AccountPool({
+      get: (key: string) => key === 'settings'
+        ? {
+            register: () => ({
+              get: () => stored,
+              replace: async (value: Record<string, unknown>) => {
+                // 判定这次写入是「账号」还是「模型黑名单」：前者有非空 accounts
+                // 且黑名单未变；用更直接的判据 —— 对比写入前后的字段差异。
+                const prevDisabled = JSON.stringify((stored as { disabledModels?: unknown }).disabledModels ?? {})
+                const nextDisabled = JSON.stringify((value as { disabledModels?: unknown }).disabledModels ?? {})
+                if (prevDisabled !== nextDisabled) writeOrder.push('models')
+                const prevAccounts = JSON.stringify((stored as { accounts?: unknown }).accounts ?? [])
+                const nextAccounts = JSON.stringify((value as { accounts?: unknown }).accounts ?? [])
+                if (prevAccounts !== nextAccounts) writeOrder.push('accounts')
+                stored = value
+              },
+            }),
+          }
+        : undefined,
+      logger: { warn: () => {}, info: () => {} },
+      credentials: {
+        describe: async () => ({ configured: false, writable: true }),
+        resolve: async () => undefined,
+        set: async () => {},
+        unset: async () => {},
+      },
+    } as never)
+
+    const adapter = options.catalog !== undefined && options.withAdapter !== false
+      ? { listAllModels: () => options.catalog! }
+      : undefined
+
+    const ctx = {
+      get: (key: string) => {
+        if (key === 'connection') {
+          return { fetch: { register: (config: { fetch: Handler }) => { handler = config.fetch } } }
+        }
+        if (key === 'llm' && options.withoutLlm !== true) {
+          return {
+            listModels: async (provider: string) => {
+              if (options.listModelsError !== undefined) throw new Error(options.listModelsError)
+              const disabled = ((stored.disabledModels as Record<string, Record<string, boolean>> | undefined)?.[provider]) ?? {}
+              // 复刻真实适配器：黑名单命中的模型不出现在 listModels 结果里。
+              return (options.catalog ?? [])
+                .filter(m => disabled[m.id] !== true)
+                .map(m => ({ ...m, provider }))
+            },
+          }
+        }
+        return undefined
+      },
+      inject: (_deps: string[], callback: (ctx: unknown) => void) => { callback(ctx) },
+      logger: { warn: () => {}, info: () => {} },
+      emit: (event: string) => {
+        if (options.emitThrows === true) throw new Error('listener exploded')
+        emitted.push(event)
+      },
+    }
+
+    registerJetHubRpc(
+      // ⚠️ **位置参数**：auth 实例是按顺序传的，每新增一个 provider 都要在这里
+      // 补一个 `{}` 占位，否则 `modelAdapters` 会错位落到最后一个 auth 形参上。
+      // 加 Raccoon（第 9 个）时本地就因此踩过一次：`modelAdapters` 落到 `raccoon`
+      // 上 → `listAllModels()` 读不到 → `provider.status` 的 total 恒为 0、
+      // 三条用例假失败。改签名后请 `grep -n 'registerJetHubRpc(' tests/` 全部补齐。
+      // ⚠️ 合并上游 `qoderCn`（第 8 个）时**第四次**踩到同一个坑：git 认为本文件
+      // 「无冲突」（改动分散在不同段落），但 `qoderCn` 插入后这里的占位整体错位
+      // 一位 → `modelAdapters` 落到 `raccoon` 上 → 上面那三条用例再次假失败。
+      // **合并新增 provider 后必须重跑本组用例，不能只看 git 是否报冲突。**
+      // ⚠️ **第六次**（2026-10-01，为提交独立 PR 而把本分支重建到最新上游）：
+      // 上游此后又加了 `minimax` 与 `zcode` ⇒ 这里少两个占位、`modelAdapters`
+      // 落到 `zcode` 上，本组 3 条用例**再次**以完全相同的形态失败。
+      // 判据永远是同一条：`provider.status` 的 `total` 恒为 0 ⇒ 先数占位。
+      ctx as never, pool,
+      {} as never, // codearts
+      {} as never, // buddy
+      {} as never, // workbuddy
+      {} as never, // lobsterai
+      {} as never, // qoder
+      {} as never, // qoderCn
+      {} as never, // trae
+      {} as never, // cline
+      {} as never, // loomy
+      {} as never, // raccoon
+      {} as never, // minimax
+      {} as never, // zcode
+      (adapter !== undefined ? { buddy: adapter } : undefined) as never,
+    )
+    if (handler === undefined) throw new Error('endpoint handler was not registered')
+
+    const call = async (method: string, payload: unknown) => {
+      const response = await handler!(new Request('http://localhost/api/jet-hub', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          type: 'client-request', rpcId: 'rpc-1', method: 'jet-hub',
+          payload: { method, payload },
+        }),
+      }))
+      const body = await response.json() as { result: { ok: boolean; value?: unknown; error?: { message: string } } }
+      return body.result
+    }
+
+    return {
+      call,
+      emitted,
+      writeOrder,
+      storedDisabled: () => (stored.disabledModels as Record<string, Record<string, boolean>> | undefined) ?? {},
+      storedAccounts: () => (stored.accounts as Array<{ id: string; provider: string; enabled: boolean }> | undefined) ?? [],
+    }
+  }
+
+  const CATALOG = [
+    { id: 'glm-5.2', name: 'GLM-5.2' },
+    { id: 'deepseek-v4-flash', name: 'DeepSeek V4 Flash' },
+    { id: 'hy3', name: 'Hy3' },
+  ]
+
+  describe('provider.status', () => {
+    it('全部模型都已关闭时 closed 为 true', async () => {
+      const { call } = setup({
+        catalog: CATALOG,
+        disabledModels: { buddy: { 'glm-5.2': true, 'deepseek-v4-flash': true, hy3: true } },
+      })
+      const result = await call('provider.status', { providers: ['buddy'] })
+      expect(result.ok).toBe(true)
+      const s = (result.value as { statuses: Record<string, { models: { total: number; disabled: number }; closed: boolean }> }).statuses.buddy
+      expect(s.models).toEqual({ total: 3, disabled: 3 })
+      expect(s.closed).toBe(true)
+    })
+
+    it('⚠️ 只关了一部分时 closed 为 false（不能按「关过」判）', async () => {
+      const { call } = setup({
+        catalog: CATALOG,
+        disabledModels: { buddy: { hy3: true } },
+      })
+      const result = await call('provider.status', { providers: ['buddy'] })
+      const s = (result.value as { statuses: Record<string, { models: { total: number; disabled: number }; closed: boolean }> }).statuses.buddy
+      expect(s.models).toEqual({ total: 3, disabled: 1 })
+      expect(s.closed).toBe(false)
+    })
+
+    it('⚠️ 没有任何模型时 closed 必须为 false（「没有模型可关」≠「已关闭」）', async () => {
+      const { call } = setup({ catalog: [] })
+      const result = await call('provider.status', { providers: ['buddy'] })
+      const s = (result.value as { statuses: Record<string, { models: { total: number; disabled: number }; closed: boolean }> }).statuses.buddy
+      expect(s.models.total).toBe(0)
+      expect(s.closed).toBe(false)
+    })
+
+    it('⚠️ 适配器缺失时保守判为未关闭（不误报已关闭）', async () => {
+      const { call } = setup({ catalog: CATALOG, withAdapter: false, disabledModels: { buddy: { 'glm-5.2': true } } })
+      const result = await call('provider.status', { providers: ['buddy'] })
+      const s = (result.value as { statuses: Record<string, { closed: boolean }> }).statuses.buddy
+      expect(s.closed).toBe(false)
+    })
+
+    it('回传账号计数（enabled 只统计启用的）', async () => {
+      const { call } = setup({
+        catalog: CATALOG,
+        accounts: [
+          { id: 'b1', provider: 'buddy', enabled: true },
+          { id: 'b2', provider: 'buddy', enabled: false },
+          { id: 'c1', provider: 'codearts', enabled: true },
+        ],
+      })
+      const result = await call('provider.status', { providers: ['buddy'] })
+      const s = (result.value as { statuses: Record<string, { accounts: { total: number; enabled: number } }> }).statuses.buddy
+      // 只统计本 provider，codearts 的账号不计入
+      expect(s.accounts).toEqual({ total: 2, enabled: 1 })
+    })
+
+    it('一次查询多个供应商，各自独立判定', async () => {
+      const { call } = setup({
+        catalog: CATALOG,
+        disabledModels: { buddy: { 'glm-5.2': true, 'deepseek-v4-flash': true, hy3: true } },
+      })
+      const result = await call('provider.status', { providers: ['buddy', 'qoder'] })
+      const statuses = (result.value as { statuses: Record<string, { closed: boolean }> }).statuses
+      expect(statuses.buddy.closed).toBe(true)
+      // qoder 没有目录 → 未关闭
+      expect(statuses.qoder?.closed ?? false).toBe(false)
+    })
+
+    it('providers 非字符串数组 → bad-request', async () => {
+      const { call } = setup({ catalog: CATALOG })
+      expect((await call('provider.status', { providers: 'buddy' })).ok).toBe(false)
+      expect((await call('provider.status', { providers: [1, 2] })).ok).toBe(false)
+      expect((await call('provider.status', {})).ok).toBe(false)
+    })
+
+    it('provider.status 是只读的：不写盘、不广播', async () => {
+      const { call, emitted, writeOrder } = setup({ catalog: CATALOG })
+      await call('provider.status', { providers: ['buddy'] })
+      expect(emitted).toEqual([])
+      expect(writeOrder).toEqual([])
+    })
+  })
+
+  describe('provider.setEnabled（关闭方向）', () => {
+    it('关闭：把全部模型写入黑名单，并停用全部账号', async () => {
+      const { call, storedDisabled, storedAccounts } = setup({
+        catalog: CATALOG,
+        accounts: [{ id: 'b1', provider: 'buddy', enabled: true }],
+      })
+      const result = await call('provider.setEnabled', { provider: 'buddy', enabled: false })
+      expect(result.ok).toBe(true)
+      expect(result.value).toMatchObject({ provider: 'buddy', enabled: false, models: 3, accounts: 1 })
+      expect(Object.keys(storedDisabled().buddy).sort()).toEqual(['deepseek-v4-flash', 'glm-5.2', 'hy3'])
+      expect(storedAccounts()[0].enabled).toBe(false)
+    })
+
+    it('⚠️ 顺序必须是「先关模型、再停账号」', async () => {
+      // 判据是模型是否全关；先关模型可保证中途失败时状态仍自洽。
+      const { call, writeOrder } = setup({
+        catalog: CATALOG,
+        accounts: [{ id: 'b1', provider: 'buddy', enabled: true }],
+      })
+      await call('provider.setEnabled', { provider: 'buddy', enabled: false })
+      expect(writeOrder).toEqual(['models', 'accounts'])
+    })
+
+    it('关闭后广播 llm/adapters-updated（否则界面要重启才更新）', async () => {
+      const { call, emitted } = setup({ catalog: CATALOG })
+      await call('provider.setEnabled', { provider: 'buddy', enabled: false })
+      expect(emitted).toContain('llm/adapters-updated')
+    })
+
+    it('⚠️ 目录读失败 → 整个操作失败，不落盘、不广播', async () => {
+      const { call, emitted, writeOrder, storedDisabled } = setup({
+        catalog: CATALOG,
+        withAdapter: false,
+        withoutLlm: true,
+        accounts: [{ id: 'b1', provider: 'buddy', enabled: true }],
+      })
+      const result = await call('provider.setEnabled', { provider: 'buddy', enabled: false })
+      expect(result.ok).toBe(false)
+      expect(result.error?.message).toBeTruthy()
+      // 三条关键断言：不写黑名单、不停账号、不广播
+      expect(storedDisabled().buddy).toBeUndefined()
+      expect(writeOrder).toEqual([])
+      expect(emitted).toEqual([])
+    })
+
+    it('⚠️ llm.listModels 抛错同样不落盘、不广播', async () => {
+      const { call, emitted, writeOrder } = setup({
+        catalog: CATALOG,
+        withAdapter: false,
+        listModelsError: 'boom',
+        accounts: [{ id: 'b1', provider: 'buddy', enabled: true }],
+      })
+      const result = await call('provider.setEnabled', { provider: 'buddy', enabled: false })
+      expect(result.ok).toBe(false)
+      expect(writeOrder).toEqual([])
+      expect(emitted).toEqual([])
+    })
+
+    it('⚠️ 目录为空 → 拒绝且不落盘（「不关闭模型就不关闭供应商」的落点）', async () => {
+      const { call, emitted, writeOrder, storedAccounts } = setup({
+        catalog: [],
+        accounts: [{ id: 'b1', provider: 'buddy', enabled: true }],
+      })
+      const result = await call('provider.setEnabled', { provider: 'buddy', enabled: false })
+      expect(result.ok).toBe(false)
+      expect(result.error?.message).toContain('没有可关闭的模型')
+      // ⚠️ 关键：绝不能「关不掉模型就只停账号」——那会让它显示成已关闭而模型仍在。
+      expect(writeOrder).toEqual([])
+      expect(emitted).toEqual([])
+      expect(storedAccounts()[0].enabled).toBe(true)
+    })
+
+    it('已是目标状态时 accounts 计数为 0（不谎报已停用 N 个）', async () => {
+      const { call } = setup({
+        catalog: CATALOG,
+        accounts: [{ id: 'b1', provider: 'buddy', enabled: false }],
+      })
+      const result = await call('provider.setEnabled', { provider: 'buddy', enabled: false })
+      expect(result.value).toMatchObject({ models: 3, accounts: 0 })
+    })
+
+    it('无账号时关闭仍可执行（关模型、停 0 个账号）', async () => {
+      const { call } = setup({ catalog: CATALOG })
+      const result = await call('provider.setEnabled', { provider: 'buddy', enabled: false })
+      expect(result.ok).toBe(true)
+      expect(result.value).toMatchObject({ models: 3, accounts: 0 })
+    })
+  })
+
+  describe('provider.setEnabled（打开方向）', () => {
+    it('打开：清空该 provider 的黑名单，并启用全部账号，且广播', async () => {
+      const { call, emitted, storedDisabled, storedAccounts } = setup({
+        catalog: CATALOG,
+        disabledModels: { buddy: { 'glm-5.2': true, hy3: true } },
+        accounts: [{ id: 'b1', provider: 'buddy', enabled: false }],
+      })
+      const result = await call('provider.setEnabled', { provider: 'buddy', enabled: true })
+      expect(result.ok).toBe(true)
+      expect(result.value).toMatchObject({ models: 2, accounts: 1 })
+      expect(storedDisabled().buddy).toBeUndefined()
+      expect(storedAccounts()[0].enabled).toBe(true)
+      expect(emitted).toContain('llm/adapters-updated')
+    })
+
+    it('⚠️ 打开方向不读目录：目录缺失/故障时仍能把开关全打开', async () => {
+      const { call } = setup({
+        catalog: CATALOG,
+        withAdapter: false,
+        withoutLlm: true,
+        disabledModels: { buddy: { 'glm-5.2': true } },
+      })
+      const result = await call('provider.setEnabled', { provider: 'buddy', enabled: true })
+      expect(result.ok).toBe(true)
+    })
+
+    it('⚠️ 只清本 provider 的黑名单，不波及其它 provider', async () => {
+      const { call, storedDisabled } = setup({
+        catalog: CATALOG,
+        disabledModels: { buddy: { hy3: true }, trae: { 'glm-5.2': true } },
+      })
+      await call('provider.setEnabled', { provider: 'buddy', enabled: true })
+      expect(storedDisabled().buddy).toBeUndefined()
+      expect(storedDisabled().trae).toEqual({ 'glm-5.2': true })
+    })
+
+    it('⚠️ 打开也要广播（两个方向都改变 listModels 结果）', async () => {
+      const { call, emitted } = setup({ catalog: CATALOG })
+      await call('provider.setEnabled', { provider: 'buddy', enabled: true })
+      expect(emitted).toEqual(['llm/adapters-updated'])
+    })
+  })
+
+  describe('provider.setEnabled（参数校验与健壮性）', () => {
+    it('enabled 非布尔（缺失 / 字符串 / 数字）一律 bad-request，且不落盘', async () => {
+      const { call, writeOrder, emitted } = setup({
+        catalog: CATALOG,
+        accounts: [{ id: 'b1', provider: 'buddy', enabled: true }],
+      })
+      expect((await call('provider.setEnabled', { provider: 'buddy' })).ok).toBe(false)
+      expect((await call('provider.setEnabled', { provider: 'buddy', enabled: 'false' })).ok).toBe(false)
+      expect((await call('provider.setEnabled', { provider: 'buddy', enabled: 0 })).ok).toBe(false)
+      // ⚠️ 不做默认值猜测：一次字段名写错不该静默改动用户数据
+      expect(writeOrder).toEqual([])
+      expect(emitted).toEqual([])
+    })
+
+    it('provider 缺失或空串 → bad-request', async () => {
+      const { call } = setup({ catalog: CATALOG })
+      expect((await call('provider.setEnabled', { enabled: false })).ok).toBe(false)
+      expect((await call('provider.setEnabled', { provider: '', enabled: false })).ok).toBe(false)
+    })
+
+    it('⚠️ 广播抛错仍算成功（通知失败不得反噬已落盘的开关）', async () => {
+      const { call, storedDisabled } = setup({ catalog: CATALOG, emitThrows: true })
+      const result = await call('provider.setEnabled', { provider: 'buddy', enabled: false })
+      expect(result.ok).toBe(true)
+      // 开关确实已落盘
+      expect(Object.keys(storedDisabled().buddy)).toHaveLength(3)
+    })
+  })
+})

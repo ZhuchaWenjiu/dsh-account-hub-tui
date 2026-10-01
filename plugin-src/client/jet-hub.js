@@ -28,6 +28,11 @@ import {
   filterModels,
   isFilterActive,
 } from './model-filter.js';
+import {
+  groupProviders,
+  providerSwitchState,
+  summarizeProviderToggle,
+} from './provider-toggle.js';
 import { decryptBackup, encryptBackup, isEncryptedBackup } from './backup-crypto.js';
 
 export const JET_HUB_RPC_CHANNEL = '/jet-hub';
@@ -2199,12 +2204,119 @@ export function JetHubPage({ close, rpcCall }) {
   // 一键签到：busy 防重复点击，notice 显示上一次结果摘要。
   const [checkinBusy, setCheckinBusy] = React.useState(false);
   const [checkinNotice, setCheckinNotice] = React.useState(null);
+  /**
+   * 供应商级状态（provider id → ProviderStatus），driving 左侧分组与一键开关。
+   *
+   * `null` = 尚未读取成功（分组退化为不分组平铺，开关全部禁用）——
+   * 与「读取到空对象」区分：后者说明服务端确实什么都没返回，也按未读取处理。
+   */
+  const [providerStatuses, setProviderStatuses] = React.useState(null);
+  /** 正在提交的供应商 id 集合：只禁用被点的那一个开关。 */
+  const [providerBusy, setProviderBusy] = React.useState(() => new Set());
+  /**
+   * 供应商开关的结果提示（成功或失败）。
+   *
+   * 与 `checkinNotice` 分开：两者可能先后出现，共用一个状态会让后写的覆盖先写的，
+   * 用户就看不到自己刚做的那个操作的结果了。
+   */
+  const [providerNotice, setProviderNotice] = React.useState(null);
   const mounted = React.useRef(true);
   React.useEffect(() => () => { mounted.current = false; }, []);
+
+  /**
+   * 读取全部供应商的汇总状态。
+   *
+   * 一次请求拿全部 8 个（而不是逐个查）：服务端全程只用同步内存副本，
+   * 不产生网络往返（见 `provider.status` 的注释）。
+   *
+   * **失败不阻断账号管理**：读不到就把 `providerStatuses` 置为 null，让 rail
+   * 退化为不分组平铺（仍可正常选择供应商、管理账号），只在页头提示一句。
+   * 若在这里抛错，整个设置页会白屏 —— 那是「左侧装饰性功能拖垮主功能」的糟糕取舍。
+   */
+  const loadProviderStatuses = React.useCallback(async () => {
+    try {
+      const res = await rpcCall('provider.status', { providers: PROVIDERS.map(p => p.id) });
+      if (!mounted.current) return;
+      setProviderStatuses(res?.statuses || {});
+    } catch (caught) {
+      console.error('[jet-hub] load provider statuses failed:', caught);
+      if (!mounted.current) return;
+      setProviderStatuses(null);
+      setProviderNotice({
+        tone: 'warn',
+        text: `供应商开关状态读取失败（${caught?.message || '未知错误'}），已按原顺序显示供应商；账号管理不受影响。`,
+      });
+    }
+  }, [rpcCall]);
+
+  React.useEffect(() => {
+    mounted.current = true;
+    void loadProviderStatuses();
+  }, [loadProviderStatuses]);
 
   const selectProvider = (id) => {
     setSelected(id);
     setVersion(v => v + 1);
+  };
+
+  /**
+   * 供应商级一键开关。
+   *
+   * 语义（用户已确认，与后端 `provider.setEnabled` 严格对应）：
+   * - **关闭** = 关闭它的全部模型（从对话框的模型选择里移除）+ 停用它的全部账号；
+   * - **打开** = 打开它的全部模型 + 启用它的全部账号。
+   *
+   * 三个要点：
+   * 1. **关闭前必须确认**：这是会改动多个模型与账号的批量操作，静默执行不可接受。
+   *    文案带上已读取到的计数，让用户知道影响面。
+   * 2. **失败时保留 rail 原状态**：不乐观更新 —— 供应商状态是推导出来的
+   *    （由模型黑名单），本地猜测容易与服务端不一致；成功后重新拉状态即可。
+   * 3. **成功后递增版号**：该 provider 的账号启用状态刚在服务端被改过，
+   *    右侧账号面板必须重新加载才能与左侧一致（用户已确认允许这一处刷新）。
+   */
+  const toggleProvider = async (providerId, enabled) => {
+    const label = PROVIDERS.find(p => p.id === providerId)?.label || providerId;
+    const status = providerStatuses?.[providerId];
+    if (!enabled) {
+      const models = status?.models?.total ?? 0;
+      const accounts = status?.accounts?.enabled ?? 0;
+      const ok = confirm(
+        `确认关闭「${label}」？\n\n`
+        + `将关闭它的 ${models} 个模型（从对话框的模型选择里移除），`
+        + `并停用它的 ${accounts} 个启用账号。\n\n`
+        + `取消则不做任何变更。`,
+      );
+      if (!ok) return;
+    }
+    setProviderBusy(prev => new Set(prev).add(providerId));
+    setProviderNotice(null);
+    try {
+      const res = await rpcCall('provider.setEnabled', { provider: providerId, enabled });
+      if (!mounted.current) return;
+      setProviderNotice({
+        tone: 'ok',
+        text: `${label}：${summarizeProviderToggle(enabled, res)}`,
+      });
+      // 重新拉状态（分组随之变化）+ 重挂载右侧面板（账号启用状态已变）
+      await loadProviderStatuses();
+      if (mounted.current) setVersion(v => v + 1);
+    } catch (caught) {
+      console.error('[jet-hub] toggle provider failed:', caught);
+      if (!mounted.current) return;
+      // 保留 rail 原状态：状态由模型黑名单推导，本地猜测容易与服务端不一致。
+      setProviderNotice({
+        tone: 'error',
+        text: `${label} 操作失败：${caught?.message || '未知错误'}`,
+      });
+    } finally {
+      if (mounted.current) {
+        setProviderBusy((prev) => {
+          const next = new Set(prev);
+          next.delete(providerId);
+          return next;
+        });
+      }
+    }
   };
 
   /**
@@ -2302,6 +2414,78 @@ export function JetHubPage({ close, rpcCall }) {
     setVersion(v => v + 1);
   };
 
+  /**
+   * 单个供应商行：`<button role="tab">`（选择面板）+ 行尾开关。
+   *
+   * ⚠️ **开关是 button 的兄弟节点，绝不嵌进 button 内**：
+   * ① 交互元素嵌套在 HTML 里是非法的（浏览器行为未定义）；
+   * ② 本项目有过同类真实缺陷 —— 在 `<label>` 里插入第二个 checkbox 后，
+   *    点行内文字会激活第一个可标记控件，导致「点模型名切换可见性」失效
+   *    （见 `model-filter.js` 的记载）。这里是同一类风险，故结构上直接隔开。
+   *
+   * 行容器**不挂 onClick**：点击行为只属于那个 button，开关则由 onChange 处理。
+   */
+  const renderProviderRow = (p) => {
+    const status = providerStatuses?.[p.id];
+    const sw = providerSwitchState(status);
+    const busy = providerBusy.has(p.id);
+    const on = sw.checked;
+    return React.createElement('div', { className: 'dim-jh-providerRow', key: p.id, 'data-provider': p.id },
+      React.createElement('button', {
+        type: 'button',
+        role: 'tab',
+        className: 'dim-jh-provider',
+        'aria-selected': p.id === selected,
+        title: p.label,
+        onClick: () => selectProvider(p.id),
+      },
+      React.createElement(ProviderLogo, { provider: p.id }),
+      // ⚠️ 这里给 label 加了 `dim-jh-providerLabel` —— 该类在样式表里**早已定义**
+      // （含 min-width: 0 与省略号），但此前从未被任何 JS 使用，故真实界面上长
+      // 供应商名一直在**折行**。加上它可把折行改为单行省略号（实测：rail 243px 时
+      // 只有 WorkBuddy 一行超宽 21px），且列表总高不变（384px）；若不加，行高会
+      // 从 48px 被顶到 58px、总高 424px。这是一处左侧的可见变化，已在交付说明中注明。
+      React.createElement('span', { className: 'dim-jh-providerLabel' },
+        React.createElement('strong', null, p.label))),
+      React.createElement('input', {
+        type: 'checkbox',
+        className: 'dim-jh-switch',
+        role: 'switch',
+        checked: on,
+        disabled: busy || sw.disabled,
+        title: sw.disabled
+          ? sw.reason
+          : (on ? `关闭「${p.label}」：关闭它的全部模型并停用全部账号` : `打开「${p.label}」：打开它的全部模型并启用全部账号`),
+        'aria-label': `${on ? '关闭' : '打开'} ${p.label}`,
+        onChange: () => void toggleProvider(p.id, !on),
+      }));
+  };
+
+  /**
+   * 渲染左侧导航。
+   *
+   * 两种形态：
+   * - **已读取到状态**：分「已打开 / 已关闭」两组，各带计数；
+   * - **未读取到**（首次加载中 / 请求失败）：按 `PROVIDERS` 原顺序平铺、不分组。
+   *   此时所有开关都被 `providerSwitchState(undefined)` 判为禁用 —— 状态未知时
+   *   让用户点一个状态不明的开关比禁用更糟。
+   *
+   * 分组只是**展示分组**，不改变用户的认知顺序：组内保持 `PROVIDERS` 声明顺序。
+   */
+  const renderRail = () => {
+    if (providerStatuses === null) {
+      return PROVIDERS.map(p => renderProviderRow(p));
+    }
+    const { open, closed } = groupProviders(PROVIDERS, providerStatuses);
+    const group = (title, list, key) => React.createElement('div', { className: 'dim-jh-railGroup', key },
+      React.createElement('div', { className: 'dim-jh-railGroupTitle' }, title),
+      list.map(p => renderProviderRow(p)));
+    return [
+      group(`已打开 (${open.length})`, open, 'open'),
+      group(`已关闭 (${closed.length})`, closed, 'closed'),
+    ];
+  };
+
   return React.createElement('section', { className: 'dim-jh-page', 'aria-label': 'Jet Hub Provider 设置' },
     React.createElement('header', { className: 'dim-jh-header' },
       React.createElement('div', { className: 'dim-jh-brand' },
@@ -2345,19 +2529,17 @@ export function JetHubPage({ close, rpcCall }) {
                 React.createElement('li', { key: index }, note)))
           : null)
       : null,
+    providerNotice
+      ? React.createElement('div', {
+          className: 'dim-jh-probeNotice',
+          'data-tone': providerNotice.tone,
+          role: providerNotice.tone === 'error' ? 'alert' : 'status',
+          style: { flex: 'none', margin: '12px 24px 0' },
+        }, React.createElement('div', null, providerNotice.text))
+      : null,
     React.createElement('div', { className: 'dim-jh-layout' },
       React.createElement('nav', { className: 'dim-jh-rail', role: 'tablist', 'aria-label': 'Provider 导航' },
-        PROVIDERS.map(p => React.createElement('button', {
-          key: p.id,
-          type: 'button',
-          role: 'tab',
-          className: 'dim-jh-provider',
-          'aria-selected': p.id === selected,
-          onClick: () => selectProvider(p.id),
-        },
-        React.createElement(ProviderLogo, { provider: p.id }),
-        React.createElement('span', null,
-          React.createElement('strong', null, p.label))))),
+        renderRail()),
       React.createElement('main', {
         className: 'dim-jh-panel',
         role: 'tabpanel',

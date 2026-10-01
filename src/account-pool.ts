@@ -221,6 +221,63 @@ export class AccountPool {
   }
 
   /**
+   * 批量启用/停用某 provider 的**全部**账号（Jet Hub 左侧供应商一键开关）。
+   *
+   * ## 为什么需要批量方法
+   *
+   * 供应商级开关的语义是「关闭该供应商」= 关掉它的全部模型（黑名单）+
+   * 停用它的全部账号。前者复用 {@link setModelsDisabled}，后者没有现成路径 ——
+   * 逐账号调 {@link updateAccount} 会写 N 次完整文档（且每次都可能与其它
+   * provider 的改动互相覆盖），故这里一次落盘。
+   *
+   * ## 与「账号级开关」的区别（勿混）
+   *
+   * 账号级开关（账号卡片上的「停用/启用」）只动**单个**账号，且带
+   * 「是否连带关闭该 provider 模型」的询问（见前端 `toggleAccount`）。
+   * 本方法只动 `enabled`，**不碰模型黑名单**、不做任何询问 ——
+   * 模型那侧由调用方（`provider.setEnabled` 端点）按固定顺序显式处理。
+   *
+   * ## 语义要点
+   *
+   * - **只改本 provider 的账号**：账号存在一个全局数组里（各 provider 混排），
+   *   与 {@link reorderAccounts} 的隔离约定一致，绝不波及其它 provider。
+   * - **幂等且无变更不落盘**：全部已是目标状态时直接返回 0，不产生无意义的
+   *   文档重写（与 {@link setModelsDisabled} 的「空列表不落盘」同精神）。
+   * - ⚠️ **返回「实际变更数」而非「命中数」**：调用方用它给用户提示
+   *   （如「已停用 2 个账号」）。若返回命中数，全部本就停用时也会报「已停用 2 个」，
+   *   用户会以为发生了他没预料到的改动。
+   *
+   * @param provider - provider id（`this.product.id`，不要写死字面量）
+   * @param enabled - 目标状态：true 启用 / false 停用
+   * @returns 实际被改变的账号数
+   */
+  async setAccountsEnabled(provider: string, enabled: boolean): Promise<number> {
+    // ⚠️ 必须先确保已载入：本类只在**读**方法里调 `ensureLoaded()`，若首次访问
+    // 就是写操作，`this.cache` 还是初始空数组 —— 这里虽然会按 provider 过滤后
+    // 才写，但 `writeAccounts` 是**整体替换**，未载入时写回等于把磁盘上其它
+    // provider 的账号全部抹掉（与 setModelsDisabled 的教训同型，后果更严重）。
+    this.ensureLoaded()
+    const accounts = this.cache
+    let changed = 0
+    const next = accounts.map((entry) => {
+      if (entry.provider !== provider) return entry
+      // 只把「显式 boolean」与目标比较：老文档里 enabled 可能缺失，
+      // 缺失语义等同启用（与适配器 `enabled !== false` 的判定保持一致）。
+      const current = entry.enabled !== false
+      if (current === enabled) return entry
+      changed++
+      return { ...entry, enabled }
+    })
+    // 无实际变更不落盘：避免一次「没有任何改动」的开关操作产生文档重写。
+    if (changed === 0) return 0
+    await this.writeAccounts(next)
+    this.ctx.logger?.info?.(
+      `[jet-hub] 已${enabled ? '启用' : '停用'} ${provider} 的 ${changed} 个账号`,
+    )
+    return changed
+  }
+
+  /**
    * 清空某 provider 的全部关闭项（Jet Hub 模型列表的「打开全部」）。
    *
    * ⚠️ **刻意不看模型目录**：直接删掉该 provider 在黑名单里的**全部**键，
