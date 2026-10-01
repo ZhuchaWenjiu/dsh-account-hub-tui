@@ -481,36 +481,61 @@ const STYLES = `
    浮层用 position:absolute + bottom:calc(100% + 8px) 向上展开。
    ⚠ 输入区（RlGAzG_root / dock / trailing / standardControls）没有
    overflow:hidden（只有文本域 .RlGAzG_scroll 是 overflow-y:auto），故浮层
-   不会被裁剪 —— 若将来上游给这些容器加上裁剪，这里要改成固定定位 + 锚点换算。 */
+   不会被裁剪 —— 若将来上游给这些容器加上裁剪，这里要改成固定定位 + 锚点换算。
+
+   浮层尺寸口径（用户 2026-10-02：「小巧、美观，但信息不能缺失」）：
+   宽 300px、字号 10.5–11.5px、节间距 8px，全部信息（渠道、更新时间、缓存标记、
+   偏好、订阅窗口的百分比与重置倒计时、套餐名称与到期、逐账号余额与分桶、
+   停用/失败计数、两个签到按钮）都保留，只压缩**行数**。 */
 .dim-jh-badge { position: relative; display: flex; align-items: center; flex: none; }
-.dim-jh-badgeBtn { display: flex; align-items: center; gap: 6px; max-width: 300px; padding: 2px 9px; border: .5px solid var(--dsw-alias-border-l2); border-radius: 999px; background: var(--dsw-alias-bg-layer-2); color: var(--dsw-alias-label-secondary); font: inherit; font-size: 11.5px; line-height: 1.5; cursor: pointer; white-space: nowrap; font-variant-numeric: tabular-nums; }
+.dim-jh-badgeBtn { display: flex; align-items: center; gap: 6px; max-width: 280px; padding: 2px 9px; border: .5px solid var(--dsw-alias-border-l2); border-radius: 999px; background: var(--dsw-alias-bg-layer-2); color: var(--dsw-alias-label-secondary); font: inherit; font-size: 11.5px; line-height: 1.5; cursor: pointer; white-space: nowrap; font-variant-numeric: tabular-nums; transition: background .15s ease, color .15s ease, border-color .15s ease; }
 .dim-jh-badgeBtn:hover { background: var(--dsw-alias-bg-layer-3); color: var(--dsw-alias-label-primary); }
-.dim-jh-badgeBtn[aria-expanded="true"] { background: var(--dsw-alias-bg-layer-3); color: var(--dsw-alias-label-primary); }
+.dim-jh-badgeBtn[aria-expanded="true"] { background: var(--dsw-alias-bg-layer-3); color: var(--dsw-alias-label-primary); border-color: color-mix(in srgb, #1677ff 45%, var(--dsw-alias-border-l2)); }
 /* min-width:0 是省略号生效的前提（flex 子项默认 min-width:auto，会撑破 max-width） */
 .dim-jh-badgeText { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
 .dim-jh-badgeDot { width: 6px; height: 6px; flex: none; border-radius: 999px; background: var(--dsw-alias-state-success-primary); }
 .dim-jh-badgeDot[data-tone="warn"] { background: var(--dsw-alias-state-warn-primary); }
 .dim-jh-badgeDot[data-tone="error"] { background: var(--dsw-alias-state-error-primary); }
 .dim-jh-badgeDot[data-tone="muted"] { background: var(--dsw-alias-label-tertiary); }
-.dim-jh-badgePop { position: absolute; bottom: calc(100% + 8px); right: 0; z-index: 40; width: 340px; max-width: min(340px, 88vw); max-height: 62vh; overflow-y: auto; display: flex; flex-direction: column; gap: 10px; padding: 12px 14px; border: .5px solid var(--dsw-alias-border-l2); border-radius: 10px; background: var(--dsw-alias-bg-layer-1); box-shadow: 0 8px 24px rgba(0, 0, 0, .16); text-align: left; white-space: normal; }
-.dim-jh-badgeHead { display: flex; align-items: center; gap: 10px; }
-.dim-jh-badgeTitle { flex: none; font-size: 12.5px; font-weight: 600; color: var(--dsw-alias-label-primary); }
-.dim-jh-badgeAt { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; font-size: 11px; color: var(--dsw-alias-label-tertiary); }
-.dim-jh-badgeAction { flex: none; padding: 3px 10px; border: .5px solid var(--dsw-alias-border-l2); border-radius: 8px; background: var(--dsw-alias-bg-layer-2); color: var(--dsw-alias-label-primary); font: inherit; font-size: 11.5px; cursor: pointer; }
-.dim-jh-badgeAction:hover:not(:disabled) { border-color: var(--dsw-alias-brand-primary); color: var(--dsw-alias-brand-primary); }
-.dim-jh-badgeAction:disabled { opacity: .6; cursor: default; }
-.dim-jh-badgePref { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; padding-bottom: 8px; border-bottom: .5px solid var(--dsw-alias-border-l2); }
-.dim-jh-badgePrefBtn { padding: 2px 9px; border: .5px solid transparent; border-radius: 999px; background: var(--dsw-alias-bg-layer-2); color: var(--dsw-alias-label-secondary); font: inherit; font-size: 11.5px; cursor: pointer; }
-.dim-jh-badgePrefBtn[aria-pressed="true"] { border-color: var(--dsw-alias-brand-primary); background: var(--dsw-alias-bg-layer-3); color: var(--dsw-alias-brand-primary); }
-.dim-jh-badgeSection { display: flex; flex-direction: column; gap: 8px; }
-.dim-jh-badgeSectionTitle { font-size: 11.5px; font-weight: 600; color: var(--dsw-alias-label-secondary); }
-.dim-jh-badgeRow { display: flex; flex-direction: column; gap: 4px; }
-.dim-jh-badgeRowHead { display: flex; align-items: center; justify-content: space-between; gap: 12px; font-size: 12px; color: var(--dsw-alias-label-primary); }
-.dim-jh-badgeValue { flex: none; font-weight: 600; font-variant-numeric: tabular-nums; }
-.dim-jh-badgeValue[data-tone="warn"] { color: var(--dsw-alias-state-warn-primary); }
-.dim-jh-badgeNote { font-size: 11px; line-height: 16px; color: var(--dsw-alias-label-tertiary); }
-.dim-jh-badgeFail { font-size: 11.5px; color: var(--dsw-alias-state-error-primary); }
-.dim-jh-badgeFoot { padding-top: 8px; border-top: .5px solid var(--dsw-alias-border-l2); font-size: 11px; line-height: 16px; color: var(--dsw-alias-label-tertiary); }
+.dim-jh-badgePop { position: absolute; bottom: calc(100% + 8px); right: 0; z-index: 40; width: 300px; max-width: min(300px, 90vw); max-height: 60vh; overflow-y: auto; display: flex; flex-direction: column; padding: 10px 12px 11px; border: .5px solid var(--dsw-alias-border-l2); border-radius: 12px; background: var(--dsw-alias-bg-layer-1); box-shadow: 0 10px 30px rgba(0, 0, 0, .18); text-align: left; white-space: normal; }
+.dim-jh-badgeHead { display: flex; align-items: center; gap: 6px; padding-bottom: 8px; }
+.dim-jh-badgeTitle { flex: none; max-width: 130px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; font-weight: 600; color: var(--dsw-alias-label-primary); }
+.dim-jh-badgeAt { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 10.5px; color: var(--dsw-alias-label-tertiary); font-variant-numeric: tabular-nums; }
+/* 刷新做成 22px 图标键（省一行宽度），文字说明放 title/aria-label */
+.dim-jh-badgeRefresh { flex: none; width: 22px; height: 22px; display: grid; place-items: center; border: .5px solid var(--dsw-alias-border-l2); border-radius: 7px; background: var(--dsw-alias-bg-layer-2); color: var(--dsw-alias-label-secondary); font: inherit; font-size: 13px; line-height: 1; cursor: pointer; transition: color .15s ease, border-color .15s ease; }
+.dim-jh-badgeRefresh:hover:not(:disabled) { border-color: var(--dsw-alias-brand-primary); color: var(--dsw-alias-brand-primary); }
+.dim-jh-badgeRefresh:disabled { opacity: .55; cursor: default; }
+/* 偏好：分段控件（未选中透明、选中浮起），比三个独立胶囊更紧凑整齐 */
+.dim-jh-badgePref { display: flex; gap: 2px; padding: 2px; border-radius: 8px; background: var(--dsw-alias-bg-layer-2); }
+.dim-jh-badgePrefBtn { flex: 1; min-width: 0; padding: 3px 2px; border: 0; border-radius: 6px; background: transparent; color: var(--dsw-alias-label-secondary); font: inherit; font-size: 10.5px; line-height: 1.4; white-space: nowrap; cursor: pointer; transition: background .15s ease, color .15s ease; }
+.dim-jh-badgePrefBtn:hover { color: var(--dsw-alias-label-primary); }
+.dim-jh-badgePrefBtn[aria-pressed="true"] { background: var(--dsw-alias-bg-layer-1); color: var(--dsw-alias-brand-primary); font-weight: 600; box-shadow: 0 1px 3px rgba(0, 0, 0, .08); }
+/* 分区：用细分隔线代替大间距，视觉分组明确且更矮 */
+.dim-jh-badgeSection { display: flex; flex-direction: column; gap: 5px; margin-top: 8px; padding-top: 8px; border-top: .5px solid var(--dsw-alias-border-l2); }
+.dim-jh-badgeSectionTitle { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; font-size: 10.5px; font-weight: 600; color: var(--dsw-alias-label-tertiary); }
+.dim-jh-badgeSectionSum { font-weight: 600; color: var(--dsw-alias-label-primary); font-variant-numeric: tabular-nums; }
+.dim-jh-badgeRow { display: flex; flex-direction: column; gap: 2px; }
+/* 一行放下「名字 …… 数值」（名字可省略号，数值不换行） */
+.dim-jh-badgeRowHead { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; font-size: 11.5px; color: var(--dsw-alias-label-primary); }
+.dim-jh-badgeRowName { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.dim-jh-badgeRowNote { font-size: 10.5px; line-height: 15px; color: var(--dsw-alias-label-tertiary); }
+/* 窗口：两行 —— 名称 + 重置倒计时 / 进度条 + 百分比 */
+.dim-jh-badgeWin { display: flex; flex-direction: column; gap: 3px; }
+.dim-jh-badgeWinTrack { display: flex; align-items: center; gap: 8px; }
+.dim-jh-badgeWinTrack .dim-jh-quotaBar { flex: 1; height: 4px; }
+.dim-jh-badgeValue { flex: none; font-size: 11.5px; font-weight: 600; font-variant-numeric: tabular-nums; }
+.dim-jh-badgeValue[data-tone="warn"] { color: var(--dsw-alias-state-warn-primary); font-weight: 500; }
+.dim-jh-badgeNote { font-size: 10.5px; line-height: 15px; color: var(--dsw-alias-label-tertiary); }
+/* 签到：两个按钮并排、等分（本渠道按钮在不支持签到时不渲染，另一个占满整行） */
+.dim-jh-badgeClaim { gap: 6px; }
+.dim-jh-badgeClaimRow { display: flex; gap: 6px; }
+.dim-jh-badgeAction { flex: 1; min-width: 0; padding: 4px 8px; border: .5px solid var(--dsw-alias-border-l2); border-radius: 8px; background: var(--dsw-alias-bg-layer-2); color: var(--dsw-alias-label-primary); font: inherit; font-size: 11px; line-height: 1.5; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; cursor: pointer; transition: border-color .15s ease, color .15s ease, background .15s ease; }
+.dim-jh-badgeAction:hover:not(:disabled) { border-color: var(--dsw-alias-brand-primary); color: var(--dsw-alias-brand-primary); background: var(--dsw-alias-bg-layer-3); }
+.dim-jh-badgeAction:disabled { opacity: .55; cursor: default; }
+.dim-jh-badgeNotice { font-size: 10.5px; line-height: 15px; color: var(--dsw-alias-label-secondary); }
+.dim-jh-badgeNotice[data-tone="warn"] { color: var(--dsw-alias-state-warn-primary); }
+.dim-jh-badgeFail { font-size: 10.5px; line-height: 15px; color: var(--dsw-alias-state-error-primary); }
+.dim-jh-badgeFoot { font-size: 10.5px; line-height: 15px; color: var(--dsw-alias-label-tertiary); }
 
 `
 

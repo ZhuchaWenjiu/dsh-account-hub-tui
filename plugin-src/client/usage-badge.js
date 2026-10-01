@@ -28,7 +28,7 @@
 
 import * as React from 'react';
 
-import { supportsCreditBalance, supportsDailyCheckin } from './credits-capabilities.js';
+import { supportsCreditBalance, supportsDailyCheckin, checkinProviders } from './credits-capabilities.js';
 import {
   badgeView,
   formatUpdatedAt,
@@ -92,8 +92,15 @@ function UsageBadgeActive(props) {
   /** 本地偏好镜像：写入后立刻生效，不等待下一轮轮询（否则像「点了没反应」）。 */
   const [preference, setPreference] = React.useState(null);
   const [prefError, setPrefError] = React.useState('');
-  const [claiming, setClaiming] = React.useState(false);
-  const [notice, setNotice] = React.useState('');
+  /**
+   * 领取状态。`claiming` 用**字符串**而不是布尔：
+   * `'current'` = 只签当前渠道（单次请求）；`'all'` = 遍历全部支持签到的渠道
+   * （串行多次请求，要显示 `done/total` 进度，否则用户以为卡住了）。
+   */
+  const [claiming, setClaiming] = React.useState(null);
+  const [claimProgress, setClaimProgress] = React.useState(null);
+  /** 领取结果：`{ tone, text, notes }`；`notes` 是**需要用户操作**的提示（后端显式字段）。 */
+  const [claimNotice, setClaimNotice] = React.useState(null);
   const root = React.useRef(null);
   /** 供定时器与按钮调用的「读一次」入口（每次渲染替换，避免闭包过期）。 */
   const read = React.useRef(() => {});
@@ -102,7 +109,7 @@ function UsageBadgeActive(props) {
   React.useEffect(() => {
     setSnapshot(null);
     setFailed(false);
-    setNotice('');
+    setClaimNotice(null);
     setPrefError('');
   }, [provider]);
 
@@ -206,20 +213,94 @@ function UsageBadgeActive(props) {
     }
   };
 
-  /** 一键签到（仅能力表允许的渠道渲染按钮）。 */
+  /**
+   * 一键签到 —— **只签当前渠道**（单次 `credits.claimAll({ provider })`）。
+   *
+   * 按钮只在能力表允许的渠道渲染（`supportsDailyCheckin`）。
+   */
   const onClaim = async () => {
-    setClaiming(true);
-    setNotice('');
+    setClaiming('current');
+    setClaimNotice(null);
     try {
       const result = await claimCredits(provider);
-      setNotice(describeClaim(result));
+      setClaimNotice(summarizeClaim(result));
       // 签到会改变余额 → 立刻强制重读（否则要等下一轮轮询才看到新数字）。
       read.current();
     } catch (error) {
-      setNotice(error?.message || '签到失败');
+      setClaimNotice({ tone: 'warn', text: error?.message || '签到失败', notes: [] });
     } finally {
-      setClaiming(false);
+      setClaiming(null);
     }
+  };
+
+  /**
+   * 签到**所有支持签到的渠道**（用户 2026-10-02 要求放进弹窗）。
+   *
+   * 与 Jet Hub 设置页页头那个「一键签到」**同一套语义**（见 `jet-hub.js` 的
+   * `checkinAll`），差别只是结果渲染成弹窗里的紧凑版：
+   *
+   * - **必须串行** `await`，不能 `Promise.all`：这是**真实领积分**的写操作，
+   *   跨渠道并发会同时发出多路领取请求，触发风控的代价是用户当天领不到
+   *  （单渠道内部本就是「逐账号顺序执行」，见 `src/jet-hub-rpc.ts`）。
+   * - 渠道集合由能力表推导（`checkinProviders()`）：WorkBuddy 国际版 / Cline /
+   *   Raccoon 后端没有签到接口，**绝不能**出现在请求列表里。
+   * - 单渠道失败只计入失败数，**不中断后续渠道**。
+   * - 每个**非零**计数都要出现在结果里（否则「暂无活动」的渠道会整条消失，
+   *   用户以为它没执行）；一个渠道可能同时有成功与失败，不用 else-if 短路。
+   * - `actionRequired` 的提示单独列出（后端显式字段，不靠文案匹配）。
+   */
+  const onClaimAll = async () => {
+    const providers = checkinProviders();
+    setClaiming('all');
+    setClaimNotice(null);
+    setClaimProgress({ done: 0, total: providers.length });
+    const parts = [];
+    const notes = [];
+    let totalCredit = 0;
+    let failed = 0;
+    for (let index = 0; index < providers.length; index += 1) {
+      const id = providers[index];
+      try {
+        const result = await claimCredits(id);
+        const summary = result?.summary || {};
+        const bits = [];
+        if (summary.claimed > 0) {
+          totalCredit += Number(summary.totalCredit) || 0;
+          bits.push(`+${Math.round(Number(summary.totalCredit) || 0)}`);
+        }
+        if (summary.alreadyClaimed > 0) bits.push(`${summary.alreadyClaimed} 个今日已领`);
+        if (summary.inactive > 0) bits.push(`${summary.inactive} 个暂无活动`);
+        if (summary.failed > 0) {
+          failed += summary.failed;
+          const reason = (result?.results || [])
+            .map((item) => item?.outcome?.message)
+            .find((message) => typeof message === 'string' && message.length > 0);
+          bits.push(`${summary.failed} 个失败${reason ? `（${reason}）` : ''}`);
+        }
+        parts.push(`${providerLabel(id)} ${bits.length > 0 ? bits.join('，') : '无账号'}`);
+        for (const item of result?.results || []) {
+          const outcome = item?.outcome || {};
+          if (outcome.actionRequired !== true) continue;
+          const message = outcome.message;
+          if (typeof message !== 'string' || message.length === 0) continue;
+          if (!notes.includes(message)) notes.push(message);
+        }
+      } catch (error) {
+        failed += 1;
+        parts.push(`${providerLabel(id)} 失败（${error?.message || '未知原因'}）`);
+      }
+      setClaimProgress({ done: index + 1, total: providers.length });
+    }
+    setClaimNotice({
+      tone: failed > 0 || notes.length > 0 ? 'warn' : 'ok',
+      text: parts.length > 0
+        ? `全部渠道：${parts.join('；')}${totalCredit > 0 ? `（共 +${Math.round(totalCredit)} 积分）` : ''}`
+        : '全部渠道：没有可领取的渠道',
+      notes,
+    });
+    setClaimProgress(null);
+    setClaiming(null);
+    read.current();
   };
 
   const tone = failed && snapshot === null ? 'error' : view.tone;
@@ -241,59 +322,83 @@ function UsageBadgeActive(props) {
     open ? renderPopover() : null,
   ]);
 
-  /** 弹窗内容（订阅区 → 积分区 → 签到 → 脚注）。 */
+  /**
+   * 弹窗内容。
+   *
+   * ## 布局取舍（用户 2026-10-02：「小巧、美观，但信息不能缺失」）
+   *
+   * 全部信息都在，但把**行数**压到最少：
+   * - 头部一行：色调圆点 + 渠道名 + 更新时间（含「缓存」标记）+ 图标刷新按钮；
+   * - 偏好做成分段控件（三个标签自带含义，故不再单占一行写「显示偏好」）；
+   * - 节标题右侧直接带合计（省掉「合计…」那一行）；
+   * - 每个账号一行：名字左、数值右，分桶/资源包说明作为**灰色小字**跟在后面
+   *   （存在时才换到第二行，不存在就是单行）；
+   * - 窗口两行：`名称 … 重置倒计时` / `进度条 + 百分比`；
+   * - 两个签到按钮并排一行，结果摘要与「需要你操作」的提示在下方。
+   */
   function renderPopover() {
     // `formatUpdatedAt` 对缺失时刻返回空串（不显示 1970），故这里也要处理空值。
     const stamp = snapshot === null ? '' : formatUpdatedAt(value?.generatedAt ?? snapshot.at);
     const children = [
       React.createElement('div', { key: 'head', className: 'dim-jh-badgeHead' }, [
-        React.createElement('span', { key: 'title', className: 'dim-jh-badgeTitle' }, `${label} 用量`),
+        React.createElement('span', { key: 'dot', className: 'dim-jh-badgeDot', 'data-tone': tone }),
+        React.createElement('span', { key: 'title', className: 'dim-jh-badgeTitle' }, label),
         React.createElement('span', { key: 'at', className: 'dim-jh-badgeAt' },
           snapshot === null
             ? '读取中…'
-            : `${stamp === '' ? '已读取' : `更新于 ${stamp}`}${value?.cached === true ? '（缓存）' : ''}`),
+            : `${stamp === '' ? '已读取' : stamp}${value?.cached === true ? ' · 缓存' : ''}`),
         React.createElement('button', {
           key: 'refresh',
           type: 'button',
-          className: 'dim-jh-badgeAction',
+          className: 'dim-jh-badgeRefresh',
           disabled: busy,
+          title: '刷新（绕过宿主缓存）',
+          'aria-label': '刷新用量',
           onClick: () => read.current(),
-        }, busy ? '刷新中…' : '刷新'),
+        }, busy ? '…' : '↻'),
       ]),
       renderPreference(),
     ];
 
-    if (failed && snapshot === null) {
-      children.push(React.createElement('div', { key: 'fail', className: 'dim-jh-badgeFail', role: 'alert' },
-        '用量不可用（可点「刷新」重试）'));
-      return React.createElement('div', { className: 'dim-jh-badgePop' }, children);
-    }
-
-    // ⚠️ 首屏读数还没到时**不要**渲染下面几个区：它们会拿空账号列表说出
-    // 「该渠道还没有账号」，把「还没读到」说成「没有账号」（用户报障）。
+    // 首屏：读数未到 / 首次就失败 —— 说明白，但**不**渲染会说出
+    // 「该渠道还没有账号」的明细区（用户报障：那是把「还没读到」说成「没有账号」）。
     if (snapshot === null) {
-      children.push(React.createElement('div', { key: 'loading', className: 'dim-jh-badgeNote' },
-        '正在读取用量…（首次要逐账号查询，可能要几秒）'));
+      children.push(React.createElement('div', {
+        key: 'placeholder',
+        className: failed ? 'dim-jh-badgeFail' : 'dim-jh-badgeNote',
+        role: failed ? 'alert' : undefined,
+      }, failed
+        ? '用量不可用，可点右上角 ↻ 重试'
+        : '正在读取用量…（首次要逐账号查询，可能要几秒）'));
+      // 签到不依赖本渠道的读数，故首屏也放出来（用户可能就是想先签到）。
+      children.push(renderClaim());
       return React.createElement('div', { className: 'dim-jh-badgePop' }, children);
     }
 
     children.push(renderSubscription());
     children.push(renderCredits());
-    if (supportsDailyCheckin(provider)) children.push(renderClaim());
+    children.push(renderClaim());
     children.push(renderFoot());
     return React.createElement('div', { className: 'dim-jh-badgePop' }, children);
   }
 
-  /** 显示偏好三态开关（分段按钮；本仓库无 `<select>` 先例，故用按钮组）。 */
+  /**
+   * 显示偏好：分段控件（本仓库无 `<select>` 先例，故用按钮组 + `aria-pressed`）。
+   *
+   * 不再单占一行写「显示偏好」：三个标签（自动 / 优先订阅 / 优先积分）自带含义，
+   * 容器的 title 里给出完整解释 —— 省一行而信息不丢。
+   */
   function renderPreference() {
-    return React.createElement('div', { key: 'pref', className: 'dim-jh-badgePref' }, [
-      React.createElement('span', { key: 'label', className: 'dim-jh-badgeNote' }, '显示偏好'),
+    return React.createElement('div', {
+      key: 'pref',
+      className: 'dim-jh-badgePref',
+      title: '显示偏好：决定徽标优先显示订阅还是积分（「优先积分」也是套餐判定不准时的兜底）',
+    }, [
       ...BADGE_PREFERENCES.map((item) => React.createElement('button', {
         key: item,
         type: 'button',
         className: 'dim-jh-badgePrefBtn',
         'aria-pressed': effectivePreference === item,
-        title: item === 'credits' ? '始终显示积分（套餐判定不准时用这个）' : undefined,
         onClick: () => { void onPickPreference(item); },
       }, BADGE_PREFERENCE_LABELS[item])),
       prefError === '' ? null : React.createElement('span', { key: 'err', className: 'dim-jh-badgeFail' }, prefError),
@@ -316,19 +421,23 @@ function UsageBadgeActive(props) {
           : windows.map(([type, windowLabel, win]) => {
             const percent = quotaPercentValue(win?.percentUsed);
             const left = quotaResetsIn(win?.resetsAt);
-            return React.createElement('div', { key: type, className: 'dim-jh-badgeRow' }, [
+            return React.createElement('div', { key: type, className: 'dim-jh-badgeWin' }, [
+              // 第一行：名称 + 重置倒计时（倒计时缺失就只留名称）
               React.createElement('div', { key: 'head', className: 'dim-jh-badgeRowHead' }, [
                 React.createElement('span', { key: 'l' }, windowLabel),
+                left === '' ? null : React.createElement('span', { key: 'r', className: 'dim-jh-badgeNote' }, left),
+              ]),
+              // 第二行：进度条 + 百分比（同一行放得下，省掉单独一行百分比）
+              React.createElement('div', { key: 'track', className: 'dim-jh-badgeWinTrack' }, [
+                React.createElement('div', { key: 'bar', className: 'dim-jh-quotaBar' },
+                  React.createElement('div', {
+                    key: 'fill',
+                    className: 'dim-jh-quotaBarFill',
+                    'data-tone': quotaTone(percent),
+                    style: { width: `${percent}%` },
+                  })),
                 React.createElement('span', { key: 'v', className: 'dim-jh-badgeValue' }, formatQuotaPercent(percent)),
               ]),
-              React.createElement('div', { key: 'track', className: 'dim-jh-quotaBar' },
-                React.createElement('div', {
-                  key: 'fill',
-                  className: 'dim-jh-quotaBarFill',
-                  'data-tone': quotaTone(percent),
-                  style: { width: `${percent}%` },
-                })),
-              left === '' ? null : React.createElement('div', { key: 'note', className: 'dim-jh-badgeNote' }, left),
             ]);
           })),
       ]);
@@ -344,11 +453,11 @@ function UsageBadgeActive(props) {
           className: 'dim-jh-badgeRow',
         }, [
           React.createElement('div', { key: 'head', className: 'dim-jh-badgeRowHead' }, [
-            React.createElement('span', { key: 'l' }, group.name),
+            React.createElement('span', { key: 'l', className: 'dim-jh-badgeRowName', title: group.name }, group.name),
             React.createElement('span', { key: 'v', className: 'dim-jh-badgeValue' },
               `${formatUnits(group.remaining, group.unit) ?? '?'} / ${formatUnits(group.total, group.unit) ?? '?'} ${group.label}`),
           ]),
-          React.createElement('div', { key: 'note', className: 'dim-jh-badgeNote' },
+          React.createElement('div', { key: 'note', className: 'dim-jh-badgeRowNote' },
             [
               group.accountCount > 1 ? `${group.accountCount} 个账号合计` : null,
               group.deductionEndTime === undefined ? null : `扣费截止 ${formatUpdatedAt(group.deductionEndTime)}`,
@@ -361,15 +470,25 @@ function UsageBadgeActive(props) {
   function renderCredits() {
     const accounts = value?.accounts ?? [];
     const windowDays = value?.windowDays;
+    const sum = view.groups.map((group) => `${formatUnits(group.total, group.unit) ?? '?'} ${group.label}`).join(' · ');
     return React.createElement('div', { key: 'credits', className: 'dim-jh-badgeSection' }, [
-      React.createElement('div', { key: 'title', className: 'dim-jh-badgeSectionTitle' },
-        accounts.length === 0 ? '积分' : `积分（启用账号合计 ${view.groups.map((group) => `${formatUnits(group.total, group.unit) ?? '?'} ${group.label}`).join(' · ') || '—'}）`),
+      // 合计放进节标题右侧，省掉一整行
+      React.createElement('div', { key: 'title', className: 'dim-jh-badgeSectionTitle' }, [
+        React.createElement('span', { key: 'l' }, '积分'),
+        accounts.length === 0 || sum === ''
+          ? null
+          : React.createElement('span', { key: 'sum', className: 'dim-jh-badgeSectionSum' }, `合计 ${sum}`),
+      ]),
       ...(accounts.length === 0
         ? [React.createElement('div', { key: 'empty', className: 'dim-jh-badgeNote' },
           value?.disabledCount > 0 ? '该渠道的账号全部已停用' : '该渠道还没有账号（可在 Jet Hub 设置页添加）')]
         : accounts.map((row) => React.createElement('div', { key: row.accountId, className: 'dim-jh-badgeRow' }, [
           React.createElement('div', { key: 'head', className: 'dim-jh-badgeRowHead' }, [
-            React.createElement('span', { key: 'l' }, row.nickname || row.accountId),
+            React.createElement('span', {
+              key: 'l',
+              className: 'dim-jh-badgeRowName',
+              title: row.nickname || row.accountId,
+            }, row.nickname || row.accountId),
             React.createElement('span', {
               key: 'v',
               className: 'dim-jh-badgeValue',
@@ -377,35 +496,75 @@ function UsageBadgeActive(props) {
               title: row.error || undefined,
             }, row.balance === null ? (row.error || '查询失败') : balanceLine(row.balance)),
           ]),
-          row.balance === null ? null : React.createElement('div', { key: 'note', className: 'dim-jh-badgeNote' },
-            splitLine(row.balance, windowDays, provider)),
+          // 分桶/资源包说明：灰色小字，存在时才占一行
+          row.balance === null
+            ? null
+            : renderNote(splitLine(row.balance, windowDays, provider)),
         ]))),
     ]);
   }
 
+  /** 一行灰色小字；空串返回 `null`（不占位）。 */
+  function renderNote(text) {
+    if (typeof text !== 'string' || text.length === 0) return null;
+    return React.createElement('div', { key: 'note', className: 'dim-jh-badgeRowNote' }, text);
+  }
+
   /**
-   * 一键签到（**只签当前渠道**，且能力表允许的渠道才渲染）。
+   * 签到：两个按钮并排（**都放在弹窗里**，用户 2026-10-02 选 B）。
    *
-   * ⚠️ 作用范围必须写在按钮上（用户 2026-10-02 问过「是针对当前供应商还是所有」）：
-   * 这里调的是 `credits.claimAll({ provider })`，**只签当前渠道的全部账号**，
-   * 不会碰其它渠道。想一次签完所有渠道请用 Jet Hub 设置页页头的「一键签到」
-   *（那里遍历 `checkinProviders()`）。文案说清范围，用户才不会以为漏签了。
+   * - `签到（仅 <渠道>）`：只在能力表允许的渠道渲染（`supportsDailyCheckin`）；
+   * - `全部渠道签到`：与设置页页头同款语义，串行遍历 `checkinProviders()`
+   *   （WorkBuddy 国际版 / Cline / Raccoon 没有签到接口，不在列表里）。
+   *   它**不依赖本渠道的读数**，故首屏/失败态也渲染。
    */
   function renderClaim() {
-    return React.createElement('div', { key: 'claim', className: 'dim-jh-badgeSection' }, [
-      React.createElement('button', {
-        key: 'btn',
-        type: 'button',
-        className: 'dim-jh-badgeAction',
-        disabled: claiming,
-        title: `只签到当前渠道（${label}）的全部账号；其它渠道请在 Jet Hub 设置页页头「一键签到」批量领取`,
-        onClick: () => { void onClaim(); },
-      }, claiming ? '领取中…' : `一键签到（仅 ${label}）`),
-      notice === '' ? null : React.createElement('div', { key: 'notice', className: 'dim-jh-badgeNote' }, notice),
+    const canClaimCurrent = supportsDailyCheckin(provider);
+    const allBusy = claiming === 'all';
+    return React.createElement('div', { key: 'claim', className: 'dim-jh-badgeSection dim-jh-badgeClaim' }, [
+      React.createElement('div', { key: 'row', className: 'dim-jh-badgeClaimRow' }, [
+        canClaimCurrent
+          ? React.createElement('button', {
+            key: 'cur',
+            type: 'button',
+            className: 'dim-jh-badgeAction',
+            disabled: claiming !== null,
+            // ⚠️ 按钮文案**不写渠道名**：`签到（仅 CodeBuddy (腾讯)）` 在 300px 弹窗里
+            // 会被 text-overflow 截成 `签到（仅 CodeBuddy (…`（截图核验发现）。渠道名
+            // 已经在弹窗头部与 title 里，按钮只要说清「范围＝本渠道」即可。
+            title: `只签到当前渠道（${label}）的全部账号`,
+            onClick: () => { void onClaim(); },
+          }, claiming === 'current' ? '领取中…' : '签到（本渠道）')
+          : null,
+        React.createElement('button', {
+          key: 'all',
+          type: 'button',
+          className: 'dim-jh-badgeAction',
+          disabled: claiming !== null,
+          title: '串行签到全部支持签到的渠道（9 个；WorkBuddy 国际版 / Cline / Raccoon 后端没有签到接口）',
+          onClick: () => { void onClaimAll(); },
+        }, allBusy
+          ? (claimProgress === null ? '签到中…' : `签到中 ${claimProgress.done}/${claimProgress.total}…`)
+          : '全部渠道签到'),
+      ]),
+      claimNotice === null
+        ? null
+        : React.createElement('div', {
+          key: 'notice',
+          className: 'dim-jh-badgeNotice',
+          'data-tone': claimNotice.tone,
+        }, claimNotice.text),
+      // 「需要用户操作」的提示单独列出（后端显式字段 actionRequired），
+      // 混进计数行会被读漏，而它的价值就在于被看到。
+      ...(claimNotice?.notes || []).map((message, index) => React.createElement('div', {
+        key: `note-${index}`,
+        className: 'dim-jh-badgeNotice',
+        'data-tone': 'warn',
+      }, message)),
     ]);
   }
 
-  /** 脚注：停用账号数、失败账号数与失败原因。 */
+  /** 脚注：停用账号数、失败账号数与「显示的是旧读数」提示。 */
   function renderFoot() {
     const parts = [];
     if (value?.disabledCount > 0) parts.push(`另有 ${value.disabledCount} 个账号已停用，未计入`);
@@ -441,16 +600,19 @@ function splitLine(balance, windowDays, provider) {
 }
 
 /**
- * 签到结果的**一行摘要**。
+ * 单渠道签到结果 → `{ tone, text, notes }`。
  *
  * 宿主返回的是 `{ results, summary }`（逐账号四态 `ClaimOutcome` + 汇总），
- * 这里按用户最关心的顺序给一句话：本次领到多少 → 已领过几个 → 几个失败。
+ * 这里按用户最关心的顺序给一句话：本次领到多少 → 已领过几个 → 活动未开启 → 几个失败。
+ *
+ * ⚠️ **每个非零计数都要出现**：早期只判 claimed / alreadyClaimed / failed，
+ * 于是「活动未开启」（`inactive > 0`）整条消失，用户以为那个渠道没执行。
  * ⚠️ 幂等判据在各渠道的响应体里（不是 HTTP 状态码），故「已领过」是**成功**语义，
  * 不能与失败混为一谈。
  */
-function describeClaim(result) {
+function summarizeClaim(result) {
   const summary = result?.summary;
-  if (summary === undefined) return '签到完成';
+  if (summary === undefined) return { tone: 'ok', text: '签到完成', notes: [] };
   const parts = [];
   if (summary.claimed > 0) parts.push(`${summary.claimed} 个账号领取成功，共 +${Math.round(Number(summary.totalCredit) || 0)} 积分`);
   if (summary.alreadyClaimed > 0) parts.push(`${summary.alreadyClaimed} 个今天已领`);
@@ -459,5 +621,14 @@ function describeClaim(result) {
     const reason = (result.results || []).find((row) => row?.outcome?.kind === 'failed')?.outcome?.message;
     parts.push(`${summary.failed} 个失败${reason ? `：${reason}` : ''}`);
   }
-  return parts.length === 0 ? '签到完成（无可领取的账号）' : parts.join('；');
+  const notes = (result?.results || [])
+    .map((row) => row?.outcome)
+    .filter((outcome) => outcome?.actionRequired === true && typeof outcome.message === 'string' && outcome.message.length > 0)
+    .map((outcome) => outcome.message)
+    .filter((message, index, all) => all.indexOf(message) === index);
+  return {
+    tone: summary.failed > 0 || notes.length > 0 ? 'warn' : 'ok',
+    text: parts.length === 0 ? '签到完成（无可领取的账号）' : parts.join('；'),
+    notes,
+  };
 }

@@ -21,13 +21,18 @@ const here = dirname(fileURLToPath(import.meta.url))
 const read = (rel: string) => readFileSync(resolve(here, '../..', rel), 'utf8')
 
 /**
- * 去掉块注释后的源码。
+ * 去掉注释后的源码（块注释 + **整行** `//` 注释都要去）。
  *
  * ⚠️ 反面断言（`not.toContain`）必须基于它：本仓库的注释里**大量引用**被禁止的
- * 写法（例如「判定来自能力表而不是 `PROVIDERS.includes()`」），直接对全文断言
- * 会把注释本身判成违规 —— 第一次写这个用例时就这么红过。
+ * 写法（例如「判定来自能力表而不是 `PROVIDERS.includes()`」「按钮文案不写
+ * `签到（仅 …）`」），直接对全文断言会把注释本身判成违规 —— 第一次写这类用例时
+ * 就这么红过两次（块注释一次、`//` 行注释一次）。
+ *
+ * ⚠️ 只去「整行以 `//` 开头」的注释，故字符串里的 `https://…` 不会被误删。
  */
-const codeOf = (text: string) => text.replace(/\/\*[\s\S]*?\*\//g, '')
+const codeOf = (text: string) => text
+  .replace(/\/\*[\s\S]*?\*\//g, '')
+  .replace(/^[ \t]*\/\/.*$/gm, '')
 
 describe('用量徽标：槽位接线', () => {
   const index = read('plugin-src/client/index.js')
@@ -115,7 +120,10 @@ describe('用量徽标：渲染门控与轮询', () => {
   })
 
   it('首屏读数未到时不渲染明细区（否则会说成「该渠道还没有账号」）', () => {
-    expect(badge).toContain("children.push(React.createElement('div', { key: 'loading', className: 'dim-jh-badgeNote' }")
+    // 首屏只给一句说明 + 签到按钮，然后 return（不 push 订阅/积分区）
+    expect(badge).toContain("key: 'placeholder'")
+    expect(badge).toContain('正在读取用量…')
+    expect(badge).toMatch(/children\.push\(renderClaim\(\)\);\s*\n\s*return React\.createElement\('div', \{ className: 'dim-jh-badgePop' \}, children\);/)
   })
 
   it('客户端**不**直接调 credits.balances（那是逐账号打上游的端点）', () => {
@@ -126,29 +134,62 @@ describe('用量徽标：渲染门控与轮询', () => {
   })
 })
 
-describe('用量徽标：签到与显示偏好', () => {
+describe('用量徽标：签到（本渠道 + 全部渠道）', () => {
   const badge = read('plugin-src/client/usage-badge.js')
+  const badgeCode = codeOf(badge)
 
-  it('签到按钮由能力表门控（WorkBuddy 国际版 / Cline 不渲染）', () => {
-    expect(badge).toContain('if (supportsDailyCheckin(provider)) children.push(renderClaim());')
+  it('本渠道按钮由能力表门控（WorkBuddy 国际版 / Cline / Raccoon 不渲染）', () => {
+    expect(badge).toContain('const canClaimCurrent = supportsDailyCheckin(provider);')
+    expect(badge).toMatch(/canClaimCurrent\s*\n?\s*\? React\.createElement\('button'/)
   })
 
-  it('签到**只签当前渠道**，且范围写在按钮上（用户 2026-10-02 问过）', () => {
-    // 载荷带 provider ⇒ 只作用于当前渠道；不遍历 checkinProviders()
-    expect(badge).toMatch(/claimCredits\(provider\)/)
-    expect(codeOf(badge)).not.toContain('checkinProviders')
-    expect(badge).toContain('一键签到（仅 ')
-    expect(badge).toMatch(/只签到当前渠道/)
+  it('本渠道按钮文案不带渠道名（否则 300px 弹窗里会被省略号截断）', () => {
+    // 截图核验发现：`签到（仅 CodeBuddy (腾讯)）` 被截成 `签到（仅 CodeBuddy (…`
+    expect(badge).toContain("'签到（本渠道）'")
+    // ⚠️ 反面断言必须基于**去注释后的代码**：上面那条解释性注释里就写着被禁的写法
+    expect(codeOf(badge)).not.toContain('签到（仅 ')
+    // 渠道名改到 title 里，信息不丢（注意源码用的是**全角**括号）
+    expect(badge).toContain('只签到当前渠道（${label}）的全部账号')
+  })
+
+  it('「全部渠道签到」串行遍历能力表推导出的渠道集合（不新增后端端点）', () => {
+    // 用户 2026-10-02 选 B：弹窗里同时提供「仅本渠道」与「全部渠道」
+    expect(badge).toContain('const providers = checkinProviders();')
+    // ⚠️ 必须串行 await：真实领积分的写操作，跨渠道并发会触发风控
+    expect(badge).toMatch(/for \(let index = 0; index < providers\.length; index \+= 1\)/)
+    expect(badgeCode).not.toContain('Promise.all')
+    // 逐个渠道调同一个端点，不新增后端接口
+    expect(badge).toMatch(/const result = await claimCredits\(id\);/)
+    // 进度可见（串行多次请求，不显示进度会像卡住）
+    expect(badge).toContain('setClaimProgress({ done: index + 1, total: providers.length })')
+    expect(badge).toMatch(/签到中 \$\{claimProgress\.done\}\/\$\{claimProgress\.total\}…/)
+  })
+
+  it('全部渠道的结果把每个非零计数与 actionRequired 提示都列出来', () => {
+    // 早期只判三个分支 ⇒「活动未开启」的渠道整条消失（设置页 2026-09-26 真实缺陷）
+    expect(badge).toContain('summary.alreadyClaimed > 0')
+    expect(badge).toContain('summary.inactive > 0')
+    expect(badge).toContain('summary.failed > 0')
+    expect(badge).toContain("outcome.actionRequired !== true")
+    // 单渠道失败不中断后续渠道
+    expect(badge).toMatch(/catch \(error\) \{\s*failed \+= 1;/)
+  })
+
+  it('全部渠道按钮**不依赖**本渠道读数（首屏/失败态也渲染）', () => {
+    expect(badge).toMatch(/children\.push\(renderClaim\(\)\);\s*\n\s*children\.push\(renderFoot\(\)\);/)
   })
 
   it('签到成功后强制重读（否则要等下一轮轮询才看到新数字）', () => {
-    expect(badge).toMatch(/claimCredits\(provider\)[\s\S]{0,400}?read\.current\(\)/)
+    expect(badge).toMatch(/await claimCredits\(provider\)[\s\S]{0,500}?read\.current\(\)/)
+    expect(badge).toMatch(/setClaiming\(null\);\s*\n\s*read\.current\(\);/)
   })
 
-  it('签到结果按四态汇总成一句话（「今天已领」不算失败）', () => {
+  it('签到结果按四态汇总成一句话 + 色调（「今天已领」不算失败）', () => {
+    expect(badge).toContain('function summarizeClaim(result)')
     expect(badge).toContain('alreadyClaimed')
     expect(badge).toContain('totalCredit')
     expect(badge).toContain('inactive')
+    expect(badge).toMatch(/tone: summary\.failed > 0 \|\| notes\.length > 0 \? 'warn' : 'ok'/)
   })
 
   it('三态偏好开关写宿主（本地先生效，失败回滚）', () => {
@@ -162,6 +203,53 @@ describe('用量徽标：签到与显示偏好', () => {
     expect(badge).toContain("document.addEventListener('mousedown', onDown)")
     expect(badge).toContain("document.addEventListener('keydown', onKey)")
     expect(badge).toMatch(/if \(!open\) return undefined;/)
+  })
+})
+
+describe('用量徽标：弹窗的紧凑布局（信息一项不少）', () => {
+  const badge = read('plugin-src/client/usage-badge.js')
+  const styles = read('plugin-src/client/jet-hub-styles.js')
+
+  it('头部一行：色调点 + 渠道名 + 更新时间 + 图标刷新（省掉「刷新」一词占的宽度）', () => {
+    expect(badge).toContain("key: 'dot', className: 'dim-jh-badgeDot'")
+    expect(badge).toContain("key: 'refresh'")
+    expect(badge).toContain("'aria-label': '刷新用量'")
+    expect(styles).toMatch(/\.dim-jh-badgeRefresh \{[^}]*width: 22px/)
+  })
+
+  it('每个窗口只占两行：名称 + 重置倒计时 / 进度条 + 百分比', () => {
+    expect(badge).toContain("key: 'track', className: 'dim-jh-badgeWinTrack'")
+    expect(styles).toMatch(/\.dim-jh-badgeWinTrack \.dim-jh-quotaBar \{[^}]*flex: 1/)
+    // ⚠️ 倒计时与百分比都必须可见（不能藏进 tooltip）
+    expect(badge).toContain('quotaResetsIn(win?.resetsAt)')
+    expect(badge).toContain('formatQuotaPercent(percent)')
+  })
+
+  it('账号行：名字与数值同一行、备注小字，合计并入节标题', () => {
+    expect(badge).toContain("className: 'dim-jh-badgeRowName'")
+    expect(badge).toContain("className: 'dim-jh-badgeRowNote'")
+    expect(badge).toContain("className: 'dim-jh-badgeSectionSum'")
+    expect(styles).toMatch(/\.dim-jh-badgeRowHead \{[^}]*justify-content: space-between/)
+  })
+
+  it('偏好做成三段等分控件（不再单占一行写「显示偏好」）', () => {
+    expect(styles).toMatch(/\.dim-jh-badgePrefBtn \{[^}]*flex: 1/)
+    // 解释性文案改到容器 title 上，信息不丢
+    expect(badge).toContain('显示偏好：决定徽标优先显示订阅还是积分')
+    expect(badge).not.toContain("'显示偏好'")
+  })
+
+  it('浮层窄于 340px 且用细分隔线分组（更矮更整齐）', () => {
+    expect(styles).toMatch(/\.dim-jh-badgePop \{[^}]*width: 300px/)
+    expect(styles).toMatch(/\.dim-jh-badgeSection \{[^}]*border-top: \.5px solid/)
+  })
+
+  it('信息不缺失：时间戳/缓存标记、停用与失败计数、套餐到期都仍在渲染里', () => {
+    expect(badge).toContain("value?.cached === true ? ' · 缓存' : ''")
+    expect(badge).toContain('另有 ${value.disabledCount} 个账号已停用，未计入')
+    expect(badge).toContain('${view.failedCount} 个账号读取失败')
+    expect(badge).toContain('扣费截止 ${formatUpdatedAt(group.deductionEndTime)}')
+    expect(badge).toContain('本次刷新失败，显示的是上一次读数')
   })
 })
 
@@ -183,7 +271,12 @@ describe('用量徽标：依赖与样式', () => {
     const styles = read('plugin-src/client/jet-hub-styles.js')
     // ⚠️ 类名允许大写（dim-jh-badgeDot / badgePop / ...），第一次写成只认小写时
     // 只匹配到 1 个类，用例假绿。
-    const classes = new Set([...badge.matchAll(/className: '([A-Za-z0-9- ]+)'/g)].map((match) => match[1].trim()))
+    // ⚠️ 一个 className 里可能写**两个**类（如 'dim-jh-badgeSection dim-jh-badgeClaim'），
+    // 必须拆开逐个查，否则断言会拿整串去找 `.A B` 而假红。
+    const classes = new Set(
+      [...badge.matchAll(/className: '([A-Za-z0-9- ]+)'/g)]
+        .flatMap((match) => match[1].trim().split(/\s+/)),
+    )
     expect(classes.size).toBeGreaterThan(10)
     for (const className of classes) {
       expect(styles, className).toContain(`.${className}`)
