@@ -421,23 +421,22 @@ function UsageBadgeActive(props) {
           : windows.map(([type, windowLabel, win]) => {
             const percent = quotaPercentValue(win?.percentUsed);
             const left = quotaResetsIn(win?.resetsAt);
+            // **一行**放下四样：名称 / 进度条 / 百分比 / 重置倒计时（用户要求更小巧）。
+            // ⚠️ 倒计时允许被省略号截断（窄窗时最后一点空间给它），完整文本在 title 里
+            // —— 这是唯一「可能看不见」的信息，故必须留 title 兜底。
             return React.createElement('div', { key: type, className: 'dim-jh-badgeWin' }, [
-              // 第一行：名称 + 重置倒计时（倒计时缺失就只留名称）
-              React.createElement('div', { key: 'head', className: 'dim-jh-badgeRowHead' }, [
-                React.createElement('span', { key: 'l' }, windowLabel),
-                left === '' ? null : React.createElement('span', { key: 'r', className: 'dim-jh-badgeNote' }, left),
-              ]),
-              // 第二行：进度条 + 百分比（同一行放得下，省掉单独一行百分比）
-              React.createElement('div', { key: 'track', className: 'dim-jh-badgeWinTrack' }, [
-                React.createElement('div', { key: 'bar', className: 'dim-jh-quotaBar' },
-                  React.createElement('div', {
-                    key: 'fill',
-                    className: 'dim-jh-quotaBarFill',
-                    'data-tone': quotaTone(percent),
-                    style: { width: `${percent}%` },
-                  })),
-                React.createElement('span', { key: 'v', className: 'dim-jh-badgeValue' }, formatQuotaPercent(percent)),
-              ]),
+              React.createElement('span', { key: 'l', className: 'dim-jh-badgeWinLabel' }, windowLabel),
+              React.createElement('div', { key: 'bar', className: 'dim-jh-quotaBar' },
+                React.createElement('div', {
+                  key: 'fill',
+                  className: 'dim-jh-quotaBarFill',
+                  'data-tone': quotaTone(percent),
+                  style: { width: `${percent}%` },
+                })),
+              React.createElement('span', { key: 'v', className: 'dim-jh-badgeValue' }, formatQuotaPercent(percent)),
+              left === ''
+                ? null
+                : React.createElement('span', { key: 'r', className: 'dim-jh-badgeWinReset', title: left }, left),
             ]);
           })),
       ]);

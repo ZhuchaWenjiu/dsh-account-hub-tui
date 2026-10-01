@@ -221,13 +221,18 @@ describe('用量徽标：弹窗的紧凑布局（信息一项不少）', () => {
     expect(badge).toContain("key: 'dot', className: 'dim-jh-badgeDot'")
     expect(badge).toContain("key: 'refresh'")
     expect(badge).toContain("'aria-label': '刷新用量'")
-    expect(styles).toMatch(/\.dim-jh-badgeRefresh \{[^}]*width: 22px/)
+    expect(styles).toMatch(/\.dim-jh-badgeRefresh \{[^}]*width: 20px/)
   })
 
-  it('每个窗口只占两行：名称 + 重置倒计时 / 进度条 + 百分比', () => {
-    expect(badge).toContain("key: 'track', className: 'dim-jh-badgeWinTrack'")
-    expect(styles).toMatch(/\.dim-jh-badgeWinTrack \.dim-jh-quotaBar \{[^}]*flex: 1/)
-    // ⚠️ 倒计时与百分比都必须可见（不能藏进 tooltip）
+  it('每个窗口只占**一行**：名称 / 进度条 / 百分比 / 重置倒计时', () => {
+    expect(badge).toContain("className: 'dim-jh-badgeWin'")
+    expect(badge).toContain("className: 'dim-jh-badgeWinLabel'")
+    expect(badge).toContain("className: 'dim-jh-badgeWinReset'")
+    // ⚠️ 倒计时允许被省略号截断，故必须留 title 兜底（这是唯一可能看不见的信息）
+    expect(badge).toMatch(/className: 'dim-jh-badgeWinReset', title: left/)
+    expect(styles).toMatch(/\.dim-jh-badgeWin \{[^}]*display: flex/)
+    expect(styles).toMatch(/\.dim-jh-badgeWin \.dim-jh-quotaBar \{[^}]*height: 3px/)
+    // ⚠️ 倒计时与百分比都必须可见（不能只藏在 tooltip 里）
     expect(badge).toContain('quotaResetsIn(win?.resetsAt)')
     expect(badge).toContain('formatQuotaPercent(percent)')
   })
@@ -246,9 +251,16 @@ describe('用量徽标：弹窗的紧凑布局（信息一项不少）', () => {
     expect(badge).not.toContain("'显示偏好'")
   })
 
-  it('浮层窄于 340px 且用细分隔线分组（更矮更整齐）', () => {
-    expect(styles).toMatch(/\.dim-jh-badgePop \{[^}]*width: 300px/)
+  it('浮层收窄到 280px、进度条 3px、控件去线条（更小巧精致）', () => {
+    expect(styles).toMatch(/\.dim-jh-badgePop \{[^}]*width: 280px/)
     expect(styles).toMatch(/\.dim-jh-badgeSection \{[^}]*border-top: \.5px solid/)
+    // 刷新键默认无边框无底色，hover 才浮起
+    expect(styles).toMatch(/\.dim-jh-badgeRefresh \{[^}]*border: \.5px solid transparent/)
+    expect(styles).toMatch(/\.dim-jh-badgeRefresh \{[^}]*background: transparent/)
+    // 签到按钮同样无边框（避免弹窗里到处是框线）
+    expect(styles).toMatch(/\.dim-jh-badgeAction \{[^}]*border: 0/)
+    // 双层柔和阴影
+    expect(styles).toMatch(/\.dim-jh-badgePop \{[^}]*box-shadow: 0 1px 2px[^}]*0 8px 24px/)
   })
 
   it('信息不缺失：时间戳/缓存标记、停用与失败计数、套餐到期都仍在渲染里', () => {
