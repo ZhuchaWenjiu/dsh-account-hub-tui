@@ -33,6 +33,7 @@
  */
 
 import { mkdir, readFile, writeFile } from 'node:fs/promises'
+import { readFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { OPENCODE_MODELS_DEV_URL, OPENCODE_MODELS_DEV_TTL_MS } from './opencode-product.js'
@@ -155,6 +156,46 @@ async function ensureDiskLoaded(): Promise<void> {
   }
 }
 
+/**
+ * **同步**读磁盘缓存（模块加载时执行一次）。
+ *
+ * ## ⚠️⚠️ 为什么必须有这一步（真机报障 2026-10-02，根因）
+ *
+ * DSH 内核在 `prompt` 准入阶段校验图片：
+ * ```js
+ * const model = await this.ctx.llm.resolveModelInfo(current.provider, current.model)
+ * if (model.inputModalities !== void 0 && !model.inputModalities.includes("image"))
+ *   throw new RemoteError(..., "Model ... does not support image input.")
+ * ```
+ * （见 `dsh-api-session-controller/lib/index.js`）
+ *
+ * 那次校验**紧贴用户操作**发生，而能力表此前只靠 `ensureDiskLoaded()` 的
+ * **异步** `await readFile` 填充 ⇒ 冷启动后有一段窗口里
+ * `getOpencodeCapabilitiesSync()` 恒返回 `[]` ⇒ `inputModalities` 报 `['text']`
+ * ⇒ **网关发图被内核拒绝**，报「模型不支持图片输入」。
+ *
+ * 「后台刷新后广播 `llm/adapters-updated`」救不了：广播只触发 UI 重渲染，
+ * 不会重新走一次准入校验。
+ *
+ * ⇒ 模块加载时**同步**把磁盘缓存读进内存（缓存文件 ~19KB，`readFileSync`
+ * 代价可忽略），保证 `resolveModel` 第一次被调用就拿到完整能力表。
+ * 代价是插件加载多一次同步 IO，可接受。
+ */
+function loadDiskCacheSync(): void {
+  if (diskLoaded) return
+  diskLoaded = true
+  try {
+    const raw = readFileSync(cacheFilePath(), 'utf8')
+    const parsed = JSON.parse(raw) as CapabilityCacheFile
+    if (parsed?.version === 1 && Array.isArray(parsed.entries) && parsed.entries.length > 0) {
+      memory = parsed.entries
+      cacheFileAt = typeof parsed.at === 'number' ? parsed.at : 0
+    }
+  } catch {
+    // 没有缓存文件是正常的（首次运行），后台会补齐。
+  }
+}
+
 async function writeDiskCache(entries: readonly OpencodeModelCapability[]): Promise<void> {
   try {
     const path = cacheFilePath()
@@ -234,15 +275,22 @@ let refreshingStartedAt = 0
  * **同步**读当前已知的能力表。
  *
  * ⚠️ 刻意**不是** async：调用方在渲染路径上（listModels / resolveModel），
- * await 网络会卡住模型选择器（真机事故）。拿不到就返回空数组，
- * 调用方按「纯文本」兜底，后台刷新后自动补上。
+ * await 网络会卡住模型选择器（真机事故）。
+ *
+ * ⚠️⚠️ 首次调用会**同步**读磁盘缓存（`readFileSync`，~19KB）—— 不是网络 IO，
+ * 代价可忽略，却能保证 `resolveModel` 第一次被调用就拿到完整能力表。
+ * 少了这一步，内核的 `prompt` 准入校验会读到 `inputModalities: ['text']`
+ * 而拒绝图片（详见 {@link loadDiskCacheSync} 的事故记录）。
  */
 export function getOpencodeCapabilitiesSync(): readonly OpencodeModelCapability[] {
+  loadDiskCacheSync()
   return memory
 }
 
 /** 首次调用：读磁盘缓存（非阻塞，fire-and-forget）。 */
 export function primeOpencodeCapabilities(): void {
+  // 同步读一次，让紧随其后的任何 resolveModel/listModels 都拿得到。
+  loadDiskCacheSync()
   void ensureDiskLoaded().then(() => {
     // 有缓存就直接用；没有则在后台补一次。
     if (memory.length === 0) refreshOpencodeCapabilities()
