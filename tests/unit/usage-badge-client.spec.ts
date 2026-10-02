@@ -294,23 +294,25 @@ describe('用量徽标：弹窗的紧凑布局（信息一项不少）', () => {
     expect(styles).toMatch(/\.dim-jh-badgeAuto\[data-running="true"\] \{ color: var\(--dsw-alias-brand-primary\); \}/)
   })
 
-  it('「全部渠道签到」按钮**右上方**有自动签到小标识（文案与状态灯同源）', () => {
-    // 用户 2026-10-02：「是否在全部签到按钮右上方标是否有自动的小标识？这样的设计
-    // 配合那个状态灯。这样别人才知道当前是否是自动签到状态。」
-    expect(badge).toContain("className: 'dim-jh-badgeClaimHead'")
-    expect(badge).toContain("className: 'dim-jh-badgeAutoTag'")
-    // 右对齐 ⇒ 视觉上正落在「全部渠道签到」（最右那个按钮）的上方
-    expect(styles).toMatch(/\.dim-jh-badgeClaimHead \{[^}]*justify-content: flex-end/)
-    // ⚠️ 文案必须能独立读懂（含「自动签到」字样与状态词），不能只有一个点
-    expect(badge).toMatch(/`自动签到 \$\{autoStateWord\}`/)
-    expect(badge).toMatch(/auto\.enabled !== true\s*\?\s*'已关闭'/)
-    expect(badge).toMatch(/auto\.ranToday === true \? '今天已完成' : '已开启'/)
-    // ⚠️ 它必须是**只读说明**而不是第二个开关：两个控件都能改状态会误触
-    const tag = badge.slice(badge.indexOf("className: 'dim-jh-badgeAutoTag'"), badge.indexOf('dim-jh-badgeClaimRow'))
-    expect(tag).not.toContain('onClick')
-    // 小标识与状态灯共用同一份状态词（避免两处口径漂移）
-    expect(badge).toContain('自动签到 ${autoStateWord}')
-    expect(badge).toMatch(/title: autoTagTitle/)
+  it('「（自动）」后缀标在签到按钮文案上（关掉则不显示），不再用上方小胶囊', () => {
+    // 用户 2026-10-02 的口径：「直接在原有的全渠道签到后面加一个括号，添加自动二字。
+    // 如果没有，只有单渠道，也在后方加一个自动二字。如果自动签到关闭，则不显示这个自动二字。」
+    expect(badge).toContain('const withAutoSuffix = (label) => (auto?.enabled === true ? `${label}（自动）` : label);')
+    expect(badge).toContain("withAutoSuffix('全部渠道签到')")
+    // ⚠️ 关掉时按钮保持原样（后缀函数返回原 label，不是空串）
+    expect(badge).toMatch(/: label\);/)
+    // ⚠️ 只标在**实际渲染的那个**按钮上：弹窗里「全部渠道签到」无条件渲染，
+    // 故「签到（本渠道）」不再重复标（两个都标会被读成两个独立功能）。
+    expect(badge).not.toContain("withAutoSuffix('签到（本渠道）')")
+    // ⚠️ 上一版那枚右对齐小胶囊已被用户否掉（「感觉有点不是太好看」），
+    // 组件与样式都不该再留着它。
+    expect(badge).not.toContain('dim-jh-badgeAutoTag')
+    expect(badge).not.toContain('dim-jh-badgeClaimHead')
+    expect(styles).not.toContain('.dim-jh-badgeAutoTag')
+    // 状态灯的悬停提示必须说清「这个按钮是干什么的」
+    expect(badge).toContain("const what = '自动签到开关';")
+    expect(badge).toMatch(/点击开启后，每天首次启动 DSH 时会自动为全部渠道签到一次/)
+    expect(badge).toMatch(/title: autoTitle/)
   })
 
   it('浅色模式下按钮与线条可见（用主题描边，取消上一轮的「去线条」）', () => {

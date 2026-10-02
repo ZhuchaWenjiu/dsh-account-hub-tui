@@ -259,43 +259,45 @@ function UsageBadgeActive(props) {
   };
 
   /**
-   * 状态灯与它的完整文字说明。
+   * 状态灯的**悬停提示**（用户 2026-10-02：「鼠标放上去增加文字提示，这个按钮是
+   * 干什么的」）。故第一句就说清「这是个开关」，再给当前状态与点击后果。
    *
    * 四态：关闭（空心灰环）/ 已开·今天未跑（实心绿点）/ 已开·今天已跑（绿点带外环）/
    * 进行中（省略号）。文字里必须说清**作用范围（全部渠道）与日界**，否则用户
    * 无法判断「为什么今天没动静」。
    */
   const autoTitle = (() => {
-    const base = '自动签到（全局，全部渠道）';
-    if (auto === undefined) return `${base}：状态读取中…`;
-    if (auto.enabled !== true) return `${base}：已关闭 —— 点击开启，此后每天首次启动 DSH 时自动为全部渠道签到`;
-    if (auto.running === true) return `${base}：正在执行（串行遍历有账号的渠道，请稍候）`;
+    const what = '自动签到开关';
+    if (auto === undefined) return `${what}：状态读取中…`;
+    if (auto.enabled !== true) {
+      return `${what}（当前：关闭）—— 点击开启后，每天首次启动 DSH 时会自动为全部渠道签到一次`;
+    }
+    if (auto.running === true) return `${what}（当前：开启，正在执行）—— 串行遍历有账号的渠道，请稍候`;
     const last = auto.lastResult === '' ? '' : `；上次：${auto.lastResult}`;
-    if (auto.ranToday === true) return `${base}：已开启，今天已完成${last} —— 点击关闭`;
-    return `${base}：已开启，今天尚未执行（下次启动 DSH 时自动签到）${last} —— 点击关闭`;
+    if (auto.ranToday === true) return `${what}（当前：开启，今天已完成）${last} —— 点击关闭`;
+    return `${what}（当前：开启，今天尚未执行）—— 每天首次启动 DSH 时自动签到${last}；点击关闭`;
   })();
   const autoState = auto === undefined || auto.enabled !== true
     ? 'off'
     : (auto.ranToday === true ? 'done' : 'on');
 
   /**
-   * 状态的**短文案**：状态灯（右上角）与签到按钮上方那枚小标识**共用同一份**，
-   * 免得两处口径漂移（用户 2026-10-02：「在全部签到按钮右上方标是否有自动的小标识…
-   * 这样别人才知道当前是否是自动签到状态」）。
+   * 签到按钮上的「（自动）」后缀。
    *
-   * ⚠️ 只有四个词，但必须能**独立读懂**（不依赖颜色、不依赖另一个控件）：
-   * 用户看到的是「自动签到 已关闭」这样的完整短语，而不是一个孤零零的点。
+   * 用户 2026-10-02 的两次要求：
+   * ① 「在全部签到按钮右上方标是否有自动的小标识」→ 先做成了按钮上方的小胶囊；
+   * ② 随后改成：「直接在原有的全渠道签到后面加一个括号，添加自动二字。如果没有，
+   *    只有单渠道，也在后方加一个自动二字。如果自动签到关闭，则不显示这个自动二字。」
+   *    ⇒ **去掉那枚小胶囊**（用户觉得不够好看），改成按钮文案后缀；**只在开关打开时**
+   *    才加，关闭时按钮保持原样。
+   *
+   * ⚠️ 只加在**实际会渲染的那个**按钮上，不是两个都加：弹窗里 `全部渠道签到`
+   * 是**无条件**渲染的（它不依赖本渠道能力），故后缀恒落在它身上；`签到（本渠道）`
+   * 只在能力表允许时出现，此时它与「全部渠道」并存 —— 按用户的口径
+   *（「直接在原有的全渠道签到后面加…如果没有，只有单渠道，也在后方加」）**不再重复标**。
+   * 若将来出现「只有单渠道按钮」的形态，把 `withAutoSuffix` 用在那一个上即可。
    */
-  const autoStateWord = auto === undefined
-    ? '读取中'
-    : auto.enabled !== true
-      ? '已关闭'
-      : auto.running === true
-        ? '进行中'
-        : auto.ranToday === true ? '今天已完成' : '已开启';
-
-  /** 小标识的提示：说清它和状态灯是同一个开关、以及去哪里改。 */
-  const autoTagTitle = `${autoTitle}（与右上角的自动签到状态灯是同一个开关，点那盏灯切换）`;
+  const withAutoSuffix = (label) => (auto?.enabled === true ? `${label}（自动）` : label);
 
   /** 切换显示偏好：本地先生效，宿主写入失败时提示并回滚下一次渲染。 */
   const onPickPreference = async (next) => {
@@ -644,28 +646,6 @@ function UsageBadgeActive(props) {
     const canClaimCurrent = supportsDailyCheckin(provider);
     const allBusy = claiming === 'all';
     return React.createElement('div', { key: 'claim', className: 'dim-jh-badgeSection dim-jh-badgeClaim' }, [
-      /**
-       * 签到按钮上方那枚「自动签到」小标识（**右对齐**，正落在「全部渠道签到」
-       * 按钮的右上方）。
-       *
-       * ⚠️ 为什么需要它：状态灯在弹窗**右上角**，与底部这两个按钮隔着整块内容，
-       * 用户看到「全部渠道签到」时无法判断「每天是不是已经自动签了」——
-       * 于是要么重复手点、要么以为没生效。这枚标识把同一个状态搬到按钮旁边
-       * （用户 2026-10-02 的建议），文案与状态灯**共用 `autoStateWord`**。
-       *
-       * ⚠️ 只读不写：它是**说明**而不是第二个开关 —— 两个控件都能改状态时，
-       * 误触会直接改变「每天自动打上游」的行为。要改请点右上角那盏灯（title 里写明）。
-       */
-      React.createElement('div', { key: 'autotag', className: 'dim-jh-badgeClaimHead' },
-        React.createElement('span', {
-          className: 'dim-jh-badgeAutoTag',
-          'data-state': autoState,
-          'data-running': auto?.running === true,
-          title: autoTagTitle,
-        }, [
-          React.createElement('span', { key: 'd', className: 'dim-jh-badgeAutoTagDot' }),
-          `自动签到 ${autoStateWord}`,
-        ])),
       React.createElement('div', { key: 'row', className: 'dim-jh-badgeClaimRow' }, [
         canClaimCurrent
           ? React.createElement('button', {
@@ -676,6 +656,8 @@ function UsageBadgeActive(props) {
             // ⚠️ 按钮文案**不写渠道名**：`签到（仅 CodeBuddy (腾讯)）` 在 300px 弹窗里
             // 会被 text-overflow 截成 `签到（仅 CodeBuddy (…`（截图核验发现）。渠道名
             // 已经在弹窗头部与 title 里，按钮只要说清「范围＝本渠道」即可。
+            // ⚠️ 自动签到开着时加「（自动）」后缀 —— 只在**只有这一个按钮**的形态下
+            // 才轮到它承载该标识（见 `withAutoSuffix` 的注释）。
             title: `只签到当前渠道（${label}）的全部账号`,
             onClick: () => { void onClaim(); },
           }, claiming === 'current' ? '领取中…' : '签到（本渠道）')
@@ -685,11 +667,11 @@ function UsageBadgeActive(props) {
           type: 'button',
           className: 'dim-jh-badgeAction',
           disabled: claiming !== null,
-          title: '串行签到全部支持签到的渠道（9 个；WorkBuddy 国际版 / Cline / Raccoon 后端没有签到接口）',
+          title: `串行签到全部支持签到的渠道（9 个；WorkBuddy 国际版 / Cline / Raccoon 后端没有签到接口）${auto?.enabled === true ? '；自动签到已开启，每天首次启动 DSH 时会自动执行一次' : ''}`,
           onClick: () => { void onClaimAll(); },
         }, allBusy
           ? (claimProgress === null ? '签到中…' : `签到中 ${claimProgress.done}/${claimProgress.total}…`)
-          : '全部渠道签到'),
+          : withAutoSuffix('全部渠道签到')),
       ]),
       /**
        * 本渠道没有签到接口时**明说原因**。

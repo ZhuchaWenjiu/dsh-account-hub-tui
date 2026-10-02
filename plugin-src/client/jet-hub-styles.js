@@ -526,19 +526,10 @@ const STYLES = `
 .dim-jh-badgeAuto[data-state="done"] .dim-jh-badgeAutoDot { background: currentColor; border: 0; }
 .dim-jh-badgeAuto[data-state="done"] .dim-jh-badgeAutoDot { box-shadow: 0 0 0 2px color-mix(in srgb, var(--dsw-alias-state-success-primary) 28%, transparent); }
 .dim-jh-badgeAuto[data-running="true"] { color: var(--dsw-alias-brand-primary); }
-/* 「自动签到」小标识：右对齐落在「全部渠道签到」按钮的右上方（用户 2026-10-02 建议），
-   解决「状态灯在右上角、与底部按钮隔着整块内容，看不出每天是否已自动签」。
-   ⚠️ 只读说明，不是第二个开关（两个控件都能改状态会误触）。 */
-.dim-jh-badgeClaimHead { display: flex; justify-content: flex-end; margin-bottom: -1px; }
-.dim-jh-badgeAutoTag { display: inline-flex; align-items: center; gap: 4px; padding: 1px 5px; border: .5px solid var(--dsw-alias-border-l2); border-radius: 999px; background: var(--dsw-alias-bg-layer-2); color: var(--dsw-alias-label-tertiary); font-size: 9.5px; line-height: 1.5; white-space: nowrap; }
-.dim-jh-badgeAutoTagDot { width: 5px; height: 5px; box-sizing: border-box; border-radius: 999px; background: transparent; border: 1.5px solid currentColor; }
-/* 与状态灯同语义：关=空心灰环 / 开与今天已跑=实心绿点 / 进行中=品牌色 */
-.dim-jh-badgeAutoTag[data-state="on"],
-.dim-jh-badgeAutoTag[data-state="done"] { color: var(--dsw-alias-state-success-primary); border-color: color-mix(in srgb, var(--dsw-alias-state-success-primary) 45%, var(--dsw-alias-border-l2)); }
-.dim-jh-badgeAutoTag[data-state="on"] .dim-jh-badgeAutoTagDot,
-.dim-jh-badgeAutoTag[data-state="done"] .dim-jh-badgeAutoTagDot { background: currentColor; border: 0; }
-.dim-jh-badgeAutoTag[data-state="done"] .dim-jh-badgeAutoTagDot { box-shadow: 0 0 0 1.5px color-mix(in srgb, var(--dsw-alias-state-success-primary) 28%, transparent); }
-.dim-jh-badgeAutoTag[data-running="true"] { color: var(--dsw-alias-brand-primary); border-color: color-mix(in srgb, #1677ff 45%, var(--dsw-alias-border-l2)); }
+/* ⚠️ 这里曾有一枚「自动签到 已关闭 / 今天已完成」的小胶囊（右对齐在签到按钮上方）。
+   用户 2026-10-02 反馈「新加的这个感觉有点不是太好看」，改为在「全部渠道签到」
+   按钮文案后加「（自动）」后缀（只在开关打开时加）⇒ 相关样式整段删除。
+   状态本身的说明仍由右上角状态灯的 title 承载。 */
 /* 偏好：分段控件（未选中透明、选中浮起），比三个独立胶囊更紧凑整齐 */
 .dim-jh-badgePref { display: flex; gap: 2px; padding: 2px; border: .5px solid var(--dsw-alias-border-l2); border-radius: 7px; background: var(--dsw-alias-bg-layer-2); }
 .dim-jh-badgePrefBtn { flex: 1; min-width: 0; padding: 2px; border: 0; border-radius: 5px; background: transparent; color: var(--dsw-alias-label-secondary); font: inherit; font-size: 10px; line-height: 1.5; white-space: nowrap; cursor: pointer; transition: background .15s ease, color .15s ease; }
