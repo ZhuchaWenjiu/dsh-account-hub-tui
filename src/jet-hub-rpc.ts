@@ -124,6 +124,7 @@ import {
   retestAllAccounts,
 } from './account-probe.js'
 import { exportBackup, importBackup } from './backup.js'
+import { handleOpencodeRpc } from './opencode-rpc.js'
 import type {
   ProviderAccountEntry,
   RpcBackupExportResponse,
@@ -1220,8 +1221,26 @@ function registerJetHubEndpoints(
     }
   }
 
-  /** 分发端点方法到对应的处理器 */
+  /**
+   * 分发端点方法到对应的处理器。
+   *
+   * ⚠️ **opencode 的方法在此之前先试一次**（2026-10-02 修）。
+   *
+   * 背景：`opencode-rpc.ts` 曾自己调 `rpc.register('jet-hub', …)`，以为能与
+   * 本文件的 handler 并存。真机报障「添加失败：unknown method:
+   * opencode.addAnonymous」—— Jet Hub **只有这一条通道**（本函数的
+   * `connection.fetch.register`），它的 `switch` 穷举所有方法，
+   * `default` 直接回 `unknown method` 且不让路。
+   *
+   * ⚠️ 顺序很重要：必须放在 `switch` **之前**、且 `handleOpencodeRpc` 对不认识
+   * 的方法返回 `undefined` —— 否则 opencode 的方法名永远落不到这里，
+   * 反过来（switch 先匹配）又会被别的 provider 的 case 误吞。
+   */
   async function handleMethod(method: string, payload: unknown, _signal?: AbortSignal): Promise<unknown> {
+    if (method.startsWith('opencode.')) {
+      const handled = await handleOpencodeRpc(ctx, pool, method, payload)
+      if (handled !== undefined) return handled
+    }
     switch (method) {
       case 'account.list': {
         const req = payload as RpcListAccountsRequest

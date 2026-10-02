@@ -165,6 +165,19 @@ export const CREDITS_CAPABILITIES = Object.freeze({
    * `src/zcode-auth.ts` 的 `claimDaily`）。
    */
   zcode: Object.freeze({ balance: true, dailyCheckin: true }),
+  /**
+   * OpenCode：余额与签到**都没有**。
+   *
+   * ⚠️ **显式登记为 false，而不是省略这个键** —— 省略会让
+   * `supportsBalance()` 之类的判定走 `undefined === true` 的假路，
+   * 看起来「能查」但一请求就 400（CodeArts 早期「对所有 provider 无条件
+   * 调 credits.balances」就是这一类缺陷）。登记 false 让面板**不渲染**
+   * 积分行、不发请求。
+   *
+   * 语义依据：OpenCode Zen 是按量计费的 API 网关，没有积分/签到概念
+   * （额度体现在账号的用量限制上，不是一个可查询的余额数字）。
+   */
+  opencode: Object.freeze({ balance: false, dailyCheckin: false }),
 });
 
 /**

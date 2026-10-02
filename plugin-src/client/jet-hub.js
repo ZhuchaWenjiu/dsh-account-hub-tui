@@ -12,6 +12,7 @@ import {
   checkinProviders,
 } from './credits-capabilities.js';
 import { orderAfterDrop, dropPositionFromPointer } from './account-order.js';
+import { OpencodeKeyModal, OpencodeProxyModal } from './opencode-proxy-modal.js';
 import {
   formatExpirySplitLine,
   formatPoolSplitLine,
@@ -241,6 +242,15 @@ const MINIMAX_ICON = 'data:image/svg+xml;base64,PHN2ZyB3aWR0aD0iODAiIGhlaWdodD0i
  */
 const ZCODE_ICON = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAAgklEQVR42u3XsRGAIAyF4UxgYe0g7j+FpZtgRwN36stLAhruqP+v4ICIdNaybsViy92yCj+CeMW7CO94gwgFRMUrIgFTAPbzgPe/Aa5nAInTAGicAtDE1QBtXAVgxGEAeuIpAFYYArDj81xEoQDLd+A1ID8k3wTkXDDEaDbEcBo1nl/XXoK4yMqvMgAAAABJRU5ErkJggg==';
 
+/**
+ * OpenCode 面板图标（内联 SVG data URL，手绘）。
+ *
+ * ⚠️ 与 Qoder / LobsterAI / TRAE 同款做法：opencode 没有可取的小图标资源，
+ * 走内联 SVG（体积小、无色差、20×20 下清晰）。
+ * 图形：深色圆角方块 + 白色终端提示符（`>` 加下划线），呼应 CLI 形象。
+ */
+const OPENCODE_ICON = 'data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNCAyNCI+PHJlY3Qgd2lkdGg9IjI0IiBoZWlnaHQ9IjI0IiByeD0iNSIgZmlsbD0iIzEyMTYxZCIvPjxwYXRoIGQ9Ik02LjUgOC41IDEwLjUgMTJsLTQgMy41IiBzdHJva2U9IiNmZmYiIHN0cm9rZS13aWR0aD0iMS44IiBmaWxsPSJub25lIiBzdHJva2UtbGluZWNhcD0icm91bmQiIHN0cm9rZS1saW5lam9pbj0icm91bmQiLz48cGF0aCBkPSJNMTIuNSAxNmg1IiBzdHJva2U9IiNmZmYiIHN0cm9rZS13aWR0aD0iMS44IiBmaWxsPSJub25lIiBzdHJva2UtbGluZWNhcD0icm91bmQiLz48L3N2Zz4=';
+
 const PROVIDERS = Object.freeze([
   { id: 'codearts', label: 'CodeArts (华为云)', icon: CODEARTS_ICON, logoClass: 'codearts' },
   { id: 'buddy', label: 'CodeBuddy (腾讯)', icon: CODEBUDDY_ICON, logoClass: 'buddy' },
@@ -275,6 +285,14 @@ const PROVIDERS = Object.freeze([
    * 「弹窗 + 登录轮询」路径。
    */
   { id: 'zcode', label: 'ZCode (智谱)', icon: ZCODE_ICON, logoClass: 'zcode' },
+  /**
+   * OpenCode（第 12 个 provider）。
+   *
+   * ⚠️ label 必须与 `OPENCODE.displayName` **逐字一致**（'OpenCode'）：
+   * rail 宽度算式与 `tests/unit/opencode-client-panel.spec.ts` 的跨文件
+   * 一致性断言都依赖它（raccoon 那条同理，改一处会连锁失败）。
+   */
+  { id: 'opencode', label: 'OpenCode', icon: OPENCODE_ICON, logoClass: 'opencode' },
 ]);
 
 /**
@@ -511,7 +529,21 @@ function CreditBalanceRow({ balance, error, loading, windowDays, provider }) {
       : null));
 }
 
-function AccountCard({ account, index, order, provider, onToggle, onDelete, onRetest, onReset, onClaimOnboarding, onboardingBusy, busy, credits, creditsLoading, showCredits, showPackageList, windowDays, showRateLimitActions, drag }) {
+/**
+ * 该账号条目是否为 opencode 的匿名通道。
+ *
+ * ⚠️ 判据是**条目 id 前缀**（`opencode-anon-`）而不是凭据内容：客户端拿不到
+ * 凭据（它存在 `ctx.credentials` 里，面板只拿得到 `credentialRef`），而 id 前缀
+ * 是宿主与客户端之间约定好的（见 `opencode-rpc.ts` 的 `addAnonymous`）。
+ */
+function isAnonymousAccountId(accountId) {
+  return String(accountId || '').indexOf('opencode-anon-') === 0;
+}
+
+function AccountCard({ account, index, order, provider, onToggle, onDelete, onRetest, onReset, onClaimOnboarding, onboardingBusy, busy, credits, creditsLoading, showCredits, showPackageList, windowDays, showRateLimitActions, drag,
+  // ⚠️ opencode 专属：传了才渲染「代理」「指纹」两个按钮（见按钮区注释）。
+  // 前者额外需要 current 代理串，故签名与 onRetest 略有不同。
+  onOpenProxy, onRotateFingerprint }) {
   const rateLimits = account.modelRateLimits
     ? Object.entries(account.modelRateLimits).filter(([, v]) => v > Date.now())
     : [];
@@ -601,7 +633,18 @@ function AccountCard({ account, index, order, provider, onToggle, onDelete, onRe
         'data-tone': account.enabled ? 'on' : 'off',
         // 同账号名：hover 出资源包列表（两处都挂，用户 hover 哪个都能看见）。
         title: accountTitle,
-      }, account.enabled ? '已启用' : '已停用')),
+      }, account.enabled ? '已启用' : '已停用'),
+      // ⚠️ 匿名通道标记：它不需要 key、只用于免费模型，额度按**出口 IP** 计。
+      // 标注出来是为了让用户知道「这几条不是登录账号」，
+      // 以及为什么给它们配不同代理才会各自获得独立额度。
+      provider === 'opencode' && isAnonymousAccountId(account.id)
+        ? React.createElement('span', {
+            className: 'dim-jh-accountTag',
+            'data-tone': 'on',
+            title: '匿名通道：无需 API key，仅用于免费模型。'
+              + '额度按出口 IP 计算 —— 给它单独配置代理，才会获得独立额度。',
+          }, '匿名')
+        : null),
     React.createElement('dl', { className: 'dim-jh-accountMeta' },
       React.createElement('div', { className: 'dim-jh-metaRow' },
         React.createElement('dt', null, '凭据'),
@@ -695,6 +738,31 @@ function AccountCard({ account, index, order, provider, onToggle, onDelete, onRe
         className: 'dim-jh-btn',
         onClick: () => onToggle(account.id, !account.enabled),
       }, account.enabled ? '停用' : '启用'),
+      // ⚠️ 仅 opencode：出口代理与指纹轮换是该 provider **独有**的账号维度
+      // （其余 provider 没有这两项）。用 props 存在性开关而非
+      // `provider === 'opencode'` 硬判断 —— 前者让 AccountCard 无需知道
+      // provider 列表，也避免以后新增同类 provider 时漏改。
+      // 位置在「停用」之后、「删除」之前：删除按钮带 data-kind='danger'，
+      // 是这一行的视觉终点，不能被挤到中间。
+      onOpenProxy
+        ? React.createElement('button', {
+            className: 'dim-jh-btn',
+            // ⚠️ tooltip 必须解释「不设置会怎样」：看到「代理」按钮很容易
+            // 当成锦上添花，实际不设 = 与其它账号共用同一出口（同一份额度）。
+            title: account.opencodeProxy
+              ? '出口代理：' + account.opencodeProxy + '（点击修改）'
+              : '设置该账号的出口代理；不设置则与其它未设代理的账号共享本机出口 IP',
+            onClick: () => onOpenProxy(account.id, account.opencodeProxy || ''),
+          }, '代理')
+        : null,
+      onRotateFingerprint
+        ? React.createElement('button', {
+            className: 'dim-jh-btn',
+            title: '轮换该账号的指纹（生成新的 project id；用于怀疑多个账号被关联时）',
+            disabled: busy,
+            onClick: () => onRotateFingerprint(account.id),
+          }, '指纹')
+        : null,
       React.createElement('button', {
         className: 'dim-jh-btn',
         'data-kind': 'danger',
@@ -1663,6 +1731,18 @@ function ProviderPanel({ provider, rpcCall }) {
    * 没必要让整个登录流程作废。
    */
   const [loginUrlForManual, setLoginUrlForManual] = React.useState(null);
+  /**
+   * 出口代理弹窗状态：{ accountId, current } 或 null。
+   *
+   * ⚠️ **独立于** `loginUrlForManual`：那个是登录链接兜底弹窗，两者共存时
+   * 共用一个 state 会让开代理弹窗把登录链接顶掉（表现为链接凭空消失）。
+   */
+  const [proxyModal, setProxyModal] = React.useState(null);
+  // 「添加 opencode 账号」弹窗：null（关闭）或 { error }。
+  // ⚠️ 输入框内容**不放 state**（用 ref + DOM 读值）：API key 是凭据，
+  // 进 state 会随每次重渲染经过整棵组件树，也会被 devtools 组件树检查器读到。
+  const [keyModal, setKeyModal] = React.useState(null);
+  const keyInputRef = React.useRef(null);
 
   /**
    * 拖拽排序状态：正在拖的账号 id 与当前悬停的目标账号 id。
@@ -1987,11 +2067,64 @@ function ProviderPanel({ provider, rpcCall }) {
     if (mounted.current) setCreating(false);
   };
 
+  /**
+   * 真正提交一个 opencode 账号（由「添加账号」弹窗的确认按钮调用）。
+   *
+   * ⚠️ 错误**留在弹窗内**展示，不 `setPhase('error')`：后者会把整个账号列表
+   * 换成错误态，用户刚填的 key 与错误信息一起消失，只能刷新重试。
+   */
+  const submitOpencodeKey = async (rawKey) => {
+    const key = String(rawKey == null ? '' : rawKey).trim();
+    // 空串 = 没填就点确认：静默关弹窗，不报错（免费通道本来就能用）。
+    if (key === '') return;
+    await submitOpencodeEntry('opencode.addAccount', { apiKey: key });
+  };
+
+  /**
+   * 添加一条**匿名通道**（无需 key）。
+   *
+   * 匿名通道是账号池里的一条普通条目（`api_key` 为字面量 `public`），于是
+   * 拖拽排序 / 停用 / 删除 / 代理 / 指纹代次全部复用既有机制 —— 这正是
+   * 「多条匿名通道各走各的出口」的实现方式。
+   *
+   * ⚠️ 指纹分离**不增加配额**（匿名按出口 IP 限额，实测换 key/伪装头/指纹
+   * 全部无效）；要多份额度必须给不同匿名通道配**不同代理**。弹窗里已说明。
+   */
+  const submitAnonymous = async () => {
+    await submitOpencodeEntry('opencode.addAnonymous', {});
+  };
+
+  /** 两个添加入口的公共收尾（成功关弹窗并刷新；失败把错误留在弹窗里）。 */
+  const submitOpencodeEntry = async (method, payload) => {
+    setCreating(true);
+    setError(null);
+    try {
+      const res = await rpcCall(method, payload);
+      setKeyModal(null);
+      await loadAccounts();
+      // 重复 key 时后端返回 existed（复用已有账号）—— 这不是错误，
+      // 但要明确告知，否则用户会以为第二次粘贴白费了。
+      if (res && res.existed) setProbeNotice('该 key 已存在，已为你定位到原有账号。');
+    } catch (caught) {
+      setKeyModal({ error: caught && caught.message ? caught.message : '未知错误' });
+    } finally {
+      setCreating(false);
+    }
+  };
+
   const createAccount = async () => {
     // ⚠ 已有一轮登录在跑时直接忽略（真实缺陷）：`creating` 在返回 loginUrl 后
     // 会被 `finally` 无条件释放，按钮随即恢复可点，再点一次会叠加第二个轮询 +
     // 宿主再插一条占位账号。以轮询句柄作为重入闸门，比 UI 的 disabled 更可靠。
     if (pollRef.current !== 0) return;
+    // ⚠️ opencode 的登录**不跳浏览器**，而是开自绘弹窗粘贴 API key；
+    // 走 `setKeyModal` 而不是下面的 `account.create` 流程。
+    // 弹窗里另有两个入口：粘贴 key（submitOpencodeKey）与添加匿名通道（submitAnonymous）。
+    if (provider === 'opencode') {
+      setKeyModal({ error: '' });
+      return;
+    }
+
     setCreating(true);
     let accountId = '';
     let loginUrl = '';
@@ -2184,6 +2317,23 @@ function ProviderPanel({ provider, rpcCall }) {
       await loadAccounts();
     } catch (caught) {
       console.error('[jet-hub] delete failed:', caught);
+    }
+  };
+
+  /**
+   * 轮换某账号的指纹（仅 opencode）。
+   *
+   * ⚠️ 二次确认是有意的：它不是「修复失败」的操作，而是**预防性**手段
+   * （怀疑多个账号被上游关联时换一份新身份）。没有确认框的话，用户容易
+   * 当成普通按钮随手点，点了也不知道发生了什么。
+   */
+  const rotateFingerprint = async (accountId) => {
+    if (!confirm('轮换该账号的指纹？将生成新的 project id（用于与其他账号区分）。')) return;
+    try {
+      await rpcCall('opencode.rotateFingerprint', { accountId });
+      await loadAccounts();
+    } catch (caught) {
+      alert('轮换失败：' + (caught?.message || String(caught)));
     }
   };
 
@@ -2466,9 +2616,28 @@ function ProviderPanel({ provider, rpcCall }) {
             React.createElement('button', { className: 'dim-jh-btn', onClick: loadAccounts }, '重新读取'))
         : accounts.length === 0
           ? React.createElement('div', { className: 'dim-jh-empty' },
-              React.createElement('p', null, '尚未配置账号'),
-              React.createElement('p', null, '点击"+ 新建账号"进行浏览器登录。'))
+              // ⚠️ opencode 的「新建」是**粘贴 API key**、不是浏览器登录，
+              // 空态文案必须跟着变 —— 否则用户会去找一个根本不存在的登录页。
+              provider === 'opencode'
+                ? React.createElement('div', null,
+                    React.createElement('p', null,
+                      '尚未添加账号。免费模型无需账号即可使用；添加自己的 API key 可启用付费模型，并为每个账号配置独立出口。'),
+                    React.createElement('p', { className: 'dim-jh-hint' },
+                      'API key 在 opencode.ai/auth 生成，形如 sk-…'))
+                : React.createElement('div', null,
+                    React.createElement('p', null, '尚未配置账号'),
+                    React.createElement('p', null, '点击"+ 新建账号"进行浏览器登录。')))
           : React.createElement('div', null,
+              // ⚠️ opencode 专属策略提示：必须说清「多账号 ≠ 多额度」——
+              // 匿名通道按出口 IP 限流，同一出口下的多个账号共用一份额度。
+              // 不解释的话，用户加了 5 个号却只看到一份配额，会以为功能坏了。
+              provider === 'opencode'
+                ? React.createElement('p', { className: 'dim-jh-hint' },
+                    '免费模型在所有通道间自动轮换，收费模型仅「API key 账号」可用。'
+                    + '匿名通道无需 key，可添加多条、各自配代理；'
+                    + '注意额度按**出口 IP** 计算 —— 多条通道共用一个出口不会增加额度，'
+                    + '分别配不同代理才会各自获得独立额度。')
+                : null,
               // 排序提示：顺序会真实影响自动选号，必须让用户知道，否则
               // 「拖了有什么用」无从得知。仅两个以上账号时才显示。
               accounts.length > 1
@@ -2507,6 +2676,14 @@ function ProviderPanel({ provider, rpcCall }) {
                 onDelete: deleteAccount,
                 onRetest: (id) => void runLimitAction('retest', id),
                 onReset: (id) => void runLimitAction('reset', id),
+                // ⚠️ 仅 opencode：这两个回调只在该 provider 下传，
+                // AccountCard 靠「props 存在性」决定是否渲染按钮。
+                ...(provider === 'opencode'
+                  ? {
+                      onOpenProxy: (id, current) => setProxyModal({ accountId: id, current }),
+                      onRotateFingerprint: (id) => void rotateFingerprint(id),
+                    }
+                  : {}),
                 // 新手任务（仅 Loomy）：一次性 10000 分，每号只能领一次。
                 // 与「一键领取积分」（每日签到）是**不同**的操作，故独立按钮。
                 onClaimOnboarding: canClaimOnboarding
@@ -2532,6 +2709,38 @@ function ProviderPanel({ provider, rpcCall }) {
       ? React.createElement(ClineQuotaPanel, {
           rpcCall,
           onClose: () => setShowQuota(false),
+        })
+      : null,
+    // 出口代理弹窗（仅 opencode）：覆盖层，与上面两个弹窗各自独立 state，
+    // 同时打开也只是叠加，不会互相顶掉。
+    //
+    // ⚠️⚠️ **必须用 `React.createElement(组件, props)`，不能直接调用函数**
+    // （真实事故 2026-10-02）：这两个弹窗内部有 `useState`，若在
+    // ProviderPanel 的渲染过程中**直接函数调用**，它们的 hook 会被算进
+    // ProviderPanel —— 于是「打开弹窗」与「关闭弹窗」两次渲染的 hook 数量
+    // 不同，React 抛 #310（"Rendered more hooks than during the previous render"），
+    // 整个设置页崩成白屏。仓库其它弹窗（ModelListPanel / BackupPanel /
+    // ClineQuotaPanel）都是 `createElement` 形式，正是这个原因。
+    proxyModal
+      ? React.createElement(OpencodeProxyModal, {
+          // ⚠️ 传最小 ctx 门面而不是整个面板：弹窗只需要 rpc，
+          // 这样它在单测/复用时不必拖上整个 ProviderPanel 的依赖。
+          ctx: { rpc: (payload) => rpcCall(payload.method, payload.payload) },
+          accountId: proxyModal.accountId,
+          current: proxyModal.current,
+          onClose: () => setProxyModal(null),
+        })
+      : null,
+    // 「添加 opencode 账号」弹窗：自绘而非 window.prompt ——
+    // DSH 客户端沙箱里 prompt() 直接抛 `prompt() is not supported`（真机报障）。
+    keyModal
+      ? React.createElement(OpencodeKeyModal, {
+          error: keyModal.error,
+          busy: creating,
+          inputRef: keyInputRef,
+          onSubmit: (value) => void submitOpencodeKey(value),
+          onSubmitAnonymous: () => void submitAnonymous(),
+          onClose: () => setKeyModal(null),
         })
       : null);
 }
