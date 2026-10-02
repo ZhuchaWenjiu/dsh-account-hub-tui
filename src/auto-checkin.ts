@@ -22,9 +22,16 @@
  *    （见 `index.ts` 的注释：短寿命 provider 的凭据在关机期间早就过期）。
  *    若抢在续期之前签到，过期凭据会让整轮变成失败。
  * 即便如此仍可能抢在续期完成前（多账号时续期本身就要几秒到几十秒），故**再加
- * 一道保险**：整轮「零成功且零已领」时**不记日期**，下次启动会重试（见
- * `shouldMarkToday`）。延迟可用 `DSH_JET_HUB_AUTO_CHECKIN_DELAY_MS` 覆盖，
- * `0` 合法（表示立刻跑，单测用它）。
+ * 一道保险**：整轮跑完**没有任何一条能证明「今天已被处理」**时**不记日期**，
+ * 下次启动会重试（见 `shouldMarkToday`）。延迟可用
+ * `DSH_JET_HUB_AUTO_CHECKIN_DELAY_MS` 覆盖，`0` 合法（表示立刻跑，单测用它）。
+ *
+ * ## 什么算「今天已被处理」
+ *
+ * ⚠️ **不是** `claimed + alreadyClaimed`，而是各渠道用
+ * `ClaimOutcome.coversToday` 声明出来的 `summary.coversToday`
+ * （真实缺陷，2026-10-02 审查 PR !33 定位：Qoder 活动每日 10:00（UTC+8）才刷新，
+ * 上午那轮看到的 `CLAIMED` 属于**昨天**，拿它记账会让当天额度**整天漏领**）。
  *
  * ## 为什么单独一份文档，而不是塞进 ui-preferences.json
  *
@@ -45,6 +52,13 @@
  * ⚠️ 其中 **workbuddy 的那条守卫是本功能先补上的**：此前它会落到 buddy 产品
  * 分支、真去发必然失败的签到请求（客户端从不调用它，是因为能力表写着 false，
  * 所以这个洞一直没被触发）。补上之后，「调用即判定」这条规则才真正安全。
+ *
+ * ## ⚠️「调用即判定」管不到的一类：签到**有代价**的渠道
+ *
+ * zcode 有签到，但每次领取都要现场产阿里云 captcha（web 版会拉起 headful
+ * Chromium，且阿里云按设备限流 150 次/小时）。「等它返回错误再判定」来不及 ——
+ * 代价发生在**调用期间**。故另有一张**排除表** `isAutoCheckinExcluded()`，
+ * 在调 `claim` **之前**生效（详见那里的说明与维护口径）。用户仍可手动签到。
  */
 
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
@@ -52,6 +66,7 @@ import { join } from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
 import { QODER_BILLING_UTC_OFFSET_MS } from './model-queue.js'
 import { resolveJetHubHome } from './jet-hub-store.js'
+import { ZCODE } from './zcode-product.js'
 import type { BadgeRpcResult } from './usage-badge.js'
 import type { RpcCreditsClaimAllResponse, RpcUsageAutoCheckinState } from './types.js'
 
@@ -219,9 +234,11 @@ class FileAutoCheckinStore implements AutoCheckinStore {
       if (!existsSync(this.path)) return { ...DEFAULT_AUTO_CHECKIN }
       return sanitizeAutoCheckin(JSON.parse(readFileSync(this.path, 'utf-8')) as unknown)
     } catch (error) {
-      // 损坏时回落默认值（= 开关关闭）而不是抛错：这是后台任务，读不到文档最多
-      // 是「今天不自动签到」，不该让插件起不来。
-      this.logger?.warn(`[jet-hub] 读取 ${this.path} 失败，自动签到按关闭处理: ${String(error)}`)
+      // 损坏时回落默认值而不是抛错：这是后台任务，读不到文档不该让插件起不来。
+      // ⚠️ 默认值现在是「**打开**」（见 `DEFAULT_AUTO_CHECKIN`），所以回落的后果
+      // 是「今天照常自动签到」，不是「不签」。早先这里写的是「= 开关关闭」，
+      // 那是默认值翻转前的旧语义 —— 留着会把排障引到反方向。
+      this.logger?.warn(`[jet-hub] 读取 ${this.path} 失败，自动签到按默认设置（开启）处理: ${String(error)}`)
       return { ...DEFAULT_AUTO_CHECKIN }
     }
   }
@@ -261,6 +278,15 @@ interface RunTotals {
   alreadyClaimed: number
   inactive: number
   failed: number
+  /**
+   * 其中**能证明「今天这一轮已被处理」**的账号数（来自 `summary.coversToday`）。
+   *
+   * ⚠️ 这是 {@link shouldMarkToday} **唯一**该看的口径 —— 不能用
+   * `claimed + alreadyClaimed`：那两项里混着「刷新前那一轮」的痕迹
+   * （Qoder 活动 10:00 UTC+8 才刷新），拿它们记账会让当天新额度整天漏领。
+   * 字段语义见 `src/credits.ts` 的 `ClaimOutcomeCommon.coversToday`。
+   */
+  coversToday: number
   /** 渠道级：不支持签到（`claimAll` 未发上游请求就返回的那些）。 */
   skipped: number
   /** 渠道级：其它错误（凭据、网络……）。 */
@@ -268,7 +294,7 @@ interface RunTotals {
 }
 
 function emptyTotals(): RunTotals {
-  return { providers: 0, claimed: 0, totalCredit: 0, alreadyClaimed: 0, inactive: 0, failed: 0, skipped: 0, errors: 0 }
+  return { providers: 0, claimed: 0, totalCredit: 0, alreadyClaimed: 0, inactive: 0, failed: 0, coversToday: 0, skipped: 0, errors: 0 }
 }
 
 /**
@@ -282,6 +308,36 @@ function emptyTotals(): RunTotals {
  */
 export function isUnsupportedCheckin(message: string): boolean {
   return message.includes('不支持每日签到') || message.includes('unsupported provider')
+}
+
+/**
+ * ⚠️ **自动签到不适合**的渠道：领取过程需要**用户在场 / 外部程序**。
+ *
+ * ## 为什么不靠「错误文案」判（真实缺陷，2026-10-02 审查 PR !33 定位）
+ *
+ * 本文件原先的规则是「判据交给 `credits.claimAll` 自己：不支持的渠道会
+ * **不发上游请求**就返回错误」。那对 cline / raccoon / workbuddy 成立 ——
+ * 它们的守卫在 `claimAll` 里，返回前一个请求都没发。
+ *
+ * 但**漏了一类**：zcode **有**签到，只是每次领取都要现场产一个阿里云
+ * captcha param（`jet-hub-rpc.ts` 的 zcode 分支无条件调 `zcode.mintCaptcha`）。
+ * web 版下它会**拉起 headful Chromium**（约 200–400MB），而阿里云按**设备**
+ * 限流「同设备每小时 150 次」。默认开启的自动签到等于：用户什么都没点，
+ * 开 DSH 就起一棵浏览器进程树、白耗设备级配额；一旦这轮失败又不写 `lastDate`
+ * ⇒ **每次启动都重来**，一天开十次就是十轮 captcha。
+ *
+ * ## 判据与维护口径
+ *
+ * - 这张表是**第二份名单**，但它记的不是「谁有签到接口」（那仍由
+ *   `claimAll` 的守卫 + 客户端能力表负责），而是「谁有签到**代价**」——
+ *   后者无处可查，只能显式登记。**新增带 captcha / 外部浏览器的 provider 时，
+ *   必须同时登记到这里**（`tests/unit/auto-checkin.spec.ts` 有反向守护用例：
+ *   一旦 zcode 的 claim 分支又开始调 `mintCaptcha`，而本表没登记，用例会红）。
+ * - 用户仍可在面板里**手动**点 zcode 的「一键领取积分」—— 那是有意行为，
+ *   浏览器弹出来是用户自己能理解的交互。
+ */
+export function isAutoCheckinExcluded(provider: string): boolean {
+  return provider === ZCODE.id
 }
 
 /** 把一轮结果拼成一句中文摘要（给状态灯提示与日志用）。 */
@@ -301,16 +357,26 @@ export function describeRun(totals: RunTotals): string {
 /**
  * 这一轮该不该把「今天」记为已跑。
  *
- * 判据：**至少有一个账号「领到了」或「今天已领」**才记。
+ * 判据：**至少有一个账号能证明「今天这一轮已被处理」**（`coversToday > 0`）才记。
+ *
+ * ⚠️⚠️ **为什么不能看 `claimed + alreadyClaimed`**（真实缺陷，2026-10-02 审查
+ * PR !33 定位）：那两项里混着「**刷新前那一轮**」的痕迹。Qoder 的活动每日
+ * 10:00（UTC+8）才刷新，于是上午 9 点跑的那一轮看到的是**昨天**那条 `CLAIMED`
+ * —— 记成「今天已跑」之后，当天 10 点刷新出来的新额度**整天不会再被领**，
+ * 而且界面还显示「1 个今天已领」，用户毫无提示。渠道自己用
+ * `ClaimOutcome.coversToday` 标出「这条不算今天」，本函数只负责数。
+ *
  * 反例（不记、下次启动重试）：
  * - 整轮零成功零已领（凭据全过期 / 网络不通 / 启动太早抢在续期之前）——
  *   若记了，用户当天就再也不会自动签到，且界面只说「上次：N 个失败」；
+ * - 跑完但**没有一条能证明今天**（例如只有 Qoder 且赶在 10:00 之前）——
+ *   同理不记，当天稍后还有机会；
  * - 一个渠道都没跑（全被跳过）：没有意义，不记。
  * 反之「有成功也有失败」要记：否则一个坏账号会让插件每次启动都把好账号再领一遍
  * （虽然幂等，但白白多发请求）。
  */
 export function shouldMarkToday(totals: RunTotals): boolean {
-  return totals.claimed + totals.alreadyClaimed > 0
+  return totals.coversToday > 0
 }
 
 /**
@@ -326,6 +392,8 @@ export function describeChannel(summary: {
   alreadyClaimed: number
   inactive: number
   failed: number
+  /** 见 `RpcCreditsClaimSummary.coversToday`；缺省按 `claimed+alreadyClaimed` 兜底。 */
+  coversToday?: number
 }): string {
   const parts: string[] = []
   if (summary.claimed > 0) {
@@ -336,7 +404,15 @@ export function describeChannel(summary: {
   if (summary.alreadyClaimed > 0) parts.push(`${summary.alreadyClaimed} 个今天已领`)
   if (summary.failed > 0) parts.push(`${summary.failed} 个失败`)
   if (summary.inactive > 0) parts.push(`${summary.inactive} 个未开启`)
-  return parts.length === 0 ? '无可领' : parts.join('，')
+  if (parts.length === 0) return '无可领'
+  // ⚠️ 声称「今天已领」之前先自问一句：这些痕迹是不是**今天这一轮**的？
+  // Qoder 在 10:00（UTC+8）刷新前看到的 `CLAIMED` 属于昨天 —— 此时那句
+  // 「今天已领」既不准确，又会让用户以为今天不必再领。
+  const coversToday = summary.coversToday ?? (summary.claimed + summary.alreadyClaimed)
+  if (coversToday === 0 && (summary.claimed + summary.alreadyClaimed) > 0) {
+    parts.push('非今日轮次')
+  }
+  return parts.join('，')
 }
 
 /** 装配层注入的依赖（全部可替换 ⇒ 单测零网络、零文件系统、零等待）。 */
@@ -420,6 +496,14 @@ export function createAutoCheckin(deps: AutoCheckinDeps): AutoCheckin {
     }
     const channels: Array<{ provider: string; text: string }> = []
     for (const provider of providers) {
+      // ⚠️ 排除表先于**任何**上游请求生效（见 isAutoCheckinExcluded 的说明）：
+      // zcode 的代价发生在**调用期间**（拉起浏览器产 captcha），事后再判断已经
+      // 太晚 —— 必须在调 `claim` 之前就把它摘掉。
+      if (isAutoCheckinExcluded(provider)) {
+        totals.skipped += 1
+        channels.push({ provider, text: '需手动签到' })
+        continue
+      }
       let result: BadgeRpcResult<RpcCreditsClaimAllResponse>
       try {
         result = await deps.claim(provider)
@@ -452,12 +536,16 @@ export function createAutoCheckin(deps: AutoCheckinDeps): AutoCheckin {
       totals.alreadyClaimed += summary.alreadyClaimed
       totals.inactive += summary.inactive
       totals.failed += summary.failed
+      // ⚠️ 记账口径**只认**这一项：渠道用 `coversToday` 自己声明「这条痕迹是不是
+      // 今天这一轮的」。缺省回落到 `claimed + alreadyClaimed`，是为了兼容尚未
+      // 上报该字段的旧响应（缺字段 ≠ 0，否则整轮会被判成「什么都没证明」）。
+      totals.coversToday += summary.coversToday ?? (summary.claimed + summary.alreadyClaimed)
       channels.push({ provider, text: describeChannel(summary) })
     }
 
     if (!shouldMarkToday(totals)) {
-      // ⚠️ 刻意**不写** lastDate：让「凭据还没续上 / 网络不通」这类整轮失败
-      // 能在下次启动重试，而不是当天就此放弃（判据见 shouldMarkToday 注释）。
+      // ⚠️ 刻意**不写** lastDate：让「凭据还没续上 / 网络不通 / 赶在渠道刷新前
+      // 跑的那一轮」能在下次启动重试，而不是当天就此放弃（判据见 shouldMarkToday）。
       deps.warn?.(
         `[jet-hub] 自动签到未记入今日（下次启动会重试）：${describeRun(totals)}`,
       )

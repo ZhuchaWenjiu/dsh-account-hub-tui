@@ -33,8 +33,33 @@ describe('积分领取结果汇总', () => {
       { kind: 'failed', code: 500, message: 'boom' },
     ]
     expect(computeClaimSummary(outcomes)).toEqual({
-      claimed: 2, totalCredit: 150, alreadyClaimed: 1, inactive: 0, failed: 1,
+      claimed: 2, totalCredit: 150, alreadyClaimed: 1, inactive: 0, failed: 1, coversToday: 3,
     })
+  })
+
+  /**
+   * ⚠️ **`coversToday` 才是记账口径**（真实缺陷，2026-10-02 审查 PR !33 定位）。
+   *
+   * `coversToday:false` 由渠道自己标出「这条痕迹属于刷新前那一轮」（Qoder 活动
+   * 10:00 UTC+8 才刷新）。它**必须**既不计入 `coversToday`、也不让上层误以为
+   * 「今天已处理」—— 否则当天 10 点刷新出来的新额度整天不会再被领。
+   */
+  it('coversToday:false 的领取/已领都不计入 coversToday（刷新前那一轮）', () => {
+    const outcomes: ClaimOutcome[] = [
+      { kind: 'already-claimed', message: '今天已领取', coversToday: false },
+      { kind: 'claimed', credit: 100, streakDays: 0, isStreakDay: false, coversToday: false },
+    ]
+    expect(computeClaimSummary(outcomes)).toEqual({
+      claimed: 1, totalCredit: 100, alreadyClaimed: 1, inactive: 0, failed: 0, coversToday: 0,
+    })
+  })
+
+  it('混合时只把覆盖今天的那几条计入 coversToday', () => {
+    const outcomes: ClaimOutcome[] = [
+      { kind: 'already-claimed', message: 'a' },
+      { kind: 'already-claimed', message: 'b', coversToday: false },
+    ]
+    expect(computeClaimSummary(outcomes)).toMatchObject({ alreadyClaimed: 2, coversToday: 1 })
   })
 
   it('全部已领取时 claimed 为 0', () => {
@@ -55,7 +80,7 @@ describe('积分领取结果汇总', () => {
 
   it('空数组返回全 0', () => {
     expect(computeClaimSummary([])).toEqual({
-      claimed: 0, totalCredit: 0, alreadyClaimed: 0, inactive: 0, failed: 0,
+      claimed: 0, totalCredit: 0, alreadyClaimed: 0, inactive: 0, failed: 0, coversToday: 0,
     })
   })
 
@@ -230,7 +255,7 @@ describe('credits.claimAll 单账号异常隔离与顺序性', () => {
     expect(response.results.map(r => r.accountId)).toEqual(['enabled-1', 'disabled-1', 'disabled-2'])
     expect(response.results.every(r => r.outcome.kind === 'claimed')).toBe(true)
     expect(response.summary).toEqual({
-      claimed: 3, totalCredit: 300, alreadyClaimed: 0, inactive: 0, failed: 0,
+      claimed: 3, totalCredit: 300, alreadyClaimed: 0, inactive: 0, failed: 0, coversToday: 3,
     })
   })
 
@@ -258,7 +283,7 @@ describe('credits.claimAll 单账号异常隔离与顺序性', () => {
     // 坏账号没有阻止后两个账号真正发起领取
     expect(claimed).toHaveLength(2)
     expect(response.summary).toEqual({
-      claimed: 2, totalCredit: 200, alreadyClaimed: 0, inactive: 0, failed: 1,
+      claimed: 2, totalCredit: 200, alreadyClaimed: 0, inactive: 0, failed: 1, coversToday: 2,
     })
   })
 
@@ -1767,7 +1792,7 @@ describe('积分端点的 provider 能力边界', () => {
     const result = await call('credits.claimAll', { provider: 'codearts' })
     expect(result.ok).toBe(true)
     expect((result.value as { summary: unknown }).summary).toEqual({
-      claimed: 0, totalCredit: 0, alreadyClaimed: 0, inactive: 0, failed: 0,
+      claimed: 0, totalCredit: 0, alreadyClaimed: 0, inactive: 0, failed: 0, coversToday: 0,
     })
   })
 

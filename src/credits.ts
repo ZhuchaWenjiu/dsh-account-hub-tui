@@ -114,12 +114,42 @@ export interface CheckinStatus {
  *
  * ⚠️ 与 `checkin-all.js`/`jet-hub.js` 的约定：前端判 `actionRequired === true`
  * **而不是**判 message 是否非空、更不是判文案内容 —— 后者会随措辞变化而失效。
+ *
+ * ## ⚠️ `coversToday`：把「这次的结果算不算**今天这一轮**」变成显式语义
+ *
+ * **真实缺陷（2026-10-02 审查 PR !33 定位）**：`already-claimed` 这个 kind
+ * **天然有歧义** —— 它只说明「服务端认为没有可领的了」，而「没有可领的」在某些
+ * 渠道里**不等于**「今天这条已领」。典型是 Qoder：活动**每日 10:00（UTC+8）
+ * 才刷新**（服务端原文：「每日 10:00（UTC+8）刷新，领取后 30 天有效」）。
+ * 于是上午 9 点那次查询看到的是**昨天**那条 `CLAIMED`，返回
+ * `already-claimed`；上层若拿它当「今天已处理」的凭证记档，当天 10 点刷新后
+ * 就再也不会去领 —— **每天静默漏掉 100 积分**。
+ *
+ * 修法不靠给每个渠道配一张「刷新时刻表」（那必然漂移），而是让**产出方自己
+ * 回答**「我这条结果覆盖的是不是今天这一轮」：
+ * - `coversToday` 缺省视为 `true` ⇒ 绝大多数渠道（每日签到语义）一行不用改；
+ * - 观察到的是「刷新前的那一轮」时置 `false`。
+ * 于是记账方（`auto-checkin.ts` 的 `shouldMarkToday`）根本不需要知道任何渠道的
+ * 日界细节，只要数「有几条能证明今天已被处理」。
+ *
+ * ⚠️ 判据只能由**看得见该渠道刷新语义的那一层**给出（当前是 `qoder-credits.ts`），
+ * 不要在汇总层用猜测补 —— 那正是本缺陷的成因。
  */
+export interface ClaimOutcomeCommon {
+  /**
+   * 本次结果是否**覆盖「今天」这一轮**（缺省 `true`）。
+   *
+   * 置 `false` 表示「看到的是刷新前/上一轮的痕迹」，据此**不得**认定今天
+   * 已处理（见上方缺陷说明）。
+   */
+  coversToday?: boolean
+}
+
 export type ClaimOutcome =
-  | { kind: 'claimed'; credit: number; streakDays: number; isStreakDay: boolean; delayedMessage?: string }
-  | { kind: 'already-claimed'; message: string }
-  | { kind: 'inactive'; message: string; actionRequired?: boolean }
-  | { kind: 'failed'; code: number; message: string }
+  | (ClaimOutcomeCommon & { kind: 'claimed'; credit: number; streakDays: number; isStreakDay: boolean; delayedMessage?: string })
+  | (ClaimOutcomeCommon & { kind: 'already-claimed'; message: string })
+  | (ClaimOutcomeCommon & { kind: 'inactive'; message: string; actionRequired?: boolean })
+  | (ClaimOutcomeCommon & { kind: 'failed'; code: number; message: string })
 
 /**
  * 积分资源包（`get-user-resource` 响应里 `Accounts[]` 的一项）。

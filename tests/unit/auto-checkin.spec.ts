@@ -7,6 +7,7 @@ import {
   createAutoCheckin,
   describeChannel,
   describeRun,
+  isAutoCheckinExcluded,
   isUnsupportedCheckin,
   sanitizeAutoCheckin,
   shouldMarkToday,
@@ -16,6 +17,7 @@ import {
   type AutoCheckinStore,
 } from '../../src/auto-checkin.js'
 import type { BadgeRpcResult } from '../../src/usage-badge.js'
+import { ZCODE } from '../../src/zcode-product.js'
 import type { RpcCreditsClaimAllResponse } from '../../src/types.js'
 
 /**
@@ -401,19 +403,156 @@ describe('自动签到：摘要与判据的纯函数', () => {
 
   it('describeRun 汇总各计数；无内容时给可读文案', () => {
     expect(describeRun({
-      providers: 3, claimed: 2, totalCredit: 300, alreadyClaimed: 1, inactive: 0, failed: 0, skipped: 1, errors: 0,
+      providers: 3, claimed: 2, totalCredit: 300, alreadyClaimed: 1, inactive: 0, failed: 0, skipped: 1, errors: 0, coversToday: 3,
     })).toBe('3 个渠道：2 个账号领取成功（+300 积分），1 个今天已领，1 个渠道不支持签到')
     expect(describeRun({
-      providers: 2, claimed: 0, totalCredit: 0, alreadyClaimed: 0, inactive: 0, failed: 0, skipped: 0, errors: 0,
+      providers: 2, claimed: 0, totalCredit: 0, alreadyClaimed: 0, inactive: 0, failed: 0, skipped: 0, errors: 0, coversToday: 0,
     })).toBe('2 个渠道：没有需要领取的账号')
   })
 
-  it('shouldMarkToday：至少一个「领到 / 今天已领」才记账', () => {
-    const base = { providers: 1, claimed: 0, totalCredit: 0, alreadyClaimed: 0, inactive: 0, failed: 0, skipped: 0, errors: 0 }
-    expect(shouldMarkToday({ ...base, claimed: 1 })).toBe(true)
-    expect(shouldMarkToday({ ...base, alreadyClaimed: 1 })).toBe(true)
+  it('shouldMarkToday：只看「能证明今天已被处理」的条数（`coversToday`）', () => {
+    const base = {
+      providers: 1, claimed: 0, totalCredit: 0, alreadyClaimed: 0, inactive: 0, failed: 0, skipped: 0, errors: 0, coversToday: 0,
+    }
+    expect(shouldMarkToday({ ...base, coversToday: 1 })).toBe(true)
+    expect(shouldMarkToday({ ...base, claimed: 1, coversToday: 1 })).toBe(true)
+    expect(shouldMarkToday({ ...base, alreadyClaimed: 1, coversToday: 1 })).toBe(true)
     expect(shouldMarkToday({ ...base, failed: 2 })).toBe(false)
     expect(shouldMarkToday({ ...base, errors: 1 })).toBe(false)
     expect(shouldMarkToday(base)).toBe(false)
+  })
+
+  /**
+   * ⚠️⚠️ **真实缺陷回归（2026-10-02 审查 PR !33 定位）**：`claimed` / `alreadyClaimed`
+   * 为正但 `coversToday` 为 0 时**不得**记账。
+   *
+   * 场景：Qoder 活动每日 10:00（UTC+8）才刷新。上午 9 点那轮看到的是**昨天**
+   * 那条 `CLAIMED`（`alreadyClaimed:1, coversToday:0`）。修复前按
+   * `claimed + alreadyClaimed` 记账 ⇒ 当天新额度**整天不会再被领**，而面板
+   * 还显示「1 个今天已领」，用户毫无提示。
+   */
+  it('只有「非今日轮次」的痕迹时 ⇒ 不记账（否则当天刷新后的额度整天漏领）', () => {
+    const base = { providers: 1, totalCredit: 0, inactive: 0, failed: 0, skipped: 0, errors: 0 }
+    expect(shouldMarkToday({ ...base, claimed: 0, alreadyClaimed: 1, coversToday: 0 })).toBe(false)
+    expect(shouldMarkToday({ ...base, claimed: 1, totalCredit: 100, alreadyClaimed: 0, coversToday: 0 })).toBe(false)
+  })
+
+  it('describeChannel 会标出「非今日轮次」，不把昨天的痕迹说成「今天已领」', () => {
+    expect(describeChannel({ claimed: 0, totalCredit: 0, alreadyClaimed: 1, inactive: 0, failed: 0, coversToday: 0 }))
+      .toBe('1 个今天已领，非今日轮次')
+    // 缺 coversToday（旧响应）时按 claimed+alreadyClaimed 兜底，行为不变
+    expect(describeChannel({ claimed: 0, totalCredit: 0, alreadyClaimed: 3, inactive: 0, failed: 0 }))
+      .toBe('3 个今天已领')
+  })
+
+  /**
+   * ⚠️ **B1 端到端**：整轮只有 Qoder 且赶在 10:00 刷新前 → 不写 `lastDate`，
+   * 当天还有机会补领（修复前会写，于是 10 点刷新的额度永远领不到）。
+   */
+  it('端到端：整轮 coversToday=0 ⇒ 不写 lastDate（刷新后还有机会）', async () => {
+    const { runner, store, warnings } = makeRunner({
+      providers: ['qoder'],
+      claim: async () => ok({ alreadyClaimed: 1, coversToday: 0 }),
+    })
+    await runner.runIfDue()
+    expect(store.saves).toEqual([])
+    expect(runner.state().ranToday).toBe(false)
+    expect(warnings.some((w) => w.includes('未记入今日'))).toBe(true)
+  })
+
+  it('端到端：coversToday=1 ⇒ 照常记账（防止把上面那条修成「永不记账」）', async () => {
+    const { runner, store } = makeRunner({
+      providers: ['qoder'],
+      claim: async () => ok({ claimed: 1, totalCredit: 100, coversToday: 1 }),
+    })
+    await runner.runIfDue()
+    expect(store.saves).toHaveLength(1)
+    expect(runner.state().ranToday).toBe(true)
+  })
+
+  it('旧响应没有 coversToday 字段时回落到 claimed+alreadyClaimed（不误伤旧宿主）', async () => {
+    const { runner, store } = makeRunner({
+      providers: ['buddy'],
+      // 构造一个**没有** coversToday 键的响应（模拟宿主未升级）
+      claim: async () => ({ ok: true, value: { results: [], summary: { claimed: 1, totalCredit: 100, alreadyClaimed: 0, inactive: 0, failed: 0 } } }),
+    })
+    await runner.runIfDue()
+    expect(store.saves).toHaveLength(1)
+  })
+})
+
+/**
+ * ⚠️ **B2 回归（2026-10-02 审查 PR !33 定位）**：自动签到**不能**碰 zcode。
+ *
+ * zcode 有签到，但每次领取都要现场产一个阿里云 captcha param（web 版会拉起
+ * headful Chromium，约 200–400MB；阿里云按**设备**限流 150 次/小时）。
+ * 默认开启的自动签到 + 排除表漏了它 = 用户什么都没点，开 DSH 就起浏览器进程树；
+ * 失败时又不写 `lastDate` ⇒ 每次启动都重来。
+ *
+ * 「等 `claimAll` 返回错误再判定」在这里**来不及** —— 代价发生在调用期间。
+ */
+describe('自动签到：排除「签到有代价」的渠道', () => {
+  it('isAutoCheckinExcluded 只认 zcode（其余渠道照常自动）', () => {
+    expect(isAutoCheckinExcluded('zcode')).toBe(true)
+    for (const provider of ['codearts', 'buddy', 'workbuddy', 'lobsterai', 'qoder', 'qodercn', 'trae', 'loomy', 'minimax']) {
+      expect(isAutoCheckinExcluded(provider)).toBe(false)
+    }
+  })
+
+  it('端到端：zcode **一个上游请求都不发**，只计为跳过', async () => {
+    const { runner, calls, store } = makeRunner({
+      providers: ['buddy', 'qoder', 'zcode'],
+      claim: async (provider) => {
+        calls.push(provider)
+        return ok({ claimed: 1, totalCredit: 100, coversToday: 1 })
+      },
+    })
+    await runner.runIfDue()
+    expect(calls).not.toContain('zcode')
+    expect(calls).toEqual(['buddy', 'qoder'])
+    const state = runner.state()
+    expect(state.channels).toContainEqual({ provider: 'zcode', text: '需手动签到' })
+    // 跳过 zcode 不影响其余渠道记账
+    expect(state.ranToday).toBe(true)
+    expect(store.saves).toHaveLength(1)
+  })
+
+  it('只有 zcode 一个渠道时：不记账（跳过不构成「今天跑过」）', async () => {
+    const { runner, calls, store } = makeRunner({ providers: ['zcode'] })
+    await runner.runIfDue()
+    expect(calls).toEqual([])
+    expect(store.saves).toEqual([])
+    expect(runner.state().ranToday).toBe(false)
+  })
+
+  /**
+   * ⚠️ **反向守护**：把「自动签到不该碰的渠道」与「claim 分支真的要产 captcha」
+   * 两件事**绑在一起**断言。
+   *
+   * 只测排除表会漏掉一种回归：将来 zcode 的签名变了、或**新增**了一个同样要
+   * 产 captcha 的 provider，而没人记得登记。这里锁的不变式是：
+   * **会产 captcha 的 claim 分支，必须逐个登记进排除表。**
+   *
+   * 做法：按 `if (req.provider === X)` 把 `claimAll` 切成一段段，看哪几段里
+   * 出现了 `mintCaptcha`。（不用「X 前后 4000 字符」那种窗口 —— 分支体长度
+   * 一变就悄悄失配，那正是本仓库反复吃过的那类假绿。）
+   */
+  it('反向守护：会产 captcha 的 claim 分支必须登记进排除表', async () => {
+    const { readFileSync } = await import('node:fs')
+    const source = readFileSync(new URL('../../src/jet-hub-rpc.ts', import.meta.url), 'utf-8')
+    // 只看 `credits.claimAll` 这一段：`req.provider === ZCODE.id` 在余额端点里
+    // 也会出现，不按 `case` 边界切就会把两个端点混进来数成两个分支。
+    const claimAllAt = source.indexOf("case 'credits.claimAll':")
+    expect(claimAllAt).toBeGreaterThan(-1)
+    const nextCase = source.indexOf("case '", claimAllAt + 1)
+    const claimAll = source.slice(claimAllAt, nextCase === -1 ? undefined : nextCase)
+    const heads = [...claimAll.matchAll(/if \(req\.provider === (ZCODE\.id)\)/g)]
+    expect(heads.length).toBe(1)
+    const body = claimAll.slice(heads[0]!.index)
+    // 该分支体取到下一个 provider 分支（或 case 结束）为止
+    const nextBranch = body.slice(1).search(/if \(req\.provider === /)
+    const branchBody = nextBranch === -1 ? body : body.slice(0, nextBranch + 1)
+    expect(branchBody).toContain('mintCaptcha')
+    expect(isAutoCheckinExcluded(ZCODE.id)).toBe(true)
   })
 })

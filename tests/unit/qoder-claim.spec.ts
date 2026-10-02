@@ -6,11 +6,22 @@ import {
   claimQoderCampaign,
   claimQoderDailyCheckin,
   fetchQoderCheckinStatus,
+  hasQoderCampaignRefreshedToday,
   parseQoderCampaigns,
+  QODER_CAMPAIGN_REFRESH_HOUR_UTC8,
 } from '../../src/qoder-credits.js'
 import { resetQoderMachineIdentityCache } from '../../src/qoder-machine.js'
 import { QODER } from '../../src/qoder-product.js'
 import type { QoderCredential } from '../../src/qoder.js'
+
+/**
+ * ⚠️ 签到相关判据**依赖「今天刷新了没有」**（每日 10:00 UTC+8），
+ * 所以下面所有用到 `CLAIMED` 痕迹的用例都必须**注入固定时刻** ——
+ * 否则它们会在每天 UTC+8 02:00–10:00 这个窗口里时绿时红（CI 最容易踩）。
+ */
+const AFTER_REFRESH = Date.UTC(2026, 8, 21, 6, 0, 0)   // 2026-09-21 14:00（UTC+8）
+const BEFORE_REFRESH = Date.UTC(2026, 8, 21, 0, 30, 0) // 2026-09-21 08:30（UTC+8）
+
 /**
  * 2026-09-21 由抓包（keylog 解密）解出的真实响应。
  *
@@ -278,7 +289,7 @@ describe('Qoder 签到状态', () => {
    */
   it('领取后的真实形态（CLAIM_BENEFIT 变 CLAIMED）→ todayCheckedIn=true', async () => {
     const status = await fetchQoderCheckinStatus(
-      cred, QODER, vi.fn(async () => json(CAMPAIGNS_AFTER_CLAIM)) as never,
+      cred, QODER, vi.fn(async () => json(CAMPAIGNS_AFTER_CLAIM)) as never, AFTER_REFRESH,
     )
     expect(status).toMatchObject({ active: true, todayCheckedIn: true })
   })
@@ -362,7 +373,7 @@ describe('Qoder 领取全部可领活动', () => {
   /** 抓包实证的「真已领」形态 → already-claimed。 */
   it('领取后的真实形态 → already-claimed（真的领过了）', async () => {
     const outcome = await claimQoderDailyCheckin(
-      cred, QODER, vi.fn(async () => json(CAMPAIGNS_AFTER_CLAIM)) as never,
+      cred, QODER, vi.fn(async () => json(CAMPAIGNS_AFTER_CLAIM)) as never, AFTER_REFRESH,
     )
     expect(outcome.kind).toBe('already-claimed')
   })
@@ -396,5 +407,76 @@ describe('Qoder 领取全部可领活动', () => {
   it('查询列表失败 → failed（不误报已领）', async () => {
     const outcome = await claimQoderDailyCheckin(cred, QODER, vi.fn(async () => { throw new Error('x') }) as never)
     expect(outcome).toMatchObject({ kind: 'failed' })
+  })
+})
+
+/**
+ * ⚠️⚠️ **真实缺陷回归（2026-10-02 审查 PR !33 定位）**：每日活动** 10:00（UTC+8）
+ * 才刷新**，故**刷新之前**看到的那条 `CLAIMED` 属于**昨天**。
+ *
+ * 修复前：9 点跑一轮自动签到 → 返回 `already-claimed` → 上层记成「今天已跑」
+ * → 当天 10 点刷新出来的新额度**整天不会再被领**，面板还显示「1 个今天已领」。
+ * 每天净损失 100 Credits 且**完全静默**。
+ *
+ * 修法：产出方自己声明「这条痕迹不算今天」（`ClaimOutcome.coversToday`），
+ * 记账方只数 `summary.coversToday`。本组用例锁住产出侧。
+ */
+describe('Qoder 每日刷新时刻边界（10:00 UTC+8）', () => {
+  it('纯函数：刷新时刻本身算「已刷新」，早一分钟不算', () => {
+    // 10:00（UTC+8）= 02:00Z —— 整点起算「已刷新」
+    expect(hasQoderCampaignRefreshedToday(Date.UTC(2026, 8, 21, 2, 0, 0))).toBe(true)
+    // 09:59（UTC+8）= 01:59Z —— 差一分钟
+    expect(hasQoderCampaignRefreshedToday(Date.UTC(2026, 8, 21, 1, 59, 0))).toBe(false)
+    expect(hasQoderCampaignRefreshedToday(Date.UTC(2026, 8, 21, 2, 0, 1))).toBe(true)
+  })
+
+  it('按 UTC+8 判定而不是本机时区（东八区以外同样正确）', () => {
+    // 10:00（UTC+8）= 02:00Z ⇒ 这一刻起算「已刷新」
+    expect(hasQoderCampaignRefreshedToday(Date.parse('2026-09-21T02:00:00Z'))).toBe(true)
+    // 09:59（UTC+8）= 01:59Z ⇒ 还没到
+    expect(hasQoderCampaignRefreshedToday(Date.parse('2026-09-21T01:59:00Z'))).toBe(false)
+    // ⚠️ 傍晚的 UTC 时刻落在 UTC+8 的**次日凌晨**，仍按 UTC+8 判（不是 UTC）
+    expect(hasQoderCampaignRefreshedToday(Date.parse('2026-09-21T18:30:00Z'))).toBe(false)
+  })
+
+  it('刷新前看到「昨天那条已领」→ inactive 且**不**说「今天已领」', async () => {
+    const outcome = await claimQoderDailyCheckin(
+      cred, QODER, vi.fn(async () => json(CAMPAIGNS_AFTER_CLAIM)) as never, BEFORE_REFRESH,
+    )
+    expect(outcome.kind).toBe('inactive')
+    expect(String((outcome as { message: string }).message)).toContain('10:00')
+    // inactive 本身不参与记账（coversToday 只对 claimed / already-claimed 有意义），
+    // 所以这里不该出现「今天已领」的字样。
+    expect(String((outcome as { message: string }).message)).not.toContain('已领取')
+  })
+
+  it('刷新后同一份响应才判 already-claimed（前后对照，证明判据是时刻而非报文）', async () => {
+    const outcome = await claimQoderDailyCheckin(
+      cred, QODER, vi.fn(async () => json(CAMPAIGNS_AFTER_CLAIM)) as never, AFTER_REFRESH,
+    )
+    expect(outcome.kind).toBe('already-claimed')
+  })
+
+  it('刷新前领到的是昨天那条补领：算「领取成功」但 coversToday:false', async () => {
+    const fetcher = vi.fn(async (url: string) =>
+      String(url).includes('/claim') ? json(CLAIMED_OK) : json(CAMPAIGNS_BODY))
+    const outcome = await claimQoderDailyCheckin(cred, QODER, fetcher as never, BEFORE_REFRESH)
+    expect(outcome).toMatchObject({ kind: 'claimed', credit: 100, coversToday: false })
+  })
+
+  it('刷新后同样的领取不带 coversToday:false（缺省即「算今天」）', async () => {
+    const fetcher = vi.fn(async (url: string) =>
+      String(url).includes('/claim') ? json(CLAIMED_OK) : json(CAMPAIGNS_BODY))
+    const outcome = await claimQoderDailyCheckin(cred, QODER, fetcher as never, AFTER_REFRESH)
+    expect(outcome).toMatchObject({ kind: 'claimed', credit: 100 })
+    expect(outcome).not.toHaveProperty('coversToday')
+  })
+
+  it('状态查询同源：刷新前不谎报「今天已领」', async () => {
+    const fetcher = vi.fn(async () => json(CAMPAIGNS_AFTER_CLAIM))
+    const before = await fetchQoderCheckinStatus(cred, QODER, fetcher as never, BEFORE_REFRESH)
+    const after = await fetchQoderCheckinStatus(cred, QODER, fetcher as never, AFTER_REFRESH)
+    expect(before).toMatchObject({ active: true, todayCheckedIn: false })
+    expect(after).toMatchObject({ todayCheckedIn: true })
   })
 })

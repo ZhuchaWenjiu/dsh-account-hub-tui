@@ -357,16 +357,20 @@ export const PERMANENT_LOCK_PROVIDERS: ReadonlySet<string> = new Set([
  */
 export function computeClaimSummary(outcomes: readonly ClaimOutcome[]): RpcCreditsClaimSummary {
   const summary: RpcCreditsClaimSummary = {
-    claimed: 0, totalCredit: 0, alreadyClaimed: 0, inactive: 0, failed: 0,
+    claimed: 0, totalCredit: 0, alreadyClaimed: 0, inactive: 0, failed: 0, coversToday: 0,
   }
   for (const outcome of outcomes) {
     switch (outcome.kind) {
       case 'claimed':
         summary.claimed += 1
         summary.totalCredit += outcome.credit
+        // ⚠️ 只有**覆盖今天**的领取才算「今天已处理」。`coversToday:false` 是
+        // 渠道自己标的（当前是 Qoder 刷新前那一轮），见 `credits.ts` 的字段说明。
+        if (outcome.coversToday !== false) summary.coversToday += 1
         break
       case 'already-claimed':
         summary.alreadyClaimed += 1
+        if (outcome.coversToday !== false) summary.coversToday += 1
         break
       case 'inactive':
         summary.inactive += 1

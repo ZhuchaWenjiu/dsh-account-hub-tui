@@ -317,6 +317,15 @@ export interface RpcCreditsClaimSummary {
   alreadyClaimed: number
   inactive: number
   failed: number
+  /**
+   * 其中**能证明「今天这一轮已被处理」**的条数（`claimed` + `alreadyClaimed`
+   * 里 `coversToday !== false` 的那些）。
+   *
+   * ⚠️ 它**不是** `claimed + alreadyClaimed`：那两项里可能混着「刷新前那一轮」的
+   * 痕迹（Qoder 活动 10:00 UTC+8 才刷新），拿它们记账会导致当天新额度整天漏领。
+   * 判据见 `src/credits.ts` 的 `ClaimOutcomeCommon.coversToday`。
+   */
+  coversToday: number
 }
 /** RPC: 一键领取积分响应 */
 export interface RpcCreditsClaimAllResponse {
@@ -1119,7 +1128,12 @@ export interface RpcUsageBadgePreferenceResponse {
  * - `lastDate` 就是「不多次重复触发」的凭据：等于今天 ⇒ 当天不再自动跑。
  */
 export interface RpcUsageAutoCheckinState {
-  /** 开关是否打开。默认**关闭**（这是代用户打上游的写操作，须显式开启）。 */
+  /**
+   * 开关是否打开。默认**打开**（`auto-checkin.ts` 的 `DEFAULT_AUTO_CHECKIN`：
+   * 用户 2026-10-02 明确要求「自动签到默认保持打开」）。⚠️ 本注释早于那次
+   * 决定、写的是「默认关闭」，已按实现更正 —— 改默认值前先改这里，别让注释
+   * 与实现分家（那正是本 PR 审查发现的一处矛盾）。
+   */
   enabled: boolean
   /** 上次**完成**自动签到的 UTC+8 日期（`YYYY-MM-DD`）；空串 = 从未跑过。 */
   lastDate: string

@@ -152,6 +152,9 @@ describe('actionRequired 置位规则（走真实产品函数）', () => {
         { showCampaign: true, claimable: false, campaigns: [{ campaignId: 'c', actionType: 'CLAIM_BENEFIT', claimStatus: 'CLAIMED' }] },
         USAGE_NOT_ACTIVATED,
       ),
+      // ⚠️ 注入「已过 10:00（UTC+8）」的固定时刻：那条 CLAIMED 痕迹在刷新前
+      // 属于昨天，会被判成「还没刷新」而不是「今天已领」（见 qoder-claim.spec.ts）。
+      Date.UTC(2026, 8, 21, 6, 0, 0),
     )
     expect(outcome.kind).toBe('already-claimed')
     expect(outcome).not.toHaveProperty('actionRequired')
