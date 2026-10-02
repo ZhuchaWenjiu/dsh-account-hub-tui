@@ -59,6 +59,39 @@ describe('积分能力矩阵', () => {
     expect(supportsDailyCheckin('workbuddy')).toBe(false)
   })
 
+  /**
+   * ⚠️ **能力表与宿主端守卫必须成对**（真实缺陷，2026-10-02 补）。
+   *
+   * 客户端因为能力表写着 `dailyCheckin: false` 而从不调用 `credits.claimAll
+   * ({ provider: 'workbuddy' })`，所以宿主那条分支**一直没有守卫也没人发现**：
+   * 它原本会落到 `productById('workbuddy')` 拿到的 buddy 产品上，用**国际版**
+   * 凭据去发国内版的签到请求 —— 必然失败，而且是一次**真实的上游请求**。
+   *
+   * 触发它的是新增的「每日首次启动自动签到」（`src/auto-checkin.ts`）：那个执行体
+   * **刻意不维护第二份能力名单**，只按 `claimAll` 返回的信封判「跳过」，所以
+   * 宿主漏一个守卫，它就会真去发一轮必然失败的请求。⇒ 两处必须成对存在。
+   *
+   * ⚠️ 为什么用源码扫描：`registerJetHubRpc` 是 12 个**位置参数**，在测试里逐个
+   * 填替身既脆弱又与 `jet-hub-rpc.spec.ts` 的桩重复 —— 与本仓库
+   * `raccoon-rpc-dispatch.spec.ts` 对同类守卫的做法一致。
+   */
+  it('宿主端 credits.claimAll 对 workbuddy 有显式守卫（与能力表成对）', () => {
+    // ⚠️ 本文件里的 `here` 是**块内局部**变量（另有几处各写各的），这里自解析一次。
+    const specDir = dirname(fileURLToPath(import.meta.url))
+    const rpcSource = readFileSync(resolve(specDir, '../../src/jet-hub-rpc.ts'), 'utf8')
+    expect(rpcSource).toContain("if (req.provider === 'workbuddy') {")
+    expect(rpcSource).toContain('WorkBuddy 国际版不支持每日签到')
+    // 守卫必须**早于** `productById` 兜底：否则会走到 buddy 产品分支真发请求
+    const guardAt = rpcSource.indexOf("if (req.provider === 'workbuddy') {")
+    const claimAllAt = rpcSource.indexOf("case 'credits.claimAll'")
+    expect(claimAllAt).toBeGreaterThan(-1)
+    expect(guardAt).toBeGreaterThan(claimAllAt)
+    // 该守卫的返回块里不能出现真实调用（只能是 ok:false 的信封）
+    const guardBlock = rpcSource.slice(guardAt, guardAt + 700)
+    expect(guardBlock).toContain('ok: false')
+    expect(guardBlock).not.toMatch(/collectClaimResults|await /)
+  })
+
   it('Qoder 两项能力都有（余额 + 每日领取）', () => {
     // ⚠️ 早期把 qoder 误判为「两项皆无」，随后又误判为「有余额、无签到」，
     // 两次都值得记录：

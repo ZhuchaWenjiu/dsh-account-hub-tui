@@ -40,6 +40,16 @@ const read = (rel: string) => readFileSync(resolve(here, '../..', rel), 'utf8')
 describe('Cline 订阅额度：客户端接线', () => {
   const client = read('plugin-src/client/jet-hub.js')
   const styles = read('plugin-src/client/jet-hub-styles.js')
+  /**
+   * ⚠️ 额度窗口的**纯函数实现**自 2026-10-01 起住在 `plugin-src/client/quota-format.js`。
+   *
+   * 搬出去的原因是会话输入区的**用量徽标**（`usage-badge.js`）要显示同一份读数，
+   * 而 `jet-hub.js` 顶部 `import * as React from 'react'`（react 是宿主注入的
+   * external，node_modules 里没有）⇒ 任何 import 它的模块在 vitest 里都跑不起来。
+   * 搬移只改**位置**、不改口径：本文件对实现的断言改到 `quotaFormat` 上，
+   * 对「面板里怎么用」的断言仍留在 `client` 上。
+   */
+  const quotaFormat = read('plugin-src/client/quota-format.js')
 
   it('从能力表导入 supportsSubscriptionQuota', () => {
     expect(client).toContain('supportsSubscriptionQuota,')
@@ -119,14 +129,18 @@ describe('Cline 订阅额度：客户端接线', () => {
    * 排列都可能不同。
    */
   it('已知窗口按固定顺序在前、未知窗口追加在后', () => {
-    expect(client).toMatch(/const QUOTA_WINDOWS = Object\.freeze\(\[/)
-    expect(client).toContain("['five_hour', '5 小时']")
-    expect(client).toContain("['weekly', '本周']")
-    expect(client).toContain("['monthly', '本月']")
-    expect(client).toMatch(/function quotaWindowsOf\(windows\)/)
+    expect(quotaFormat).toMatch(/const QUOTA_WINDOWS = Object\.freeze\(\[/)
+    expect(quotaFormat).toContain("['five_hour', '5 小时']")
+    expect(quotaFormat).toContain("['weekly', '本周']")
+    expect(quotaFormat).toContain("['monthly', '本月']")
+    expect(quotaFormat).toMatch(/function quotaWindowsOf\(windows\)/)
     // 已识别窗口按 QUOTA_WINDOWS 顺序取，未识别的原样追加（标签=type，不丢弃）
-    expect(client).toMatch(/const known = new Map\(windows\.map/)
-    expect(client).toMatch(/const extra = windows\s*\n?\s*\.filter\(\(win\) => !QUOTA_WINDOWS\.some/)
+    expect(quotaFormat).toMatch(/const known = new Map\(windows\.map/)
+    expect(quotaFormat).toMatch(/const extra = windows\s*\n?\s*\.filter\(\(win\) => !QUOTA_WINDOWS\.some/)
+    // 面板侧只引用，不复制实现
+    expect(client).toMatch(/from '\.\/quota-format\.js'/)
+    expect(client).toContain('quotaWindowsOf(')
+    expect(client).not.toMatch(/const QUOTA_WINDOWS = /)
   })
 
   /**
@@ -135,10 +149,10 @@ describe('Cline 订阅额度：客户端接线', () => {
    * 两处各算一次是「进度条 100%、文案 120%」这类不一致的来源。
    */
   it('百分比夹取 0–100 后取整（文案与进度条共用同一个值）', () => {
-    expect(client).toMatch(/function quotaPercentValue\(percent\)/)
-    expect(client).toMatch(/return Math\.max\(0, Math\.min\(100, n\)\)/)
-    expect(client).toMatch(/function formatQuotaPercent\(percent\)/)
-    expect(client).toMatch(/Math\.round\(quotaPercentValue\(percent\)\)/)
+    expect(quotaFormat).toMatch(/function quotaPercentValue\(percent\)/)
+    expect(quotaFormat).toMatch(/return Math\.max\(0, Math\.min\(100, n\)\)/)
+    expect(quotaFormat).toMatch(/function formatQuotaPercent\(percent\)/)
+    expect(quotaFormat).toMatch(/Math\.round\(quotaPercentValue\(percent\)\)/)
     // 宽度与文案都走 quotaPercentValue（不是各算一次）
     expect(client).toMatch(/const percent = quotaPercentValue\(win\.percentUsed\)/)
     expect(client).toMatch(/style: \{ width: `\$\{percent\}%` \}/)
@@ -150,10 +164,10 @@ describe('Cline 订阅额度：客户端接线', () => {
    * 额度条就失去警示作用。
    */
   it('进度条三档配色（≥90 红 / ≥70 黄 / 其余绿）', () => {
-    expect(client).toMatch(/function quotaTone\(percent\)/)
-    expect(client).toMatch(/if \(percent >= 90\) return 'error'/)
-    expect(client).toMatch(/if \(percent >= 70\) return 'warn'/)
-    expect(client).toContain("return 'ok'")
+    expect(quotaFormat).toMatch(/function quotaTone\(percent\)/)
+    expect(quotaFormat).toMatch(/if \(percent >= 90\) return 'error'/)
+    expect(quotaFormat).toMatch(/if \(percent >= 70\) return 'warn'/)
+    expect(quotaFormat).toContain("return 'ok'")
     // 样式层：正常档必须是**绿**（state-success），不是品牌蓝
     expect(styles).toMatch(/\.dim-jh-quotaBarFill \{[^}]*background: var\(--dsw-alias-state-success-primary/)
     expect(styles).toMatch(/\.dim-jh-quotaBarFill\[data-tone="warn"\]/)

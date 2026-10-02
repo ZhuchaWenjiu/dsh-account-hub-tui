@@ -42,6 +42,20 @@ import {
 } from './model-groups.js';
 import { formatRowTokensPerSecond } from './tokens-per-second.js';
 import { decryptBackup, encryptBackup, isEncryptedBackup } from './backup-crypto.js';
+import {
+  formatCredits,
+  formatTokens,
+  formatUnits,
+  unitLabel,
+} from './credits-format.js';
+import {
+  quotaWindowLabel,
+  quotaWindowsOf,
+  quotaResetsIn,
+  quotaTone,
+  quotaPercentValue,
+  formatQuotaPercent,
+} from './quota-format.js';
 
 export const JET_HUB_RPC_CHANNEL = '/jet-hub';
 
@@ -250,6 +264,18 @@ const PROVIDERS = Object.freeze([
 ]);
 
 /**
+ * 渠道 id → 展示名。
+ *
+ * ⚠️ **唯一的渠道名来源**：用量徽标（`./usage-badge.js`）与设置页左栏都走它，
+ * 不要在别处再抄一份 `{ codearts: 'CodeArts (华为云)', … }` —— 那样改名时必然
+ * 出现「徽标写着旧名字、设置页写着新名字」的分裂。查不到时**原样返回 id**：
+ * 徽标宁可显示一个裸 id（可排查），也不要显示空白。
+ */
+export function providerLabel(id) {
+  return PROVIDERS.find(p => p.id === id)?.label ?? id;
+}
+
+/**
  * 积分能力判定见 `./credits-capabilities.js`。
  *
  * 之前这里有一份 `CREDITS_PROVIDERS = ['buddy']`，只用来决定「一键领取积分」
@@ -324,64 +350,12 @@ function summarizeProbe(kind, res) {
 }
 
 /**
- * 把积分余额格式化成一行文案。
- *
- * 保留两位小数：服务端下发的精确值就是两位（如 247.87），而整数版字段
- * 会截断成 247 —— IDE 顶部显示的 "Credits Balance 347.87" 用的是精确值，
- * 这里必须对齐，否则用户会以为插件算错了。
+ * 积分 / token 数值的格式化已搬到 `./credits-format.js`（纯函数模块）：
+ * 会话输入区的**用量徽标**同样要显示余额，而它的折叠态文案必须可单测 ——
+ * 本文件顶部 `import * as React from 'react'`，而 react 是宿主注入的 external
+ * （node_modules 里没有），任何 import 本文件的测试都跑不起来。
+ * 搬出去同时保证了「徽标」与「设置页」不可能显示出两个不同的数字。
  */
-function formatCredits(value) {
-  if (typeof value !== 'number' || !Number.isFinite(value)) return null;
-  // 整数不显示多余的小数位（100 而不是 100.00），有小数才保留两位
-  return Number.isInteger(value) ? String(value) : value.toFixed(2);
-}
-
-/**
- * 把 **token 计数**格式化成人类可读的 `xx.yyM` / `x.yyK`。
- *
- * ## ⚠ 为什么需要它（真实缺陷）
- *
- * 用户报障：「智谱 plan 给的不是积分是 tokens，应该显示 `Token: xx.yyM` 这种格式」。
- *
- * 上游 `billing/balance` 的桶里有明确单位声明（实测）：
- * ```json
- * { "meter": "model_usage", "unit_type": "token",
- *   "total_units": 100000000, "remaining_units": 94539275 }
- * ```
- * Host 侧已如实标注 `unit: 'token'`，但客户端此前**完全不消费 `unit`** ——
- * 于是界面显示 `94539275`（无单位、看起来像 1 亿积分，量级也读不出来）。
- *
- * 规则（与常见 token 展示一致）：
- *   - `>= 1e6` → `94.54M`
- *   - `>= 1e3` → `945.39K`
- *   - 其余     → 原样整数
- *
- * ⚠ 小数位**固定两位**（`94.54M` 而不是 `94.5M`）：token 余额的百位变化
- * 对用户有意义（差 0.04M = 4 万 token），一位小数会把它们抹平。
- */
-function formatTokens(value) {
-  if (typeof value !== 'number' || !Number.isFinite(value)) return null;
-  const abs = Math.abs(value);
-  if (abs >= 1e6) return `${(value / 1e6).toFixed(2)}M`;
-  if (abs >= 1e3) return `${(value / 1e3).toFixed(2)}K`;
-  return String(Math.round(value));
-}
-
-/**
- * 按**单位**选择格式化函数。
- *
- * ⚠ 这是 `unit` 字段的唯一消费点 —— 加新单位（如 `credit`）时改这里，
- * 不要在渲染处写 `if (provider === 'zcode')` 那种分支（会漏掉别的 provider）。
- */
-function formatUnits(value, unit) {
-  if (unit === 'token') return formatTokens(value);
-  return formatCredits(value);
-}
-
-/** 单位的展示名（账号卡片上的标签）。 */
-function unitLabel(unit) {
-  return unit === 'token' ? 'Token' : '积分';
-}
 
 /**
  * 把一个包的明细格式化成 tooltip 的一行。
@@ -1133,100 +1107,10 @@ function ModelListPanel({ provider, rpcCall, onClose }) {
 }
 
 /**
- * 额度窗口类型 → 中文标签。
- *
- * ⚠️ **未识别的类型原样显示**，而不是丢弃或归入「其它」：网关新增窗口
- * （例如将来的 `daily`）时，面板立刻就能显示出新窗口，不必等插件发版 ——
- * 这与后端「窗口按网关原序透传、不映射到固定形状」是同一个设计。
+ * 额度窗口的标签 / 排序 / 百分比 / 倒计时已搬到 `./quota-format.js`（纯函数模块），
+ * 理由同上面的数值格式化：会话输入区的**用量徽标**要显示同一份订阅读数，
+ * 而它的文案必须可单测；且两个界面共用同一套窗口顺序与夹取口径。
  */
-/**
- * 已知额度窗口及其**固定顺序**（与参考实现 `dsh-cline-pass` 同款）。
- *
- * ⚠️ 已知窗口按此顺序排在前，网关下发的**未知窗口追加在后** ——
- * 纯按网关原序会让新窗口插到中间，同一账号两次读数的排列可能不同。
- */
-const QUOTA_WINDOWS = Object.freeze([
-  ['five_hour', '5 小时'],
-  ['weekly', '本周'],
-  ['monthly', '本月'],
-]);
-
-/** 额度窗口类型 → 中文标签（未识别时原样返回，不丢弃也不归入「其它」）。 */
-function quotaWindowLabel(type) {
-  const known = QUOTA_WINDOWS.find(([id]) => id === type);
-  return known === undefined ? type : known[1];
-}
-
-/**
- * 窗口排序：**已知窗口按固定顺序在前，未知窗口追加在后**（参考实现同款）。
- * 这样网关新增窗口（如 `daily`）时面板立刻多一行，不必为它发插件版本。
- * @returns `[type, label, window]` 三元组数组。
- */
-function quotaWindowsOf(windows) {
-  const known = new Map(windows.map((win) => [String(win.type), win]));
-  const ordered = QUOTA_WINDOWS
-    .filter(([type]) => known.has(type))
-    .map(([type, label]) => [type, label, known.get(type)]);
-  const extra = windows
-    .filter((win) => !QUOTA_WINDOWS.some(([type]) => type === String(win.type)))
-    .map((win) => [String(win.type), String(win.type), win]);
-  return [...ordered, ...extra];
-}
-
-/**
- * 额度重置的**粗粒度**倒计时（参考实现同款）：
- * 「3 天 4 小时」/「4 小时 5 分钟」/「5 分钟」。
- *
- * ⚠️ 粗粒度是刻意的：额度重置是一眼扫过去的信息，秒级精度只会让面板
- * 无谓重渲染，对用户也没有意义。
- * 已过期 / 缺失 / 不可解析一律返回**空串**（不显示「已过期」这类噪音）。
- */
-function quotaCountdown(resetsAt) {
-  const at = Date.parse(String(resetsAt ?? ''));
-  if (!Number.isFinite(at)) return '';
-  const minutes = Math.round((at - Date.now()) / 60_000);
-  if (minutes <= 0) return '';
-  const days = Math.floor(minutes / 1440);
-  const hours = Math.floor((minutes % 1440) / 60);
-  const mins = minutes % 60;
-  if (days > 0) return `${days} 天 ${hours} 小时`;
-  if (hours > 0) return `${hours} 小时 ${mins} 分钟`;
-  return `${Math.max(1, mins)} 分钟`;
-}
-
-/** 「{倒计时}后重置」；没有可读倒计时时返回空串（那一行不渲染）。 */
-function quotaResetsIn(resetsAt) {
-  const left = quotaCountdown(resetsAt);
-  return left === '' ? '' : `${left}后重置`;
-}
-
-/**
- * 额度百分比 → 色调（参考实现同款三档）：≥90 红 / ≥70 黄 / 其余绿。
- *
- * ⚠️ 只给「值得反应」的两档染色，正常读数保持绿色 —— 全部染成品牌蓝会让
- * 「用掉九成」和「用掉一成」看起来一样，额度条就失去了警示作用。
- */
-function quotaTone(percent) {
-  if (!Number.isFinite(percent)) return 'ok';
-  if (percent >= 90) return 'error';
-  if (percent >= 70) return 'warn';
-  return 'ok';
-}
-
-/**
- * 百分比取值：**先夹取到 0–100**（参考实现同款）。
- * 进度条宽度与百分比文案共用这一个值，两者口径必须一致。
- */
-function quotaPercentValue(percent) {
-  const n = Number(percent ?? 0);
-  if (!Number.isFinite(n)) return 0;
-  return Math.max(0, Math.min(100, n));
-}
-
-/** 百分比文案：夹取后**四舍五入到整数**（参考实现同款）。 */
-function formatQuotaPercent(percent) {
-  return `${Math.round(quotaPercentValue(percent))}%`;
-}
 
 /**
  * 时间戳 → 请求记录里的「时间」列（参考实现同款）。

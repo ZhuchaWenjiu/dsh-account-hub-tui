@@ -1,4 +1,5 @@
 import type { DpopPrivateJwk } from './oauth.js'
+import type { BadgePreference } from './badge-preferences.js'
 
 /** snap-manager ticket 端点响应的传输格式。 */
 export interface CodeArtsCredentialResponse {
@@ -1007,4 +1008,164 @@ export interface RpcCaptchaContributeRequest {
 /** RPC: 内部载体回传 param 的结果（`false` = 没进槽，client 可决定要不要重试）。 */
 export interface RpcCaptchaContributeResponse {
   accepted: boolean
+}
+
+/**
+ * ========================================
+ * 用量徽标（模型选择器旁）
+ * ========================================
+ *
+ * 一个端点回答「当前选中的渠道还剩多少」，供会话输入区那枚徽标使用：
+ * 折叠态给一个数字（订阅优先 / 积分兜底），展开后给逐账号明细。
+ *
+ * ⚠️ 与 `credits.balances` 的关系：**读数是同一份**（本端点内部直接复用
+ * `credits.balances` 的实现），差别有三处 ——
+ * 1. 只返回**启用**账号（停用账号不计入合计，另给 `disabledCount` 说明）；
+ * 2. 多带一份订阅读数（窗口 / 套餐），形状由 `badge-subscription.ts` 判定；
+ * 3. 结果带**宿主侧 TTL 缓存**（`cached` 标出来），因为徽标会按分钟轮询，
+ *    而余额是逐账号打上游的（见 `collectCreditBalances` 的「顺序查询」）。
+ */
+
+/** RPC: 读取用量徽标读数。 */
+export interface RpcUsageBadgeRequest {
+  /** 渠道 id（与 provider id 同名，即模型选择器里的路由 id）。 */
+  provider: string
+  /** `true` = 绕过宿主 TTL 缓存（手动刷新、签到之后用）。 */
+  force?: boolean
+}
+
+/**
+ * 套餐读数（**折叠态只显示一条**，故每个账号先折算成一条）。
+ *
+ * ⚠️ 与窗口式订阅（Cline）是**两种形态**，不要合并：
+ * 窗口答「各时间窗用掉百分之几」，套餐答「这份套餐还剩多少额度」。
+ */
+export interface RpcUsageBadgePlanReading {
+  /** 展示名：套餐包名，或「整个余额即套餐」时的固定名（见 `badge-subscription.ts`）。 */
+  name: string
+  remaining: number
+  total: number
+  /** 额度单位（`credits` / `token`），渲染标签与数字格式化都按它走。 */
+  unit: string
+  /** 扣费截止（毫秒）；缺省 = 服务端未下发（**不是**已过期）。 */
+  deductionEndTime?: number
+}
+
+/** 套餐读数：一个账号一条（`plan` 为 `null` = 该账号没有可用套餐包）。 */
+export interface RpcUsageBadgePlanAccount {
+  accountId: string
+  nickname: string
+  plan: RpcUsageBadgePlanReading | null
+  /** 余额本身查询失败时的原因（与 `plan: null` 严格区分）。 */
+  error?: string
+}
+
+/** 订阅读数：窗口（Cline）或套餐（Qoder / ZCode / 两个 buddy）。 */
+export type RpcUsageBadgeSubscription =
+  | { kind: 'windows'; accounts: RpcClineQuotaAccount[] }
+  | { kind: 'plan'; accounts: RpcUsageBadgePlanAccount[] }
+
+/** RPC: 用量徽标读数响应。 */
+export interface RpcUsageBadgeResponse {
+  /** 回显请求的渠道（前端并发切换时据此对号，避免把 A 的读数画到 B 上）。 */
+  provider: string
+  /** 宿主**生成**这份读数的时刻（毫秒）；UI 的「更新于」用它，不用到达时刻。 */
+  generatedAt: number
+  /** `true` = 命中宿主 TTL 缓存（这一轮没有真的打上游）。 */
+  cached: boolean
+  /** 逐账号余额（**仅启用账号**），形状与 `credits.balances` 一致。 */
+  accounts: RpcCreditsBalanceAccount[]
+  /** 被停用而**未计入**的账号数（弹窗脚注说明用；为 0 时不渲染脚注）。 */
+  disabledCount: number
+  /** 临时 / 长期分桶的窗口天数（沿用 `credits.balances` 的口径）。 */
+  windowDays?: number
+  /** 订阅读数；该渠道没有订阅数据、或订阅查询失败时**整个字段缺席**。 */
+  subscription?: RpcUsageBadgeSubscription
+  /** 当前生效的显示偏好（顺带回传，省一次往返）。 */
+  preference: BadgePreference
+  /**
+   * 「每日首次启动自动签到」的实时状态（顺带回传，供弹窗右上角那盏状态灯）。
+   *
+   * ⚠️ 与 `preference` 同理**不进 TTL 缓存**：`running` / `ranToday` 会在宿主
+   * 后台任务跑起来后变化，缓存住会让界面一直停在旧状态（看起来像「开关点了没反应」）。
+   */
+  autoCheckin: RpcUsageAutoCheckinState
+}
+
+/**
+ * RPC: 读写「用量徽标显示偏好」。
+ *
+ * ⚠️ `preference` **省略 = 只读**；给出时必须是 `auto` / `subscription` /
+ * `credits` 三者之一 —— 非法值一律 `bad-request`，**不做**静默回落
+ *（回落会让「设置没生效」看起来像「保存成功」）。读取侧的容错在
+ * `sanitizeBadgePreference`，那里面对的是**磁盘上的脏数据**，不是用户输入。
+ */
+export interface RpcUsageBadgePreferenceRequest {
+  preference?: BadgePreference
+}
+
+/** RPC: 用量徽标显示偏好响应（回显写入后的生效值）。 */
+export interface RpcUsageBadgePreferenceResponse {
+  preference: BadgePreference
+}
+
+/**
+ * 「每日首次启动自动签到」的实时状态。
+ *
+ * 语义要点（用户 2026-10-02 的需求：「每日第一次打开 DSH 可以按照这个状态是否
+ * 自动签到，并记录签到状态，不多次重复触发」）：
+ * - 开关是**全局**的（不分渠道），作用范围是**全部有账号的渠道**；
+ * - 「今天」按 **UTC+8** 日界算（各渠道的每日额度都按 UTC+8 结算）；
+ * - `lastDate` 就是「不多次重复触发」的凭据：等于今天 ⇒ 当天不再自动跑。
+ */
+export interface RpcUsageAutoCheckinState {
+  /** 开关是否打开。默认**关闭**（这是代用户打上游的写操作，须显式开启）。 */
+  enabled: boolean
+  /** 上次**完成**自动签到的 UTC+8 日期（`YYYY-MM-DD`）；空串 = 从未跑过。 */
+  lastDate: string
+  /** 今天是否已经自动签到过（`lastDate` 等于今天）。 */
+  ranToday: boolean
+  /** 正在执行中（刚打开开关会立刻跑一轮，此时为 true）。 */
+  running: boolean
+  /** 上次结果摘要（中文短句，展示在状态灯提示里）。 */
+  lastResult: string
+  /** 上次跑完的时刻（毫秒）；0 = 从未跑过。面板上的时间戳用它。 */
+  lastAt: number
+  /**
+   * **逐渠道**结果（顺序即遍历顺序，文本形如 `2 个 +800` / `今天已领` /
+   * `无签到接口` / `出错`）。
+   *
+   * 用户 2026-10-02：「自动签到状态下，下方应该也显示文字状态，这样才能够知道
+   * 各个渠道的签到状态」—— 汇总句看不出是哪个渠道，故这里给逐渠道明细。
+   */
+  channels: Array<{ provider: string; text: string }>
+  /**
+   * 用户是否已手动关闭那行**常驻**的自动签到状态文字。
+   *
+   * ⚠️ 判据是「关闭的是当前这一轮」：新一轮跑出结果后自动变回 `false`
+   *（否则用户关过一次就再也看不到新结果了）。
+   */
+  dismissed: boolean
+}
+
+/**
+ * RPC: 读写「每日首次启动自动签到」开关，以及关闭常驻状态文字。
+ *
+ * ⚠️ `enabled` 与 `dismiss` 都**省略 = 只读**；给出时必须是布尔值 —— 非法值一律
+ * `bad-request`，**不做**静默回落（与本仓库 `usage.badgePreference` 同口径：
+ * 回落会让「设置没生效」看起来像「保存成功」）。磁盘脏数据的容错在
+ * `sanitizeAutoCheckin`。
+ * ⚠️ 打开开关时宿主会**立刻尝试一轮**（今天已跑过则内部拦住）：否则用户今天点了
+ * 开关要等到明天才有动作，看起来像没生效。
+ * ⚠️ `dismiss: true` 只关掉**当前这一轮**的状态文字（下一轮结果会重新出现）——
+ * 手动签到的结果提示是按时自动消失的，两者语义不同，别合并。
+ */
+export interface RpcUsageAutoCheckinRequest {
+  enabled?: boolean
+  dismiss?: boolean
+}
+
+/** RPC: 自动签到开关响应（回显写入后的生效状态）。 */
+export interface RpcUsageAutoCheckinResponse {
+  autoCheckin: RpcUsageAutoCheckinState
 }
