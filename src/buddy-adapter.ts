@@ -816,6 +816,51 @@ export class BuddyAdapter extends LlmAdapter {
   }
 
   /**
+   * 该模型此刻是否**免费**（消耗 0 积分）。
+   *
+   * ## 为什么需要它
+   *
+   * `pickBuddyCredential`（`src/index.ts`）只问「锁没锁 + 有没有临期积分」，
+   * 从不问「这个模型要不要钱」。于是免费模型也会被「锁定永久积分 + 无临期积分」
+   * 这道门拦下，报出「没有可用账号……已锁定永久积分，而所有账号的『N 天内到期』
+   * 积分都已用尽」，而它**一分积分都不需要** —— 用户看到的是
+   * 「账号明明有余额却失败」的矛盾错误（真实报障）。
+   *
+   * 免费模型既不消耗临时积分也不消耗永久积分，故它与「锁定」要保护的
+   * 目标（别把永久积分烧掉）无关，不该受该门约束。
+   *
+   * ## 判据（任一成立即免费，与展示层口径一致）
+   *
+   * 1. `creditsRate === 'x0'` —— 服务端 `credits: "0x"` / `"x0"`；
+   * 2. `discountedCreditsRate === 'x0'` —— 促销价打到 0；
+   * 3. 两者 === `'免费'` —— 促销 `factor: 0` 时 `parsePromotions` 直接写入的
+   *    **中文串**（不是 `x0`，这条最容易漏，见 `src/buddy.ts` 的 `rate = '免费'`）。
+   *
+   * ⚠️ **只在确定免费时返回 true**：字段缺失、解析失败、未知模型一律 false。
+   * 把付费模型误判成免费会绕开锁定，**真烧掉永久积分且不可撤回** ——
+   * 因此这里取「保守方向」：宁可让免费模型多走一次余额门，
+   * 也不放过任何无法确认的情形。
+   *
+   * ⚠️ 远端目录是懒加载的（`ensureRemoteModels()`），必须先 await：
+   * 调用点虽在 `prepareCall` 之后（目录通常已就绪），但「直接进会话」等路径
+   * 可能尚未拉取，漏掉这一步补丁会**静默失效**（退回被拦截的行为）。
+   *
+   * @param modelId - 模型 id。
+   * @returns true 仅当能确认该模型消耗 0 积分。
+   */
+  async isFreeModel(modelId: string | undefined): Promise<boolean> {
+    if (typeof modelId !== 'string' || modelId.length === 0) return false
+    await this.ensureRemoteModels()
+    // ⚠️ 兜底表（`BuddyFallbackModel`）**没有**倍率字段 —— 它是编译期快照，
+    // 价格会变，故刻意不写死（见 `reconcileWithFallback` 的说明）。
+    // 因此这里只信远端 `remoteMeta`；查不到即视为「无法确认免费」。
+    const meta = this.remoteMeta.get(modelId)
+    if (meta === undefined) return false
+    const isZeroRate = (rate: string | undefined): boolean => rate === 'x0' || rate === '免费'
+    return isZeroRate(meta.creditsRate) || isZeroRate(meta.discountedCreditsRate)
+  }
+
+  /**
    * 描述本适配器拥有的 provider 路由。
    *
    * DSH 会强制校验 `info.id === provider` 且 `info.name` 为非空字符串；
