@@ -58,6 +58,7 @@ import {
 } from './opencode-auth.js'
 import { OPENCODE } from './opencode-product.js'
 import { deriveProjectId, opencodeUserAgent } from './opencode.js'
+import { primeOpencodeCapabilities, refreshOpencodeCapabilities } from './opencode-capability.js'
 import { closeAllProxyDispatchers } from './opencode-proxy.js'
 import { execFile } from 'node:child_process'
 
@@ -90,6 +91,16 @@ function lazyOpencodeUserAgent(): () => string {
     return cached
   }
 }
+
+/**
+ * 拉取 Zen 模型目录的超时（毫秒）。
+ *
+ * ⚠️ 桌面版实测：到 `opencode.ai` 的 fetch 可能**永不 settle**（宿主网络
+ * 异常），而 `loadOpencodeCatalog` 的兜底分支只有在内层 Promise **结束**
+ * 后才可能执行。挂死时模型列表与用量徽标会同时空白（用户报障 2026-10-02）。
+ * 8 秒足够覆盖正常路径（实测首字节 720ms 量级），又不会让 UI 干等太久。
+ */
+const OPENCODE_CATALOG_TIMEOUT_MS = 8_000
 
 export const name = 'codearts-auth'
 // `connection` 刻意不列入静态 inject：它只由 Web bundle（dsh-client-connection）
@@ -1554,9 +1565,17 @@ const zcodeAdapter = registerZcodeLlm(ctx, {
       // 宁可前几次 UA 用兜底值，也不让插件启动阻塞在 2 秒的子进程上。
       opencodeUA(),
     ),
+    // ⚠️⚠️ **必须有超时**（真机事故 2026-10-02）：桌面版到 opencode.ai 的
+    // fetch 可能**永不 settle**（与同源的 remote.session 故障都是宿主网络问题）。
+    // 没有超时 → `loadOpencodeCatalog` 的 try/catch 永远走不到 →
+    // `listModels` 永不返回 → **模型列表与徽标同时空白**（用户报障）。
+    // 有超时则超时后回退兜底表，UI 立刻可用（只是暂时看不到付费模型）。
     fetchRemoteCatalog: (slot, signal) => fetch(`${OPENCODE.baseUrl}${OPENCODE.modelsPath}`, {
       headers: { authorization: `Bearer ${slot.apiKey}` },
-      ...signal === undefined ? {} : { signal },
+      // 组合两个信号：调用方给的（取消）+ 自己的超时（防挂死）。
+      signal: signal === undefined
+        ? AbortSignal.timeout(OPENCODE_CATALOG_TIMEOUT_MS)
+        : AbortSignal.any([signal, AbortSignal.timeout(OPENCODE_CATALOG_TIMEOUT_MS)]),
     }),
     disabledModels: () => pool.disabledModelsFor(OPENCODE.id),
     markLimited: async (slotId, modelId, resetAtMs) => {
@@ -1565,6 +1584,13 @@ const zcodeAdapter = registerZcodeLlm(ctx, {
       await pool.updateModelRateLimit(slotId, modelId, resetAtMs)
     },
     warn: (message) => ctx.logger.warn(`[codearts-auth] ${message}`),
+    // ⚠️ 图片字节桥接：Zen 有多个免费模型实测支持图片输入（big-pickle /
+    // space-bunny-free / mimo-v2.6 / mimo-v2.5，2026-10-02 真机验证），
+    // 模态由 `opencode-capability.ts` 按远端 models.dev 播报。
+    // ⚠️ 不接 `readImageRequest`（缩放桥接）：Zen 免费通道对图片体积的
+    // 限制**未实测**，不凭猜测加一层压缩（Qoder/Raccoon 是实测撞到体积
+    // 限制才接的）。先发原图，撞到限制再按实测加。
+    readImage: makeReadImage(ctx),
   })
   // 保证至少有一条匿名通道（零账号也能用免费模型）。
   //
@@ -1583,6 +1609,26 @@ const zcodeAdapter = registerZcodeLlm(ctx, {
     if (id !== '') ctx.logger.info(`[codearts-auth] 已为 OpenCode 创建默认匿名通道：${id}`)
   }).catch((error: unknown) => {
     ctx.logger.warn(`[codearts-auth] 创建默认 OpenCode 匿名通道失败：${String(error)}`)
+  })
+
+  // 预热模型能力表（models.dev）。
+  //
+  // ⚠️⚠️ **两条硬约定**（真机事故 2026-10-02）：
+  // 1. 渲染路径上**只读同步缓存**，永不 await 网络 —— 我最初在 `listModels`
+  //    里 await 这个拉取，而它 5 MB / 慢则 1.4s、宿主网络异常时**永不返回**，
+  //    于是模型选择器一直空白（用户报障「一直卡着」）。
+  // 2. 拉取完成要**广播目录变更**：能力表是能力判定的来源，DSH 已经用
+  //    「纯文本」渲染过一帧，不广播它不会重算（免费模型会一直显示不支持图片）。
+  //
+  // 首次运行磁盘没缓存时，本次刷新可能晚于首帧几十秒；那段时间能力按纯文本
+  // 保守处理（见 opencode-capability.ts 的模块头）。
+  primeOpencodeCapabilities()
+  refreshOpencodeCapabilities(() => {
+    try {
+      ctx.emit('llm/adapters-updated')
+    } catch (error) {
+      ctx.logger.warn(`[codearts-auth] 广播 OpenCode 能力更新失败：${String(error)}`)
+    }
   })
   // ⚠️ 这里**不再**调 `registerOpencodeRpc`：opencode 的端点已并入
   // `registerJetHubRpc` 内部的 handleMethod（见 `opencode-rpc.ts` 模块头）。

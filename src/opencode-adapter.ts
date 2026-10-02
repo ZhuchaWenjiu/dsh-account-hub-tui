@@ -1,4 +1,18 @@
 /**
+ * 某模型的输入模态（`LlmModelInfo` / `LlmResolvedModelInfo` 共用）。
+ *
+ * ⚠️ **能力表缺失时一律回退 `['text']`** —— 这是本仓库的硬约定：
+ * 声明支持就必须真支持（Qoder 图片丢失事故的教训）。把「查不到」当成
+ * 「支持」会让 DSH 把图片投影成上游根本不接受的形态。
+ */
+function inputModalitiesOf(
+  capabilities: readonly OpencodeModelCapability[],
+  modelId: string,
+): readonly ['text'] | readonly ['text', 'image'] {
+  return supportsOpencodeImage(capabilities.find((c) => c.id === modelId)) ? ['text', 'image'] : ['text']
+}
+
+/**
  * OpenCode Zen 模型适配器（账号槽 + 匿名槽平权混合池）。
  *
  * ## 平权轮换语义（设计文档 §5）
@@ -31,8 +45,11 @@ import {
 import { listIdentitySlots, type IdentitySlot } from './opencode-auth.js'
 import { deriveRequestId, deriveSessionId, opencodeHeaders, opencodeUserAgent } from './opencode.js'
 import { buildOpencodePayload } from './opencode-messages.js'
+import {
+  getOpencodeCapabilitiesSync, supportsOpencodeImage, type OpencodeModelCapability,
+} from './opencode-capability.js'
 import { buildProxyDispatcher } from './opencode-proxy.js'
-import { consumeOpenAiSse, httpErrorCode, serializeMessages } from './openai-compat.js'
+import { consumeOpenAiSse, collectImages, httpErrorCode, serializeMessages } from './openai-compat.js'
 import { registerAdapterIdempotent } from './llm-register-compat.js'
 
 /** 目录条目（远端与兜底共用的输出形状）。 */
@@ -119,6 +136,13 @@ export interface OpencodeAdapterOptions {
   markLimited?: (slotId: string, modelId: string, resetAtMs: number) => Promise<void>
   /** 诊断日志。 */
   warn?: (message: string) => void
+  /**
+   * 附件字节读取。**只有声明了 image 模态的模型才需要**。
+   *
+   * ⚠️ 缺省时带图请求会抛 `UNSUPPORTED_CONTENT`（见 `resolveImageUrls`），
+   * 而不是把图片静默丢掉（Qoder 图片丢失事故的教训）。
+   */
+  readImage?: (ref: unknown) => Promise<{ data: Uint8Array; mediaType: string } | undefined>
 }
 
 /**
@@ -217,24 +241,37 @@ export class OpencodeAdapter extends LlmAdapter {
     if (slots.length === 0) return []
     const all = await this.catalog()
     // ⚠️ 可见性口径（用户定稿）：只有匿名身份时**只给免费模型**。
+    // 免费判定以**远端 models.dev 的 cost** 为准（见 opencode-capability.ts）。
     const hasAccountSlot = slots.some((s) => s.kind === 'account')
     const visible = hasAccountSlot ? all : all.filter((m) => m.isFree)
     const disabled = this.options.disabledModels?.() ?? new Set<string>()
+    // ⚠️ **同步**读能力表（不 await）：渲染路径上等网络会让模型选择器一直空白
+    // （真机事故 2026-10-02）。拿不到就按纯文本兜底，后台补齐后会重渲染。
+    const capabilities = getOpencodeCapabilitiesSync()
     return visible
       .filter((m) => !disabled.has(m.id))
-      .map((m) => ({ provider: OPENCODE.id, id: m.id, name: m.name, inputModalities: ['text'] as const }))
+      .map((m) => ({
+        provider: OPENCODE.id,
+        id: m.id,
+        name: m.name,
+        // ⚠️ 模态以**远端能力表**为准，不再一律 text（用户报障
+        // 「space-bunny-free 发图提示不支持」：该模型实测接受图片，
+        // 而我们硬编码 ['text'] 让 DSH 在本地就把图投影成了文字占位符）。
+        // ⚠️ 能力表拿不到时**保守回退 text**（`inputModalitiesOf` 的实现）——
+        // 声明支持就必须真支持，这是本仓库的硬约定。
+        inputModalities: inputModalitiesOf(capabilities, m.id),
+      }))
   }
 
   async resolveModel(provider: string, model: string, _signal?: AbortSignal): Promise<LlmResolvedModelInfo> {
     const all = await this.catalog()
     const entry = all.find((m) => m.id === model)
+    const capabilities = getOpencodeCapabilitiesSync()
     const resolved: LlmResolvedModelInfo = {
       provider,
       id: model,
       name: entry?.name ?? model,
-      // ⚠️ 首期只声明 text：Zen 免费通道的图片能力未经逐模型实测，
-      // 声明支持就必须真支持（Qoder 图片缺陷的教训）。
-      inputModalities: ['text'],
+      inputModalities: inputModalitiesOf(capabilities, model),
     }
     // ⚠️ 窗口未知**不编造**：0 是「不知道」哨兵，不能当合法窗口下发。
     if (entry !== undefined && entry.contextWindow > 0) {
@@ -359,9 +396,52 @@ export class OpencodeAdapter extends LlmAdapter {
     }
   }
 
+  /**
+   * 解析消息里的图片附件为 data URL。
+   *
+   * ⚠️ **模型不支持图片时直接抛 UNSUPPORTED_CONTENT**（而不是静默丢弃）——
+   * 静默丢弃会让用户以为模型看到了图（Qoder 图片事故的教训）。
+   * ⚠️ 附件字节读不出来时写入**空 Map**：`openai-compat` 的
+   * `userContentParts` 遇到缺失会产出 `[image unavailable]` 占位，
+   * 至少让模型知道「这里本该有张图但没拿到」，而不是消息里凭空少一块。
+   */
+  private async resolveImageUrls(
+    model: string,
+    messages: readonly { content: unknown }[],
+  ): Promise<ReadonlyMap<string, string> | undefined> {
+    const refs = new Map<string, unknown>()
+    for (const message of messages) {
+      if (Array.isArray(message.content)) collectImages(message.content, refs)
+    }
+    if (refs.size === 0) return undefined
+
+    const capabilities = getOpencodeCapabilitiesSync()
+    if (!supportsOpencodeImage(capabilities.find((c) => c.id === model))) {
+      throw new LlmError(
+        `opencode: 模型 "${model}" 不支持图片输入（能力以远端 models.dev 为准）`,
+        'UNSUPPORTED_CONTENT',
+      )
+    }
+    if (this.options.readImage === undefined) {
+      throw new LlmError('opencode: 图片输入需要附件服务', 'UNSUPPORTED_CONTENT')
+    }
+    const readImage = this.options.readImage
+    const out = new Map<string, string>()
+    for (const [id, ref] of refs) {
+      const image = await readImage(ref)
+      if (image === undefined) continue
+      out.set(id, `data:${image.mediaType};base64,${Buffer.from(image.data).toString('base64')}`)
+    }
+    return out
+  }
+
   /** 用指定槽发一次请求（轮换循环的复用单元）。 */
   protected async *streamVia(slot: IdentitySlot, options: GenerateOptions): AsyncIterable<StreamChunk> {
-    const messages = serializeMessages(options.messages)
+    // ⚠️ **图片**：`inputModalities` 声明了 image 的模型，DSH 才会把图片
+    // 投影进消息；序列化时要用 `imageUrls` 把 attachmentId 换成 data URL，
+    // 否则图片会被静默丢掉（Qoder 图片丢失事故的同型缺陷）。
+    const imageUrls = await this.resolveImageUrls(options.model, options.messages)
+    const messages = serializeMessages(options.messages, imageUrls)
     const payload = buildOpencodePayload({
       model: options.model,
       messages,

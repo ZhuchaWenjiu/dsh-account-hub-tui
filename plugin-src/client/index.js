@@ -18,8 +18,24 @@ export const name = 'jet-hub-client'
  * 本插件的 bundle 到达（见 `dsh-client-modules` 的 `arriveGraphRow`）。
  * 未声明时本插件可能先被物化，`inject` 便会一直等服务，徽标不出现（不影响
  * 设置页与其余功能）。
+ *
+ * ## ⚠️⚠️ `remote.session` **必须**在这里（真机事故 2026-10-02，desktop 永久失效）
+ *
+ * `dsh-client-ui-model-selection` 自己的声明是
+ * `inject = ["sessions", "remote", "remote.session"]`，而它的
+ * `directoryFor(sessionId)` 内部会读 `this.ctx.sessions` 与
+ * `this.ctx.remote.session`。
+ *
+ * cordis 的 inject 是**逐插件**校验的：我们自己的 ctx 没声明 `remote.session`，
+ * 那句 `ctx.remote.session` 就直接抛
+ * `cannot get property "remote.session" without inject`。
+ * 症状是**桌面版徽标永久不显示、且无任何报错**（我曾用 try/catch 吞掉异常，
+ * 结果把崩溃换成了静默失败，比原问题更难发现）。
+ *
+ * ⇒ 这里必须与该包**对齐**地声明 `sessions` / `remote` / `remote.session`。
+ * 少一个都会让 `directoryFor` 在 desktop 上失败。
  */
-export const inject = ['slots', 'connection', 'modelDirectories']
+export const inject = ['slots', 'connection', 'modelDirectories', 'sessions', 'remote', 'remote.session']
 
 import { callManagementRpc, unwrapRpcResult } from '../management-rpc.mjs'
 import { installJetHubStyles } from './jet-hub-styles.js'
@@ -101,8 +117,43 @@ export function apply(ctx) {
     id: 'jet-hub-usage',
     order: 100,
     inject: (sessionId) => ({
-      // 目录的 store（订阅它即可跟随「用户切了模型」重新渲染）。
-      directory: ctx.modelDirectories.directoryFor(sessionId).store,
+      // ⚠️⚠️ **必须惰性取目录，不能在 inject 里取**（真机事故 2026-10-02）。
+      //
+      // 原写法 `directory: ctx.modelDirectories.directoryFor(sessionId).store`
+      // 有两个问题：
+      // 1. `directoryFor` 是**惰性 getter** —— 写 `directoryFor(sessionId).store`
+      //    里的 `.store` 才触发求值，而求值发生在**槽位 inject 期**（即会话
+      //    输入区渲染的同步路径上）。桌面版此时它内部要访问未注入的
+      //    `remote.session`，直接抛 `cannot get property "remote.session"
+      //    without inject`（Web 版不走那条分支，故只在 desktop 复现）。
+      // 2. 该异常发生在渲染关键路径上，**会让整个会话输入区渲染中断** ——
+      //    表现为模型选择器点不动（用户报障），远不止「徽标不显示」。
+      //
+      // ⇒ 改为交出一个**取值函数** `resolveDirectory()`，由组件在自己的
+      // effect 里调用：失败被组件自身的 try/catch 兜住，影响面收敛到
+      // 「徽标不显示」，绝不影响模型选择器。
+      //
+      // ⚠️⚠️ **必须同时交出 `store` 与 `load`（真机事故 2026-10-02 的真正根因）
+      //
+      // 读 `dsh-client-ui-model-selection` 的 `ModelDirectory` 源码得到两个事实：
+      //   ① 它的**公开方法是 `load()` / `syncInputs()`，没有 `getSnapshot()` /
+      //      `subscribe()`** —— 那两个在 `this.store` 上。我第一版只交出实例，
+      //      组件调 `directory.getSnapshot()` 得到 `undefined` → TypeError →
+      //      被 safe() 吞掉 → `provider` 恒为空 → **徽标永不显示**。
+      //   ② `store` 的初值是 `{ current: null, status: 'idle' }`，**只有
+      //      `await load()` 之后** `syncInputs()` 才把真实 `current` 填进去。
+      //      徽标自己不发模型目录请求（`usage.badge` 按 provider 查），
+      //      所以必须由它调 `load()`，否则 `current` 永远是 null。
+      //
+      // 两者缺一不可：只给 store 不 load → current 为 null；
+      // 只给实例不 load 也不 store → getSnapshot 不存在。
+      resolveDirectory: () => {
+        const directory = ctx.modelDirectories.directoryFor(sessionId);
+        return {
+          store: directory.store,
+          load: () => directory.load(),
+        };
+      },
       providerLabel,
       readBadge: (provider, options) => rpcCall('usage.badge', { provider, ...options }),
       writePreference: (preference) => rpcCall('usage.badgePreference', { preference }),

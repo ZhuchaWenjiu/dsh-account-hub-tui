@@ -38,7 +38,35 @@ describe('用量徽标：槽位接线', () => {
   const index = read('plugin-src/client/index.js')
 
   it('注入 modelDirectories（当前渠道的唯一来源）', () => {
-    expect(index).toContain("export const inject = ['slots', 'connection', 'modelDirectories']")
+    expect(index).toContain("export const inject = ['slots', 'connection', 'modelDirectories'")
+  })
+
+  it('⚠️⚠️ 徽标宽度必须收敛（否则挤压右侧模型选择器）', () => {
+    // 真机报障 2026-10-02：徽标 flex:none + max-width:280px 把模型选择器
+    // 压到只剩几十 px，**图标被挤没**（用户要放大到很大才看得见）。
+    // 两级收敛（用户定 1+2）：基础 150px，窄屏（<720px）只剩状态点。
+    const styles = read('plugin-src/client/jet-hub-styles.js')
+    const btn = /\.dim-jh-badgeBtn \{[^}]*max-width:\s*(\d+)px/.exec(styles)
+    expect(btn, '应能解析出徽标按钮的 max-width').not.toBeNull()
+    expect(Number(btn![1]), '徽标基础宽度应 ≤ 160px（给模型选择器留 ≥130px）')
+      .toBeLessThanOrEqual(160)
+    expect(styles, '窄屏应收敛为只剩状态点').toMatch(/@media \(max-width: 720px\)/)
+    expect(styles, '需 min-width:0 才能真正收缩/省略').toMatch(/min-width: 0/)
+  })
+
+  it('⚠️⚠️ 同时注入 sessions / remote / remote.session（真机事故根因）', () => {
+    // `directoryFor(sessionId)` 内部读 `this.ctx.sessions` 与
+    // `this.ctx.remote.session`（源码见 @deepseek-ai/dsh-client-ui-model-selection
+    // 的 client.js，该包自己的 inject 就是 ["sessions","remote","remote.session"]）。
+    // cordis 逐插件校验 inject，漏声明就会抛
+    // `cannot get property "remote.session" without inject`
+    // ⇒ desktop 徽标永久不显示。
+    const m = /export const inject = \[([^\]]*)\]/.exec(codeOf(index))
+    expect(m, '应能解析 export const inject').not.toBeNull()
+    const list = m![1]!
+    for (const svc of ['modelDirectories', 'sessions', 'remote', 'remote.session']) {
+      expect(list, `inject 缺少 ${svc}`).toContain(`'${svc}'`)
+    }
   })
 
   it('注册到 conversation.input.right（模型选择器旁的 list 槽）', () => {

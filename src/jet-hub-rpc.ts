@@ -125,6 +125,7 @@ import {
 } from './account-probe.js'
 import { exportBackup, importBackup } from './backup.js'
 import { handleOpencodeRpc } from './opencode-rpc.js'
+import { OPENCODE } from './opencode-product.js'
 import type {
   ProviderAccountEntry,
   RpcBackupExportResponse,
@@ -2688,6 +2689,68 @@ function registerJetHubEndpoints(
               ...balance === null ? { error: '积分查询失败（凭据失效或响应异常）' } : {},
             })
           }
+          return { ok: true, value: { accounts: values } satisfies RpcCreditsBalancesResponse }
+        }
+        if (req.provider === OPENCODE.id) {
+          // ⚠️⚠️ **这里不查远端余额**（设计决定，2026-10-02，与用户确认走「限额状态」路 A）。
+          //
+          // ## 为什么
+          //
+          // OpenCode Zen **没有公开的余额查询端点**：实测 `/zen/v1/` 下的
+          // `balance` / `credits` / `usage` / `billing` / `quota` / `limits` /
+          // `subscription` / `workspace` 等 15 个候选路径**全部 404**
+          // （返回官网页面 HTML，不是 API 的 JSON 404）。
+          // 它确实有额度概念（余额耗尽回 `402 Insufficient account funds`），
+          // 但那个数字只在控制台网页里看，没有 API 可查。
+          //
+          // ⇒ 徽标展示**我们真正测得到的东西**：每个通道（账号槽 / 匿名通道）
+          // 当前是否可用、是否处于限额冷却。数据全部来自**本地状态**
+          // （账号池的 `modelRateLimits` 与 `enabled`），**零网络请求**。
+          //
+          // ## 语义映射（不伪装成「余额」）
+          //
+          // `CreditBalance.total` 在此表示「**当前可用通道数**」，单位固定
+          // 「通道」；限额中的通道数放进 `expiredTotal`，面板据此显示
+          // 「另有 N 限额中」——与其它 provider 的「已失效资源包」口径一致，
+          // 徽标的 UI 逻辑不用改。
+          const values = accounts.map((account) => {
+            const now = Date.now()
+            const limits = Object.entries(account.modelRateLimits ?? {})
+            const limitedUntil = limits.reduce((max, [, resetAt]) => Math.max(max, Number(resetAt) || 0), 0)
+            // 只数**尚未到期**的限额（已过期的交给 sweepExpiredRateLimits 清理）。
+            const limitedModels = limits.filter(([, resetAt]) => Number(resetAt) > now).length
+            const available = account.enabled && limitedUntil <= now ? 1 : 0
+            // ⚠️ `CreditPackage` 的必填字段对 opencode 大多**无意义**
+            // （remaining/used/cycle* 都是「资源包计费周期」的概念，
+            // 而我们表达的是「通道是否可用」）。按类型要求填中性值，
+            // 徽标 UI 实际只读 `unit` / `total` / `active`（见 badge-model.js
+            // 的 creditGroupsOf），故这些字段不会出现在展示里。
+            const balance: CreditBalance = {
+              total: available,
+              packages: [{
+                name: limitedModels > 0 ? `${limitedModels} 个模型限额中` : '可用通道',
+                unit: '通道',
+                remaining: available,
+                total: available,
+                used: 0,
+                active: true,
+                cycleStartTime: '',
+                cycleEndTime: '',
+                expiredTime: '',
+              }],
+              expiredTotal: account.enabled && limitedUntil > now ? 1 : 0,
+            }
+            return {
+              accountId: account.id,
+              nickname: account.nickname,
+              balance,
+              ...(!account.enabled
+                ? { error: '已停用' }
+                : limitedUntil > now
+                  ? { error: `限额中，${new Date(limitedUntil).toLocaleString('zh-CN')} 恢复` }
+                  : {}),
+            }
+          })
           return { ok: true, value: { accounts: values } satisfies RpcCreditsBalancesResponse }
         }
         if (req.provider === TRAE.id) {

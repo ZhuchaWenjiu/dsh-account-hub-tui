@@ -72,17 +72,141 @@ export const CLAIM_NOTICE_MS = 8_000;
 export const CLAIM_NOTICE_WARN_MS = 20_000;
 
 /**
+ * 目录解析失败后的重试退避（毫秒）。
+ *
+ * ⚠️ 覆盖「宿主在该槽位注入期还没接上 `remote.session`」这一实际情形
+ * （桌面版）：挂载时抛错，几秒后可能就绪。共 5 次、总计约 4.6 秒，
+ * 之后安静放弃 —— 再长就变成用户可感知的「徽标迟迟不出来」。
+ */
+const RESOLVE_RETRY_DELAYS = [300, 700, 1500, 2000];
+
+/**
  * 徽标本体：只做门控，真正的工作在 {@link UsageBadgeActive}。
  *
- * ⚠️ 用 `useSyncExternalStore` 订阅模型目录：目录快照变化
- * （用户切模型 / 切渠道）会立刻触发重渲染，徽标的 provider 随之更新。
+ * ## ⚠️⚠️ 目录必须**惰性解析且容错**（真机事故 2026-10-02）
+ *
+ * 宿主侧的槽位 inject 传下来的是 `resolveDirectory()`（**函数**）而非
+ * `directory`（对象）—— 因为 `ctx.modelDirectories.directoryFor(sessionId)`
+ * 是**惰性 getter**，在 inject 期求值时，桌面版会抛
+ * `cannot get property "remote.session" without inject`。
+ * 那个异常发生在**会话输入区的同步渲染路径**上，会让模型选择器整个点不动
+ * （用户报障），比「徽标不显示」严重得多。
+ *
+ * ⇒ 这里在 effect 里解析目录，任何失败都只让**徽标**不渲染：
+ * `useSyncExternalStore` 的三个回调因此不会把异常抛回宿主渲染树。
  */
 export function UsageBadge(props) {
-  const directory = props.directory;
+  const resolveDirectory = props.resolveDirectory;
+  // 已解析的目录对象；null = 还没解析出来（首帧必然如此）。
+  const [directory, setDirectory] = React.useState(null);
+  // ⚠️ 已解析出目录就不再重跑：若宿主每次渲染都重建 inject 的返回对象，
+  // `resolveDirectory` 的函数身份就会变 → effect 反复重启 →
+  // 重试计时器被无限清除、永远解析不出来（比不重试还糟）。
+  // 「非 null 就跳过」既省了重复解析，也天然挡住了这个循环。
+  const resolvedRef = React.useRef(false);
+  /** 快照读取异常只记一次（见 safe() 处说明）。 */
+  const snapshotErrorRef = React.useRef(false);
+
+  // 惰性解析 + **有限重试**。
+  //
+  // ## 为什么必须重试（真机事故 2026-10-02 的第二次）
+  //
+  // 桌面版上 `ctx.modelDirectories.directoryFor(sessionId)` 会抛
+  // `cannot get property "remote.session" without inject`（宿主在该槽位
+  // 注入期还没把 `remote.session` 接上）。我第一版修法是「try/catch 吞掉」，
+  // 结果**异常没了、徽章也永远不显示** —— 把崩溃换成了静默失败，
+  // 比原问题更难发现（用户报障：d8405aa 之前徽标是好的，之后就没了）。
+  //
+  // ⇒ 解析失败**不等于永远不可用**：宿主可能在挂载之后才补齐注入。
+  // 故按退避序列重试若干次，每次成功即停止；全失败才安静放弃
+  // （此时徽标不显示，但**不影响**会话输入区与模型选择器）。
+  //
+  // ⚠️ **只保留失败路径的 console.warn，不再有定位用的 console.info**
+  // （2026-10-02 清理）。那批 info 是为追 desktop 徽标问题临时加的，
+  // 问题已修好，留着只会污染用户控制台。它们唯一留下的价值已经写进本注释
+  // 与回归断言 —— 教训（别静默吞异常）不该靠刷屏来保存。
+  React.useEffect(() => {
+    if (typeof resolveDirectory !== 'function') return undefined;
+    if (resolvedRef.current) return undefined;
+    let alive = true;
+    const timers = [];
+    let attempt = 0;
+    const tryResolve = () => {
+      if (!alive || resolvedRef.current) return;
+      let resolved = null;
+      try {
+        resolved = resolveDirectory();
+      } catch {
+        // 失败不在此处上报 —— 重试全用尽时统一 warn 一次（避免刷屏）。
+        resolved = null;
+      }
+      if (!alive) return;
+      if (resolved !== null && resolved !== undefined && resolved.store !== undefined) {
+        resolvedRef.current = true;
+        const store = resolved.store;
+        setDirectory(store);
+        // ⚠️⚠️ **必须自己调 `load()`**（真机事故 2026-10-02 的真正根因）：
+        // `ModelDirectory` 的 store 初值是 `{ current: null, status: 'idle' }`，
+        // 只有 `await load()` 之后 `syncInputs()` 才把真实 `current` 填进去。
+        // 徽标自己不发模型目录请求（`usage.badge` 是按 provider 查的），
+        // 所以若不调 load()，`current` 永远是 null ⇒ provider 空 ⇒ 徽标不显示。
+        if (typeof resolved.load === 'function') {
+          Promise.resolve(resolved.load()).catch((error) => {
+            // eslint-disable-next-line no-console
+            console.warn('[jet-hub usage] 目录 load() 失败，徽标将不显示：', error);
+          });
+        }
+        return;
+      }
+      attempt += 1;
+      if (attempt >= RESOLVE_RETRY_DELAYS.length) {
+        // eslint-disable-next-line no-console
+        console.warn('[jet-hub usage] 目录解析最终失败，徽标不显示');
+        return;
+      }
+      timers.push(setTimeout(tryResolve, RESOLVE_RETRY_DELAYS[attempt - 1]));
+    };
+    tryResolve();
+    return () => {
+      alive = false;
+      for (const timer of timers) clearTimeout(timer);
+    };
+  }, [resolveDirectory]);
+
+  // ⚠️ 没有目录就到此为止：`useSyncExternalStore` 的回调必须始终是函数，
+  // 直接在 directory 为 null 时调用会抛 TypeError 并把异常带回宿主渲染树。
+  // ⚠️ 三个回调都再包一层 try/catch：`directoryFor` 求值成功**不等于**
+  // `subscribe` / `getSnapshot` 不抛 —— 惰性 getter 的真正求值可能推迟到
+  // 订阅时（那正是桌面版的实际行为）。这里必须假设它们**会**抛，
+  // 否则同一个故障换个时机复发，又是一次「模型选择器点不动」。
+  // ⚠️ 静默吞异常是本次排查最大的阻碍（`directory.getSnapshot is not a
+  // function` 被这里吞掉，表现为「徽标不显示且毫无线索」）。故失败**只记一次**
+  // 关键信息，仍不抛出 —— 抛出仍会打崩宿主渲染树。
+  const safe = (fn) => () => {
+    try {
+      return directory ? fn(directory) : undefined;
+    } catch (error) {
+      if (!snapshotErrorRef.current) {
+        snapshotErrorRef.current = true;
+        // eslint-disable-next-line no-console
+        console.warn('[jet-hub usage] 读目录快照失败（store 上应有 getSnapshot）:', error);
+      }
+      return undefined;
+    }
+  };
   const state = React.useSyncExternalStore(
-    (onChange) => directory.subscribe(onChange),
-    () => directory.getSnapshot(),
-    () => directory.getSnapshot(),
+    // ⚠️ 订阅要**真的转发 onChange**（用户切模型时徽标跟着更新）；
+    // try/catch 只为把「订阅时才发现抛错」这一类也收进徽标内部。
+    (onChange) => {
+      if (!directory) return () => {};
+      try {
+        return directory.subscribe(onChange);
+      } catch {
+        return () => {};
+      }
+    },
+    safe((d) => d.getSnapshot()),
+    safe((d) => d.getSnapshot()),
   );
   const provider = state?.current?.provider;
   // 没有选中模型（新会话尚未选择 / 已寻址的 subagent 会话）→ 不渲染。

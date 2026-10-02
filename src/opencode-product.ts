@@ -33,6 +33,17 @@ export interface OpencodeProduct {
   readonly chatChunkTimeoutMs: number
   readonly anonymousKey: string
   readonly defaultUserAgent: string
+  /**
+   * 模型能力元数据源（**远端**，能力的主来源）。
+   *
+   * ⚠️ 不是 `/zen/v1/models` —— 实测它只返回 `id`/`object`/`created`/
+   * `owned_by` 四个字段，**不含任何能力信息**（85 条全如此）。
+   * 能力在 **models.dev** 的 `opencode` 条目里，官方 CLI 自己就用它
+   * （`packages/core/src/models-dev.ts`）。见 `opencode-capability.ts`。
+   */
+  readonly modelsDevUrl: string
+  /** 能力表缓存 TTL（与官方 CLI 的 60 分钟同档）。 */
+  readonly modelsDevTtlMs: number
 }
 
 export const OPENCODE: OpencodeProduct = {
@@ -51,7 +62,21 @@ export const OPENCODE: OpencodeProduct = {
   anonymousKey: 'public',
   // ⚠️ 兜底 UA 版本号。接线层会用真机 `opencode --version` 的结果覆盖它。
   defaultUserAgent: 'opencode/1.18.22',
+  /**
+   * 模型能力元数据源（**远端**，能力的主来源）。
+   *
+   * ⚠️ 不是 `/zen/v1/models` —— 实测它只返回 `id`/`object`/`created`/
+   * `owned_by` 四个字段，**不含任何能力信息**（85 条全如此）。
+   * 能力在 **models.dev** 的 `opencode` 条目里，官方 CLI 自己就用它
+   * （`packages/core/src/models-dev.ts`）。见 `opencode-capability.ts`。
+   */
+  modelsDevUrl: 'https://models.dev/api.json',
+  /** 能力表缓存 TTL（与官方 CLI 的 60 分钟同档）。 */
+  modelsDevTtlMs: 60 * 60 * 1000,
 }
+
+export const OPENCODE_MODELS_DEV_URL = OPENCODE.modelsDevUrl
+export const OPENCODE_MODELS_DEV_TTL_MS = OPENCODE.modelsDevTtlMs
 
 /** 兜底模型目录条目。 */
 export interface OpencodeFallbackModel {

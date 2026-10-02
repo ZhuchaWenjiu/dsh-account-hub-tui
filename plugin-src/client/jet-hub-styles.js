@@ -499,10 +499,34 @@ const STYLES = `
    - 阴影双层（近处极淡 + 远处扩散），比单层大阴影更精致。
    信息项一项未减（渠道名、更新时间与缓存标记、偏好三态、窗口百分比与倒计时、
    套餐名称与到期与账号数、逐账号余额与分桶、停用/失败计数、两个签到按钮）。 */
-.dim-jh-badge { position: relative; display: flex; align-items: center; flex: none; }
-.dim-jh-badgeBtn { display: flex; align-items: center; gap: 5px; max-width: 280px; padding: 2px 9px; border: .5px solid var(--dsw-alias-border-l2); border-radius: 999px; background: var(--dsw-alias-bg-layer-2); color: var(--dsw-alias-label-secondary); font: inherit; font-size: 11px; line-height: 1.5; cursor: pointer; white-space: nowrap; font-variant-numeric: tabular-nums; transition: background .15s ease, color .15s ease, border-color .15s ease; }
+/* ⚠️ 徽标宽度会**挤压右侧的模型选择器**（真机报障 2026-10-02）。
+ *
+ * ## 症状
+ *
+ * 徽标与模型选择器同在 composer 一行（徽标 order:100 在模型选择器左侧），
+ * 而本元素是 flex: none —— 不参与收缩。原先 max-width: 280px 会把
+ * 「图标 + 模型名 + ▾」的模型选择器压到只剩几十 px，**图标被挤没**，
+ * 用户看到「只有放大到很大才能看到那个图标」。
+ *
+ * ## 为什么会暴露
+ *
+ * 早期徽标永不显示（store.current 恒为 null 的缺陷期），模型选择器独占
+ * 整行所以一直正常；徽标修好后开始占位，才暴露出这个抢占。
+ *
+ * ## 两级收敛（用户定：1+2）
+ *
+ * ① 基础宽度从 280px 收窄到 **150px**（文字超出走省略号，已有 min-width:0
+ *    + ellipsis 支撑）—— 给模型选择器让出约 130px，够显示「图标+名字+▾」。
+ * ② 容器再窄时（< 720px，媒体查询挂在**全局宽度**上：composer 宽度受
+ *    侧栏影响，用容器查询无法表达「右侧还剩多少」）**只留状态点**，
+ *    文字与 chevron 全部隐藏 —— 此时代理器优先级让给模型选择器。 */
+.dim-jh-badge { position: relative; display: flex; align-items: center; flex: none; min-width: 0; }
+.dim-jh-badgeBtn { display: flex; align-items: center; gap: 5px; max-width: 150px; min-width: 0; padding: 2px 9px; border: .5px solid var(--dsw-alias-border-l2); border-radius: 999px; background: var(--dsw-alias-bg-layer-2); color: var(--dsw-alias-label-secondary); font: inherit; font-size: 11px; line-height: 1.5; cursor: pointer; white-space: nowrap; font-variant-numeric: tabular-nums; transition: background .15s ease, color .15s ease, border-color .15s ease; }
 .dim-jh-badgeBtn:hover { background: var(--dsw-alias-bg-layer-3); color: var(--dsw-alias-label-primary); }
 .dim-jh-badgeBtn[aria-expanded="true"] { background: var(--dsw-alias-bg-layer-3); color: var(--dsw-alias-label-primary); border-color: color-mix(in srgb, #1677ff 45%, var(--dsw-alias-border-l2)); }
+/* ② 窄屏收敛：只留状态点，文字与 chevron 让位给模型选择器。
+ * 阈值 720px 是实测桌面版在 100% 缩放下「徽标 150px + 模型选择器 ≥ 240px」的临界值。 */
+@media (max-width: 720px) { .dim-jh-badgeText, .dim-jh-badgeBtn > svg, .dim-jh-badgeBtn > .dim-jh-badgeChevron { display: none; } .dim-jh-badgeBtn { max-width: none; padding: 2px 6px; } }
 /* min-width:0 是省略号生效的前提（flex 子项默认 min-width:auto，会撑破 max-width） */
 .dim-jh-badgeText { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
 .dim-jh-badgeDot { width: 5px; height: 5px; flex: none; border-radius: 999px; background: var(--dsw-alias-state-success-primary); }
@@ -510,6 +534,10 @@ const STYLES = `
 .dim-jh-badgeDot[data-tone="error"] { background: var(--dsw-alias-state-error-primary); }
 .dim-jh-badgeDot[data-tone="muted"] { background: var(--dsw-alias-label-tertiary); }
 .dim-jh-badgePop { position: absolute; bottom: calc(100% + 8px); right: 0; z-index: 40; width: 280px; max-width: min(280px, 86vw); max-height: 58vh; overflow-y: auto; display: flex; flex-direction: column; padding: 9px 10px 10px; border: .5px solid var(--dsw-alias-border-l2); border-radius: 11px; background: var(--dsw-alias-bg-layer-1); box-shadow: 0 1px 2px rgba(0, 0, 0, .06), 0 8px 24px rgba(0, 0, 0, .14); text-align: left; white-space: normal; }
+/* 窄屏时徽标只留状态点，弹窗也随之收窄（否则它会盖住模型选择器）。
+ * 宽度写 min() 而非媒体查询覆盖：弹窗是 absolute，媒体查询命中时按钮虽已
+ * 收窄，但弹窗仍按 280px 渲染会显得与触发点不匹配。 */
+@media (max-width: 720px) { .dim-jh-badgePop { width: 220px; max-width: min(220px, 76vw); } }
 .dim-jh-badgeHead { display: flex; align-items: center; gap: 5px; padding-bottom: 7px; }
 .dim-jh-badgeTitle { flex: none; max-width: 118px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11.5px; font-weight: 600; color: var(--dsw-alias-label-primary); }
 .dim-jh-badgeAt { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 10px; color: var(--dsw-alias-label-tertiary); font-variant-numeric: tabular-nums; }
