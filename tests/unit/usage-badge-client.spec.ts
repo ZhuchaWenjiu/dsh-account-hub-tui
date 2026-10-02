@@ -315,6 +315,36 @@ describe('用量徽标：弹窗的紧凑布局（信息一项不少）', () => {
     expect(badge).toMatch(/title: autoTitle/)
   })
 
+  it('自动签到状态文字**常驻**（不自动消失），由文字上方的小叉手动关闭', () => {
+    // 用户 2026-10-02：「自动签到状态下，下方应该也显示文字状态，这样才能够知道各个
+    // 渠道的签到状态。但是自动签到状态下不要给我自动取消文字，给我开放手动关闭文字
+    // 显示，在文字上方放个小按钮，点击直接关闭。」
+    expect(badge).toContain('function renderAutoStatus()')
+    expect(badge).toContain("className: 'dim-jh-badgeAutoStatus'")
+    // ⚠️ 小关闭按钮在**文字上方**（closerow 排在 head 之前），且是「×」
+    expect(badge).toContain("className: 'dim-jh-badgeAutoCloseRow'")
+    expect(badge).toMatch(/\}, '×'\)/)
+    const closerAt = badge.indexOf("className: 'dim-jh-badgeAutoCloseRow'")
+    const headAt = badge.indexOf("className: 'dim-jh-badgeAutoStatusHead'")
+    expect(closerAt).toBeGreaterThan(-1)
+    expect(headAt, '关闭按钮必须排在状态文字之前（视觉上在上方）').toBeGreaterThan(closerAt)
+    // ⚠️ **绝不接进**那条「按时自动消失」的计时器：两者语义不同
+    //（手动签到结果是回执 8s/20s 消失；自动签到状态是状态，只手动关）
+    expect(badge).toMatch(/\}, \[claimNotice\]\);/)
+    expect(badge).not.toMatch(/setClaimNotice\(null\), [A-Z_]*AUTO/)
+    // 逐渠道明细（用户要「知道各个渠道的签到状态」）
+    expect(badge).toContain("className: 'dim-jh-badgeAutoChannels'")
+    expect(badge).toContain('providerLabel(entry.provider)')
+    // 显示条件：开关打开 + 用户没关掉这一轮 + 有内容
+    expect(badge).toMatch(/if \(auto\?\.enabled !== true \|\| auto\.dismissed === true\) return null;/)
+    // 关闭走独立 RPC（dismiss），不是改开关
+    expect(badge).toContain('await dismissAutoCheckin();')
+    // ⚠️ `index` 是另一个 describe 里的局部变量，这里自己读一次
+    expect(read('plugin-src/client/index.js'))
+      .toContain("dismissAutoCheckin: () => rpcCall('usage.autoCheckin', { dismiss: true })")
+    expect(styles).toMatch(/\.dim-jh-badgeAutoCloseRow \{[^}]*justify-content: flex-end/)
+  })
+
   it('浅色模式下按钮与线条可见（用主题描边，取消上一轮的「去线条」）', () => {
     // 用户 2026-10-02：「浅色模式下按钮和线条不太明显」
     // 刷新键与签到按钮都要有主题描边（浅色下 layer-2 与弹窗底色几乎同色）

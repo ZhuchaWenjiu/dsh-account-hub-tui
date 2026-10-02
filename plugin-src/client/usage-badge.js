@@ -93,7 +93,7 @@ export function UsageBadge(props) {
 
 /** 展开态的完整实现（数据、轮询、弹窗）。 */
 function UsageBadgeActive(props) {
-  const { provider, providerLabel, readBadge, writePreference, setAutoCheckin, claimCredits } = props;
+  const { provider, providerLabel, readBadge, writePreference, setAutoCheckin, dismissAutoCheckin, claimCredits } = props;
   const label = providerLabel(provider);
 
   /** `{ value, at }`：宿主返回的读数 + **到达**本地的时刻（兜底显示用）。 */
@@ -255,6 +255,17 @@ function UsageBadgeActive(props) {
       if (next) setTimeout(() => read.current(), 12_000);
     } catch (error) {
       setAutoError(error?.message || '自动签到开关保存失败');
+    }
+  };
+
+  /** 关闭那行常驻的自动签到状态文字（只关当前这一轮；下一轮结果会重新出现）。 */
+  const onDismissAuto = async () => {
+    setAutoError('');
+    try {
+      await dismissAutoCheckin();
+      read.current();
+    } catch (error) {
+      setAutoError(error?.message || '关闭自动签到状态失败');
     }
   };
 
@@ -699,6 +710,49 @@ function UsageBadgeActive(props) {
         className: 'dim-jh-badgeNotice',
         'data-tone': 'warn',
       }, message)),
+      renderAutoStatus(),
+    ]);
+  }
+
+  /**
+   * **常驻**的自动签到状态文字（用户 2026-10-02 的第三轮要求）。
+   *
+   * 与上面那条手动签到结果的区别（**两者语义不同，别合并**）：
+   * - 手动签到结果：按时**自动消失**（成功 8s / 警告 20s），因为它是「刚做完这件事」的回执；
+   * - 自动签到状态：**不自动消失**，由用户点上方那个小按钮手动关闭 —— 用户要能随时
+   *   「知道各个渠道的签到状态」，自动消失会让它永远看不到。
+   *
+   * 显示条件：开关打开、用户没关掉**这一轮**、且有内容可显示（跑过一轮，或正在跑）。
+   * 逐渠道明细由宿主记录（`state.channels`），这里只做展示与渠道名映射。
+   */
+  function renderAutoStatus() {
+    if (auto?.enabled !== true || auto.dismissed === true) return null;
+    const channels = Array.isArray(auto.channels) ? auto.channels : [];
+    const running = auto.running === true;
+    if (!running && channels.length === 0) return null;
+    const stamp = running ? '' : formatUpdatedAt(auto.lastAt);
+    return React.createElement('div', { key: 'autostatus', className: 'dim-jh-badgeAutoStatus' }, [
+      // 小关闭按钮在**文字上方**（用户：「在文字上方放个小按钮，点击直接关闭」）。
+      React.createElement('div', { key: 'closerow', className: 'dim-jh-badgeAutoCloseRow' },
+        React.createElement('button', {
+          key: 'close',
+          type: 'button',
+          className: 'dim-jh-badgeAutoClose',
+          title: '关闭这行自动签到状态（下一轮自动签到后会重新出现）',
+          'aria-label': '关闭自动签到状态文字',
+          onClick: () => { void onDismissAuto(); },
+        }, '×')),
+      React.createElement('div', { key: 'head', className: 'dim-jh-badgeAutoStatusHead' },
+        running
+          ? '自动签到 · 进行中…'
+          : `自动签到${stamp === '' ? '' : ` · ${stamp}`}：${auto.lastResult}`),
+      channels.length === 0
+        ? null
+        : React.createElement('div', { key: 'channels', className: 'dim-jh-badgeAutoChannels' },
+          channels.map((entry, index) => React.createElement('span', {
+            key: `${entry.provider}-${index}`,
+            className: 'dim-jh-badgeAutoChannel',
+          }, `${providerLabel(entry.provider)} ${entry.text}`))),
     ]);
   }
 

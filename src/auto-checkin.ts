@@ -5,8 +5,13 @@
  *
  * DSH 启动后延迟一小段（默认 30 秒，见下），若这个开关开着、且**今天（UTC+8）
  * 还没跑过**，就串行遍历「账号池里真的有账号的渠道」，逐个调内部
- * `credits.claimAll`；跑完把日期与结果摘要写进文档 ⇒ **当天不再触发**。
+ * `credits.claimAll`；跑完把日期与**逐渠道结果**写进文档 ⇒ **当天不再触发**。
  * 用户手动点「全部渠道签到」不受此限（那是显式操作，永远放行）。
+ *
+ * ⚠️ **开关默认打开**（用户 2026-10-02 明确要求：「自动签到默认保持打开状态」）。
+ * 这与「这是代用户打上游的写操作」相权：该特性本身是用户要的，默认开启才符合
+ * 「每日第一次打开 DSH 就自动签到」的预期；用户随时可以在状态灯上关掉。
+ * 判据是**只有显式 `false` 才算关闭**（与本仓库账号的 `enabled !== false` 同惯例）。
  *
  * ## 为什么延迟 30 秒
  *
@@ -59,21 +64,63 @@ const SCHEMA = 'dsh-codearts-auth/auto-checkin/v1'
  * 文档内容。
  *
  * `lastDate` / `lastResult` 既是「当天不重复触发」的判据，也是状态灯提示的来源
- * （用户要求「记录签到状态，不多次重复触发」）。
+ * （用户要求「记录签到状态，不多次重复触发」）。`channels` 是**逐渠道**结果，
+ * 供面板上那行常驻的自动签到状态文字使用（用户 2026-10-02：「自动签到状态下，
+ * 下方应该也显示文字状态，这样才能够知道各个渠道的签到状态」）。
  */
 export interface AutoCheckinDoc {
-  /** 自动签到开关。**默认关闭**：这是会代用户打上游的写操作，须显式开启。 */
+  /**
+   * 自动签到开关。**默认打开**（用户 2026-10-02 明确要求：「自动签到默认保持打开
+   * 状态」）—— 故判据是「只有显式 `false` 才算关闭」，与本仓库账号的
+   * `enabled !== false` 惯例一致。
+   */
   enabled: boolean
   /** 上次**完成**自动签到的 UTC+8 日期（`YYYY-MM-DD`）；空串 = 从未跑过。 */
   lastDate: string
-  /** 上次结果摘要（中文短句，直接展示）。 */
+  /** 上次结果摘要（中文短句，展示在状态灯提示里）。 */
   lastResult: string
+  /** 上次跑完的时刻（毫秒）；0 = 从未跑过。 */
+  lastAt: number
+  /** 逐渠道结果（顺序即遍历顺序）；空数组 = 没有可展示的逐渠道信息。 */
+  channels: Array<{ provider: string; text: string }>
+  /**
+   * 用户点过「关闭」的那一轮（存的是那一刻的 `lastAt`）。
+   *
+   * ⚠️ 存 `lastAt` 而不是布尔：新一轮跑出来 `lastAt` 变了，状态文字就会**重新出现**
+   *（否则用户关过一次以后就再也看不到新的结果）。0 = 未曾关闭过。
+   */
+  dismissedRunAt: number
 }
 
-/** 默认：关闭 + 无记录。 */
-export const DEFAULT_AUTO_CHECKIN: AutoCheckinDoc = { enabled: false, lastDate: '', lastResult: '' }
+/** 默认：打开 + 无记录。 */
+export const DEFAULT_AUTO_CHECKIN: AutoCheckinDoc = {
+  enabled: true,
+  lastDate: '',
+  lastResult: '',
+  lastAt: 0,
+  channels: [],
+  dismissedRunAt: 0,
+}
 
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/
+
+/** 逐渠道条目的上限：渠道总数就 12 个，留一点余量即可（脏数据不该撑大文档）。 */
+const MAX_CHANNEL_ENTRIES = 24
+
+/** 归一化逐渠道结果（丢非法项、截断超长文本、限制条数）。 */
+function sanitizeChannels(raw: unknown): Array<{ provider: string; text: string }> {
+  if (!Array.isArray(raw)) return []
+  const out: Array<{ provider: string; text: string }> = []
+  for (const item of raw) {
+    if (typeof item !== 'object' || item === null || Array.isArray(item)) continue
+    const record = item as Record<string, unknown>
+    if (typeof record.provider !== 'string' || record.provider.length === 0) continue
+    if (typeof record.text !== 'string') continue
+    out.push({ provider: record.provider, text: record.text.slice(0, 120) })
+    if (out.length >= MAX_CHANNEL_ENTRIES) break
+  }
+  return out
+}
 
 /**
  * 归一化文档：非法值一律回落默认值（**不抛错**）。
@@ -81,15 +128,24 @@ const DATE_RE = /^\d{4}-\d{2}-\d{2}$/
  * ⚠️ 与 RPC 写入路径的严格校验**不冲突**：那条路径面对用户输入，要拒绝非法值；
  * 这条路径面对**磁盘上的脏数据**（手工编辑过、被旧版本写坏），回落比整机不可用
  * 更合理 —— 判据口径与 `sanitizeBadgePreference` 一致。
+ * ⚠️ 缺新字段的**旧文档**（没有 `channels` / `lastAt` / `enabled`）必须照常读出来：
+ * 前两个是本功能上线后追加的，而 `enabled` 缺失要按**默认打开**处理（不是关闭）。
  */
 export function sanitizeAutoCheckin(raw: unknown): AutoCheckinDoc {
   if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) return { ...DEFAULT_AUTO_CHECKIN }
   const record = raw as Record<string, unknown>
+  const ms = (value: unknown): number => (typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : 0)
   return {
-    // 只认显式 `true`：`'true'` / `1` 都不算（避免脏数据把开关悄悄打开）。
-    enabled: record.enabled === true,
+    // ⚠️ **只有显式 `false` 才算关闭**（默认是打开的，见 `AutoCheckinDoc.enabled`）：
+    // 写成 `=== true` 会让旧文档（没有该字段）与脏数据把开关静默关掉，与
+    // 「默认保持打开状态」相反。`'false'` / `0` 这些非布尔值一律按打开处理 ——
+    // 它们不是用户点出来的值。
+    enabled: record.enabled !== false,
     lastDate: typeof record.lastDate === 'string' && DATE_RE.test(record.lastDate) ? record.lastDate : '',
     lastResult: typeof record.lastResult === 'string' ? record.lastResult : '',
+    lastAt: ms(record.lastAt),
+    channels: sanitizeChannels(record.channels),
+    dismissedRunAt: ms(record.dismissedRunAt),
   }
 }
 
@@ -178,6 +234,9 @@ class FileAutoCheckinStore implements AutoCheckinStore {
       enabled: doc.enabled,
       lastDate: doc.lastDate,
       lastResult: doc.lastResult,
+      lastAt: doc.lastAt,
+      channels: doc.channels,
+      dismissedRunAt: doc.dismissedRunAt,
     }, null, 2), 'utf-8')
     renameSync(tmp, this.path)
   }
@@ -254,6 +313,32 @@ export function shouldMarkToday(totals: RunTotals): boolean {
   return totals.claimed + totals.alreadyClaimed > 0
 }
 
+/**
+ * 单个渠道的短状态（面板上那行常驻文字用它逐渠道列出，用户要求「这样才能够知道
+ * **各个渠道**的签到状态」）。
+ *
+ * ⚠️ 必须**短**：9 个渠道要挤在 280px 的面板里一行一个片段，长文案会撑成好几屏。
+ * 故只给「几个账号 + 什么结果」，不带渠道名（渠道名由展示层补）。
+ */
+export function describeChannel(summary: {
+  claimed: number
+  totalCredit: number
+  alreadyClaimed: number
+  inactive: number
+  failed: number
+}): string {
+  const parts: string[] = []
+  if (summary.claimed > 0) {
+    // ⚠️ 「领到了但 +0 分」与「今天已领」必须能分辨：前者写成「已领」会和
+    // alreadyClaimed 撞词，用户无法判断这次到底有没有动作。
+    parts.push(summary.totalCredit > 0 ? `${summary.claimed} 个 +${summary.totalCredit}` : `${summary.claimed} 个领取成功`)
+  }
+  if (summary.alreadyClaimed > 0) parts.push(`${summary.alreadyClaimed} 个今天已领`)
+  if (summary.failed > 0) parts.push(`${summary.failed} 个失败`)
+  if (summary.inactive > 0) parts.push(`${summary.inactive} 个未开启`)
+  return parts.length === 0 ? '无可领' : parts.join('，')
+}
+
 /** 装配层注入的依赖（全部可替换 ⇒ 单测零网络、零文件系统、零等待）。 */
 export interface AutoCheckinDeps {
   store: AutoCheckinStore
@@ -282,6 +367,14 @@ export interface AutoCheckin {
   state(): RpcUsageAutoCheckinState
   /** 写开关；**打开时若今天还没跑过，立刻跑一轮**（否则用户会以为开关没生效）。 */
   setEnabled(enabled: boolean): Promise<RpcUsageAutoCheckinState>
+  /**
+   * 关闭面板上那行**常驻的**自动签到状态文字（用户点它上方的小按钮时调用）。
+   *
+   * ⚠️ 与手动签到的结果提示不同：那条是**按时自动消失**；这一条是用户要求
+   * 「不要自动取消、给我开放手动关闭」。关闭记的是**这一轮**（当前的 `lastAt`），
+   * 故下一轮跑出新结果时它会重新出现。
+   */
+  dismiss(): Promise<RpcUsageAutoCheckinState>
   /** 启动时调用一次：延迟后排定一轮（内部自己判开关与当天是否已跑）。 */
   start(): void
   /** 立刻按判据跑一轮（供「刚打开开关」与单测用）。 */
@@ -308,6 +401,10 @@ export function createAutoCheckin(deps: AutoCheckinDeps): AutoCheckin {
       ranToday: doc.lastDate !== '' && doc.lastDate === today(),
       running,
       lastResult: doc.lastResult,
+      lastAt: doc.lastAt,
+      channels: doc.channels.map((entry) => ({ ...entry })),
+      // 面板据它决定要不要渲染那行常驻状态文字
+      dismissed: doc.lastAt > 0 && doc.dismissedRunAt === doc.lastAt,
     }
   }
 
@@ -321,12 +418,14 @@ export function createAutoCheckin(deps: AutoCheckinDeps): AutoCheckin {
       deps.warn?.(`[jet-hub] 自动签到：读取账号池失败，本次跳过: ${String(error)}`)
       return
     }
+    const channels: Array<{ provider: string; text: string }> = []
     for (const provider of providers) {
       let result: BadgeRpcResult<RpcCreditsClaimAllResponse>
       try {
         result = await deps.claim(provider)
       } catch (error) {
         totals.errors += 1
+        channels.push({ provider, text: '出错' })
         deps.warn?.(`[jet-hub] 自动签到：${provider} 调用异常: ${String(error)}`)
         continue
       }
@@ -334,20 +433,26 @@ export function createAutoCheckin(deps: AutoCheckinDeps): AutoCheckin {
         const message = typeof result.error?.message === 'string' ? result.error.message : ''
         if (isUnsupportedCheckin(message)) {
           totals.skipped += 1
+          channels.push({ provider, text: '无签到接口' })
           continue
         }
         totals.errors += 1
+        channels.push({ provider, text: '出错' })
         deps.warn?.(`[jet-hub] 自动签到：${provider} 失败: ${message || '未知错误'}`)
         continue
       }
       totals.providers += 1
       const summary = result.value?.summary
-      if (summary === undefined) continue
+      if (summary === undefined) {
+        channels.push({ provider, text: '无可领' })
+        continue
+      }
       totals.claimed += summary.claimed
       totals.totalCredit += summary.totalCredit
       totals.alreadyClaimed += summary.alreadyClaimed
       totals.inactive += summary.inactive
       totals.failed += summary.failed
+      channels.push({ provider, text: describeChannel(summary) })
     }
 
     if (!shouldMarkToday(totals)) {
@@ -359,7 +464,16 @@ export function createAutoCheckin(deps: AutoCheckinDeps): AutoCheckin {
       return
     }
 
-    doc = { ...doc, lastDate: today(), lastResult: describeRun(totals) }
+    doc = {
+      ...doc,
+      lastDate: today(),
+      lastResult: describeRun(totals),
+      lastAt: now(),
+      channels,
+      // ⚠️ 新一轮跑完要**清掉上一次的「已关闭」标记**：否则用户关过一次后，
+      // 明天的新结果会被旧标记静默藏住（`dismissed` 的判据是 lastAt 相等）。
+      dismissedRunAt: 0,
+    }
     try {
       await deps.store.save(doc)
     } catch (error) {
@@ -410,6 +524,17 @@ export function createAutoCheckin(deps: AutoCheckinDeps): AutoCheckin {
       pending = (deps.schedule ?? defaultSchedule)(fire, ms)
     },
     runIfDue,
+    async dismiss() {
+      // 记「关闭的是哪一轮」（当前的 lastAt）：下一轮跑完 lastAt 会变，文字自动回来。
+      doc = { ...doc, dismissedRunAt: doc.lastAt }
+      try {
+        await deps.store.save(doc)
+      } catch (error) {
+        // 写盘失败 ⇒ 重开面板时那行文字会再出现（还可再点一次关闭），如实告警。
+        deps.warn?.(`[jet-hub] 自动签到状态文字关闭标记写入失败: ${String(error)}`)
+      }
+      return state()
+    },
     stop() {
       pending?.cancel()
       pending = null

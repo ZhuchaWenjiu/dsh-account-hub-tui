@@ -108,6 +108,8 @@ export function apply(ctx) {
       writePreference: (preference) => rpcCall('usage.badgePreference', { preference }),
       // 自动签到开关（全局一个，不分渠道）：宿主在「打开」时会立刻跑一轮。
       setAutoCheckin: (enabled) => rpcCall('usage.autoCheckin', { enabled }),
+      // 关闭那行**常驻**的自动签到状态文字（只关当前这一轮，下一轮会重新出现）。
+      dismissAutoCheckin: () => rpcCall('usage.autoCheckin', { dismiss: true }),
       claimCredits: (provider) => rpcCall('credits.claimAll', { provider }),
     }),
   }, UsageBadge))

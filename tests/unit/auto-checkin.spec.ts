@@ -5,6 +5,7 @@ import {
   DSH_JET_HUB_AUTO_CHECKIN_DELAY_MS,
   autoCheckinDelayMs,
   createAutoCheckin,
+  describeChannel,
   describeRun,
   isUnsupportedCheckin,
   sanitizeAutoCheckin,
@@ -109,12 +110,43 @@ describe('自动签到：日界与配置', () => {
     expect(utc8DateString(Date.UTC(2026, 0, 1, 0, 0, 0))).toBe('2026-01-01')
   })
 
-  it('开关默认关闭，且脏数据只认显式 true', () => {
-    expect(DEFAULT_AUTO_CHECKIN.enabled).toBe(false)
-    expect(sanitizeAutoCheckin(undefined).enabled).toBe(false)
-    expect(sanitizeAutoCheckin({ enabled: 'true' }).enabled).toBe(false)
-    expect(sanitizeAutoCheckin({ enabled: 1 }).enabled).toBe(false)
-    expect(sanitizeAutoCheckin({ enabled: true }).enabled).toBe(true)
+  it('开关默认**打开**（用户 2026-10-02：「自动签到默认保持打开状态」）', () => {
+    expect(DEFAULT_AUTO_CHECKIN.enabled).toBe(true)
+    expect(sanitizeAutoCheckin(undefined).enabled).toBe(true)
+    // ⚠️ 只有**显式 `false`** 才算关闭：旧文档没有该字段、以及非布尔脏数据
+    // （`'false'` / `0` 都不是用户点出来的值）都按默认打开处理。
+    expect(sanitizeAutoCheckin({}).enabled).toBe(true)
+    expect(sanitizeAutoCheckin({ enabled: 'false' }).enabled).toBe(true)
+    expect(sanitizeAutoCheckin({ enabled: 0 }).enabled).toBe(true)
+    expect(sanitizeAutoCheckin({ enabled: false }).enabled).toBe(false)
+  })
+
+  it('缺新字段的旧文档照常读出来（channels / lastAt / dismissedRunAt 都是追加的）', () => {
+    const old = sanitizeAutoCheckin({ enabled: true, lastDate: '2026-10-01', lastResult: '2 个渠道：1 个账号领取成功' })
+    expect(old).toMatchObject({ enabled: true, lastDate: '2026-10-01', lastAt: 0, dismissedRunAt: 0 })
+    expect(old.channels).toEqual([])
+  })
+
+  it('逐渠道结果与 dismiss 标记的归一化（脏数据不撑大文档）', () => {
+    const doc = sanitizeAutoCheckin({
+      enabled: true,
+      lastAt: 1234,
+      dismissedRunAt: 1234,
+      channels: [
+        { provider: 'buddy', text: '2 个 +800' },
+        { provider: '', text: 'x' }, // 无 provider → 丢弃
+        { provider: 'qoder' }, // 无 text → 丢弃
+        'not-an-object',
+        { provider: 'cline', text: 'y'.repeat(500) }, // 超长 → 截断
+      ],
+    })
+    expect(doc.channels).toEqual([
+      { provider: 'buddy', text: '2 个 +800' },
+      { provider: 'cline', text: 'y'.repeat(120) },
+    ])
+    expect(doc.dismissedRunAt).toBe(1234)
+    // 非法时间戳回落 0
+    expect(sanitizeAutoCheckin({ lastAt: -5, dismissedRunAt: 'x' })).toMatchObject({ lastAt: 0, dismissedRunAt: 0 })
   })
 
   it('lastDate 必须是 YYYY-MM-DD，否则回落空串（脏数据不该让当天被判为已跑）', () => {
@@ -291,6 +323,70 @@ describe('自动签到：开关与启动排定', () => {
     runner.start()
     runner.start()
     expect(scheduled).toHaveLength(1)
+  })
+})
+
+/**
+ * 「常驻状态文字 + 手动关闭」的行为回归（用户 2026-10-02 第三轮要求）。
+ *
+ * 关键语义（写错就会变成「关一次以后再也看不到」或「关不掉」）：
+ * - 状态文字**不自动消失**，由用户点文字上方的小叉关闭；
+ * - 关闭记的是**这一轮**（`lastAt`）⇒ 下一轮跑出新结果时它**重新出现**；
+ * - 逐渠道结果要能列出每个渠道的简短状态。
+ */
+describe('自动签到：常驻状态文字与手动关闭', () => {
+  it('跑完记录逐渠道结果与时刻，且默认未关闭', async () => {
+    const { runner, store } = makeRunner({
+      providers: ['buddy', 'cline', 'qoder'],
+      claim: async (provider) => {
+        if (provider === 'cline') return unsupported()
+        if (provider === 'buddy') return ok({ claimed: 2, totalCredit: 800 })
+        return ok({ alreadyClaimed: 1 })
+      },
+    })
+    await runner.runIfDue()
+    const state = runner.state()
+    expect(state.channels).toEqual([
+      { provider: 'buddy', text: '2 个 +800' },
+      { provider: 'cline', text: '无签到接口' },
+      { provider: 'qoder', text: '1 个今天已领' },
+    ])
+    expect(state.lastAt).toBe(NOON_UTC8)
+    expect(state.dismissed).toBe(false)
+    // 逐渠道文本要落盘（重启后仍能看到上次各渠道状态）
+    expect(store.current().channels).toHaveLength(3)
+  })
+
+  it('dismiss() 只关掉**当前这一轮**：下一轮结果会重新出现', async () => {
+    const time = clock(NOON_UTC8)
+    const { runner } = makeRunner({ now: time.now, providers: ['buddy'] })
+    await runner.runIfDue()
+    expect(runner.state().dismissed).toBe(false)
+
+    const afterDismiss = await runner.dismiss()
+    expect(afterDismiss.dismissed).toBe(true)
+
+    // 换到第二天再跑一轮 ⇒ lastAt 变了，关闭标记失效，文字自动回来
+    time.set(NOON_UTC8 + 86_400_000)
+    await runner.runIfDue()
+    expect(runner.state().dismissed).toBe(false)
+  })
+
+  it('从未跑过时 dismiss 不产生「已关闭」的假状态', async () => {
+    const { runner } = makeRunner({ initial: { enabled: false } })
+    const state = await runner.dismiss()
+    // lastAt 为 0 ⇒ 没有可关闭的那一轮，不该显示成 dismissed（否则会永远看不到第一次结果）
+    expect(state.dismissed).toBe(false)
+  })
+
+  it('describeChannel 逐渠道短文案（不含渠道名，展示层补）', () => {
+    expect(describeChannel({ claimed: 2, totalCredit: 800, alreadyClaimed: 0, inactive: 0, failed: 0 })).toBe('2 个 +800')
+    expect(describeChannel({ claimed: 0, totalCredit: 0, alreadyClaimed: 3, inactive: 0, failed: 0 })).toBe('3 个今天已领')
+    // ⚠️「领到但 +0 分」不能说成「已领」：会和 alreadyClaimed 撞词，看不出这次有没有动作
+    expect(describeChannel({ claimed: 1, totalCredit: 0, alreadyClaimed: 1, inactive: 0, failed: 1 }))
+      .toBe('1 个领取成功，1 个今天已领，1 个失败')
+    expect(describeChannel({ claimed: 0, totalCredit: 0, alreadyClaimed: 0, inactive: 2, failed: 0 })).toBe('2 个未开启')
+    expect(describeChannel({ claimed: 0, totalCredit: 0, alreadyClaimed: 0, inactive: 0, failed: 0 })).toBe('无可领')
   })
 })
 

@@ -3498,6 +3498,28 @@ function registerJetHubEndpoints(
        */
       case 'usage.autoCheckin': {
         const req = payload as RpcUsageAutoCheckinRequest
+        /**
+         * 关闭那行**常驻**的自动签到状态文字。
+         *
+         * ⚠️ 与 `enabled` 分开判而不是「先 dismiss 再 enabled」：两者语义独立，
+         * 一次请求只该做一件事 —— 否则 `{ dismiss: true, enabled: true }` 会
+         * 既关文字又改开关，客户端将来误传就难查。
+         */
+        if (req.dismiss !== undefined) {
+          if (typeof req.dismiss !== 'boolean') {
+            return {
+              ok: false,
+              error: {
+                code: 'bad-request',
+                message: `dismiss 必须是布尔值（收到：${JSON.stringify(req.dismiss)}）`,
+              },
+            }
+          }
+          if (req.dismiss) {
+            const value: RpcUsageAutoCheckinResponse = { autoCheckin: await autoCheckin.dismiss() }
+            return { ok: true, value }
+          }
+        }
         if (req.enabled === undefined) {
           const value: RpcUsageAutoCheckinResponse = { autoCheckin: autoCheckin.state() }
           return { ok: true, value }

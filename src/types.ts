@@ -1129,19 +1129,40 @@ export interface RpcUsageAutoCheckinState {
   running: boolean
   /** 上次结果摘要（中文短句，展示在状态灯提示里）。 */
   lastResult: string
+  /** 上次跑完的时刻（毫秒）；0 = 从未跑过。面板上的时间戳用它。 */
+  lastAt: number
+  /**
+   * **逐渠道**结果（顺序即遍历顺序，文本形如 `2 个 +800` / `今天已领` /
+   * `无签到接口` / `出错`）。
+   *
+   * 用户 2026-10-02：「自动签到状态下，下方应该也显示文字状态，这样才能够知道
+   * 各个渠道的签到状态」—— 汇总句看不出是哪个渠道，故这里给逐渠道明细。
+   */
+  channels: Array<{ provider: string; text: string }>
+  /**
+   * 用户是否已手动关闭那行**常驻**的自动签到状态文字。
+   *
+   * ⚠️ 判据是「关闭的是当前这一轮」：新一轮跑出结果后自动变回 `false`
+   *（否则用户关过一次就再也看不到新结果了）。
+   */
+  dismissed: boolean
 }
 
 /**
- * RPC: 读写「每日首次启动自动签到」开关。
+ * RPC: 读写「每日首次启动自动签到」开关，以及关闭常驻状态文字。
  *
- * ⚠️ `enabled` **省略 = 只读**；给出时必须是布尔值 —— 非法值一律 `bad-request`，
- * **不做**静默回落（与本仓库 `usage.badgePreference` 同口径：回落会让「设置没生效」
- * 看起来像「保存成功」）。磁盘脏数据的容错在 `sanitizeAutoCheckin`。
+ * ⚠️ `enabled` 与 `dismiss` 都**省略 = 只读**；给出时必须是布尔值 —— 非法值一律
+ * `bad-request`，**不做**静默回落（与本仓库 `usage.badgePreference` 同口径：
+ * 回落会让「设置没生效」看起来像「保存成功」）。磁盘脏数据的容错在
+ * `sanitizeAutoCheckin`。
  * ⚠️ 打开开关时宿主会**立刻尝试一轮**（今天已跑过则内部拦住）：否则用户今天点了
  * 开关要等到明天才有动作，看起来像没生效。
+ * ⚠️ `dismiss: true` 只关掉**当前这一轮**的状态文字（下一轮结果会重新出现）——
+ * 手动签到的结果提示是按时自动消失的，两者语义不同，别合并。
  */
 export interface RpcUsageAutoCheckinRequest {
   enabled?: boolean
+  dismiss?: boolean
 }
 
 /** RPC: 自动签到开关响应（回显写入后的生效状态）。 */
