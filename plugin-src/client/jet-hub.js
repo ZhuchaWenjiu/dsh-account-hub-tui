@@ -26,6 +26,20 @@ import {
 } from './account-model-link.js';
 import { bulkButtonState } from './model-bulk.js';
 import {
+  copyToClipboard,
+  formatModelIdList,
+  gatewayApiKeyHint,
+  gatewayButtonLabel,
+  gatewayButtonTitle,
+  gatewayEndpoint,
+  gatewayModelsCurl,
+  gatewayModelsHint,
+  gatewayStatusLines,
+  gatewaySwitchDisabled,
+  gatewayToggleNotice,
+  modelCapabilityBadge,
+} from './openai-gateway-panel.js';
+import {
   filterModels,
   isFilterActive,
 } from './model-filter.js';
@@ -3008,6 +3022,190 @@ function ProviderSwitchPanel({ providers, statuses, statusFailed, busyIds, onTog
       })))));
 }
 
+/**
+ * 「本机 OpenAI 网关」弹窗。
+ *
+ * 展示三件用户配外部客户端时真正需要的信息：**开关**、**对外地址**、**密钥在哪**。
+ *
+ * ⚠️ 三条约束：
+ * 1. **地址只在真监听时显示**：端口可被 `DSH_OPENAI_GATEWAY_PORT` 改过，
+ *    没在监听时回显一个连不上的地址比不显示更糟。
+ * 2. **不在这里显示 API Key 本身**：密钥是凭据，弹窗里明文展示等于把凭据复制到
+ *    剪贴板/截图里。只告诉用户它存在哪、由哪个环境变量覆盖。
+ * 3. **状态全部来自宿主侧**（`gateway.getEnabled`），前端不拿 `enabled` 自行
+ *    推导运行态 —— 端口冲突与 env 停用都会让两者不一致。
+ */
+function GatewayPanel({ status, busy, notice, onToggle, onReload, onClose }) {
+  const [copied, setCopied] = React.useState(false);
+  const [revealed, setRevealed] = React.useState(false);
+  const [modelsOpen, setModelsOpen] = React.useState(false);
+  const [idsCopied, setIdsCopied] = React.useState(false);
+  const apiKey = status?.apiKey ?? null;
+  const models = status?.models ?? [];
+
+  // 每次重新打开/换密钥后复位：否则上一条「已复制」会挂在新密钥旁边误导用户。
+  React.useEffect(() => { setCopied(false); setRevealed(false); }, [status?.apiKey?.value]);
+  React.useEffect(() => { setIdsCopied(false); }, [models.length]);
+
+  React.useEffect(() => {
+    const onKeyDown = (event) => { if (event.key === 'Escape') onClose(); };
+    document.addEventListener('keydown', onKeyDown);
+    return () => document.removeEventListener('keydown', onKeyDown);
+  }, [onClose]);
+
+  /**
+   * 复制密钥。失败（无 Clipboard API / 非用户手势 / 权限被拒）必须给回退：
+   * 直接把密钥显示出来让用户手动选中，否则就是「点了没反应」。
+   */
+  const handleCopy = async () => {
+    if (!apiKey) return;
+    const ok = await copyToClipboard(apiKey.value);
+    if (ok) {
+      setCopied(true);
+      return;
+    }
+    setRevealed(true);
+    setCopied(false);
+  };
+
+  /**
+   * 复制全部模型 ID（每行一个）。
+   *
+   * 失败时展开列表让用户手动选中 —— 与密钥同理，不能「点了没反应」。
+   */
+  const handleCopyModelIds = async () => {
+    const text = formatModelIdList(models);
+    if (!text) return;
+    const ok = await copyToClipboard(text);
+    setIdsCopied(ok);
+    if (!ok) setModelsOpen(true);
+  };
+
+  const disabled = gatewaySwitchDisabled(status);
+  const action = status?.enabled ? '关闭' : '打开';
+
+  return React.createElement('div', {
+    className: 'dim-jh-modalOverlay dim-jh-modalOverlay--top',
+    onClick: (event) => { if (event.target === event.currentTarget) onClose(); },
+  },
+  React.createElement('div', {
+    className: 'dim-jh-modal',
+    role: 'dialog',
+    'aria-modal': 'true',
+    'aria-label': '本机 OpenAI 网关',
+  },
+  React.createElement('div', { className: 'dim-jh-modalHead' },
+    React.createElement('div', { className: 'dim-jh-modalTitle' },
+      React.createElement('strong', null, '本机 OpenAI 网关')),
+    React.createElement('div', { className: 'dim-jh-modelPanelActions' },
+      React.createElement('button', {
+        className: 'dim-jh-btn',
+        title: '重新读取网关状态。',
+        onClick: () => void onReload(),
+      }, '刷新'),
+      React.createElement('button', {
+        className: 'dim-jh-btn',
+        'data-kind': 'primary',
+        onClick: onClose,
+      }, '完成'))),
+  React.createElement('div', { className: 'dim-jh-modalBody' },
+    React.createElement('label', { className: 'dim-jh-modelRow' },
+      React.createElement('span', { className: 'dim-jh-modelInfo' },
+        React.createElement('strong', { className: 'dim-jh-modelName' }, '启用本机网关'),
+        React.createElement('code', { className: 'dim-jh-modelId' },
+          action + '（在 127.0.0.1 监听，供 Pi / Continue / Cline / OpenCode 等客户端调用）')),
+      React.createElement('input', {
+        type: 'checkbox',
+        className: 'dim-jh-switch',
+        role: 'switch',
+        checked: status?.enabled === true,
+        // 被 env 停用时禁用而非「点了没反应」：让用户做一次明知无效的操作更困惑。
+        disabled: disabled || busy,
+        'aria-label': action + '本机网关',
+        onChange: () => void onToggle(!(status?.enabled === true)),
+      })),
+    gatewayStatusLines(status).map((line, index) =>
+      React.createElement('p', { key: `status-${index}`, className: 'dim-jh-modalHint' }, line)),
+    // 凭据区：默认**不**渲染明文（设置页会被截图/录屏/投屏）。点「复制」直接
+    // 进剪贴板；复制失败（无 Clipboard API、非用户手势、权限被拒）则退回显示
+    // 明文供手动选中 —— 绝不能变成「点了没反应」。
+    React.createElement('p', { className: 'dim-jh-modalHint' },
+      '鉴权用 Authorization: Bearer <网关 API Key>。'),
+    apiKey
+      ? React.createElement('div', { className: 'dim-jh-modelPanelActions', style: { marginTop: '4px' } },
+        React.createElement('button', {
+          className: 'dim-jh-btn',
+          'data-kind': 'primary',
+          title: '把密钥复制到剪贴板。明文会进入剪贴板历史，注意别在不信任的机器上这么做。',
+          onClick: () => void handleCopy(),
+        }, copied ? '已复制 ✓' : '复制 API Key'),
+        revealed
+          ? React.createElement('code', {
+            className: 'dim-jh-modelId',
+            style: { userSelect: 'all' },
+          }, apiKey.value)
+          : React.createElement('button', {
+            className: 'dim-jh-btn',
+            title: '自动复制不可用时用它显示明文，供手动选中。',
+            onClick: () => setRevealed(true),
+          }, '显示明文'))
+      : null,
+    React.createElement('p', { className: 'dim-jh-modalHint' }, gatewayApiKeyHint(apiKey)),
+
+    // ── 模型目录 ──
+    // 存在的理由：有些 agent（ZCode 等）**不会**主动扫 `/v1/models`，要靠用户
+    // 手工把 ID 填进配置。而该端点需要 Bearer 头，浏览器地址栏直接打开只会得到
+    // 401 —— 所以清单必须出现在设置页里。
+    React.createElement('p', { className: 'dim-jh-modalHint', style: { marginTop: '16px' } },
+      React.createElement('strong', null, '模型 ID（可用的完整清单）')),
+    React.createElement('p', { className: 'dim-jh-modalHint' }, gatewayModelsHint(models, status?.modelsSource)),
+    React.createElement('div', { className: 'dim-jh-modelPanelActions', style: { marginTop: '4px' } },
+      React.createElement('button', {
+        className: 'dim-jh-btn',
+        'data-kind': 'primary',
+        disabled: models.length === 0,
+        title: '把全部模型 ID 每行一个复制到剪贴板。',
+        onClick: () => void handleCopyModelIds(),
+      }, idsCopied ? '已复制 ✓' : `复制全部 ${models.length} 个 ID`),
+      React.createElement('button', {
+        className: 'dim-jh-btn',
+        'aria-expanded': modelsOpen ? 'true' : 'false',
+        onClick: () => setModelsOpen(open => !open),
+      }, modelsOpen ? '收起' : '展开清单')),
+    modelsOpen
+      ? React.createElement('div', { className: 'dim-jh-modelList', style: { marginTop: '6px' } },
+        models.map(model => {
+          // 「可发图片」只标在支持的那个上 —— 用户据此挑模型，而不是靠撞一次
+          // unsupported_content 才知道。数据来自宿主，与 /v1/models 同源。
+          const badge = modelCapabilityBadge(model);
+          return React.createElement('div', { key: model.id, className: 'dim-jh-modelRow' },
+            React.createElement('span', { className: 'dim-jh-modelInfo' },
+              React.createElement('code', { className: 'dim-jh-modelId' }, model.id),
+              React.createElement('span', { className: 'dim-jh-modelName' }, model.name),
+              badge
+                ? React.createElement('span', { className: 'dim-jh-modelBadge', title: '该模型接受图片输入。' }, badge)
+                : null));
+        }))
+      : null,
+    React.createElement('p', { className: 'dim-jh-modalHint' },
+      '也可以用命令行查看同一份目录（地址栏直接打开会返回 401，因为它需要 Bearer 头）：'),
+    React.createElement('code', {
+      className: 'dim-jh-modelId',
+      style: { display: 'block', marginTop: '4px', userSelect: 'all' },
+    }, gatewayModelsCurl(gatewayEndpoint(status))),
+    React.createElement('p', { className: 'dim-jh-modalHint' },
+      '网关只绑定 127.0.0.1，但这挡不住同机的其它用户或进程 —— 真正的隔离靠密钥，'
+      + '不要把它配置进任何浏览器端工具或扩展。'),
+    notice
+      ? React.createElement('div', {
+        className: 'dim-jh-probeNotice',
+        'data-tone': notice.tone,
+        role: notice.tone === 'error' ? 'alert' : 'status',
+        style: { marginTop: '10px' },
+      }, React.createElement('div', null, notice.text))
+      : null)));
+}
+
 export function JetHubPage({ close, rpcCall }) {
   const [selected, setSelected] = React.useState(PROVIDERS[0].id);
   // 每次切换 provider 时递增版号，强制重新挂载 ProviderPanel 触发 loadAccounts
@@ -3046,8 +3244,65 @@ export function JetHubPage({ close, rpcCall }) {
    * 用户就看不到自己刚做的那个操作的结果了。
    */
   const [providerNotice, setProviderNotice] = React.useState(null);
+  /**
+   * 本机网关的开关面板可见性与状态。
+   *
+   * ⚠️ `gatewayStatus` 初值为 `null`（= 未知），**不能**默认成「已开启」：
+   * 未知时按钮文字与开关都必须退化成中性态，否则一次读取失败就会让 UI 显示
+   * 「网关开着」而用户其实连不上。判据见 `openai-gateway-panel.js`。
+   */
+  const [showGateway, setShowGateway] = React.useState(false);
+  const [gatewayStatus, setGatewayStatus] = React.useState(null);
+  const [gatewayBusy, setGatewayBusy] = React.useState(false);
+  const [gatewayNotice, setGatewayNotice] = React.useState(null);
   const mounted = React.useRef(true);
   React.useEffect(() => () => { mounted.current = false; }, []);
+
+  /**
+   * 读取网关状态。
+   *
+   * 失败**不抛**、也不把 `gatewayStatus` 置成任何「像是有值」的状态：保持
+   * `null` 让 UI 退化成「读取中/未知」，并在提示条里说明原因。
+   */
+  const loadGatewayStatus = React.useCallback(async () => {
+    try {
+      const res = await rpcCall('gateway.getEnabled', {});
+      if (!mounted.current) return;
+      setGatewayStatus(res);
+    } catch (caught) {
+      console.error('[jet-hub] read gateway status failed:', caught);
+      if (!mounted.current) return;
+      setGatewayStatus(null);
+      setGatewayNotice({ tone: 'error', text: '读取网关状态失败：' + (caught?.message || '未知错误') });
+    }
+  }, [rpcCall]);
+
+  React.useEffect(() => { void loadGatewayStatus(); }, [loadGatewayStatus]);
+
+  /**
+   * 打开/关闭网关。
+   *
+   * ⚠️ **不做乐观更新**：网关是否真在监听取决于端口占用与环境变量两件前端看不见
+   * 的事，本地先改会让开关显示「已开启」而实际没跑起来。一律以服务端回传为准。
+   */
+  const toggleGateway = React.useCallback(async (nextEnabled) => {
+    setGatewayBusy(true);
+    setGatewayNotice(null);
+    try {
+      const res = await rpcCall('gateway.setEnabled', { enabled: nextEnabled });
+      if (!mounted.current) return;
+      setGatewayStatus(res);
+      setGatewayNotice({ tone: 'ok', text: gatewayToggleNotice(res, nextEnabled) });
+    } catch (caught) {
+      console.error('[jet-hub] toggle gateway failed:', caught);
+      if (!mounted.current) return;
+      // 保留原状态：重新拉一次以确保与服务端一致。
+      setGatewayNotice({ tone: 'error', text: '操作失败：' + (caught?.message || '未知错误') });
+      await loadGatewayStatus();
+    } finally {
+      if (mounted.current) setGatewayBusy(false);
+    }
+  }, [rpcCall, loadGatewayStatus]);
 
   /**
    * 读取全部供应商的汇总状态。
@@ -3317,7 +3572,7 @@ export function JetHubPage({ close, rpcCall }) {
     React.createElement('header', { className: 'dim-jh-header' },
       React.createElement('div', { className: 'dim-jh-brand' },
         React.createElement('strong', { className: 'dim-jh-brandName' }, 'Jet Hub'),
-        React.createElement('p', { className: 'dim-jh-brandDesc' }, 'Provider 凭据管理与多账号支持')),
+        React.createElement('p', { className: 'dim-jh-brandDesc' }, '提供商凭据与多账号管理')),
       React.createElement('div', { className: 'dim-jh-headerActions' },
         // 「供应商开关」在页头，而不是左侧每个供应商行尾（!25 的原形态）：
         // 它是破坏性批量操作，与「选择看哪个供应商」这个高频无害动作分开摆放，
@@ -3332,7 +3587,12 @@ export function JetHubPage({ close, rpcCall }) {
             + '关闭一个供应商 = 关闭它的全部模型并停用它的全部账号。',
           'aria-haspopup': 'dialog',
           'aria-expanded': showProviderSwitches ? 'true' : 'false',
-          onClick: () => setShowProviderSwitches(true),
+          onClick: () => {
+            // 与网关弹窗互斥：两者都是 position:fixed 的全屏覆盖层，
+            // 同时打开会叠在一起，而 ESC 只关掉后挂载的那个。
+            setShowGateway(false);
+            setShowProviderSwitches(true);
+          },
         }, '供应商'),
         // 一键签到在备份/恢复**左侧**（需求指定位置）
         React.createElement('button', {
@@ -3348,6 +3608,20 @@ export function JetHubPage({ close, rpcCall }) {
           // 递增版号强制重新挂载，让账号列表与模型目录立即反映新状态。
           onImported: () => setVersion(v => v + 1),
         }),
+        // 本机网关开关。⚠️ 文字刻意只写「网关」（见「供应商」按钮上方的同款
+        // 注释）：页头按钮排成一行，长文字会把右端「关闭」挤到第二行。
+        React.createElement('button', {
+          className: 'dim-jh-btn',
+          title: gatewayButtonTitle(gatewayStatus),
+          'aria-haspopup': 'dialog',
+          'aria-expanded': showGateway ? 'true' : 'false',
+          onClick: () => {
+            setShowProviderSwitches(false);
+            setShowGateway(true);
+            setGatewayNotice(null);
+            void loadGatewayStatus();
+          },
+        }, gatewayButtonLabel(gatewayStatus)),
         close ? React.createElement('button', {
           className: 'dim-jh-btn',
           onClick: close,
@@ -3404,6 +3678,18 @@ export function JetHubPage({ close, rpcCall }) {
           onToggle: toggleProvider,
           onReload: loadProviderStatuses,
           onClose: () => setShowProviderSwitches(false),
+        })
+      : null,
+    // 同款做法：网关开关也是覆盖层，且与「供应商开关」互斥 —— 两者都是
+    // `position: fixed` 的全屏弹窗，同时打开会叠在一起、ESC 只关掉后挂载的那个。
+    showGateway
+      ? React.createElement(GatewayPanel, {
+          status: gatewayStatus,
+          busy: gatewayBusy,
+          notice: gatewayNotice,
+          onToggle: toggleGateway,
+          onReload: loadGatewayStatus,
+          onClose: () => setShowGateway(false),
         })
       : null);
 }

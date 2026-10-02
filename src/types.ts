@@ -805,6 +805,92 @@ export interface RpcProviderSetEnabledResponse {
   accounts: number
 }
 
+/**
+ * RPC: 本机 OpenAI 网关状态。
+ *
+ * ⚠️ 三个字段必须**分开回传**，不能只回一个 `enabled`：设置页里的开关读的是
+ * `enabled`（用户的选择），而端口是否真的在监听取决于另外两个条件 ——
+ * `blockedByEnv` 为真时，用户的选择**不会**让网关跑起来（`env` 是运维级
+ * 停用，优先级更高）。只回一个布尔会让 UI 显示「已打开」而实际没监听，
+ * 用户完全无从判断该改哪里。
+ */
+export interface RpcGatewayStatusResponse {
+  /** 用户在设置页里的选择（持久化状态）。 */
+  enabled: boolean
+  /** 当前是否真的在监听端口。 */
+  running: boolean
+  /** 是否被 `DSH_OPENAI_GATEWAY_ENABLED` 显式停用（此时设置页改开关无效）。 */
+  blockedByEnv: boolean
+  /** 实际监听地址；未运行或被 env 停用时为 `null`。 */
+  address: { host: string; port: number } | null
+  /**
+   * 网关正在使用的凭据。
+   *
+   * ⚠️ 明文密钥。网关尚未创建过实例时为 `null`（例如被 env 停用、或插件刚
+   * 启动还没起过网关），此时设置页应提示「启用后自动生成」而**不是**编一个
+   * 占位串 —— 复制出去必然 401，比不给更让人困惑。
+   */
+  apiKey: RpcGatewayApiKey | null
+  /**
+   * 当前可用的模型 ID 列表（`provider/模型名`）。
+   *
+   * 存在的理由：**有些 agent 不会主动扫描模型目录**（如 ZCode），要靠用户
+   * 手工把 ID 填进它的配置。而 `/v1/models` 需要 Bearer 鉴权，浏览器地址栏
+   * 直接打开只会得到 401 —— 用户在设置页外没有任何途径看到这些 ID。
+   *
+   * ⚠️ 无凭据的 provider 已在采集阶段被跳过，故不会出现在这里。
+   */
+  models: RpcGatewayModel[]
+  /**
+   * 目录是从哪来的 —— 用于在清单为空时**说清原因**。
+   *
+   * ⚠️ 这个字段存在的唯一理由：此前 `models: []` 只有一种含义，用户看到
+   * 「还没有可用模型」就去检查自己的登录，而真实原因可能是宿主根本没给出任何
+   * 可枚举的 provider（插件加载异常）。空状态必须能自解释。
+   *
+   * - `catalog`：来自 `ctx.llm.listProviders()`（权威，正常路径）
+   * - `adapters`：该方法不可用，退化为用本插件已注册的适配器 key 枚举
+   * - `none`：两者都拿不到，目录必然为空
+   */
+  modelsSource: 'catalog' | 'adapters' | 'none'
+}
+
+/** RPC: 网关可用的模型条目（设置页内嵌展示用）。 */
+export interface RpcGatewayModel {
+  /** 可直接填进 agent 配置的完整 ID（`provider/模型名`）。 */
+  id: string
+  /** 模型展示名，仅供人辨认。 */
+  name: string
+  /**
+   * 模型接受的输入模态（如 `['text']`、`['text','image']`）。
+   *
+   * 设置页据此标出**哪些模型能发图片** —— 不标的话用户只能靠撞一次
+   * `unsupported_content` 才知道。缺省为 `['text']`（与各适配器「不声明即
+   * 保守按 text 处理」一致）。
+   */
+  input: readonly string[]
+}
+
+/** RPC: 本机 OpenAI 网关开关写入请求。 */
+export interface RpcGatewaySetEnabledRequest {
+  enabled: boolean
+}
+
+/**
+ * RPC: 网关凭据信息。
+ *
+ * ⚠️ 这是**明文凭据**，只应回传给调用方用于展示/复制，**不得**写进日志。
+ * 单独成类型是为了让「拿到它」这件事在代码里显式可见，便于 review 时留意。
+ */
+export interface RpcGatewayApiKey {
+  /** 密钥本体。 */
+  value: string
+  /** 是否来自 `DSH_OPENAI_GATEWAY_API_KEY`（此时 UI 不该显示文件路径）。 */
+  fromEnv: boolean
+  /** 密钥文件路径；`fromEnv` 为真时为 `null`。 */
+  path: string | null
+}
+
 /** 存储在 CODEARTS_ACCESS_TOKEN 下的归一化临时凭据。 */
 export interface CodeArtsCredential {
   access_key_id: string

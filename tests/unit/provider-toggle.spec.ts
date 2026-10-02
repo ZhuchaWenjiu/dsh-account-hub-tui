@@ -27,8 +27,13 @@ const P = (id) => ({ id, label: id })
 function panelBody(): string {
   const start = source.indexOf('function ProviderSwitchPanel(')
   expect(start, '找不到 ProviderSwitchPanel 组件').toBeGreaterThan(-1)
-  const end = source.indexOf('export function JetHubPage', start)
-  return source.slice(start, end === -1 ? undefined : end)
+  // ⚠️ 结束锚点取「下一个顶层组件声明」，**不能**硬编码 `JetHubPage`：
+  // 在两者之间插入任何组件（如 GatewayPanel），硬编码的 slice 都会把别人的
+  // 源码一并吞进来，于是「本弹窗恰好一个 label / checkbox」这类计数断言会
+  // 假性失败（2026-10-02 加网关弹窗时实测）。
+  const rest = source.slice(start)
+  const offset = rest.slice(1).search(/^(?:export )?function /m)
+  return offset === -1 ? rest : rest.slice(0, offset + 1)
 }
 
 describe('groupProviders（左侧分组）', () => {
@@ -277,10 +282,23 @@ describe('供应商开关的接线（源码级回归）', () => {
     // 5 个字会把「关闭」挤到第二行。完整语义由 tooltip 与弹窗标题承担。
     expect(source).toContain("}, '供应商')")
     expect(source).toContain('title: (providerSummary.known')
-    expect(source).toContain('onClick: () => setShowProviderSwitches(true)')
+    expect(source).toContain('setShowProviderSwitches(true)')
     // ⚠️ 不跨行断言：源文件是 CRLF，含 `\n` 的字面量匹配不上。
     expect(source).toContain('? React.createElement(ProviderSwitchPanel')
     expect(source).toContain('onClose: () => setShowProviderSwitches(false)')
+  })
+
+  it('两个全屏弹窗互斥：点开一个必须先关掉另一个', () => {
+    // 供应商开关与网关都是 position:fixed 的全屏覆盖层，同时打开会叠在一起，
+    // 而 ESC 只关掉后挂载的那个 —— 剩下一个关不掉的弹窗挡住整个设置页。
+    // ⚠️ 取块方向是**向前**：`setShowGateway(false)` 写在
+    // `setShowProviderSwitches(true)` 之前（先关对方、再开自己），从后往前找会漏。
+    const supplierEnd = source.indexOf("}, '供应商')")
+    const gatewayEnd = source.indexOf('}, gatewayButtonLabel(gatewayStatus))')
+    expect(supplierEnd).toBeGreaterThan(-1)
+    expect(gatewayEnd).toBeGreaterThan(-1)
+    expect(source.slice(supplierEnd - 600, supplierEnd)).toContain('setShowGateway(false)')
+    expect(source.slice(gatewayEnd - 600, gatewayEnd)).toContain('setShowProviderSwitches(false)')
   })
 
   it('弹窗行是 <label> + **恰好一个** checkbox（第二个会让「点行名」激活错控件）', () => {

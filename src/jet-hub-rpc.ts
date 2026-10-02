@@ -19,6 +19,15 @@
 import type { Context } from '@deepseek-ai/cordis'
 import { credentialRef, type CredentialRef } from '@deepseek-ai/dsh-credentials'
 import { AccountPool } from './account-pool.js'
+import { isGatewayEnabled } from './openai-gateway/config.js'
+import { collectGatewayModelIds } from './openai-gateway/models.js'
+import {
+  applyGatewayDesiredState,
+  gatewayAddress,
+  gatewayApiKey,
+  isGatewayRunning,
+  setGatewayDesiredEnabled,
+} from './openai-gateway/runtime.js'
 import type { CodeArtsAuth } from './service.js'
 import type { CodeArtsCredential } from './types.js'
 import type { BuddyAuth } from './buddy-auth.js'
@@ -171,6 +180,9 @@ import type {
   RpcProviderStatusResponse,
   RpcProviderSetEnabledRequest,
   RpcProviderSetEnabledResponse,
+  RpcGatewayStatusResponse,
+  RpcGatewaySetEnabledRequest,
+  RpcGatewayModel,
   RpcCaptchaDemandResponse,
   RpcCaptchaCarrierUrlResponse,
   RpcCaptchaContributeRequest,
@@ -662,26 +674,58 @@ export async function collectCreditBalances<TCredential = BuddyCredential, TProd
   return results
 }
 
+/** `ctx.llm` 上本模块实际用到的部分。 */
+type LlmServiceLike = {
+  listProviders?(): readonly { id: string }[]
+  listModels(provider: string): Promise<Array<{ id: string; name: string }>>
+  listAllModels?(provider: string): readonly { id: string; name: string }[]
+}
+
 /**
  * 读取 `ctx.llm` 用于枚举 provider 的模型目录。
  *
- * 用 `ctx.get` 而不是 `inject`：Jet Hub 的账号管理是主要职责，模型开关只是
- * 附加能力；llm 服务缺失时账号面板仍应可用，只是「显示列表」按钮报错。
+ * ## ⚠️ 必须**优先属性访问** `ctx.llm`
+ *
+ * `src/index.ts` 里 `mountOpenAiGateway` 传的是 `ctx.llm`（属性），而本模块
+ * 原先只走 `ctx.get('llm')`。在 connection 上下文里后者可能拿不到
+ * `listProviders` —— 结果是**同一时刻**两个页面给出矛盾答案：
+ * `/v1/models` 正常返回 36 个模型，而设置页的清单恒为 0 个。
+ * 两处服务来源不一致还会让「纠错建议里给的 ID」与「网关实际接受的 ID」可能不同。
+ *
+ * 用 `ctx.get`（而非插件级 `inject`）作回退：Jet Hub 的账号管理是主要职责，
+ * 模型开关只是附加能力；llm 服务完全缺失时账号面板仍应可用。
  *
  * `listAllModels` 是本插件适配器额外提供的**不受用户黑名单影响**的完整目录
- * （见各适配器的同名方法）。DSH 的 `llm` 服务只保证 `listModels`，故这里把它
- * 声明为可选：缺失时退化为「用 listModels 的结果 + 黑名单补回裸 id」。
+ * （见各适配器的同名方法）。DSH 的 `llm` 服务只保证 `listModels`，故它与
+ * `listProviders` 都声明为可选。
  */
-function llmServiceOf(ctx: Context): {
-  listModels(provider: string): Promise<Array<{ id: string; name: string }>>
-  listAllModels?(provider: string): readonly { id: string; name: string }[]
-} | undefined {
-  return ctx.get('llm') as
-    | {
-      listModels(provider: string): Promise<Array<{ id: string; name: string }>>
-      listAllModels?(provider: string): readonly { id: string; name: string }[]
+function llmServiceOf(ctx: Context): LlmServiceLike | undefined {
+  const direct = (ctx as unknown as { llm?: LlmServiceLike }).llm
+  if (direct !== undefined && direct !== null) return direct
+  return ctx.get('llm') as LlmServiceLike | undefined
+}
+
+/**
+ * 列出可用于枚举目录的 provider。
+ *
+ * ⚠️ `listProviders` 取不到时**用已注册适配器的 key 兜底** —— 那些 key 就是本
+ * 插件注册的 provider 全集，比「什么都没有」有用得多。仍取不到才返回
+ * `undefined`（调用方据此给出明确原因，而不是显示一个空清单让用户去猜）。
+ */
+function providerIdsOf(
+  llm: LlmServiceLike | undefined,
+  modelAdapters: Readonly<Record<string, ModelCatalogSource>> | undefined,
+): readonly { id: string }[] | undefined {
+  if (llm?.listProviders !== undefined) {
+    try {
+      const listed = llm.listProviders()
+      if (Array.isArray(listed) && listed.length > 0) return listed
+    } catch {
+      // 落到下面的兜底。
     }
-    | undefined
+  }
+  const keys = Object.keys(modelAdapters ?? {})
+  return keys.length > 0 ? keys.map((id) => ({ id })) : undefined
 }
 
 /**
@@ -3293,6 +3337,120 @@ function registerJetHubEndpoints(
           enabled: req.enabled,
           models: modelCount,
           accounts: accountCount,
+        }
+        return { ok: true, value }
+      }
+
+      // ── 本机 OpenAI 网关（`src/openai-gateway/`）──
+      case 'gateway.getEnabled': {
+        // ⚠️ **每个字段独立降级**：这里是设置页唯一的网关状态来源，任何一个附属
+        // 字段采集失败都不该让**整个面板变空白**（开关、地址、密钥全看不到），
+        // 更不该把用户挡在「关掉网关」这条自救路径之外。
+        // 失败一律降级为 null / []，并在 logger 里带上是哪一步失败的。
+        const degrade = async <T,>(step: string, run: () => T | Promise<T>, fallback: T): Promise<T> => {
+          try {
+            return await run()
+          } catch (error) {
+            ctx.logger.warn(
+              `[jet-hub] gateway.getEnabled 的「${step}」读取失败，该字段降级为默认值：${String(error)}`,
+            )
+            return fallback
+          }
+        }
+        const blockedByEnv = await degrade('env 开关', () => !isGatewayEnabled(process.env), true)
+        const apiKey = await degrade('API Key', () => gatewayApiKey(), null)
+        const address = await degrade('监听地址', () => (blockedByEnv ? null : gatewayAddress() ?? null), null)
+        const llm = llmServiceOf(ctx)
+        const listed = llm?.listProviders !== undefined
+          ? (() => {
+            try {
+              const value = llm.listProviders!()
+              return Array.isArray(value) && value.length > 0 ? value : undefined
+            } catch { return undefined }
+          })()
+          : undefined
+        const adapters = Object.keys(modelAdapters ?? {}).map((id) => ({ id }))
+        const providers = listed ?? (adapters.length > 0 ? adapters : undefined)
+        // 目录来源要让**空状态能自解释**：用户看到空清单时必须能分辨「我没登录」
+        // 与「宿主没给出任何可枚举的 provider」。
+        const modelsSource: RpcGatewayStatusResponse['modelsSource'] =
+          listed !== undefined ? 'catalog' : (adapters.length > 0 ? 'adapters' : 'none')
+        const value: RpcGatewayStatusResponse = {
+          enabled: await degrade('开关状态', () => pool.gatewayEnabled(), true),
+          running: await degrade('运行态', () => isGatewayRunning(), false),
+          blockedByEnv,
+          // 被 env 停用时即使 `enabled` 为真也不会监听，此时**不**回显地址，
+          // 否则设置页会显示一个根本连不上的 URL。
+          address,
+          // ⚠️ 明文凭据：只用于设置页展示与复制，**不进日志**。
+          apiKey: apiKey === null
+            ? null
+            : { value: apiKey.value, fromEnv: apiKey.fromEnv, path: apiKey.path },
+          // 有些 agent（如 ZCode）不会主动扫目录，要靠用户手工填 ID，
+          // 故这里把目录一并回传，让设置页内嵌展示。
+          models: await degrade('模型目录', async () => {
+            if (providers === undefined) {
+              // ⚠️ 不能静默返回空：那会让用户以为是自己没登录，而真实原因是
+              // 宿主根本没给出任何可枚举的 provider。modelsSource 会把这件事
+              // 如实带到 UI 上。
+              ctx.logger.warn('[jet-hub] gateway.getEnabled：既取不到 llm.listProviders，也没有任何已注册适配器可作兜底，模型清单为空')
+              return [] as RpcGatewayModel[]
+            }
+            return collectGatewayModelIds(
+              { listProviders: () => providers, listModels: (provider) => llm!.listModels(provider) },
+              (provider, error) => {
+                ctx.logger.warn(`[jet-hub] ${provider} 模型目录读取失败，已从网关列表跳过：${String(error)}`)
+              },
+            )
+          }, [] as RpcGatewayModel[]),
+          modelsSource,
+        }
+        return { ok: true, value }
+      }
+
+      case 'gateway.setEnabled': {
+        const req = payload as RpcGatewaySetEnabledRequest
+        // ⚠️ 不做默认值猜测，与 `provider.setEnabled` 同约定：
+        // 默认成 true 会静默打开用户特意关闭的网关。
+        if (typeof req.enabled !== 'boolean') {
+          return { ok: false, error: { code: 'bad-request', message: '非空布尔 enabled 必填' } }
+        }
+        // 先落盘再启停：启停失败（端口冲突）不该让已写入的开关回滚成
+        // 「看起来没生效」——状态与运行态分开，由 status 的 running 字段区分。
+        await pool.setGatewayEnabled(req.enabled)
+        setGatewayDesiredEnabled(req.enabled)
+        await applyGatewayDesiredState()
+        const blockedByEnv = !isGatewayEnabled(process.env)
+        ctx.logger.info(
+          `[jet-hub] ${req.enabled ? '打开' : '关闭'}本机 OpenAI 网关`
+          + `${blockedByEnv ? '（已被 DSH_OPENAI_GATEWAY_ENABLED 阻止）' : isGatewayRunning() ? '' : '（未在监听）'}`,
+        )
+        // 开关切换会创建/销毁实例，密钥随之可能从「尚无」变成「已生成」。
+        const key = gatewayApiKey()
+        const llm = llmServiceOf(ctx)
+        // 刚打开网关 ⇒ 目录可能刚从空变成有值，必须重新采集。
+        // ⚠️ 同样不让目录采集拖垮整个响应：它只是回传的附加值。
+        const providers = req.enabled ? providerIdsOf(llm, modelAdapters) : undefined
+        const modelsSource: RpcGatewayStatusResponse['modelsSource'] = !req.enabled
+          ? 'none'
+          : (llm?.listProviders !== undefined ? 'catalog' : (Object.keys(modelAdapters ?? {}).length > 0 ? 'adapters' : 'none'))
+        const models = providers === undefined
+          ? []
+          : await collectGatewayModelIds({
+            listProviders: () => providers,
+            listModels: (provider) => llm!.listModels(provider),
+          }).catch((error: unknown) => {
+            ctx.logger.warn(`[jet-hub] gateway.setEnabled 的模型目录刷新失败：${String(error)}`)
+            return [] as RpcGatewayModel[]
+          })
+        const value: RpcGatewayStatusResponse = {
+          enabled: req.enabled,
+          running: isGatewayRunning(),
+          blockedByEnv,
+          address: blockedByEnv ? null : gatewayAddress() ?? null,
+          apiKey: key === null ? null : { value: key.value, fromEnv: key.fromEnv, path: key.path },
+          models,
+          modelsSource,
         }
         return { ok: true, value }
       }

@@ -20,13 +20,17 @@ describe('OpenAI gateway config', () => {
 
   it('prefers the environment API key', () => {
     const home = mkdtempSync(join(tmpdir(), 'dsh-gateway-auth-'))
-    expect(loadOrCreateApiKey(home, { DSH_OPENAI_GATEWAY_API_KEY: 'env-secret' })).toBe('env-secret')
+    // 返回结构而非裸字符串：设置页要据此显示「来自环境变量」并隐藏文件路径。
+    const source = loadOrCreateApiKey(home, { DSH_OPENAI_GATEWAY_API_KEY: 'env-secret' })
+    expect(source.value).toBe('env-secret')
+    expect(source.fromEnv).toBe(true)
+    expect(source.path).toBeNull()
   })
 
   it('generates and persists a key when the environment is empty', () => {
     const home = mkdtempSync(join(tmpdir(), 'dsh-gateway-auth-'))
-    const first = loadOrCreateApiKey(home, {})
-    const second = loadOrCreateApiKey(home, {})
+    const first = loadOrCreateApiKey(home, {}).value
+    const second = loadOrCreateApiKey(home, {}).value
     expect(first).toHaveLength(43)
     expect(second).toBe(first)
     expect(readFileSync(join(home, 'openai-gateway', 'api-key'), 'utf8')).toBe(first)

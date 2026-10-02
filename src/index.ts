@@ -1476,6 +1476,8 @@ const zcodeAdapter = registerZcodeLlm(ctx, {
   }
 
   registerJetHubRpc(ctx, pool, service, buddy, workbuddy, lobsterai, qoder, qoderCn, trae, cline, loomy, raccoon, minimax, zcode, modelAdapters)
-  mountOpenAiGateway(ctx)
+  // 网关是旁路功能：这里传 `pool` 只为读设置页里的开关，其内部任何失败都已
+  // 自行降级为日志，绝不会让插件 apply() 失败。
+  mountOpenAiGateway(ctx, pool)
   ctx.provide('accountPool', pool)
 }

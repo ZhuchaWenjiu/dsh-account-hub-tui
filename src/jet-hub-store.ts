@@ -76,6 +76,17 @@ export interface JetHubState {
    * 后果是真把永久积分烧掉（不可撤回）。这正是把表拆到独立文档的原因。
    */
   loomyPermanentLocked?: boolean
+  /**
+   * 本机 OpenAI 网关开关（`false` = 不启动网关）。
+   *
+   * ⚠️ 与 `loomyPermanentLocked` 不同，这个字段**可以**住在这里、不需要独立
+   * 文档：老版本代码整体重写 `state.json` 时会丢掉本键，后果仅仅是**网关回到
+   * 默认启用**，用户再关一次即可 —— 没有任何不可逆后果（对照 `loomyPermanentLocked`
+   * 丢失会把「永久积分已锁定」静默变成「已解锁」，那才是灾难）。
+   *
+   * 缺键语义为**启用**：老用户升级后行为与升级前完全一致。
+   */
+  gatewayEnabled?: boolean
 }
 
 /** 持久化后端的能力标识，供调用方决定要不要告警。 */
@@ -101,7 +112,22 @@ const jetHubSchema = Schema.object({
   accounts: Schema.array(Schema.any()).default([]),
   disabledModels: Schema.dict(Schema.any()).default({}),
   loomyPermanentLocked: Schema.boolean().default(false),
+  gatewayEnabled: Schema.boolean().default(true),
 })
+
+/**
+ * 归一化「本机 OpenAI 网关」开关。
+ *
+ * 判据与 `sanitizePermanentLocks` 相反：**只有显式 `false` 才算停用**，
+ * 其余（缺键 / `true` / 字符串 / 对象 / 数组）一律按启用处理。
+ *
+ * ⚠️ 方向不能反。文档缺失、被手工编辑成脏值、或老版本代码整体重写时丢了本键，
+ * 都必须**回到默认启用** —— 那正是升级前的行为；反过来（只认 `true`）会让
+ * 任何一次读取失败都变成「网关被静默关闭」，而用户根本不知道自己关过它。
+ */
+export function sanitizeGatewayEnabled(raw: unknown): boolean {
+  return raw !== false
+}
 
 /**
  * 归一化「锁定永久积分」开关表。
@@ -202,6 +228,7 @@ class SettingsStore implements JetHubStore {
         accounts?: unknown
         disabledModels?: unknown
         loomyPermanentLocked?: unknown
+        gatewayEnabled?: unknown
       }
       | undefined
     if (value === undefined || value === null) return undefined
@@ -210,6 +237,8 @@ class SettingsStore implements JetHubStore {
       disabledModels: sanitizeDisabledModels(value.disabledModels),
       // 只是**镜像**（权威表在 permanent-locks.json）；老文档没这个键 → false。
       loomyPermanentLocked: value.loomyPermanentLocked === true,
+      // 老文档没这个键 → 启用，与升级前行为一致。
+      gatewayEnabled: sanitizeGatewayEnabled(value.gatewayEnabled),
     }
   }
 
@@ -220,6 +249,8 @@ class SettingsStore implements JetHubStore {
       // 镜像字段由 AccountPool 与独立文档**同源写出**：同机上只认这个字段的
       // 旧版本代码（其它 profile）读它、也会原样写回它，故两边不会脱节。
       loomyPermanentLocked: state.loomyPermanentLocked === true,
+      // 开关丢失只会让网关回到默认启用（可逆），故接受老版本重写时丢掉本键。
+      gatewayEnabled: state.gatewayEnabled !== false,
     })
   }
 }
@@ -368,12 +399,15 @@ class FileStore implements JetHubStore {
         accounts?: unknown
         disabledModels?: unknown
         loomyPermanentLocked?: unknown
+        gatewayEnabled?: unknown
       }
       return {
         accounts: sanitizeAccounts(value.accounts),
         disabledModels: sanitizeDisabledModels(value.disabledModels),
         // 只是镜像（权威表在 permanent-locks.json）；老文档没这个键 → false。
         loomyPermanentLocked: value.loomyPermanentLocked === true,
+        // 老文档没这个键 → 启用，与升级前行为一致。
+        gatewayEnabled: sanitizeGatewayEnabled(value.gatewayEnabled),
       }
     } catch (error) {
       this.logger?.warn(`[jet-hub] 读取 ${this.path} 失败，本次以空列表启动: ${String(error)}`)
@@ -417,6 +451,8 @@ class FileStore implements JetHubStore {
         disabledModels: {},
         // 凭据文件里没有任何锁定信息 → 镜像写 false（权威表另有其文档）。
         loomyPermanentLocked: false,
+        // 恢复出的文档本来就不含任何开关信息 → 启用（与全新安装一致）。
+        gatewayEnabled: true,
       }
       try {
         this.write(state)

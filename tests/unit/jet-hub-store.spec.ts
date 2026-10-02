@@ -14,6 +14,7 @@ import {
   mergeLegacyLoomyLock,
   sanitizeAccounts,
   sanitizeDisabledModels,
+  sanitizeGatewayEnabled,
   sanitizePermanentLocks,
 } from '../../src/jet-hub-store.js'
 import type { ProviderAccountEntry } from '../../src/types.js'
@@ -35,6 +36,21 @@ const ACCOUNT: ProviderAccountEntry = {
   createdAt: 1,
   refreshable: true,
 }
+
+describe('sanitizeGatewayEnabled', () => {
+  it('只有显式 false 才算停用，其余一律按启用', () => {
+    // ⚠️ 方向不能反：老用户磁盘上没有这个键、被手工编辑成脏值、或旧版本代码
+    // 整体重写时丢了本键，都必须回到默认启用（= 升级前行为）。反过来（只认
+    // true）会让任何一次读取失败都变成「网关被静默关闭」，而用户没关过它。
+    expect(sanitizeGatewayEnabled(false)).toBe(false)
+    expect(sanitizeGatewayEnabled(undefined)).toBe(true)
+    expect(sanitizeGatewayEnabled(null)).toBe(true)
+    expect(sanitizeGatewayEnabled(true)).toBe(true)
+    expect(sanitizeGatewayEnabled('false')).toBe(true)
+    expect(sanitizeGatewayEnabled(0)).toBe(true)
+    expect(sanitizeGatewayEnabled({})).toBe(true)
+  })
+})
 
 let dir: string
 let previousDir: string | undefined
@@ -89,6 +105,7 @@ describe('老契约后端（SettingsStore）', () => {
       accounts: [ACCOUNT],
       disabledModels: { buddy: { 'glm-5.2': true } },
       loomyPermanentLocked: false,
+      gatewayEnabled: true,
     })
     // ⚠️ 锁定表**不进**这份文档：它是同机多 profile 共享的，旧版本代码全量重写
     // 时不会携带自己不认识的键 —— 表放这儿会被静默抹掉（详见
@@ -155,6 +172,8 @@ describe('文件后端（FileStore）', () => {
       disabledModels: { buddy: { 'glm-5.2': true } },
       // 镜像字段缺省 false（解锁）—— 与既有行为一致
       loomyPermanentLocked: false,
+      // 网关开关缺省启用 —— 与升级前行为一致
+      gatewayEnabled: true,
     })
     // 落盘文本里也不该出现锁定表（它属于 permanent-locks.json）
     expect(readFileSync(statePath, 'utf-8')).not.toContain('permanentLocks')
@@ -171,6 +190,34 @@ describe('文件后端（FileStore）', () => {
 
     const reader = createJetHubStore(makeCtx(undefined))
     expect(reader.load()?.loomyPermanentLocked).toBe(true)
+  })
+
+  it('网关开关 false 可跨实例读回（关了就是关了）', async () => {
+    const writer = createJetHubStore(makeCtx(undefined))
+    await writer.save({ accounts: [], disabledModels: {}, gatewayEnabled: false })
+
+    const reader = createJetHubStore(makeCtx(undefined))
+    expect(reader.load()?.gatewayEnabled).toBe(false)
+  })
+
+  it('老文档没有网关开关时缺省为启用（= 升级前行为，不静默关掉用户的网关）', () => {
+    mkdirSync(join(dir, 'jet-hub'), { recursive: true })
+    writeFileSync(
+      join(dir, 'jet-hub', 'state.json'),
+      JSON.stringify({ accounts: [], disabledModels: {} }),
+      'utf-8',
+    )
+    expect(createJetHubStore(makeCtx(undefined)).load()?.gatewayEnabled).toBe(true)
+  })
+
+  it('网关开关落盘时脏值被归一化为启用', () => {
+    mkdirSync(join(dir, 'jet-hub'), { recursive: true })
+    writeFileSync(
+      join(dir, 'jet-hub', 'state.json'),
+      JSON.stringify({ accounts: [], disabledModels: {}, gatewayEnabled: 'off' }),
+      'utf-8',
+    )
+    expect(createJetHubStore(makeCtx(undefined)).load()?.gatewayEnabled).toBe(true)
   })
 
   /**
@@ -356,6 +403,8 @@ describe('文件后端（FileStore）', () => {
       accounts: [],
       disabledModels: {},
       loomyPermanentLocked: false,
+      // 写盘时缺省即启用：读回应如实带回这个默认值。
+      gatewayEnabled: true,
     })
   })
 })

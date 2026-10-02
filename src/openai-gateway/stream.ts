@@ -1,6 +1,27 @@
 import { randomUUID } from 'node:crypto'
 import type { FinishReason, StreamChunk, TokenUsage } from '@deepseek-ai/dsh-llm'
 import { OpenAiGatewayError } from './messages.js'
+import { normalizeUpstreamFailure } from './model-errors.js'
+
+/**
+ * 失败后给出纠错建议的钩子。
+ *
+ * 只在**出错时**被调用（正常路径零开销），故可以放心在这里去查模型目录。
+ * 流式与非流式共用同一个钩子，保证两条路径给出的建议完全一致。
+ */
+export type SuggestionHook = (message: string) => string | undefined | Promise<string | undefined>
+
+/** 把「你可能是想用 X」拼到错误消息后面。 */
+async function withSuggestion(message: string, suggest: SuggestionHook | undefined): Promise<string> {
+  if (suggest === undefined) return message
+  try {
+    const hint = await suggest(message)
+    return typeof hint === 'string' && hint.length > 0 ? `${message}（${hint}）` : message
+  } catch {
+    // 建议只是锦上添花，取目录失败绝不能盖掉真正的错误消息。
+    return message
+  }
+}
 
 interface ToolState {
   id: string
@@ -104,6 +125,7 @@ export async function* toOpenAiSse(
   chunks: AsyncIterable<StreamChunk>,
   requestId = `chatcmpl-${randomUUID()}`,
   model: string,
+  suggest?: SuggestionHook,
 ): AsyncIterable<string> {
   const state: Accumulated = { content: '', reasoning: '', tools: new Map() }
   try {
@@ -111,7 +133,29 @@ export async function* toOpenAiSse(
       const event = consumeChunk(state, chunk)
       if (event === undefined) continue
       if ('error' in event) {
-        yield line({ id: requestId, object: 'chat.completion.chunk', model, choices: [], error: event.error })
+        const error = event.error as { message?: unknown; type?: unknown; code?: unknown }
+        const message = typeof error.message === 'string' ? error.message : 'upstream error'
+        // 上游「模型不存在」以 502 离开网关时会被客户端当成可重试故障重试，
+        // 但它是确定性失败 —— 翻成 404 让客户端提示用户改配置。
+        const normalized = normalizeUpstreamFailure({
+          status: 502,
+          type: typeof error.type === 'string' ? error.type : 'server_error',
+          code: typeof error.code === 'string' ? error.code : 'upstream_error',
+          message,
+        })
+        yield line({
+          id: requestId,
+          object: 'chat.completion.chunk',
+          model,
+          choices: [],
+          error: {
+            message: await withSuggestion(message, suggest),
+            type: normalized.type,
+            code: normalized.code,
+            // 流已发出 200，状态码改不了；把该有的 404 放进 status 字段供客户端读。
+            status: normalized.status,
+          },
+        })
         yield 'data: [DONE]\n\n'
         return
       }
@@ -141,6 +185,7 @@ export async function collectOpenAiCompletion(
   chunks: AsyncIterable<StreamChunk>,
   requestId = `chatcmpl-${randomUUID()}`,
   model: string,
+  suggest?: SuggestionHook,
 ): Promise<Record<string, unknown>> {
   const state: Accumulated = { content: '', reasoning: '', tools: new Map() }
   try {
@@ -160,12 +205,15 @@ export async function collectOpenAiCompletion(
     }
   } catch (error) {
     const converted = failureToOpenAiError(error)
-    throw new OpenAiGatewayError(
-      String(converted.body.error.message),
-      converted.status,
-      String(converted.body.error.type),
-      String(converted.body.error.code ?? 'upstream_error'),
-    )
+    const message = String(converted.body.error.message)
+    // 同 toOpenAiSse：把上游「模型不存在」翻成 404，避免客户端把它当可重试故障。
+    const normalized = normalizeUpstreamFailure({
+      status: converted.status,
+      type: String(converted.body.error.type),
+      code: String(converted.body.error.code ?? 'upstream_error'),
+      message,
+    })
+    throw new OpenAiGatewayError(await withSuggestion(message, suggest), normalized.status, normalized.type, normalized.code)
   }
   const toolCalls = [...state.tools.entries()].sort(([a], [b]) => a - b).map(([, tool]) => ({
     id: tool.id,

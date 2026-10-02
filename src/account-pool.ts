@@ -75,6 +75,16 @@ export class AccountPool {
    * 详见 `src/permanent-lock-store.ts` 的文件头。
    */
   private permanentLockCache: PermanentLockMap = {}
+  /**
+   * 「本机 OpenAI 网关」开关的进程内副本。
+   *
+   * 缺键语义是**启用**（与 `jet-hub-store.ts` 的 `sanitizeGatewayEnabled`
+   * 同一方向）：老用户升级后网关行为与升级前完全一致，不会被静默关掉。
+   *
+   * ⚠️ 与 {@link permanentLockCache} 不同，它**不需要**独立文档：丢失本键
+   * 的唯一后果是回到默认启用，用户再关一次即可。
+   */
+  private gatewayEnabledCache = true
   /** 是否已完成首次载入。 */
   private loaded = false
   /**
@@ -105,6 +115,8 @@ export class AccountPool {
       // 黑名单是后来才加入的字段：老文档里没有它，缺失时保持空表
       // （等价于"全部模型默认打开"），而不是报错或让整次载入失败。
       this.modelCache = state.disabledModels
+      // 网关开关同理：老文档没有该键 → 保持默认启用。
+      this.gatewayEnabledCache = state.gatewayEnabled !== false
     }
     this.loadLocks(state)
   }
@@ -184,6 +196,9 @@ export class AccountPool {
         accounts: this.cache,
         disabledModels: this.modelCache,
         ...this.lockFields(),
+        // ⚠️ 必须与账号、黑名单取自**同一时刻**的快照（见本方法的注释）：
+        // 分两次快照会让同一份文档里的字段互相矛盾。
+        gatewayEnabled: this.gatewayEnabledCache,
       })
     })
     this.storeChain = next.catch(() => {})
@@ -229,6 +244,37 @@ export class AccountPool {
   listDisabledModels(provider: string): Record<string, boolean> {
     this.ensureLoaded()
     return { ...(this.modelCache[provider] ?? {}) }
+  }
+
+  /**
+   * 「本机 OpenAI 网关」当前是否启用。
+   *
+   * 缺键语义为**启用**（老用户升级后行为不变），见
+   * {@link gatewayEnabledCache}。
+   */
+  gatewayEnabled(): boolean {
+    this.ensureLoaded()
+    return this.gatewayEnabledCache
+  }
+
+  /**
+   * 打开/关闭本机 OpenAI 网关并落盘。
+   *
+   * ⚠️ 这里**只改状态**，不负责启停 HTTP server —— 真正的启停由
+   * `src/openai-gateway/runtime.ts` 在调用方做完持久化后接手。两者分开是为了
+   * 让「存开关」与「跑进程」各自可单测，且启停失败不会把已写入的开关回滚成
+   * 看似没生效的样子。
+   */
+  async setGatewayEnabled(enabled: boolean): Promise<void> {
+    this.ensureLoaded()
+    if (this.gatewayEnabledCache === enabled) return
+    this.gatewayEnabledCache = enabled
+    this.loaded = true
+    if (this.store.kind === 'memory') {
+      this.ctx.logger?.warn?.('[jet-hub] 无持久化后端，网关开关仅本次会话有效')
+      return
+    }
+    await this.queueStoreSave()
   }
 
   /**

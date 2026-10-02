@@ -1842,4 +1842,48 @@ describe('AccountPool · setAccountsEnabled（供应商级批量启停）', () =
       expect(accounts[0].enabled).toBe(false)
     })
   })
+
+  /**
+   * 本机 OpenAI 网关开关（`src/openai-gateway/` 的启用态）。
+   *
+   * 关键约定：缺键语义是**启用**。与永久积分锁定的「缺键 = 解锁」同向，
+   * 但判据必须分开 —— 网关开关丢键的后果是「回到默认启用」，绝不能反过来
+   * 把一次读取失败变成「网关被静默关掉」。
+   */
+  describe('本机网关开关', () => {
+    it('默认启用（老用户升级后行为不变）', () => {
+      expect(new AccountPool(createMockContext() as never).gatewayEnabled()).toBe(true)
+    })
+
+    it('关闭后可读回，且跨实例落盘', async () => {
+      const seeded = createMockContext([makeMockAccount()])
+      const writer = new AccountPool(seeded as never)
+      expect(writer.gatewayEnabled()).toBe(true)
+      await writer.setGatewayEnabled(false)
+      expect(writer.gatewayEnabled()).toBe(false)
+
+      // 新实例从同一后端载入 —— 证明不是只改了内存副本。
+      expect(new AccountPool(seeded as never).gatewayEnabled()).toBe(false)
+    })
+
+    it('重新打开后可读回 true', async () => {
+      const seeded = createMockContext()
+      const pool = new AccountPool(seeded as never)
+      await pool.setGatewayEnabled(false)
+      await pool.setGatewayEnabled(true)
+      expect(pool.gatewayEnabled()).toBe(true)
+    })
+
+    it('⚠️ 改开关不得抹掉同一文档里的账号与黑名单', async () => {
+      // 整体写入语义下，只写开关会把另两份数据抹掉（与 writeAccounts 同约定）。
+      const seeded = createMockContext([makeMockAccount()])
+      const pool = new AccountPool(seeded as never)
+      await pool.setGatewayEnabled(false)
+
+      const raw = seeded.replacePayloads.at(-1) as
+        { accounts?: ProviderAccountEntry[]; disabledModels?: Record<string, unknown> }
+      expect(raw.accounts).toHaveLength(1)
+      expect(raw.disabledModels).toBeDefined()
+    })
+  })
 })

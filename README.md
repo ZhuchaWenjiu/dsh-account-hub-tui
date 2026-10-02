@@ -53,16 +53,110 @@ POST http://127.0.0.1:8326/v1/chat/completions
 Authorization: Bearer <网关 API Key>
 ```
 
-优先从 `DSH_OPENAI_GATEWAY_API_KEY` 读取；未设置时，插件首次启动会在 DSH home 的 `openai-gateway/api-key` 生成并持久化随机密钥，重启后保持不变。端口可通过 `DSH_OPENAI_GATEWAY_PORT` 修改；端口被占用时不会随机切换。
+优先从 `DSH_OPENAI_GATEWAY_API_KEY` 读取；未设置时，插件首次启动会在 DSH home 的 `openai-gateway/api-key` 生成并持久化随机密钥，重启后保持不变。端口被占用时不会随机切换。
 
-模型 ID 使用 `provider/model` 形式，例如：
+配置项：
+
+| 环境变量 | 默认值 | 说明 |
+| --- | --- | --- |
+| `DSH_OPENAI_GATEWAY_ENABLED` | `1` | 设为 `0` / `false` / `off` / `no` 时**完全不启动**网关（连 API Key 文件都不会生成） |
+| `DSH_OPENAI_GATEWAY_PORT` | `8326` | 监听端口，填非法值会记录错误并跳过网关启动，不会静默改用其他端口 |
+| `DSH_OPENAI_GATEWAY_API_KEY` | 自动生成 | 网关的 Bearer 密钥，优先于文件 |
+
+设置页里的开关状态存在 `$DSH_HOME/jet-hub/state.json` 的 `gatewayEnabled` 字段（缺省为启用）。它**不进**账号备份/恢复 —— 恢复一份旧备份不会顺手改变你本机的网关开关。
+
+### 拿到地址与密钥
+
+两者都在 **Jet Hub 设置页 → 页头「网关」按钮**里：
+
+- **地址**：弹窗顶部直接显示**实际监听地址**（`http://127.0.0.1:8326/v1`）。端口被
+  `DSH_OPENAI_GATEWAY_PORT` 改过时显示的是真实端口，不会是写死的 8326。
+- **密钥**：点「**复制 API Key**」直接进剪贴板。出于安全考虑**默认不显示明文**
+  （设置页会被截图/录屏/投屏）；若自动复制不可用（无 Clipboard API、非用户手势、
+  权限被拒），点「显示明文」可手动选中复制。
+
+也可以自己取：
 
 ```text
-codearts/GLM-5.3
-qoder/qfmodel
-qodercn/qfmodel
-zcode/GLM-5.3-Flash
+%DSH_HOME%\openai-gateway\api-key        ← 首次启动时自动生成的 43 位密钥
 ```
+
+> ⚠️ DSH home **未必**是 `%USERPROFILE%\.dsh`（换 profile、设过 `DSH_HOME` 都会变），
+> 以弹窗里显示的实际路径为准。设了 `DSH_OPENAI_GATEWAY_API_KEY` 时密钥来自环境
+> 变量、**没有文件**。
+
+⚠️ 密钥文件被改坏时插件会**明确报错**而不是悄悄换一个 —— 静默更换会让所有已配置的
+客户端同时返回 `unauthorized`，而客户端只给这一句提示，无从判断是自己的问题还是
+服务端变了。恢复办法：删掉该文件后重启 DSH（重新生成），或改用环境变量。
+
+### 关闭网关
+
+网关是**旁路功能**：它启动失败或被关闭，都不会影响插件其余功能（登录、积分、模型目录照常）。三种关闭方式：
+
+1. 设 `DSH_OPENAI_GATEWAY_ENABLED=0` 后重启 DSH（最直接，环境变量永久生效）；
+2. 在 Jet Hub 设置页**页头的「网关」按钮**里关掉「启用本机网关」（立即生效，无需重启）；
+3. 端口被别的程序占用时网关会跳过启动并在日志里记明原因，此时改 `DSH_OPENAI_GATEWAY_PORT` 即可。
+
+⚠️ 两处开关的优先级：`DSH_OPENAI_GATEWAY_ENABLED` 是**停用**时，设置页里的开关会被**禁用**并明确提示「已被环境变量停用」—— 想重新打开必须先取消该环境变量。这样不会出现「页面显示已打开、实际连不上」的状态。
+
+### 安全边界
+
+- 只绑定 `127.0.0.1`，**不可**改成对外地址 —— 注意这只挡得住远程访问，**同机其它用户/进程仍可连到该端口**，真正的隔离靠 API Key。
+- 密钥以明文写在 `$DSH_HOME/openai-gateway/api-key`。POSIX 下的 `0600` 权限在 **Windows 上不生效**，多用户机器请改用 `DSH_OPENAI_GATEWAY_API_KEY` 环境变量自行保管。
+- 网关响应带 `Access-Control-Allow-Origin: *`，因此**不要**把密钥配置进任何浏览器端工具或扩展。
+
+### 知道有哪些模型 ID
+
+有些客户端**不会**主动扫描模型目录（ZCode 就是），必须由用户手工把 ID 填进它的
+配置。获取途径：
+
+- **设置页内嵌清单（推荐）** —— 同一个「网关」弹窗里，点「展开清单」看全部，
+  或点「**复制全部 N 个 ID**」每行一个复制走。
+- **命令行** —— 弹窗底部给了现成命令（地址栏直接打开 `http://127.0.0.1:8326/v1/models`
+  会返回 **401**，因为它需要 `Authorization: Bearer` 头，而地址栏不会带）：
+
+```powershell
+$key = (Get-Content "$env:USERPROFILE\.dsh\openai-gateway\api-key" -Raw).Trim()
+(Invoke-RestMethod http://127.0.0.1:8326/v1/models -Headers @{Authorization="Bearer $key"}).data.id
+```
+
+模型 ID 形式为 `provider/模型名`，三条容易踩的规则：
+
+1. **必须带 provider 前缀**。只写 `deepseek-v4.1-flash` 会直接 400
+   `model must use provider/model format`。
+2. **模型名本身可以带斜杠**，按**第一个**斜杠切分 ——
+   `cline/anthropic/claude-sonnet-5.5` 的 provider 是 `cline`、模型是
+   `anthropic/claude-sonnet-5.5`。
+3. **区分大小写，且同名模型跨 provider 不通用**。同一 provider 内大小写就是混的
+   （`codearts/glm-5.3-flash` 与 `codearts/GLM-5.2` 并存）；而
+   `deepseek-v4.1-flash` 在 `codearts` 与 `buddy` 各有一份，额度与限流规则不同。
+
+> 💡 设置页的模型清单里，支持图片的模型会标上「可发图片」—— 判据取自各 provider
+> 上报的 `inputModalities`（与 `/v1/models` 返回的 `input` 字段同一份）。
+>
+> 网关**支持接收图片**，但有两个前提：
+> - 宿主须装载附件服务（`@deepseek-ai/dsh-attachment-local`）。DSH 的图片是**附件
+>   引用**（`ImageBlock.attachment`）而不是 OpenAI 的 data URL，所以客户端发来的
+>   base64 需先经附件服务落盘才能构造。附件服务缺失时网关会明确报「未装载附件
+>   服务」，**绝不静默丢图**。
+> - **只接受 base64 内联的 data URL**。外部 http(s) 图片链接会被明确拒绝而不是由
+>   网关去下载 —— 那需要在网关里发起出站请求，是一个真实的 SSRF 面（能打环回
+>   地址、内网服务、云元数据端点）。
+>
+> 限制取自附件服务的 `imageLimits`：单张 ≤ 20MB、单条消息 ≤ 20 张 / 200MB、
+> 边长 ≤ 8192，支持 `png` / `jpeg` / `webp` / `gif`。同一张图重复发送按内容寻址
+> （`sha256:`）去重，不会重复占空间。
+
+> 💡 填错模型名时网关会返回 `404` + `model_not_found`（**不是** 502 —— 502 会被
+> 客户端当成可重试故障白耗额度），并在消息里附上正确拼写，例如：
+>
+> ```text
+> codearts: The model is not registered, please request other model（你是不是想用 codearts/glm-5.3-flash）
+> ```
+>
+> 流式请求下 HTTP 状态码已经发出是 200，该信息会放进 SSE 错误帧的 `error.status` /
+> `error.code`。网关**不会**在请求前用目录做白名单拦截 —— 有些 provider 支持目录
+> 之外的模型，显式请求仍交给 DSH 路由处理。
 
 第一期支持流式/非流式文本、reasoning、工具调用、工具结果、用量和请求取消。图片暂不静默丢弃：当前网关无法把外部 OpenAI 图片引用安全转换为 DSH 附件时，会明确返回不支持错误。
 
