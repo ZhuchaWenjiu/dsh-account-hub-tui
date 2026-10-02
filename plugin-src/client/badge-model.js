@@ -39,6 +39,43 @@ export const BADGE_PREFERENCES = Object.freeze(['auto', 'subscription', 'credits
 /** 默认偏好（宿主侧的默认值必须与它相同）。 */
 export const DEFAULT_BADGE_PREFERENCE = 'auto';
 
+/**
+ * 「宿主进程跑的是旧代码」的用户提示（真实故障，2026-10-02 用户报障）。
+ *
+ * ## 故障长什么样
+ *
+ * 用户在模型选择器旁看到「LobsterAI · 用量不可用」，点开弹窗里赫然写着
+ * `unknown method: usage.badgePreference`。
+ *
+ * ## 根因不是代码，是**两侧加载时机不同**
+ *
+ * 宿主（Node）在**启动时**把 `lib/` 加载进内存；客户端 bundle 却是**每次请求
+ * 从磁盘读**的。于是「改了代码 → 重新构建 → 刷新页面」之后，浏览器拿到了**新**
+ * bundle（徽标 UI 出现了），而宿主仍在跑**旧**代码 —— `handleMethod` 落到
+ * `default` 分支，回 `unknown method`。
+ *
+ * ⚠️ 这类失败**静默且有指向性**：用户会以为是功能坏了，实际上只需要重启一次
+ * DSH。所以裸错误必须翻译成可行动的一句话（见 {@link describeBadgeError}）。
+ */
+export const HOST_STALE_HINT = '插件宿主未加载最新版本，请重启 DSH 后重试';
+
+/**
+ * 把 RPC 错误翻译成**用户能行动**的一句话。
+ *
+ * - 命中「宿主没有这个方法」⇒ 给出 {@link HOST_STALE_HINT}；
+ * - 其它错误**原样透出**（凭据过期、网络失败等，它们的文案本身就有指向性）；
+ * - 拿不到消息时回落到调用方给的 `fallback`。
+ *
+ * ⚠️ 判据要**窄**：只认 `unknown method` 这一个短语。这是宿主 `handleMethod`
+ * 的 `default` 分支写死的文案（`src/jet-hub-rpc.ts`），改动它时本函数要同步；
+ * 不要泛化成「含 unknown / 不支持」之类，那会把真实的参数错误也吞掉。
+ */
+export function describeBadgeError(error, fallback = '') {
+  const message = typeof error?.message === 'string' ? error.message : '';
+  if (message.includes('unknown method')) return HOST_STALE_HINT;
+  return message.length > 0 ? message : fallback;
+}
+
 /** 偏好的展示名（弹窗里的三态开关）。 */
 export const BADGE_PREFERENCE_LABELS = Object.freeze({
   auto: '自动',

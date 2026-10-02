@@ -88,10 +88,14 @@ describe('用量徽标：渲染门控与轮询', () => {
     expect(badge).toContain('setInterval(')
   })
 
-  it('读取失败保留上一次成功读数（不把旧数字清空）', () => {
-    // catch 分支只置失败标记，**不**清 snapshot
-    expect(badge).toMatch(/catch \{[\s\S]{0,220}?setFailed\(true\)/)
-    expect(badgeCode).not.toMatch(/catch \{[\s\S]{0,220}?setSnapshot\(null\)/)
+  it('读取失败保留上一次成功读数（不把旧数字清空），并记下原因', () => {
+    // catch 分支只置失败标记 + 记原因，**不**清 snapshot。
+    // ⚠️ 正则写成 `catch (\w*)`：分支现在是 `catch (error)`（要拿错误翻译文案），
+    // 旧的 `catch \{` 会在这个无害重构上假失败。
+    expect(badge).toMatch(/catch \(\w*\) \{[\s\S]{0,260}?setFailed\(true\)/)
+    expect(badgeCode).not.toMatch(/catch \(\w*\) \{[\s\S]{0,260}?setSnapshot\(null\)/)
+    // 失败原因必须经 describeBadgeError 翻译（裸的 unknown method 对用户无意义）
+    expect(badge).toContain('setReadError(describeBadgeError(error))')
   })
 
   it('只认领属于当前渠道的响应（并发/切渠道时不会画错）', () => {

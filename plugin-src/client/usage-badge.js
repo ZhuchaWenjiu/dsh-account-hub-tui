@@ -30,6 +30,7 @@ import * as React from 'react';
 import { supportsCreditBalance, supportsDailyCheckin, checkinProviders } from './credits-capabilities.js';
 import {
   badgeView,
+  describeBadgeError,
   formatUpdatedAt,
   BADGE_PREFERENCES,
   BADGE_PREFERENCE_LABELS,
@@ -99,6 +100,15 @@ function UsageBadgeActive(props) {
   /** `{ value, at }`：宿主返回的读数 + **到达**本地的时刻（兜底显示用）。 */
   const [snapshot, setSnapshot] = React.useState(null);
   const [failed, setFailed] = React.useState(false);
+  /**
+   * 最近一次读数失败的原因（已翻译成可行动文案）。
+   *
+   * ⚠️ 为什么要单独存而不是只置 `failed`：真实故障（2026-10-02 用户报障）里，
+   * 宿主进程跑的是旧代码、页面却拿到了新 bundle，于是弹窗里赫然写着裸的
+   * `unknown method: usage.badgePreference` —— 用户完全不知道该做什么。
+   * 存下来后由 `describeBadgeError` 统一翻译（判据与文案见 `badge-model.js`）。
+   */
+  const [readError, setReadError] = React.useState('');
   const [busy, setBusy] = React.useState(false);
   const [open, setOpen] = React.useState(false);
   /** 本地偏好镜像：写入后立刻生效，不等待下一轮轮询（否则像「点了没反应」）。 */
@@ -162,9 +172,13 @@ function UsageBadgeActive(props) {
         if (value?.provider !== undefined && value.provider !== provider) return;
         setSnapshot({ value, at: Date.now() });
         setFailed(false);
-      } catch {
+        setReadError('');
+      } catch (error) {
         // ⚠️ 保留上一次成功读数：一分钟前为真的数字，比一片空白有用得多。
-        if (alive) setFailed(true);
+        if (alive) {
+          setFailed(true);
+          setReadError(describeBadgeError(error));
+        }
       } finally {
         inFlight = false;
         if (alive && force) setBusy(false);
@@ -254,7 +268,7 @@ function UsageBadgeActive(props) {
       read.current();
       if (next) setTimeout(() => read.current(), 12_000);
     } catch (error) {
-      setAutoError(error?.message || '自动签到开关保存失败');
+      setAutoError(describeBadgeError(error, '自动签到开关保存失败'));
     }
   };
 
@@ -265,7 +279,7 @@ function UsageBadgeActive(props) {
       await dismissAutoCheckin();
       read.current();
     } catch (error) {
-      setAutoError(error?.message || '关闭自动签到状态失败');
+      setAutoError(describeBadgeError(error, '关闭自动签到状态失败'));
     }
   };
 
@@ -318,7 +332,7 @@ function UsageBadgeActive(props) {
       await writePreference(next);
     } catch (error) {
       setPreference(null);
-      setPrefError(error?.message || '偏好保存失败');
+      setPrefError(describeBadgeError(error, '偏好保存失败'));
     }
   };
 
@@ -490,12 +504,16 @@ function UsageBadgeActive(props) {
     // 首屏：读数未到 / 首次就失败 —— 说明白，但**不**渲染会说出
     // 「该渠道还没有账号」的明细区（用户报障：那是把「还没读到」说成「没有账号」）。
     if (snapshot === null) {
+      // ⚠️ 失败时把**原因**摆出来：最常见的一种（宿主未重启）有确定解法，
+      // 只说「可点 ↻ 重试」会让用户反复点一个不可能成功的按钮。
       children.push(React.createElement('div', {
         key: 'placeholder',
         className: failed ? 'dim-jh-badgeFail' : 'dim-jh-badgeNote',
         role: failed ? 'alert' : undefined,
       }, failed
-        ? '用量不可用，可点右上角 ↻ 重试'
+        ? (readError === ''
+          ? '用量不可用，可点右上角 ↻ 重试'
+          : `${readError}（可点右上角 ↻ 重试）`)
         : '正在读取用量…（首次要逐账号查询，可能要几秒）'));
       // 签到不依赖本渠道的读数，故首屏也放出来（用户可能就是想先签到）。
       children.push(renderClaim());

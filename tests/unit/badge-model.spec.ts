@@ -3,8 +3,10 @@ import {
   BADGE_PREFERENCE_LABELS,
   BADGE_PREFERENCES,
   DEFAULT_BADGE_PREFERENCE,
+  HOST_STALE_HINT,
   badgeView,
   creditGroupsOf,
+  describeBadgeError,
   formatUpdatedAt,
   normalizeBadgePreference,
   planGroupsOf,
@@ -310,6 +312,38 @@ describe('formatUpdatedAt', () => {
   it('非法值返回空串（不显示 NaN）', () => {
     expect(formatUpdatedAt(undefined)).toBe('')
     expect(formatUpdatedAt(Number.NaN)).toBe('')
+  })
+})
+
+describe('describeBadgeError：把「宿主没重启」翻译成可行动的一句话', () => {
+  /**
+   * ⚠️ 真实故障回归（2026-10-02 用户报障）：徽标显示「用量不可用」，弹窗里
+   * 赫然写着裸的 `unknown method: usage.badgePreference`。
+   *
+   * 根因不是代码错，而是**两侧加载时机不同**：宿主在启动时把 `lib/` 加载进内存，
+   * 客户端 bundle 却每次从磁盘读 —— 刷新页面后浏览器拿到新 UI，宿主仍跑旧代码。
+   * 用户完全不知道要重启，故必须翻译。
+   */
+  it('宿主缺方法 → 提示重启，而不是透出裸错误', () => {
+    expect(describeBadgeError(new Error('unknown method: usage.badgePreference'))).toBe(HOST_STALE_HINT)
+    expect(describeBadgeError({ message: 'unknown method: usage.badge' })).toBe(HOST_STALE_HINT)
+  })
+
+  it('其它错误原样透出（凭据/网络类文案本身就有指向性，不能被吞掉）', () => {
+    expect(describeBadgeError(new Error('凭据已过期'))).toBe('凭据已过期')
+    expect(describeBadgeError({ message: 'bad-request: provider 不能为空' })).toBe('bad-request: provider 不能为空')
+  })
+
+  it('拿不到消息时回落到调用方给的兜底', () => {
+    expect(describeBadgeError(new Error(''), '偏好保存失败')).toBe('偏好保存失败')
+    expect(describeBadgeError(undefined, '偏好保存失败')).toBe('偏好保存失败')
+    expect(describeBadgeError({}, '')).toBe('')
+  })
+
+  it('判据要窄：不把泛词误判成「宿主未重启」', () => {
+    // 「未知模型」是真实业务错误，不能被当成「宿主缺方法」
+    expect(describeBadgeError(new Error('未知模型 id'))).toBe('未知模型 id')
+    expect(describeBadgeError(new Error('该渠道不支持此操作'))).toBe('该渠道不支持此操作')
   })
 })
 
