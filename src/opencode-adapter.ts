@@ -95,6 +95,12 @@ export async function loadOpencodeCatalog(
     for (const raw of body.data) {
       if (typeof raw !== 'object' || raw === null) continue
       const record = raw as { id?: unknown; name?: unknown; context_window?: unknown; limit?: { context?: unknown } }
+      // ⚠️ `context_window` / `limit.context` 两个来源都保留，但**实测 Zen
+      // `/v1/models` 从不下发**（85 条只有 `id`/`object`/`created`/`owned_by`），
+      // 所以这里解析出来恒为 0。真正的窗口走能力表（models.dev 的 `limit.context`），
+      // 见 `resolveModel` 里的 `capability?.contextWindow` 兜底链。
+      // ⚠️ 这里**仍然解析**而不是删掉：Zen 将来若补上该字段就自动生效，
+      // 删了等于把能力又退回「只能靠能力表」。
       const id = typeof record.id === 'string' ? record.id : ''
       if (id.length === 0 || seen.has(id)) continue
       // ⚠️⚠️ **按实测可达性过滤**（真实报障 2026-10-01）：远端 `/v1/models`
@@ -275,10 +281,43 @@ export class OpencodeAdapter extends LlmAdapter {
       name: entry?.name ?? model,
       inputModalities: inputModalitiesOf(capabilities, model),
     }
+    // ⚠️⚠️ **窗口必须从能力表取，不能只信 catalog**（issue IKJJ68）。
+    //
+    // 此前只读 `entry.contextWindow`（catalog 条目），而它来自 Zen `/v1/models`
+    // —— 实测该端点**只返回 4 个字段**（`id`/`object`/`created`/`owned_by`，
+    // 85 条全如此），**从不带 `context_window`**，于是恒为 0 ⇒ 走下面
+    // `> 0` 的否分支 ⇒ `resolved.context` 整个不声明 ⇒ 后果有二：
+    //   ① 上下文占用指示器不渲染（它读 `model.contextWindow`）；
+    //   ② 自动压缩抛 `TargetPressureConfigError: contextWindow (…) must be a
+    //      positive integer`（见 dsh-compaction-basic）。
+    //
+    // 真正的窗口在 models.dev 的 `limit.context`（`opencode-capability.ts` 早已采集，
+    // 只是**采了没用**）。兜底顺序：能力表 → catalog 条目 → 都不给就不声明。
+    const contextWindow = capability?.contextWindow ?? entry?.contextWindow ?? 0
     // ⚠️ 窗口未知**不编造**：0 是「不知道」哨兵，不能当合法窗口下发。
-    if (entry !== undefined && entry.contextWindow > 0) {
-      resolved.context = { contextWindow: entry.contextWindow }
+    if (contextWindow > 0) {
+      resolved.context = { contextWindow }
     }
+    // ⚠️⚠️ **刻意不声明 `defaultMaxTokens`**（issue IKJJ68 提到它，这里说明取舍）：
+    //
+    // DSH 的契约是「用户未指定 `max_tokens` 时直接拿它填请求」
+    // （`defaulted = config.maxTokens === undefined && info.defaultMaxTokens !== undefined
+    //   ? { maxTokens: info.defaultMaxTokens } : …`），且必须是**安全正整数**，
+    // 否则 dsh-llm 直接抛 `adapter returned invalid default maxTokens`。
+    //
+    // 能力表里有 `limit.output`（models.dev 的 `limit.output`），但那是
+    // **模型单次输出上限**，不是「合理的默认输出预算」。实测 2026-10-02：
+    //   · big-pickle = 32000、nemotron-3-ultra-free = 128000、
+    //     space-bunny-free = **524288**（荒谬）
+    //   · 给到这些值**不会被服务端拒绝**（三个都 200 —— 我最初担心的
+    //     「免费通道会拒」**不成立**，已推翻）
+    //   · **不给** `max_tokens` 时服务端用自己的默认值，实测 667 tokens
+    //     且 `finish=stop`（自然结束，非截断）
+    //   · 唯一真实风险是**给小了被限死**：给 100 就真的 `finish=length` 截在 100
+    //
+    // ⇒ 不下发：当前「不下发」的行为实测就是好的，而下发等于**我们替用户决定**
+    // 每轮按上限请求（space-bunny-free 的 51 万尤其荒谬）。真要默认值，
+    // 应当按渠道实测出一个安全值，而不是拿上限顶替。
     // ⚠️⚠️ **思考档位**（issue IKJJ0V 修复，此前完全没声明 ⇒ 选择器永不出现）。
     //
     // 契约（读 DSH 内核 `dsh-api-session-controller/lib/types/catalog.js` 得到，

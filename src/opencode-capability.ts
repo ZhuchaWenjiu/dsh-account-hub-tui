@@ -46,7 +46,21 @@ export interface OpencodeModelCapability {
   modalities: readonly ('text' | 'image')[]
   /** 上下文窗口（0 = 未知，不编造）。 */
   contextWindow: number
-  /** 输出上限（0 = 未知）。 */
+  /**
+   * 模型单次输出上限（0 = 未知）。
+   *
+   * ⚠️ **刻意不下发给 DSH 的 `defaultMaxTokens`**（issue IKJJ68）。
+   * 它是**上限**而非「合理的默认输出预算」：DSH 会在用户未指定 `max_tokens` 时
+   * 直接拿它填请求，于是每轮都按上限走 —— 而 `space-bunny-free` 的上限是
+   * **524288**、`nemotron-3-ultra-free` 是 128000，作为「默认」明显荒谬。
+   *
+   * ⚠️ 实测 2026-10-02 澄清了两件事（别再凭猜写这里的注释）：
+   *   ① 给到这些值**不会被服务端拒绝**（big-pickle 32000 / nemotron 128000 /
+   *      space-bunny 524288 全部 200）—— 「免费通道会拒」的说法**不成立**；
+   *   ② **不给** `max_tokens` 时服务端用自己的默认值，实测 667 tokens 且
+   *      `finish=stop`（自然结束，非截断）—— 现有「不下发」的行为就是好的。
+   * 采下来是为了**留档**，以及将来按渠道实测出安全默认值。
+   */
   maxOutputTokens: number
   /** 是否支持思考推理（**仅表示「支持」**；档位见 {@link efforts}）。 */
   reasoning: boolean

@@ -226,21 +226,27 @@ describe('resolveModel', () => {
     const resolved = await a.resolveModel('opencode', 'nope-model')
     expect(resolved.context).toBeUndefined()
   })
-  it('窗口为 0 的条目不下发 context（0 不是合法窗口）', async () => {
+  // ⚠️ 下面两条的口径在 issue IKJJ68 修复后**变了**：窗口优先取**能力表**
+  // （models.dev 的 `limit.context`），catalog 的 `context_window` 只是兜底
+  // —— 而 Zen `/v1/models` 实测**从不下发**该字段（85 条只有 4 个基础字段）。
+  // 故这两条改用「catalog 给 0」与「未知模型」来锁真正要守的语义。
+  it('⚠️ catalog 给 0 窗口时，能力表仍能提供窗口（issue IKJJ68 根因）', async () => {
     const a = new OpencodeAdapter({
       identitySlots: async () => [anonSlot()],
-      // 用表内可达模型但显式给 0 窗口
       fetchRemoteCatalog: async () => jsonResponse({ data: [{ id: 'big-pickle', context_window: 0 }] }),
     })
-    expect((await a.resolveModel('opencode', 'big-pickle')).context).toBeUndefined()
+    const resolved = await a.resolveModel('opencode', 'big-pickle')
+    // 能力表里 big-pickle = 200000；catalog 的 0 不该压掉它
+    expect(resolved.context?.contextWindow).toBe(200000)
   })
-  it('已知模型声明 contextWindow', async () => {
+  it('⚠️ 两侧都不知道窗口时不下发 context（不编造）', async () => {
     const a = new OpencodeAdapter({
       identitySlots: async () => [anonSlot()],
-      fetchRemoteCatalog: async () => jsonResponse({ data: [{ id: 'big-pickle', context_window: 131072 }] }),
+      // 未收录的模型名：能力表没有、catalog 也没有
+      fetchRemoteCatalog: async () => jsonResponse({ data: [] }),
     })
-    const resolved = await a.resolveModel('opencode', 'big-pickle')
-    expect(resolved.context?.contextWindow).toBe(131072)
+    const resolved = await a.resolveModel('opencode', 'nope-model')
+    expect(resolved.context).toBeUndefined()
   })
   it('listAllModels 返回完整目录且**同步**（jet-hub-rpc 不 await）', () => {
     const a = new OpencodeAdapter({ identitySlots: async () => [anonSlot()] })
