@@ -58,7 +58,7 @@ import {
 } from './opencode-auth.js'
 import { OPENCODE } from './opencode-product.js'
 import { deriveProjectId, opencodeUserAgent } from './opencode.js'
-import { primeOpencodeCapabilities, refreshOpencodeCapabilities } from './opencode-capability.js'
+import { primeOpencodeCapabilities, refreshOpencodeCapabilities, getOpencodeCapabilitiesSync } from './opencode-capability.js'
 import { closeAllProxyDispatchers } from './opencode-proxy.js'
 import { execFile } from 'node:child_process'
 
@@ -1584,6 +1584,13 @@ const zcodeAdapter = registerZcodeLlm(ctx, {
       await pool.updateModelRateLimit(slotId, modelId, resetAtMs)
     },
     warn: (message) => ctx.logger.warn(`[codearts-auth] ${message}`),
+    // ⚠️ 诊断钩子（临时）：`DSH_OPENCODE_IMAGE_DEBUG=1` 时由适配器调用，
+    // 用于定位「直连能识图、经网关丢图」（真机报障 2026-10-02）。
+    // 直接读能力表（与 `inputModalitiesOf` 同一数据源），不做额外计算。
+    debugInputModalities: (model) => {
+      const entry = getOpencodeCapabilitiesSync().find((c) => c.id === model)
+      return entry?.modalities ?? ['(能力未知)']
+    },
     // ⚠️ 图片字节桥接：Zen 有多个免费模型实测支持图片输入（big-pickle /
     // space-bunny-free / mimo-v2.6 / mimo-v2.5，2026-10-02 真机验证），
     // 模态由 `opencode-capability.ts` 按远端 models.dev 播报。

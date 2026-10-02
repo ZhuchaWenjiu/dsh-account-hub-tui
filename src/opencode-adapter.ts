@@ -137,6 +137,12 @@ export interface OpencodeAdapterOptions {
   /** 诊断日志。 */
   warn?: (message: string) => void
   /**
+   * 诊断用：返回某模型声明的 `inputModalities`。
+   * ⚠️ **仅在 `DSH_OPENCODE_IMAGE_DEBUG=1` 时被调用**（真机定位「直连能识图、
+   * 经网关丢图」用），平时是可选的、无人实现也不影响任何路径。
+   */
+  debugInputModalities?: (model: string) => readonly string[]
+  /**
    * 附件字节读取。**只有声明了 image 模态的模型才需要**。
    *
    * ⚠️ 缺省时带图请求会抛 `UNSUPPORTED_CONTENT`（见 `resolveImageUrls`），
@@ -442,6 +448,30 @@ export class OpencodeAdapter extends LlmAdapter {
     // 否则图片会被静默丢掉（Qoder 图片丢失事故的同型缺陷）。
     const imageUrls = await this.resolveImageUrls(options.model, options.messages)
     const messages = serializeMessages(options.messages, imageUrls)
+    // ⚠️ **临时诊断**（真机定位用 2026-10-02）：直连能识图、经网关丢图，
+    // 而网关入站已验证正常（探针实测产出 ImageBlock），故丢弃点在**本适配器
+    // 之后**。这里只打**结构**（块类型 + 字节数 + 模态），**不打内容**，
+    // 图片本身与用户数据都不落 console。
+    if (process.env.DSH_OPENCODE_IMAGE_DEBUG === '1') {
+      console.warn('[opencode image]', JSON.stringify({
+        hasImageUrls: imageUrls !== undefined,
+        imageUrlCount: imageUrls?.size ?? 0,
+        inputModalities: this.options.debugInputModalities?.(options.model) ?? '(未提供)',
+        messages: messages.map((m) => ({
+          role: m.role,
+          content: Array.isArray(m.content)
+            ? m.content.map((part) => {
+              if (typeof part === 'string') return 'text'
+              const p = part as { type?: string; image_url?: { url?: string } }
+              if (p.type === 'image_url') {
+                return { type: 'image_url', bytes: p.image_url?.url?.length ?? 0 }
+              }
+              return p.type ?? '?'
+            })
+            : typeof m.content,
+        })),
+      }))
+    }
     const payload = buildOpencodePayload({
       model: options.model,
       messages,
