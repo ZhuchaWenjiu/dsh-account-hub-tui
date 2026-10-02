@@ -28,7 +28,7 @@ function inputModalitiesOf(
  * 指纹派生的作用是**防关联**与满足形状门禁，不参与配额计算。
  */
 
-import { LlmAdapter, LlmError } from '@deepseek-ai/dsh-llm'
+import { LlmAdapter, LlmError, ReasoningEffortId } from '@deepseek-ai/dsh-llm'
 import type {
   GenerateOptions,
   LlmModelInfo,
@@ -46,7 +46,8 @@ import { listIdentitySlots, type IdentitySlot } from './opencode-auth.js'
 import { deriveRequestId, deriveSessionId, opencodeHeaders, opencodeUserAgent } from './opencode.js'
 import { buildOpencodePayload } from './opencode-messages.js'
 import {
-  getOpencodeCapabilitiesSync, supportsOpencodeImage, type OpencodeModelCapability,
+  getOpencodeCapabilitiesSync, opencodeEffortName, supportsOpencodeImage,
+  type OpencodeModelCapability,
 } from './opencode-capability.js'
 import { buildProxyDispatcher } from './opencode-proxy.js'
 import { consumeOpenAiSse, collectImages, httpErrorCode, serializeMessages } from './openai-compat.js'
@@ -267,6 +268,7 @@ export class OpencodeAdapter extends LlmAdapter {
     const all = await this.catalog()
     const entry = all.find((m) => m.id === model)
     const capabilities = getOpencodeCapabilitiesSync()
+    const capability = capabilities.find((c) => c.id === model)
     const resolved: LlmResolvedModelInfo = {
       provider,
       id: model,
@@ -276,6 +278,34 @@ export class OpencodeAdapter extends LlmAdapter {
     // ⚠️ 窗口未知**不编造**：0 是「不知道」哨兵，不能当合法窗口下发。
     if (entry !== undefined && entry.contextWindow > 0) {
       resolved.context = { contextWindow: entry.contextWindow }
+    }
+    // ⚠️⚠️ **思考档位**（issue IKJJ0V 修复，此前完全没声明 ⇒ 选择器永不出现）。
+    //
+    // 契约（读 DSH 内核 `dsh-api-session-controller/lib/types/catalog.js` 得到，
+    // 它直接把本字段映射成客户端目录）：
+    //   reasoning: { efforts: Array<{ id, name, description? }>, defaultEffort? }
+    // 客户端**直接渲染** `efforts[].name`（不本地化、不查字典），故 name 必须给中文。
+    //
+    // ⚠️ 档位为**空**时**不声明**本字段（而不是给 `efforts: []`）：DSH 的判定是
+    // `resolved.reasoning === undefined ? undefined : {…}`，声明空数组会让 UI
+    // 出现一个没有任何档位的空选择器。
+    if (capability !== undefined && capability.efforts.length > 0) {
+      resolved.reasoning = {
+        efforts: capability.efforts.map((effort) => ({
+          // ⚠️ `id` 是**品牌类型**（`ReasoningEffortId`），必须经它的构造函数 ——
+          // 与 Qoder 同款（`src/qoder-adapter.ts:581`）。
+          id: ReasoningEffortId(effort),
+          // ⚠️ 没有官方中文的档位（models.dev 会下发 `minimal` / `xhigh` 等
+          // Qoder 那份表里没有的值）**回退到 id 本身** —— 宁可显示英文原值，
+          // 也不猜一个可能错译的中文。
+          name: opencodeEffortName(effort),
+        })),
+      }
+      // ⚠️ `defaultEffort` **刻意不下发**：models.dev 没有 `is_default` 字段
+      // （Qoder 的目录里有），无从判断默认值。让 DSH 自行取第一档，
+      // 也不写死一个可能与上游默认不符的档位。
+      // ⚠️ 若将来要下发，**必须落在 `efforts` 内** —— DSH 会直接拿它发请求，
+      // 给不存在的档位会抛 UNSUPPORTED_REASONING_EFFORT（同 Qoder 的注释）。
     }
     return resolved
   }
@@ -449,6 +479,11 @@ export class OpencodeAdapter extends LlmAdapter {
       ...options.tools !== undefined ? { tools: options.tools } : {},
       ...options.temperature !== undefined ? { temperature: options.temperature } : {},
       ...options.maxTokens !== undefined ? { maxTokens: options.maxTokens } : {},
+      // ⚠️ 思考档位（issue IKJJ0V）：`ReasoningEffortId` 是品牌类型，转普通字符串。
+      // `none`（关闭思考）也照发 —— models.dev 的 toggle 形态就产出这一档。
+      ...options.reasoningEffort !== undefined
+        ? { reasoningEffort: String(options.reasoningEffort) }
+        : {},
     })
     const headers: Record<string, string> = {
       ...opencodeHeaders(slot.fingerprint, sessionIdOf(options), deriveRequestId(), opencodeUserAgent(slot.userAgent)),

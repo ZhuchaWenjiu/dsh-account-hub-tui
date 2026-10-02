@@ -48,8 +48,18 @@ export interface OpencodeModelCapability {
   contextWindow: number
   /** 输出上限（0 = 未知）。 */
   maxOutputTokens: number
-  /** 是否支持思考推理。 */
+  /** 是否支持思考推理（**仅表示「支持」**；档位见 {@link efforts}）。 */
   reasoning: boolean
+  /**
+   * 思考档位 id（**原序**来自 models.dev 的 `reasoning_options`）。
+   *
+   * ⚠️ **空数组 = 不声明 `reasoning`**（选择器不出现），而不是「支持但无档位」。
+   * 依据是 DSH 的渲染逻辑（`dsh-api-session-controller/lib/types/catalog.js`）：
+   * `resolved.reasoning === undefined ? undefined : { efforts: … }` ——
+   * 声明了空数组会让 UI 出现一个**没有任何档位**的空选择器。
+   * （issue IKJJ0V）
+   */
+  efforts: readonly string[]
   /** 是否支持工具调用。 */
   toolCall: boolean
   /**
@@ -86,17 +96,96 @@ interface RawModelDevEntry {
   limit?: { context?: unknown; output?: unknown }
   cost?: { input?: unknown; output?: unknown }
   reasoning?: unknown
+  /**
+   * 思考档位声明（issue IKJJ0V）。
+   *
+   * 实测 2026-10-02：115 个 opencode 模型里 **88 个**带此字段，形态有四种：
+   * | 形态 | 实例 |
+   * |---|---|
+   * | 多档 | `{"type":"effort","values":["minimal","low","medium","high","xhigh"]}` |
+   * | 自定义档 | `{"type":"effort","values":["low","high","max"]}` |
+   * | 单档 | `{"type":"effort","values":["max"]}` |
+   * | 仅开关 | `{"type":"toggle"}` |
+   * | 预算制 | `{"type":"budget_tokens","max":81920}` |
+   */
+  reasoning_options?: unknown
   tool_call?: unknown
 }
 
 /** 磁盘缓存的落盘形态。 */
 interface CapabilityCacheFile {
-  version: 1
+  /**
+   * ⚠️ 2026-10-02 从 1 升到 **2**（issue IKJJ0V：新增 `efforts` 字段）。
+   * 旧版本缓存**没有** `efforts`，若沿用 version:1 会被当成有效数据继续用，
+   * 思考档位在 TTL 内（最长 60 分钟）持续缺失 —— 表现为「改了没用，重启才好」。
+   */
+  version: 2
   at: number
   entries: readonly OpencodeModelCapability[]
 }
 
 const isFiniteNumber = (v: unknown): v is number => typeof v === 'number' && Number.isFinite(v)
+
+/**
+ * 档位 id → 官方中文展示名。
+ *
+ * ⚠️ 沿用 Qoder 那份**官方 i18n**（`settings.efforts`，见 AGENTS.md §2.2），
+ * 因为 DSH 客户端**直接渲染** `efforts[].name`（不本地化、不查字典），
+ * 给英文就显示英文。
+ * ⚠️ `minimal` / `xhigh` 在那份表里没有 —— models.dev 确实会下发这两个值，
+ * 遇到时回退到 id 本身（**不猜中文**）：宁可显示 `minimal` 也不编一个错译。
+ */
+const EFFORT_NAMES: Record<string, string> = {
+  none: '关闭思考',
+  minimal: '最小',
+  low: '低',
+  medium: '中',
+  high: '高',
+  xhigh: '极高',
+  max: '最大',
+}
+
+/**
+ * 档位 id → 展示名（**无官方中文时回退到 id 本身**，不猜译名）。
+ *
+ * 导出给适配器用：`resolveModel()` 要给 `efforts[].name` 填中文，
+ * 而客户端**直接渲染**该字段。
+ */
+export function opencodeEffortName(id: string): string {
+  return EFFORT_NAMES[id] ?? id
+}
+
+/**
+ * 从 `reasoning_options` 提取思考档位。
+ *
+ * ## 三种形态的处置（issue IKJJ0V）
+ *
+ * - `type:'effort'` + `values` → **原序**产出，值就是上游认的 id。
+ * - `type:'toggle'`（只能开/关）→ 产出 `['none', 'low']` 两档：
+ *   `none`=关闭思考、`low`=开启（最低档即「开」）。这是与 Qoder 的
+ *   `supportsDisable` 独立维度等价的表达 —— 在本形态里「关」就是全部语义。
+ * - `type:'budget_tokens'`（预算制）→ **不声明**。DSH 的 `reasoning.efforts`
+ *   表达不了预算，编一档等于谎报能力。
+ *
+ * @returns 档位 id 数组；为空表示**不声明** `reasoning`（UI 不出现）。
+ */
+function normalizeEfforts(entry: RawModelDevEntry): readonly string[] {
+  if (!Array.isArray(entry.reasoning_options)) return []
+  const out: string[] = []
+  for (const raw of entry.reasoning_options) {
+    if (typeof raw !== 'object' || raw === null) continue
+    const option = raw as { type?: unknown; values?: unknown }
+    if (option.type === 'effort' && Array.isArray(option.values)) {
+      for (const v of option.values) {
+        if (typeof v === 'string' && v.length > 0 && !out.includes(v)) out.push(v)
+      }
+    } else if (option.type === 'toggle' && !out.includes('none')) {
+      out.push('none', 'low')
+    }
+    // `budget_tokens` 刻意不处理（见上方说明）
+  }
+  return out
+}
 
 /** 把 models.dev 的一个条目归一；不合法时返回 null。 */
 function normalizeEntry(id: string, raw: unknown): OpencodeModelCapability | null {
@@ -111,13 +200,17 @@ function normalizeEntry(id: string, raw: unknown): OpencodeModelCapability | nul
   if (declared.includes('image')) modalities = ['text', 'image']
   const override = MEASURED_IMAGE_OVERRIDES[id]
   if (override !== undefined) modalities = override.image ? ['text', 'image'] : ['text']
+  const efforts = normalizeEfforts(entry)
   return {
     id,
     name: typeof entry.name === 'string' && entry.name.length > 0 ? entry.name : id,
     modalities,
     contextWindow: isFiniteNumber(entry.limit?.context) ? entry.limit!.context as number : 0,
     maxOutputTokens: isFiniteNumber(entry.limit?.output) ? entry.limit!.output as number : 0,
-    reasoning: entry.reasoning === true,
+    // ⚠️ `reasoning` 与 `efforts` 必须一致：只有真拿到档位才报「支持思考」。
+    // `reasoning: true` 但 `efforts: []` 会声明一个空选择器（UI 出现但无内容）。
+    reasoning: entry.reasoning === true && efforts.length > 0,
+    efforts,
     toolCall: entry.tool_call !== false,
     isFree: isFiniteNumber(entry.cost?.input) && entry.cost!.input === 0
       && isFiniteNumber(entry.cost?.output) && entry.cost!.output === 0,
@@ -147,7 +240,7 @@ async function ensureDiskLoaded(): Promise<void> {
   try {
     const raw = await readFile(cacheFilePath(), 'utf8')
     const parsed = JSON.parse(raw) as CapabilityCacheFile
-    if (parsed?.version === 1 && Array.isArray(parsed.entries) && parsed.entries.length > 0) {
+    if (parsed?.version === 2 && Array.isArray(parsed.entries) && parsed.entries.length > 0) {
       memory = parsed.entries
       cacheFileAt = typeof parsed.at === 'number' ? parsed.at : 0
     }
@@ -187,7 +280,7 @@ function loadDiskCacheSync(): void {
   try {
     const raw = readFileSync(cacheFilePath(), 'utf8')
     const parsed = JSON.parse(raw) as CapabilityCacheFile
-    if (parsed?.version === 1 && Array.isArray(parsed.entries) && parsed.entries.length > 0) {
+    if (parsed?.version === 2 && Array.isArray(parsed.entries) && parsed.entries.length > 0) {
       memory = parsed.entries
       cacheFileAt = typeof parsed.at === 'number' ? parsed.at : 0
     }
@@ -200,7 +293,7 @@ async function writeDiskCache(entries: readonly OpencodeModelCapability[]): Prom
   try {
     const path = cacheFilePath()
     await mkdir(join(path, '..'), { recursive: true })
-    const payload: CapabilityCacheFile = { version: 1, at: Date.now(), entries }
+    const payload: CapabilityCacheFile = { version: 2, at: Date.now(), entries }
     await writeFile(path, JSON.stringify(payload), 'utf8')
   } catch {
     // 缓存写失败不影响功能（下次仍会从网络补齐）
