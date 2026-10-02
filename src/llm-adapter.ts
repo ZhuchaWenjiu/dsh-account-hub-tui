@@ -9,6 +9,7 @@ import { ReasoningEffortId, ToolCallId } from '@deepseek-ai/dsh-llm'
 import { AccountPool, providerCatalogVisible } from './account-pool.js'
 import { RemoteCatalogGate } from './remote-catalog-gate.js'
 import { settingsNamespaceFor } from './settings-compat.js'
+import { nextUtc8DayStartMs } from './model-queue.js'
 import { isCodeArtsBenefitModel } from './models.js'
 import { normalizeHarnessMessages } from './message-shape.js'
 import { signRequestHuawei } from './sign.js'
@@ -341,6 +342,81 @@ class SseQueueRetryError extends Error {
   }
 }
 
+/**
+ * SSE 流内「额度已用尽」的信号（**不可重试**）。
+ *
+ * ⚠️ 必须与 {@link SseQueueRetryError} **分开**：排队是「等一会儿就通」，
+ * 额度是「等多久都没用」。把它当排队处理正是本次缺陷的表象
+ * （静默重试 30 分钟、界面零输出）。
+ *
+ * 之所以要单独一个类而不是直接抛 `LlmError`：`stream()` 需要在**同一个地方**
+ * 完成「标记账号受限 + 切下一个账号 + 如实抛出」三件事，且要能 `continue`
+ * 重试循环 —— 这件事只有捕获点的上下文（`credential` / `currentAccountId` /
+ * `rateLimitTried`）才做得到。
+ */
+class SseQuotaExhaustedError extends Error {
+  readonly code: string
+  constructor(code: string, message: string) {
+    super(message)
+    this.name = 'SseQuotaExhaustedError'
+    this.code = code
+  }
+}
+
+/**
+ * 把「距重置还有多久」格式化成中文短句。
+ *
+ * 用户需求（2026-10-02）：「其它渠道限额到了会提示多少时间后会解除限额，
+ * 这个 codearts 的也加上吧」—— 其它渠道（buddy / workbuddy）由**服务端**
+ * 在错误文案里给出重置时刻，故 `parseRateLimitError` 能解析；CodeArts 的
+ * benefit 额度报文里**没有**任何时间字段（实测 `InferHub.4291.200` 的
+ * `details` 只有 requestId / timestamps / modelId / traceId），因此按
+ * **UTC+8 自然日**自行推算（见 {@link codeartsQuotaExhaustedMessage}）。
+ *
+ * @param resetAtMs - 解禁时刻（UTC 毫秒）。
+ * @param nowMs - 当前时刻（注入以便单测）。
+ */
+export function formatResetIn(resetAtMs: number, nowMs: number = Date.now()): string {
+  const diff = resetAtMs - nowMs
+  if (diff <= 0) return '即将重置'
+  if (diff < 60_000) return '不到 1 分钟'
+  if (diff < 3_600_000) return `${Math.round(diff / 60_000)} 分钟`
+  // 保留一位小数：额度按自然日结算，剩余时间通常在 1~24 小时之间，
+  // 只报整数会让「还有 1 小时」与「还有 1.9 小时」看起来一样。
+  return `${Math.round(diff / 360_000) / 10} 小时`
+}
+
+/**
+ * 额度用尽时给用户看的完整说明（**含解禁时间**，这是用户明确要求的）。
+ *
+ * ## 为什么按「UTC+8 次日 00:00」推算
+ *
+ * CodeArts 的 benefit（免费额度）模型（`glm-5.3-flash` / `deepseek-v4.1-flash`）
+ * 额度按**自然日**结算（IDE 模型卡标注「每日 1000 万免费 Tokens」），而
+ * `InferHub.4291.200` 的报文里**不给重置时刻**。故与 `qoder` / `zcode` 的
+ * 额度处理同款：复用 {@link nextUtc8DayStartMs} 取 UTC+8 当日 24:00，
+ * **不能**复用 `parseRateLimitError`（它解析不到时间时退回「1 小时后」，
+ * 对按日结算的额度会让标记过早失效，用户 1 小时后再撞一次同样的墙）。
+ *
+ * ⚠️ 措辞对「这是我们的推算」保持诚实：写「预计」，不谎称是服务端给的时间。
+ *
+ * @param model - 请求的模型 id（用户据此决定换哪个）。
+ * @param resetAtMs - 推算出的解禁时刻。
+ * @param nowMs - 当前时刻（注入以便单测）。
+ */
+export function codeartsQuotaExhaustedMessage(
+  model: string,
+  resetAtMs: number,
+  nowMs: number = Date.now(),
+): string {
+  const when = formatResetIn(resetAtMs, nowMs)
+  return (
+    `codearts: 模型 ${model} 的免费额度（benefit）已用尽，`
+    + `预计 ${when}后重置（按 UTC+8 自然日结算，预计 ${new Date(resetAtMs).toISOString()}）。`
+    + '可改用其它模型，或在 Jet Hub 的 CodeArts 面板切换/添加账号。'
+  )
+}
+
 /** CodeArts 后端返回的一次排队状态响应。 */
 export interface CodeArtsQueueStatus {
   readonly status: 'waiting' | 'working' | 'error' | 'queue_full'
@@ -371,15 +447,75 @@ function isAuthError(status: number, body: string): boolean {
 }
 
 /**
- * 判断 SSE 流内返回的 error_code 是否属于可重试的排队/限流错误。
+ * 判断 SSE 流内返回的 error_code 是否属于**可重试**的排队/限流错误。
+ *
  * CodeArts 以 HTTP 200 + SSE 内嵌 `error_code` 返回这类错误（例如
  * `InferHub.ModelArts.81111.429` TPM 每分钟 token 超限），而不是 4xx——
  * 适配器把它们当成排队处理：延迟后重试整个 chat 请求，与 TM.00001041
  * 行为一致，避免"思考后无输出"。
+ *
+ * ## ⚠️ 判据必须锚定「429」这个**独立数字**，不能用裸子串（真实缺陷）
+ *
+ * 原实现写作 `/81111|TPM|429|rate.?limit|…/`，其中 `429` 是**无边界子串**匹配，
+ * 于是额度耗尽码 `InferHub.4291.200` 里的 `4291` **命中了 `429` 前缀** ——
+ * 被误判成「可重试的排队限流」，进入每 10 秒重试、上限 180 次（30 分钟）的
+ * 静默重试循环。
+ *
+ * 实测（2026-10-02，用户在本机真实凭据上的会话）：
+ * ```
+ * isSseQueueErrorCode('InferHub.4291.200') === true    ← 误判
+ * 匹配到的子串: "429"
+ * ```
+ * 后果是**界面完全无输出**：`stream()` 在排队期间刻意不产出任何内容块
+ * （见下方排队循环的长注释），而它误以为自己"在排队"。实测真实适配器
+ * 25 秒内发出 4 次 chat 请求 + 3 次排队探测、**产出 0 个 chunk**，最终由
+ * 用户手动中止（会话记录里是 `turn/end aborted` + `stream: []`，**没有任何
+ * error 事件** —— 因为错误根本没被抛出）。这正是用户报障的「CodeArts Agent
+ * 没反应」。
+ *
+ * ⇒ 现在 `429` 用 `(^|[^0-9])429([^0-9]|$)` 锚定为独立数字：`…81111.429`（结尾）
+ * 与 `429 Too Many Requests`（后接空格）仍命中，而 `4291` 不再命中。
+ * 额度耗尽的 `4291` 由 {@link isSseQuotaExhaustedErrorCode} 单独识别。
+ *
+ * 导出仅供单测直接锁定「`429` 的边界」这一判据本身 —— 若只靠调用点的先后顺序
+ * （额度判据排在排队判据之前）来兜住 `4291`，那么把边界改回裸子串时**任何**
+ * 端到端用例都不会变红（实测确认过），边界就成了没人守的装饰。
  */
-function isSseQueueErrorCode(code: string): boolean {
+export function isSseQueueErrorCode(code: string): boolean {
   return code === 'TM.00001041'
-    || /81111|TPM|429|rate.?limit|too many requests|排队|限流/i.test(code)
+    || /81111|TPM|(^|[^0-9])429([^0-9]|$)|rate.?limit|too many requests|排队|限流/i.test(code)
+}
+
+/**
+ * 判断 SSE 流内返回的 error_code 是否表示**额度已用尽**（不可重试）。
+ *
+ * 实测报文（2026-10-02，真实凭据）：
+ * ```
+ * HTTP 200  data:{"error_code":"InferHub.4291.200","error_msg":"insufficient quota",
+ *                 "details":[…requestId…timestamps…modelId: deepseek-v4.1-flash…traceId…]}
+ * ```
+ * 同账号的 `deepseek-v4-flash`（非 benefit 通道）仍正常出流 —— 故这是
+ * 「该模型 + 该账号的免费额度用尽」，不是账号欠费（同期 `statistics/plugin`
+ * 显示积分余额仍有 8499.84）。
+ *
+ * 与「排队/限流」是**本质不同**的两件事，绝不可合并（同 `qoder` 的
+ * `10605` 排队 vs `110` 额度那次教训，见 `AGENTS.md`）：
+ *
+ * | | 排队/TPM 限流 | 额度用尽 |
+ * |---|---|---|
+ * | 语义 | **暂时**受阻，等一会儿就通 | **额度真的没了**，重试无意义 |
+ * | 处理 | 内部等待后重试 | **立即失败**并如实告知 |
+ *
+ * 判据用**子串** `4291`（而非全等）是刻意的：该码由服务端下发，本地产物里
+ * 没有硬编码（同 `qoder` 的 `110`），若上游改用 `InferHub.4291.xxx` 的其它
+ * 尾号表达同一语义，只认全等会漏判。`4291` 与排队族的 `81111` / 独立的
+ * `429` 均不冲突。
+ *
+ * 文案兜底（`insufficient quota`）不可省：万一上游换了码值，序列化后的
+ * detail 文本仍能命中 —— 与 `zcode` / `qoder` 的既有做法一致。
+ */
+export function isSseQuotaExhaustedErrorCode(code: string, message: string): boolean {
+  return code.includes('4291') || /insufficient[\s_-]+quota/i.test(message)
 }
 
 /** 从错误体提取可分类的 detail 文本（OpenAI 风格 error 或 CodeArts error_code/error_msg）。 */
@@ -1042,6 +1178,45 @@ export class CodeArtsAdapter extends LlmAdapter {
           yield* this.consumeSse(response, options)
           break
         } catch (error) {
+          if (error instanceof SseQuotaExhaustedError) {
+            // ── 额度用尽（InferHub.4291.200）：标记 + 换号 + 如实报出解禁时间 ──
+            //
+            // ⚠️ 这块**必须与排队分支分开**，且**不能** `continue` 去重试：
+            // 额度是按自然日结算的确定性失败，重试 180 次（30 分钟）也还是同一个
+            // 结果，只会让 UI 长期停在「运行中」且零输出 —— 那正是本次报障。
+            //
+            // 标记时限按 **UTC+8 当日 24:00** 推算（报文里没有时间字段），
+            // 与 qoder / zcode 的额度处理同款。标记写进 `modelRateLimits` 后，
+            // Jet Hub 的「限额重置 · <模型> · N 小时后」徽章与池的选号
+            // （`getAvailableAccount` 会跳过未到期的账号）同时生效。
+            const message = codeartsQuotaExhaustedMessage(options.model, nextUtc8DayStartMs())
+            // ① 先给**当前**账号记上限流标记（UI 徽章与池的选号都依赖它）。
+            if (this.options.accountPool && currentAccountId) {
+              await this.options.accountPool.updateModelRateLimit(
+                currentAccountId, options.model, nextUtc8DayStartMs(),
+              )
+              rateLimitTried.add(currentAccountId)
+            }
+            // ② 取下一个可用账号。
+            //
+            // ⚠️ 必须传 `tried`：池按用户手动顺序返回候选，**刚失败的账号可能仍排
+            // 第一**（当失败类别不写标记时尤甚），不排除就会拿回同一个、命中
+            // `tried.has` 而立即放弃切换（换号形同虚设）。
+            if (this.options.accountPool) {
+              const next = await this.options.accountPool.getAvailableAccount(
+                'codearts', options.model, rateLimitTried,
+              )
+              if (next && !rateLimitTried.has(next.entry.id)) {
+                rateLimitTried.add(next.entry.id)
+                credential = next.credential as CodeArtsCredential
+                currentAccountId = next.entry.id
+                authRefreshed = false // 新凭据：重置「已刷新过」标记
+                continue // 用下一个账号重试
+              }
+            }
+            // ③ 没有可用账号（或没有账号池）：如实抛出，带上解禁时间。
+            throw new LlmError(message, QUOTA_EXCEEDED_CODE, { status: 200 })
+          }
           if (error instanceof SseQueueRetryError) {
             // 落入下方排队重试
           } else if (
@@ -1070,6 +1245,38 @@ export class CodeArtsAdapter extends LlmAdapter {
             throw new LlmError('codearts: credential missing after refresh; log in again', 'MISSING_CREDENTIAL')
           }
           continue
+        }
+        // 额度用尽（**不可重试**）：与下面「限流/排队」是本质不同的两类。
+        //
+        // ⚠️ 必须在 `isRateLimited` **之前**判定：`insufficient quota` 这类文案
+        // 若被限流判据先接走，就会被当成「重试可自愈」，而它其实是按自然日结算的
+        // 确定性失败（同 `qoder` 的 `110` vs `10605` 那次教训）。
+        // 实测该码主要走 SSE 通道（HTTP 200），但服务端同样可能以 4xx 下发 ——
+        // 两条通道都接，避免哪天改了形态就漏（`AGENTS.md` 的既有铁律）。
+        //
+        // ⚠️ 判据用整个错误体（`errorDetail` 会拼出 `error_code` + `error_msg`）：
+        // 4xx 的报文形态与 SSE 不同，不能指望顶层 `error_code` 字段名一致。
+        if (isSseQuotaExhaustedErrorCode(errorDetail(errorText), errorText)) {
+          const message = codeartsQuotaExhaustedMessage(options.model, nextUtc8DayStartMs())
+          if (this.options.accountPool) {
+            if (currentAccountId) {
+              await this.options.accountPool.updateModelRateLimit(
+                currentAccountId, options.model, nextUtc8DayStartMs(),
+              )
+              rateLimitTried.add(currentAccountId)
+            }
+            const next = await this.options.accountPool.getAvailableAccount(
+              'codearts', options.model, rateLimitTried,
+            )
+            if (next && !rateLimitTried.has(next.entry.id)) {
+              rateLimitTried.add(next.entry.id)
+              credential = next.credential as CodeArtsCredential
+              currentAccountId = next.entry.id
+              authRefreshed = false
+              continue
+            }
+          }
+          throw new LlmError(message, QUOTA_EXCEEDED_CODE, { status: response.status })
         }
         // 限流处理：记录当前账号在该模型上的重置时间，然后切换账号重试
         // （外层 for(;;) 会在拿到新凭据后重新签名发请求）。用 tried 集合
@@ -1433,6 +1640,15 @@ export class CodeArtsAdapter extends LlmAdapter {
             const message = typeof data.error_msg === 'string' && data.error_msg.length > 0
               ? data.error_msg
               : data.error_code
+            // ⚠️ 顺序不可颠倒：额度耗尽（InferHub.4291.200）必须**先**于排队判据
+            // 检查。历史上它们混淆过一次 —— `4291` 被 `429` 的裸子串匹配吃掉，
+            // 额度错误因此被当成「可重试的排队」，进入 30 分钟静默重试循环，
+            // 界面零输出（用户报障「没反应」的直接原因）。
+            // 现在两个判据已互斥（裸 `429` 已锚定为独立数字），这里的先后仍保留：
+            // 它把「额度优先」表达成代码结构，防止后续再有人放宽 `429` 判据。
+            if (isSseQuotaExhaustedErrorCode(data.error_code, message)) {
+              throw new SseQuotaExhaustedError(data.error_code, message)
+            }
             if (isSseQueueErrorCode(data.error_code)) {
               throw new SseQueueRetryError(data.error_code, message)
             }

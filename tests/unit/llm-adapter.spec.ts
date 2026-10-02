@@ -4,9 +4,14 @@ import { credentialRef } from '@deepseek-ai/dsh-credentials'
 import {
   CHAT_API_BASE,
   CodeArtsAdapter,
+  codeartsQuotaExhaustedMessage,
+  formatResetIn,
+  isSseQueueErrorCode,
+  isSseQuotaExhaustedErrorCode,
   QUEUE_STATUS_BASE,
   RATE_LIMIT_FALLBACK_MS,
 } from '../../src/llm-adapter.js'
+import { nextUtc8DayStartMs } from '../../src/model-queue.js'
 import { setBenefitMemoryCache } from '../../src/models.js'
 import type { CodeArtsCredential } from '../../src/types.js'
 
@@ -2046,5 +2051,205 @@ describe('CodeArtsAdapter', () => {
     // 不完整 thought 作为 reasoning 放行，不泄漏到正文
     expect(textDeltas.join('')).toBe('')
     expect(reasoningDeltas.join('')).toBe('我正在思考')
+  })
+
+  /**
+   * 额度用尽（`InferHub.4291.200`）必须与「排队/限流」**彻底分开**。
+   *
+   * ## 真实缺陷（用户报障 2026-10-02）
+   *
+   * 用户报「插件 dsh-codearts-auth 里的 CodeArts Agent 没反应了」—— 实际是
+   * 该账号唯一启用的模型 `deepseek-v4.1-flash`（benefit / 免费额度通道）额度
+   * 用尽，后端以 **HTTP 200 + SSE** 下发：
+   * ```
+   * data:{"error_code":"InferHub.4291.200","error_msg":"insufficient quota",…}
+   * ```
+   * 而 `isSseQueueErrorCode` 的判据 `/…|429|…/` 是**无边界子串**匹配，
+   * `4291` 命中了 `429` 前缀 → 被当成「可重试的排队」→ 进入每 10 秒重试、
+   * 上限 180 次（30 分钟）的循环。
+   *
+   * ⚠️ 后果是**界面完全无输出**（不是报错）：排队期间适配器刻意不产出任何
+   * 内容块，而它误以为自己在排队。实测真实适配器 25 秒内发 4 次 chat 请求 +
+   * 3 次排队探测、**产出 0 个 chunk**，最终由用户手动中止 —— 会话记录里是
+   * `turn/end aborted` + `stream: []`，**没有任何 error 事件**。
+   */
+  describe('额度用尽（InferHub.4291.200）与排队分流', () => {
+    it('把 InferHub.4291.200 判为额度用尽，而 81111.429 仍判为可重试排队', () => {
+      // ① 额度码：命中额度判据、**不再**被裸 `429` 子串吃掉。
+      expect(isSseQuotaExhaustedErrorCode('InferHub.4291.200', 'insufficient quota')).toBe(true)
+      // ② 排队码：仍走排队（回归保护 —— 修 429 边界不能把真排队一起修坏）。
+      expect(isSseQuotaExhaustedErrorCode('InferHub.ModelArts.81111.429', 'TPM limit')).toBe(false)
+      // ③ 文案兜底：码值换了也能认出来。
+      expect(isSseQuotaExhaustedErrorCode('InferHub.9999.200', 'insufficient quota')).toBe(true)
+      // ④ 尾号变体：服务端若改尾号，`4291` 子串仍命中。
+      expect(isSseQuotaExhaustedErrorCode('InferHub.4291.999', 'whatever')).toBe(true)
+    })
+
+    it('429 的边界判据：4291 不再命中，而 81111.429 / 「429 Too Many Requests」仍命中', () => {
+      // ⚠️ 本用例直接测**生产函数**，不复制正则字面量 —— 复制的话就是同义反复，
+      // 把边界改回裸子串也不会变红（第一版真的这么错过，反向验证时发现了）。
+      //
+      // 额度码：修复前这里返回 `true`（被裸 `429` 子串吃掉），是缺陷的直接根因。
+      expect(isSseQueueErrorCode('InferHub.4291.200')).toBe(false)
+      // 真排队码不受影响（修边界不能把排队一起修坏）：
+      expect(isSseQueueErrorCode('InferHub.ModelArts.81111.429')).toBe(true)
+      expect(isSseQueueErrorCode('TM.00001041')).toBe(true)
+      expect(isSseQueueErrorCode('HTTP 429 Too Many Requests')).toBe(true)
+      // 429 出现在中间也要认（前后都是非数字）。
+      expect(isSseQueueErrorCode('err 429 rate limited')).toBe(true)
+      // 但含 429 的更长数字串不认。
+      expect(isSseQueueErrorCode('InferHub.14290')).toBe(false)
+    })
+
+    it('额度用尽时立即失败（不静默重试），并在报错里给出解禁时间', async () => {
+      // 账号池替身：只有一个账号，且它就是失败的那个 → 无号可换，应如实抛出。
+      const marked: Array<{ accountId: string; modelId: string; resetAtMs: number }> = []
+      const pool = {
+        findAccountIdByCredential: async () => 'acct-1',
+        getAvailableAccount: async () => null,
+        updateModelRateLimit: async (accountId: string, modelId: string, resetAtMs: number) => {
+          marked.push({ accountId, modelId, resetAtMs })
+        },
+      }
+      let chatCalls = 0
+      const fetchImpl = vi.fn(async () => {
+        chatCalls += 1
+        return new Response(
+          'data:{"error_code":"InferHub.4291.200","error_msg":"insufficient quota"}\n\n',
+          { status: 200, headers: { 'content-type': 'text/event-stream' } },
+        )
+      })
+
+      const adapter = makeAdapter({ fetchImpl, accountPool: pool })
+      const chunks: unknown[] = []
+      let thrown: unknown
+      try {
+        for await (const chunk of adapter.stream(streamOptions)) chunks.push(chunk)
+      } catch (error) {
+        thrown = error
+      }
+
+      // ① 立刻失败，且归为**不可重试**的 QUOTA（不在 harness 的可重试集合里）。
+      expect(thrown).toBeInstanceOf(LlmError)
+      expect((thrown as LlmError).code).toBe('QUOTA')
+      // ② 报错必须**带解禁时间**（用户明确要求：「其它渠道限额到了会提示多少时间
+      //    后会解除限额，这个 codearts 的也加上吧」）。
+      expect((thrown as LlmError).message).toMatch(/预计 .*后重置/)
+      expect((thrown as LlmError).message).toMatch(/UTC\+8 自然日结算/)
+      // ③ **不能**静默重试：修复前这里会是 4+ 次（每 10 秒一轮）。
+      //    修复后只发 1 次就抛出。
+      expect(chatCalls).toBe(1)
+      // ④ 零内容块（不把额度错误伪装成"正在思考"）。
+      expect(chunks).toEqual([])
+      // ⑤ 失败账号 + 该模型被写入标记，且时限是 UTC+8 当日 24:00。
+      expect(marked.map(entry => entry.accountId)).toEqual(['acct-1'])
+      expect(marked[0]!.modelId).toBe((streamOptions as { model: string }).model)
+      const delta = marked[0]!.resetAtMs - Date.now()
+      expect(delta).toBeGreaterThan(0)
+      expect(delta).toBeLessThanOrEqual(86_400_000)
+    })
+
+    it('额度用尽时切换到池中下一个账号重试', async () => {
+      const marked: Array<{ accountId: string; modelId: string }> = []
+      const pool = {
+        findAccountIdByCredential: async () => 'acct-1',
+        getAvailableAccount: async () => ({
+          entry: { id: 'acct-2' },
+          credential: {
+            access_key_id: 'AK2', secret_access_key: 'SK2', security_token: 'ST2',
+            expires_at: '2099-01-01T00:00:00Z',
+          },
+        }),
+        updateModelRateLimit: async (accountId: string, modelId: string) => {
+          marked.push({ accountId, modelId })
+        },
+      }
+      const chatKeys: string[] = []
+      const fetchImpl = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const key = /Access=([^,\s]+)/.exec(new Headers(init?.headers).get('Authorization') ?? '')?.[1] ?? ''
+        if (String(input).startsWith(CHAT_API_BASE)) chatKeys.push(key)
+        if (key === 'AK2') {
+          return new Response(
+            'data: {"choices":[{"delta":{"content":"recovered"}}]}\n\ndata: [DONE]\n\n',
+            { status: 200, headers: { 'content-type': 'text/event-stream' } },
+          )
+        }
+        return new Response(
+          'data:{"error_code":"InferHub.4291.200","error_msg":"insufficient quota"}\n\n',
+          { status: 200, headers: { 'content-type': 'text/event-stream' } },
+        )
+      })
+
+      const adapter = makeAdapter({ fetchImpl, accountPool: pool })
+      const texts: string[] = []
+      for await (const chunk of adapter.stream(streamOptions)) {
+        if (chunk.type === 'text-delta') texts.push(chunk.text)
+      }
+
+      // 换到第二个账号后成功拿到内容。
+      expect(chatKeys).toEqual(['AK', 'AK2'])
+      expect(texts).toEqual(['recovered'])
+      // 失败的那个账号被标记（不是被换上的那个）。
+      expect(marked.map(entry => entry.accountId)).toEqual(['acct-1'])
+    })
+
+    it('额度用尽也可能走 HTTP 4xx：同样立即失败并带解禁时间', async () => {
+      // 两条通道都接（`AGENTS.md` 的既有铁律）：实测该码走 SSE（HTTP 200），
+      // 但服务端同样可能以 4xx 下发。若不接这条，哪天改了形态就会退回
+      // 「重试可自愈」的错误分类。
+      let chatCalls = 0
+      const fetchImpl = vi.fn(async () => {
+        chatCalls += 1
+        // 4xx 形态：报文字段名与 SSE 不同，靠文案兜底命中。
+        return new Response(
+          JSON.stringify({ error_code: 'InferHub.4291.200', error_msg: 'insufficient quota' }),
+          { status: 400, headers: { 'content-type': 'application/json' } },
+        )
+      })
+      const adapter = makeAdapter({ fetchImpl })
+      let thrown: unknown
+      try {
+        for await (const _ of adapter.stream(streamOptions)) { /* 不应产出 */ }
+      } catch (error) {
+        thrown = error
+      }
+      expect(thrown).toBeInstanceOf(LlmError)
+      expect((thrown as LlmError).code).toBe('QUOTA')
+      expect((thrown as LlmError).message).toMatch(/预计 .*后重置/)
+      // 立即失败，**不**落入排队重试（修复前会被当限流/排队）。
+      expect(chatCalls).toBe(1)
+    })
+
+    it('标记时限按 UTC+8 当日 24:00 取，而不是 parseRateLimitError 的「1 小时后」', () => {
+      // ⚠️ 不能复用 `parseRateLimitError`：它解析不到时间时退回
+      // `Date.now() + RATE_LIMIT_FALLBACK_MS`（1 小时），对**按自然日**结算的
+      // 免费额度会让标记过早失效 —— 用户 1 小时后再撞一次同样的墙。
+      // （与 qoder / zcode 的额度处理同一口径。）
+      const now = Date.UTC(2026, 9, 2, 12, 0, 0) // 2026-10-02T12:00Z = 20:00 UTC+8
+      const reset = nextUtc8DayStartMs(now)
+      // 距 UTC+8 次日 00:00 还有 4 小时。
+      expect(reset - now).toBe(4 * 3_600_000)
+      // 明显长于 1 小时兜底（正是不能复用的原因）。
+      expect(reset - now).toBeGreaterThan(RATE_LIMIT_FALLBACK_MS)
+    })
+
+    it('解禁时间文案按时长量级给出可读单位', () => {
+      const now = Date.UTC(2026, 9, 2, 12, 0, 0)
+      expect(formatResetIn(now + 30_000, now)).toBe('不到 1 分钟')
+      expect(formatResetIn(now + 20 * 60_000, now)).toBe('20 分钟')
+      expect(formatResetIn(now + 4 * 3_600_000, now)).toBe('4 小时')
+      expect(formatResetIn(now + 90 * 60_000, now)).toBe('1.5 小时')
+      expect(formatResetIn(now - 1, now)).toBe('即将重置')
+    })
+
+    it('完整文案含模型名、预计时长与 UTC 时刻', () => {
+      const now = Date.UTC(2026, 9, 2, 12, 0, 0)
+      const msg = codeartsQuotaExhaustedMessage('deepseek-v4.1-flash', nextUtc8DayStartMs(now), now)
+      expect(msg).toContain('deepseek-v4.1-flash')
+      expect(msg).toContain('免费额度')
+      expect(msg).toContain('4 小时后重置')
+      expect(msg).toContain('2026-10-02T16:00:00.000Z') // UTC+8 次日 00:00
+      expect(msg).toContain('Jet Hub')
+    })
   })
 })
