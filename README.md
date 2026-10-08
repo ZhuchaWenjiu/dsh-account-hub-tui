@@ -163,10 +163,24 @@ $key = (Get-Content "$env:USERPROFILE\.dsh\openai-gateway\api-key" -Raw).Trim()
 
 ## 安装
 
-该包尚未发布到 npm registry。提供两种安装方式：**git 仓库安装**（推荐，自动拉取
-并构建）和**源码目录安装**（本地开发联调）。
+该包尚未发布到 npm registry。提供三种安装方式：**一键脚本**（推荐，自动处理
+pnpm 版本差异）、**git 仓库安装**和**源码目录安装**（本地开发联调）。
 
-### 方式一：从 git 仓库安装（推荐）
+### 方式零：一键安装脚本（推荐）
+
+仓库根目录的 `install.sh` 封装了下述全部细节：自动探测 pnpm 大版本、按真实报错
+写入正确的 `allowBuilds` 键、失败后自动重试第二次安装。
+
+```sh
+bash install.sh                      # 装到默认 profile dsh-tui
+PROFILE=headless bash install.sh     # 装到指定 profile
+REPO=<git-url> bash install.sh       # 从指定仓库安装
+LOCAL=1 bash install.sh              # 本地源码 link 安装（开发用，自动先 build:all）
+```
+
+不需要手动判断 pnpm 版本，也不需要手动改 `pnpm-workspace.yaml`。
+
+### 方式一：从 git 仓库安装
 
 `add` 以 `git+https` 方式安装，pnpm 会运行本包的 `prepare` 脚本自动构建 `lib/`，
 无需手动 `pnpm build`。
