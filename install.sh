@@ -41,12 +41,24 @@ echo "==> $PKG_NAME 安装器（profile: $PROFILE）"
 
 [ -d "$DSH_HOME/profiles/$PROFILE" ] || { echo "profile '$PROFILE' 不存在：$DSH_HOME/profiles/$PROFILE"; exit 1; }
 
+# Windows 提示：本脚本是 bash 脚本，且 dsh 在 Windows 上有独立的 pnpm
+# （DSH Desktop 内置），与 PowerShell 里 `pnpm` 可能不是同一个。
+case "$(uname -s 2>/dev/null)" in
+  MINGW*|MSYS*|CYGWIN*|Windows_NT)
+    echo "==> Windows 环境 detected"
+    echo "    请在 Git Bash 中运行本脚本（PowerShell/CMD 无 bash）。"
+    ;;
+esac
+
 for cmd in dsh pnpm node; do
   command -v "$cmd" >/dev/null 2>&1 || { echo "缺少 $cmd，请先安装（Node.js ≥ 20 + pnpm ≥ 10）"; exit 1; }
 done
 
-PNPM_MAJOR="$(pnpm --version 2>/dev/null | cut -d. -f1)"
-echo "==> 检测到 pnpm ${PNPM_MAJOR}.x"
+PNPM_VER="$(pnpm --version 2>/dev/null)"
+PNPM_MAJOR="$(printf '%s' "$PNPM_VER" | cut -d. -f1)"
+echo "==> 检测到 pnpm ${PNPM_VER}（$(command -v pnpm)）"
+echo "    注：Windows 上 DSH Desktop 可能内置独立的 pnpm，此处用的是 PATH 里的那个；"
+echo "        若版本与 dsh 实际使用的一致即可。"
 
 # ───────────────────────────────────────────────────────────────
 # 本地源码 link 安装（LOCAL=1 或 LOCAL=<path>）

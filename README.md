@@ -172,13 +172,44 @@ pnpm 版本差异）、**git 仓库安装**和**源码目录安装**（本地开
 写入正确的 `allowBuilds` 键、失败后自动重试第二次安装。
 
 ```sh
-bash install.sh                      # 装到默认 profile dsh-tui
-PROFILE=headless bash install.sh     # 装到指定 profile
+PROFILE=<name> bash install.sh       # 装到指定 profile（必填）
 REPO=<git-url> bash install.sh       # 从指定仓库安装
 LOCAL=1 bash install.sh              # 本地源码 link 安装（开发用，自动先 build:all）
 ```
 
 不需要手动判断 pnpm 版本，也不需要手动改 `pnpm-workspace.yaml`。
+不写 `PROFILE` 时会列出可用 profile 并退出（不猜默认值——脚本会改写该 profile
+的配置，误跑到正在使用的 profile 上有风险）。
+
+#### Windows 下运行
+
+脚本是 bash 脚本，**必须在 Git Bash 里跑**（PowerShell / CMD 没有 `bash`）。
+用 DSH Desktop 的话，其内置 pnpm 与 PowerShell 中 PATH 上的 pnpm 可能不是同一个，
+脚本会打印实际使用的 pnpm 路径与版本，留意是否一致。
+
+```bash
+# Git Bash 中
+PROFILE=<name> bash install.sh
+```
+
+若 `bash` 不可用，可直接用等价的两步命令（原理相同，只是手动判版本）：
+
+```powershell
+# 1) 先跑一次，必然失败，复制报错里 pnpm 给出的那行键
+dsh plugin --profile <name> add "https://github.com/Zhuchawenjiu/dsh-account-hub-tui.git"
+
+# 2) 把那行键写进 %USERPROFILE%\.dsh\profiles\<name>\pnpm-workspace.yaml
+#    pnpm 10.x →  allowBuilds:\n  dsh-codearts-auth: true
+#    pnpm 11.x →  用第 1 步报错里打印的完整键（带 commit / tar.gz 后缀）
+
+# 3) 再跑一次即成功
+dsh plugin --profile <name> add "https://github.com/Zhuchawenjiu/dsh-account-hub-tui.git"
+```
+
+⚠️ Windows 上 pnpm 11.x 的键形态实测有两种，取决于具体版本：
+`pkg@git+https://github.com/...#<sha>`（11.7.0）与
+`pkg@https://codeload.github.com/.../tar.gz/<sha>`（11.28.1）。
+**一律以第 1 步报错里打印的那一行为准**，不要照抄本文档或其他机器上的写法。
 
 ### 方式一：从 git 仓库安装
 
