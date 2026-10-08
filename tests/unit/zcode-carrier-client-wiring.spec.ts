@@ -22,6 +22,13 @@
  * 一轮「导航 + 三次轮询」实测就要 ~50ms；预算压太小会得到**看起来像实现错了**的假红
  * （本轮真踩过一次，别再来一次）。
  *
+ * ⚠⚠ **别用「假 guest 的 5ms 导航延迟」当断言的量尺**（2026-10-02 修掉一条时序 flaky）：
+ * 「`elapsedMs` 锚在导航之前」那条原先断言 `elapsedMs >= 5`，而那个 5 既是假 guest 的
+ * `setTimeout` 延迟、又正好是断言门槛 —— 两者同量级 ⇒ **全量并发跑时实测抖到 4ms 就假红**
+ * （单文件单独跑 3 次全绿；单测环境的 `setTimeout` 只保证「不早于」，不保证「等于」）。
+ * 现在改用 `setup({ fakeNavMs })` 注入的**假时钟**：只有导航完成推动它，`elapsedMs` 是确定值。
+ * ⇒ **凡是「耗时 ≥ N」的断言都别贴着定时器粒度写**，要么给足余量，要么（更好）注入时钟。
+ *
  * ## ★ 2026-10-02 修订：导航目标改成「每轮问 server」（评审 C1/C2）
  * 原先 `CARRIER_PATH` 是 client 里的一个常量（与 `src/jet-hub-rpc.ts` 的
  * `CAPTCHA_CARRIER_PATH` 靠断言对齐），指向插件自己的 `/api/jet-hub/captcha-carrier`。
@@ -120,10 +127,30 @@ interface PageScript {
   evaluateThrows?: boolean
 }
 
+/**
+ * 可注入的**假时钟**（单位 ms）：只有「导航完成」这一个事件会推进它。
+ *
+ * ★ 为什么需要它（2026-10-02 修一条时序 flaky 用例）：`elapsedMs` 的锚点用例原先靠
+ *   「假 guest 的导航延迟 5ms」这条**真实墙钟**延迟来区分「锚点在导航前 / 锚点在导航后」，
+ *   而断言门槛与定时器粒度同量级 ⇒ **全量并发跑（207 个文件）时实测抖到 4ms 就假红**
+ *   （单文件单独跑 3 次全绿）。那是用例在**量墙钟**，不是产品有问题。
+ *   把「导航耗时」搬进这个假时钟后：`elapsedMs` 是**确定值**（= `navCostMs`），
+ *   与调度抖动无关；而「锚点必须在导航之前」这个语义反而咬得更死 ——
+ *   锚点一挪到导航之后，这次推进就落在锚点**之前**，`elapsedMs` 会**正好是 0**。
+ */
+interface FakeClock {
+  /** 当前假时刻（ms）。 */
+  t: number
+  /** 一次导航完成推进多少（= 这一轮要验的「导航耗时」）。 */
+  navCostMs: number
+}
+
 class FakeGuest {
   readonly attributes = new Map<string, string>()
   readonly style: Record<string, string> = {}
   readonly page: PageScript
+  /** 注入的假时钟（不传 = 这一轮不量耗时，走真实墙钟，与既有用例无差别）。 */
+  readonly clock?: FakeClock
   readonly listeners = new Map<string, Array<(event: any) => void>>()
   url = ''
   loads = 0
@@ -132,8 +159,9 @@ class FakeGuest {
   removed = false
   private stageIndex = 0
 
-  constructor (page: PageScript) {
+  constructor (page: PageScript, clock?: FakeClock) {
     this.page = page
+    this.clock = clock
   }
 
   setAttribute (name: string, value: string): void { this.attributes.set(name, value) }
@@ -163,6 +191,9 @@ class FakeGuest {
     this.url = url
     return new Promise((resolveLoad) => {
       setTimeout(() => {
+        // ★ 假时钟：导航完成（成功或失败都算耗时）就推进 —— 锚点在导航**之前**的实现
+        //   会把这段耗时算进 `elapsedMs`；锚点挪到导航之后的实现拿到的增量是 0。
+        if (this.clock !== undefined) this.clock.t += this.clock.navCostMs
         if (this.page.failLoad !== undefined) {
           this.emit('did-fail-load', {
             isMainFrame: true,
@@ -218,7 +249,7 @@ class FakeGuest {
   }
 }
 
-function makeDoc (page: PageScript) {
+function makeDoc (page: PageScript, clock?: FakeClock) {
   const doc: any = {
     URL: `${GUI_ORIGIN}/settings`,
     location: { href: `${GUI_ORIGIN}/settings`, origin: GUI_ORIGIN },
@@ -236,7 +267,7 @@ function makeDoc (page: PageScript) {
       },
     },
     createElement (tag: string): FakeGuest {
-      const guest = new FakeGuest(page)
+      const guest = new FakeGuest(page, clock)
       ;(guest as any).tag = tag
       doc.created.push(guest)
       return guest
@@ -304,9 +335,19 @@ function setup (options: {
   carrierUrl?: string | null
   /** 覆盖 `acquire` 的返回形状（造「租约形状异常」那一支，评审 I6）。 */
   reservation?: unknown
+  /**
+   * ★ 假时钟（ms，可选）：注入 `now`，并让假 guest 在**导航完成**时把时钟推进这么多。
+   * 于是那一轮的 `elapsedMs` 是**确定值**（= 这个数），与真实墙钟/调度抖动无关。
+   * 不传 ⇒ `now` 走产品默认的 `Date.now()`，所有既有用例行为不变。
+   */
+  fakeNavMs?: number
 }) {
   const logs: Array<{ level: string, message: string }> = []
-  const doc = makeDoc(options.page)
+  // 初值随便给（用例只关心**差值**）：只要求它是一个整数。
+  const clock = options.fakeNavMs === undefined
+    ? undefined
+    : { t: 1_000, navCostMs: options.fakeNavMs }
+  const doc = makeDoc(options.page, clock)
   const bridge = makeBridge(options.reservation === undefined ? {} : { reservation: options.reservation })
   const demands = Array.isArray(options.demand) ? options.demand : [options.demand ?? false]
   let demandIndex = 0
@@ -335,6 +376,10 @@ function setup (options: {
     doc,
     timing: FAST_TIMING,
     log: (level: string, message: string) => { logs.push({ level, message }) },
+    // ⚠ 不传 `fakeNavMs` 时**不能**写成 `now: undefined`：产品用 `typeof options.now === 'function'`
+    //   判「有没有注入」，显式 undefined 虽然也会退回 `Date.now()`，但展开写法更能表达
+    //   「这条用例压根没碰时钟」。
+    ...(clock === undefined ? {} : { now: () => clock.t }),
   })
   return { stop, logs, doc, bridge, calls, rpcCall }
 }
@@ -478,14 +523,29 @@ describe('C. 一轮贡献的形状（导航 → 读回 → 回传）', () => {
   })
 
   it('★ elapsedMs 锚在「本轮开始产」= 导航之前（含导航 + SDK + 等待的全部时间）', async () => {
-    // 假 guest 的导航要 5ms 才回事件 ⇒ 锚点若被挪到导航之后，elapsedMs 会掉到 0～2ms。
-    const { stop, calls } = setup({ page: { stages: ['success'], param: 'P-2' }, demand: [true, false] })
+    /**
+     * ★ 用**假时钟**量这一轮：假 guest 的导航完成时把时钟推进 `NAV_COST_MS`，
+     * 于是 `elapsedMs` 是确定值 —— 不再依赖「导航真的花了多久」。
+     *
+     * ⚠ 为什么不再用「导航延迟 5ms + 断言 >= 5」：那是拿**真实墙钟**的两条同量级数字作比较，
+     *   `elapsedMs` 实测会抖到 4ms（全量 207 个文件并发时），得到**看起来像实现错了**的假红
+     *   （单文件单独跑则全绿）。断言门槛贴着定时器粒度就是它的病根。
+     * ⚠ 语义**没有**被削弱，反而更强：锚点若被挪到导航之后，这次时钟推进就发生在锚点之前，
+     *   `elapsedMs` 会**正好是 0**（原实现是「掉到 0～2ms」，要靠门槛区分）。
+     */
+    const NAV_COST_MS = 50
+    const { stop, calls } = setup({
+      page: { stages: ['success'], param: 'P-2' },
+      demand: [true, false],
+      fakeNavMs: NAV_COST_MS,
+    })
     await vi.waitFor(() => {
       expect(calls.some((call) => call.endpoint === 'captcha.contribute')).toBe(true)
     }, WAIT_FOR)
     const payload = calls.find((call) => call.endpoint === 'captcha.contribute')?.payload
     expect(Number.isSafeInteger(payload.elapsedMs)).toBe(true)
-    expect(payload.elapsedMs).toBeGreaterThanOrEqual(5)
+    // 导航那 50ms 必须**全额**落在 elapsedMs 里 —— 假时钟下没有别的推进点，故可断言等值。
+    expect(payload.elapsedMs).toBe(NAV_COST_MS)
     stop()
   })
 

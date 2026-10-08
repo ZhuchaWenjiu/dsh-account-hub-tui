@@ -1,6 +1,21 @@
 /**
- * Jet Hub 多账号管理的 RPC 端点注册。
+ * Jet Hub 多账号管理：**账号操作核心**（`createJetHubOps`）+ RPC 端点注册
+ * （`registerJetHubHttpEndpoints`）。
  *
+ * ## 为什么拆成两层（2026-10-05 加 `/account_hub` 斜杠命令时的重构）
+ *
+ * 早先这两层是同一个函数：账号操作全都在 `connection.fetch.register` 的闭包里，
+ * 而 `connection` 服务**只存在于 Web bundle**。后果是 headless / CLI / **dst TUI**
+ * 这些 profile 下整套账号管理根本不可达 —— 用户只能在浏览器 GUI 里管账号。
+ *
+ * 现在把**方法分派本身**抽成不依赖 `connection` 的 `createJetHubOps`：
+ * - Web GUI 仍旧走 RPC（`registerJetHubHttpEndpoints`），行为与 envelope 一字不变；
+ * - dst TUI 走 `/account_hub` 斜杠命令，**直接调同一个 `handleMethod`**，不 http、不复制分派逻辑。
+ *
+ * 两条出口共用同一份实现，故上面记着的每一处缺陷修复（qoder 同族分派、
+ * workbuddy 的签到守卫、codearts 的 Token 计户文案……）对 TUI 同时生效。
+ *
+ * ── 以下为 Web 出口契约（原文件头，保留备查） ──
  * 使用 DSH 的 connection.fetch.register() 模式注册 HTTP API 端点，
  * 与 dsh-im 的 registerManagementRpc 一致。
  * 通道名 jet-hub → 路径 /api/jet-hub
@@ -731,6 +746,24 @@ function providerIdsOf(
 }
 
 /**
+ * 账号操作核心的**外部形状**：一个方法名 + 一个载荷进、一个 RPC 信封出。
+ *
+ * 之所以只暴露 `handleMethod` 而不暴露十几个具名方法：Jet Hub 的 Web RPC 与
+ * `/account_hub` 斜杠命令是**同一套方法表**的两张皮。让消费者按名字调用，
+ * 新增方法时两个出口零改动即可同时获得，且不会有第三份平行实现可漂移。
+ *
+ * ⚠️ 信封形状**必须**与 Web RPC 一致（`{ ok: true, value }` / `{ ok: false, error }`）：
+ * 它同时是 `reply()` 的入参与命令 handler 的解析对象。
+ */
+export interface JetHubOps {
+  handleMethod(
+    method: string,
+    payload: unknown,
+    signal?: AbortSignal,
+  ): Promise<unknown>
+}
+
+/**
  * 注册 Jet Hub 管理 API 端点。
  *
  * `connection` 服务只存在于 Web bundle；这里用**惰性注入**而非插件级静态
@@ -762,13 +795,19 @@ export function registerJetHubRpc(
    * 省略时退化为只用 `ctx.llm.listModels()` 的历史行为。
    */
   modelAdapters?: Readonly<Record<string, ModelCatalogSource>>,
-): void {
+): JetHubOps {
+  // 账号操作核心**先于**任何 inject 建好：它不依赖 connection，headless / CLI /
+  // dst TUI 这些没有 connection 服务的 profile 下同样完整可用。
+  const ops = createJetHubOps(
+    ctx, pool, codearts, buddy, workbuddy, lobsterai,
+    qoder, qoderCn, trae, cline, loomy, raccoon, minimax, zcode, modelAdapters,
+  )
+  // 端点注册保持**惰性注入**：connection 只存在于 Web bundle，静态 inject 会让
+  // headless/CLI profile 永久 pending 而启动失败（见该函数的原始注释）。
   ctx.inject(['connection'], (connectionCtx) => {
-    registerJetHubEndpoints(
-      connectionCtx as Context, pool, codearts, buddy, workbuddy, lobsterai,
-      qoder, qoderCn, trae, cline, loomy, raccoon, minimax, zcode, modelAdapters,
-    )
+    registerJetHubHttpEndpoints(connectionCtx as Context, ops)
   })
+  return ops
 }
 
 /**
@@ -843,8 +882,19 @@ async function fullCatalogIds(
   }
 }
 
-/** 注册 Jet Hub 管理 API 端点。使用 ctx.connection.fetch.register() 注册 HTTP POST 端点。 */
-function registerJetHubEndpoints(
+/**
+ * 账号操作核心：**不依赖 connection** 的 Jet Hub 方法分派。
+ *
+ * ## 为什么它必须独立于 `connection.fetch.register`
+ *
+ * `connection` 服务只存在于 Web bundle。把分派写在端点闭包里，等于让
+ * headless / CLI / **dst TUI** 这些 profile 彻底失去账号管理能力 ——
+ * 这正是 2026-10-05 加 `/account_hub` 斜杠命令要拆掉的这层耦合。
+ * 现在 Web GUI 与 TUI 命令**共用同一个 `handleMethod`**，任何一处缺陷修复
+ * （qoder 同族分派、workbuddy/cline/raccoon 的签到守卫、codearts 的
+ * 「Token 计费账户」文案……）对两个出口同时生效，不存在第二份会漂移的实现。
+ */
+export function createJetHubOps(
   ctx: Context,
   pool: AccountPool,
   codearts: CodeArtsAuth,
@@ -860,13 +910,7 @@ function registerJetHubEndpoints(
   minimax: MinimaxAuth,
   zcode: ZcodeAuth,
   modelAdapters?: Readonly<Record<string, ModelCatalogSource>>,
-): void {
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const connection = (ctx as any).connection ?? ctx.get('connection')
-  if (!connection || typeof connection.fetch?.register !== 'function') {
-    ctx.logger.warn('[jet-hub] connection.fetch not available, RPC endpoints not registered')
-    return
-  }
+): JetHubOps {
 
   /**
    * Qoder **同协议族**成员：国际版与中国版共用同一组 RPC 实现，只换 `product`
@@ -975,124 +1019,8 @@ function registerJetHubEndpoints(
     warn: (message) => ctx.logger?.warn?.(message),
   })
 
-  connection.fetch.register({
-    path: JET_HUB_API_PATH,
-    methods: ['POST'],
-    requestBody: 'buffered' as const,
-    async fetch(request: Request): Promise<Response> {
-      if (request.method !== 'POST') {
-        return new Response('method not allowed', { status: 405 })
-      }
-      const contentType = request.headers.get('content-type')?.split(';', 1)[0].trim().toLowerCase()
-      if (contentType !== 'application/json') {
-        return new Response('content type must be application/json', { status: 415 })
-      }
-
-      let message: Record<string, unknown>
-      try {
-        message = await request.json() as Record<string, unknown>
-      } catch {
-        return new Response('body is not JSON', { status: 400 })
-      }
-
-      const rpcId = typeof message.rpcId === 'string' ? message.rpcId : 'invalid-request'
-      const call = message.payload as Record<string, unknown> | undefined
-      if (
-        message.type !== 'client-request' || typeof message.rpcId !== 'string'
-        || message.method !== JET_HUB_ENDPOINT
-        || !call || typeof call.method !== 'string'
-        || !Object.prototype.hasOwnProperty.call(call, 'payload')
-      ) {
-        return reply(rpcId, { ok: false, error: { code: 'gateway/bad-request', message: 'Invalid Jet Hub management request.' } })
-      }
-
-      try {
-        const result = await handleMethod(call.method as string, call.payload, request.signal)
-        return reply(rpcId, result)
-      } catch (error) {
-        // 必须返回规范的 RPC 错误响应（而不是裸 500 文本），
-        // 否则客户端 unwrapRpcResult 无法识别错误，表现为"点击无反应"。
-        const message = error instanceof Error ? error.message : String(error)
-        ctx.logger.warn(`[jet-hub] ${String(call.method)} failed: ${message}`)
-        return reply(rpcId, {
-          ok: false,
-          error: { code: 'jet-hub/handler-failed', message },
-        })
-      }
-    },
-  })
-
-  /**
-   * 载体页要用的 captcha 配置：**远端优先、拉不到就兜底**。
-   *
-   * ⚠ 远端那次请求**不是**在 GET 处理里现加的额外开销 —— `fetchCaptchaConfig()`
-   * 自带 60 秒 TTL 缓存（`src/zcode-auth.ts` 的 `captchaConfigCacheInstance`），
-   * 与推理侧 `index.ts` 走的是同一份缓存实例。
-   * ⚠ 拉不到（无凭据 / 网络失败 / 该形态的 zcode 实例没有这个方法）一律回落
-   *   `ZCODE_CAPTCHA_FALLBACK`：载体页**必须**给得出去。回 500 的话，client 那边
-   *   表现为「导航成功但没有 `window.__zcodeCaptcha`」，比配置旧一点难查得多。
-   */
-  async function carrierCaptchaConfig(): Promise<ZcodeCaptchaConfig> {
-    try {
-      const remote = await zcode.fetchCaptchaConfig()
-      return remote ?? ZCODE_CAPTCHA_FALLBACK
-    } catch {
-      return ZCODE_CAPTCHA_FALLBACK
-    }
-  }
-
-  /**
-   * 内部载体的载体页（**旧路由：已不是 guest 的入口**，见下面的取证）。
-   *
-   * ## ⚠⚠ 它**不可能**被 `<webview>` guest 加载（评审 C1/C2，2026-10-02 实测取证）
-   * 这条路由挂在应用自己的 host 上，而桌面版主进程对 guest 有两道硬闸
-   * （DSH Desktop 0.2.0-rc.2，`resources/app.asar/lib/main.js`）：
-   * - `allowedNavigation(value)` = http(s) + 无账号密码 + `!isApplicationHost(url)`；
-   * - `isApplicationHost(url)` = **`url.port === host.port` 且（主机相同或回环）**；
-   * - `configureSession().onBeforeRequest` 对命中者直接 `callback({ cancel: true })`；
-   * - guest 的 partition 是 `dsh-sidebar-browser-${randomUUID()}`（**无 `persist:`**），
-   *   Host 的会话 cookie 在 `defaultSession` 里 ⇒ 即便加载到了也过不了 `/api/*` 的认证。
-   *
-   * ⇒ 内部载体的真正入口是**独立回环端口上的小服务**
-   * （`src/captcha-carrier-server.ts`，地址由 `captcha.carrierUrl` 这条 RPC 给）。
-   *
-   * ## 那为什么还留着这条
-   * ① 它是**手工诊断**用的：web 版下 GUI 就是 `http://127.0.0.1:<port>`，
-   *   在浏览器标签里直接打开这一页可以验证「载体页本身能不能产 param」；
-   * ② 表达式只有这一份（`buildCarrierPageHtml`），删路由不会让逻辑分叉；
-   * ③ 保留 = 不破坏既有 `CAPTCHA_CARRIER_PATH` 契约（`tests/unit/zcode-carrier-rpc.spec.ts`）。
-   * ⚠ **别再把 client 导航指回这里** —— 那正是评审 C1/C2 指出的「收益恒为 0」的成因。
-   *
-   * ⚠ 只读、无凭据：这条 GET 不接收任何参数，输出里不含 JWT / token；
-   *   产出的 param 由 guest 自己经 `captcha.contribute` 回传，**不**经这条路由。
-   */
-  connection.fetch.register({
-    path: CAPTCHA_CARRIER_PATH,
-    methods: ['GET'],
-    requestBody: 'buffered' as const,
-    async fetch(request: Request): Promise<Response> {
-      /**
-       * ⚠ 真实挂载下这条**永远轮不到**：dsh 的分发器按 `methods` 集合筛过才调本 handler
-       * （`@deepseek-ai/dsh-client-connection` 里 `fetchRoutes.get(pathname)` +
-       * `methods.has(request.method)`）。留着它不是防御性装饰，是为了**不依赖挂载假设**：
-       * 直接调 handler 的用例（本仓库的 connection 替身就是这么跑的）要能自己判 405，
-       * 且将来有人把 `methods` 放宽成含 POST 时，这里不会静默把 RPC 流量当页面接走。
-       */
-      if (request.method !== 'GET') {
-        return new Response('method not allowed', { status: 405 })
-      }
-      const html = buildCarrierPageHtml(await carrierCaptchaConfig())
-      return new Response(html, {
-        status: 200,
-        headers: {
-          'content-type': 'text/html; charset=utf-8',
-          // 每次都现渲染：配置跟着远端 60 秒 TTL 变，缓存这份只会让载体页拿旧 SceneId。
-          'cache-control': 'no-store',
-        },
-      })
-    },
-  })
-
+  // ── HTTP 出口已拆出，见下方 {@link registerJetHubHttpEndpoints} ──
+  // 账号操作核心到此为止：只负责方法分派，不持有任何 HTTP 路由。
   /**
    * 给 `account.list` 的返回项补上**只存在于凭据里**的展示字段（账号名 / 手机号）。
    *
@@ -1287,6 +1215,16 @@ function registerJetHubEndpoints(
           // 后台异步执行完整登录流程，使用同一个 state
           runBuddyLoginFlow({ openBrowser: () => {}, state, product }).then(async (flow) => {
             await ctx.credentials.set(ref, flow.access)
+            // ⚠️⚠️ **凭据落库的这一瞬间必须广播**（真实缺陷，2026-10-05）：
+            // `dsh-client-ui-model-selection` 的 ModelCatalogDirectory 只在
+            // `llm/adapters-updated` / `settings/document-updated` /
+            // `credentials/reference-updated` 三个宿主事件上重读目录，而建号
+            // 与登录路径此前一次都没广播。后果是「授权在终端轮询超时**之后**
+            // 才补完」时（buddy 的 loopGetToken 超时远长于命令侧 2 分钟轮询），
+            // 凭据已落库但客户端一直复用旧缓存 ⇒ 模型要重启 dst 才出现。
+            // 放在这里而不是命令侧：命令侧只知道「自己这次没等到」，
+            // 而这里才是「凭据确实写进去了」的唯一真相点。
+            broadcastCatalogChanged(ctx)
             // 续期定时器归属该产品自己的服务实例
             ;(product.id === CODEBUDDY.id ? buddy : workbuddy).scheduleRefresh()
             const credential = parseBuddyCredential(flow.access)
@@ -1914,6 +1852,25 @@ function registerJetHubEndpoints(
             },
           }
         }
+      }
+
+      /**
+       * 全量账号清单（**不按 provider 过滤**）。
+       *
+       * ## 为什么单独开一条（2026-10-05）
+       *
+       * `account.list` 的入参是单个 provider，调用方要列全池就得发 N 次 RPC。
+       * `/account_hub list`（无参）要的正是「全池概览」，故在此透出
+       * `pool.listAllAccounts()` —— 它本身只是进程内权威副本的异步外壳，
+       * 零网络、零额外 IO。
+       *
+       * ⚠️ 条目形状是 {@link ProviderAccountEntry}（池内存储态），**不带**
+       * `account.list` 那个 `accountName` / `phone` 派生字段 —— 那两个只在
+       * 凭据里、要逐条 resolve 才拿得到，对「概览」是白烧。
+       */
+      case 'account.listAll': {
+        const accounts = await pool.listAllAccounts()
+        return { ok: true, value: { accounts } }
       }
 
       case 'login.poll': {
@@ -3547,6 +3504,35 @@ function registerJetHubEndpoints(
       // ⚠ web 版：GUI 里没有 `dshDesktop.browser` ⇒ 没人读需求位、也没人贡献
       //   ⇒ 槽长期为空 ⇒ 载体链直接退回既有 chromium 路径，行为不变。
 
+      /**
+       * 载体页要用的 captcha 配置（**远端优先、拉不到就兜底**）。
+       *
+       * ## 为什么它必须在方法表里（2026-10-05）
+       *
+       * 原实现是端点闭包里的局部函数，直接摸 `zcode.fetchCaptchaConfig()`。
+       * 拆出 `createJetHubOps` 后 `zcode` 实例只在 ops 闭包里可见，而载体页路由
+       * 在 `registerJetHubHttpEndpoints` 里 —— 要么把第二个 zcode 实例拖进签名，
+       * 要么像这样开一条方法。选后者：它顺带让 `/account_hub` 也能读到同一份配置。
+       *
+       * ⚠ 远端那次请求**不是**新加的开销 —— `fetchCaptchaConfig()` 自带 60 秒
+       * TTL 缓存（`src/zcode-auth.ts` 的 `captchaConfigCacheInstance`），与推理侧
+       * `index.ts` 走的是同一份缓存实例。
+       * ⚠ 拉不到（无凭据 / 网络失败 / 该形态的实例没有这个方法）一律回落
+       *   `ZCODE_CAPTCHA_FALLBACK`：载体页**必须**给得出去。调用方据此显示兜底值
+       *   即可，不把「配置旧一点」当故障报。
+       */
+      case 'captcha.config': {
+        const value: ZcodeCaptchaConfig = await (async () => {
+          try {
+            const remote = await zcode.fetchCaptchaConfig()
+            return remote ?? ZCODE_CAPTCHA_FALLBACK
+          } catch {
+            return ZCODE_CAPTCHA_FALLBACK
+          }
+        })()
+        return { ok: true, value }
+      }
+
       /** client 心跳问「现在要不要产 param」——不需要时 client 一次都不产（零配额消耗）。 */
       case 'captcha.demand': {
         const value: RpcCaptchaDemandResponse = { active: captchaDemand() }
@@ -3785,6 +3771,136 @@ function registerJetHubEndpoints(
         return { ok: false, error: { code: 'bad-request', message: `unknown method: ${method}` } }
     }
   }
+
+  return { handleMethod }
+}
+
+/**
+ * 把账号操作核心挂成 Web 的 HTTP 端点（**只此一个消费者**）。
+ *
+ * `connection.fetch` 只存在于 Web bundle；缺失时安静返回，账号操作核心
+ * （`ops`）仍在，供 `/account_hub` 斜杠命令直接调用。
+ */
+export function registerJetHubHttpEndpoints(connectionCtx: Context, ops: JetHubOps): void {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const connection = (connectionCtx as any).connection ?? connectionCtx.get('connection')
+  if (!connection || typeof connection.fetch?.register !== 'function') {
+    connectionCtx.logger.warn('[jet-hub] connection.fetch not available, RPC endpoints not registered')
+    return
+  }
+  const ctx = connectionCtx
+
+  /** 载体页要用的 captcha 配置：**远端优先、拉不到就兜底**（取值见 ops 闭包注释）。 */
+  async function carrierCaptchaConfig(): Promise<ZcodeCaptchaConfig> {
+    const result = await ops.handleMethod('captcha.config', undefined) as
+      | { ok: true; value: ZcodeCaptchaConfig }
+      | { ok: false; error: { message: string } }
+    if (result.ok) return result.value
+    ctx.logger.warn(`[jet-hub] 远端 captcha 配置读取失败，回落兜底值：${result.error.message}`)
+    return ZCODE_CAPTCHA_FALLBACK
+  }
+
+  // Jet Hub 管理 API 主端点：客户端经 `connection.rpc` 调（见 plugin-src/client/）。
+  // 所有方法**全部**分派给账号操作核心，本文件不再保有任何第二份实现。
+  connection.fetch.register({
+    path: JET_HUB_API_PATH,
+    methods: ['POST'],
+    requestBody: 'buffered' as const,
+    async fetch(request: Request): Promise<Response> {
+      if (request.method !== 'POST') {
+        return new Response('method not allowed', { status: 405 })
+      }
+      const contentType = request.headers.get('content-type')?.split(';', 1)[0].trim().toLowerCase()
+      if (contentType !== 'application/json') {
+        return new Response('content type must be application/json', { status: 415 })
+      }
+
+      let message: Record<string, unknown>
+      try {
+        message = await request.json() as Record<string, unknown>
+      } catch {
+        return new Response('body is not JSON', { status: 400 })
+      }
+
+      const rpcId = typeof message.rpcId === 'string' ? message.rpcId : 'invalid-request'
+      const call = message.payload as Record<string, unknown> | undefined
+      if (
+        message.type !== 'client-request' || typeof message.rpcId !== 'string'
+        || message.method !== JET_HUB_ENDPOINT
+        || !call || typeof call.method !== 'string'
+        || !Object.prototype.hasOwnProperty.call(call, 'payload')
+      ) {
+        return reply(rpcId, { ok: false, error: { code: 'gateway/bad-request', message: 'Invalid Jet Hub management request.' } })
+      }
+
+      try {
+        const result = await ops.handleMethod(call.method as string, call.payload, request.signal)
+        return reply(rpcId, result)
+      } catch (error) {
+        // 必须返回规范的 RPC 错误响应（而不是裸 500 文本），
+        // 否则客户端 unwrapRpcResult 无法识别错误，表现为"点击无反应"。
+        const message = error instanceof Error ? error.message : String(error)
+        ctx.logger.warn(`[jet-hub] ${String(call.method)} failed: ${message}`)
+        return reply(rpcId, {
+          ok: false,
+          error: { code: 'jet-hub/handler-failed', message },
+        })
+      }
+    },
+  })
+
+  /**
+   * 内部载体的载体页（**旧路由：已不是 guest 的入口**，见下面的取证）。
+   *
+   * ## ⚠⚠ 它**不可能**被 `<webview>` guest 加载（评审 C1/C2，2026-10-02 实测取证）
+   * 这条路由挂在应用自己的 host 上，而桌面版主进程对 guest 有两道硬闸
+   * （DSH Desktop 0.2.0-rc.2，`resources/app.asar/lib/main.js`）：
+   * - `allowedNavigation(value)` = http(s) + 无账号密码 + `!isApplicationHost(url)`；
+   * - `isApplicationHost(url)` = **`url.port === host.port` 且（主机相同或回环）**；
+   * - `configureSession().onBeforeRequest` 对命中者直接 `callback({ cancel: true })`；
+   * - guest 的 partition 是 `dsh-sidebar-browser-${randomUUID()}`（**无 `persist:`**），
+   *   Host 的会话 cookie 在 `defaultSession` 里 ⇒ 即便加载到了也过不了 `/api/*` 的认证。
+   *
+   * ⇒ 内部载体的真正入口是**独立回环端口上的小服务**
+   * （`src/captcha-carrier-server.ts`，地址由 `captcha.carrierUrl` 这条 RPC 给）。
+   *
+   * ## 那为什么还留着这条
+   * ① 它是**手工诊断**用的：web 版下 GUI 就是 `http://127.0.0.1:<port>`，
+   *   在浏览器标签里直接打开这一页可以验证「载体页本身能不能产 param」；
+   * ② 表达式只有这一份（`buildCarrierPageHtml`），删路由不会让逻辑分叉；
+   * ③ 保留 = 不破坏既有 `CAPTCHA_CARRIER_PATH` 契约（`tests/unit/zcode-carrier-rpc.spec.ts`）。
+   * ⚠ **别再把 client 导航指回这里** —— 那正是评审 C1/C2 指出的「收益恒为 0」的成因。
+   *
+   * ⚠ 只读、无凭据：这条 GET 不接收任何参数，输出里不含 JWT / token；
+   *   产出的 param 由 guest 自己经 `captcha.contribute` 回传，**不**经这条路由。
+   */
+  connection.fetch.register({
+    path: CAPTCHA_CARRIER_PATH,
+    methods: ['GET'],
+    requestBody: 'buffered' as const,
+    async fetch(request: Request): Promise<Response> {
+      /**
+       * ⚠ 真实挂载下这条**永远轮不到**：dsh 的分发器按 `methods` 集合筛过才调本 handler
+       * （`@deepseek-ai/dsh-client-connection` 里 `fetchRoutes.get(pathname)` +
+       * `methods.has(request.method)`）。留着它不是防御性装饰，是为了**不依赖挂载假设**：
+       * 直接调 handler 的用例（本仓库的 connection 替身就是这么跑的）要能自己判 405，
+       * 且将来有人把 `methods` 放宽成含 POST 时，这里不会静默把 RPC 流量当页面接走。
+       */
+      if (request.method !== 'GET') {
+        return new Response('method not allowed', { status: 405 })
+      }
+      const html = buildCarrierPageHtml(await carrierCaptchaConfig())
+      return new Response(html, {
+        status: 200,
+        headers: {
+          'content-type': 'text/html; charset=utf-8',
+          // 每次都现渲染：配置跟着远端 60 秒 TTL 变，缓存这份只会让载体页拿旧 SceneId。
+          'cache-control': 'no-store',
+        },
+      })
+    },
+  })
+
 }
 
 /** 构造带 rpcId 的响应 JSON */

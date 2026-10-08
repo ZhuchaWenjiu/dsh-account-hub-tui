@@ -1,7 +1,13 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import {
   OpencodeAdapter, clearOpencodeCatalogCache, loadOpencodeCatalog, pickSlot,
 } from '../../src/opencode-adapter.js'
+import {
+  clearOpencodeCapabilitiesCache, type OpencodeModelCapability,
+} from '../../src/opencode-capability.js'
 import { listIdentitySlots, type IdentitySlot } from '../../src/opencode-auth.js'
 import { OPENCODE, isFreeOpencodeModel } from '../../src/opencode-product.js'
 
@@ -40,6 +46,51 @@ const remoteCatalog = {
     { id: 'big-pickle', name: 'Big Pickle' },
     { id: 'claude-opus-4-5', name: 'Claude Opus 4.5' },
   ],
+}
+
+/**
+ * 把一份最小能力表落进**临时** `DSH_HOME` 的合法磁盘缓存，让紧随其后的
+ * `getOpencodeCapabilitiesSync()` 读到它；返回的 `restore()` 必须放在
+ * `finally`（或 `afterEach`）里调用。
+ *
+ * ## ⚠️⚠️ 为什么需要它（本文件那条用例曾经**假绿/假红**的根因）
+ *
+ * 能力表的真实来源是**运行时抓取**的 models.dev（`opencode-capability.ts`），
+ * 磁盘缓存落 `$DSH_HOME/cache/opencode-capabilities.json` —— 它是外部产物、
+ * **不入库**。于是：
+ * - 作者机器上跑过插件 ⇒ 有缓存 ⇒ 用例绿；
+ * - 全新 clone / 从未联网抓过的机器（含 CI）⇒ `memory === []` ⇒
+ *   `capability === undefined` ⇒ 兜底链落到 catalog 的 0 ⇒ 用例红。
+ *
+ * ⇒ 用例必须**自带夹具**，不能依赖机器状态。这里只用既有接口：
+ * `clearOpencodeCapabilitiesCache()` 会把 `diskLoaded` 复位（否则
+ * `loadDiskCacheSync()` 会因「已读过」而直接返回、忽略我们新写的文件），
+ * 然后按 `CapabilityCacheFile`（`version: 2 + entries`）的形状写一份缓存。
+ */
+async function seedCapabilities(
+  entries: readonly OpencodeModelCapability[],
+): Promise<{ restore: () => Promise<void> }> {
+  const home = await mkdtemp(join(tmpdir(), 'opencode-caps-'))
+  const previousHome = process.env.DSH_HOME
+  process.env.DSH_HOME = home
+  // ⚠️ 顺序不可颠倒：`clear` 会同时清内存与复位 `diskLoaded`，
+  // 若先写文件再 clear，文件会被 `unlink` 掉。
+  await clearOpencodeCapabilitiesCache()
+  await mkdir(join(home, 'cache'), { recursive: true })
+  await writeFile(
+    join(home, 'cache', 'opencode-capabilities.json'),
+    JSON.stringify({ version: 2, at: Date.now(), entries }),
+    'utf8',
+  )
+  return {
+    restore: async () => {
+      // 在恢复 DSH_HOME **之前**清理：这样 unlink 删的是夹具文件本身
+      await clearOpencodeCapabilitiesCache()
+      await rm(home, { recursive: true, force: true })
+      if (previousHome === undefined) delete process.env.DSH_HOME
+      else process.env.DSH_HOME = previousHome
+    },
+  }
 }
 
 describe('loadOpencodeCatalog', () => {
@@ -231,13 +282,31 @@ describe('resolveModel', () => {
   // —— 而 Zen `/v1/models` 实测**从不下发**该字段（85 条只有 4 个基础字段）。
   // 故这两条改用「catalog 给 0」与「未知模型」来锁真正要守的语义。
   it('⚠️ catalog 给 0 窗口时，能力表仍能提供窗口（issue IKJJ68 根因）', async () => {
-    const a = new OpencodeAdapter({
-      identitySlots: async () => [anonSlot()],
-      fetchRemoteCatalog: async () => jsonResponse({ data: [{ id: 'big-pickle', context_window: 0 }] }),
-    })
-    const resolved = await a.resolveModel('opencode', 'big-pickle')
-    // 能力表里 big-pickle = 200000；catalog 的 0 不该压掉它
-    expect(resolved.context?.contextWindow).toBe(200000)
+    // ⚠️⚠️ 本用例原先**依赖机器状态**（读真实 `$DSH_HOME` 里那份由插件运行时
+    // 抓下来的 models.dev 缓存）—— 全新 clone 上必然失败。现在自带夹具：
+    // 只声明本用例需要的那一条（`big-pickle` 的窗口 = models.dev 的 `limit.context`）。
+    const caps = await seedCapabilities([{
+      id: 'big-pickle',
+      name: 'Big Pickle',
+      modalities: ['text', 'image'],
+      contextWindow: 200_000,
+      maxOutputTokens: 0,
+      reasoning: false,
+      efforts: [],
+      toolCall: true,
+      isFree: true,
+    }])
+    try {
+      const a = new OpencodeAdapter({
+        identitySlots: async () => [anonSlot()],
+        fetchRemoteCatalog: async () => jsonResponse({ data: [{ id: 'big-pickle', context_window: 0 }] }),
+      })
+      const resolved = await a.resolveModel('opencode', 'big-pickle')
+      // 能力表里 big-pickle = 200000；catalog 的 0 不该压掉它
+      expect(resolved.context?.contextWindow).toBe(200000)
+    } finally {
+      await caps.restore()
+    }
   })
   it('⚠️ 两侧都不知道窗口时不下发 context（不编造）', async () => {
     const a = new OpencodeAdapter({

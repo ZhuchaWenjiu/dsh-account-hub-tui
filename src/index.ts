@@ -30,6 +30,7 @@ import { AccountPool } from './account-pool.js'
 import { hasLegacyNamespaceRegistration, settingsOf, suppressAutoSettingsPage } from './settings-compat.js'
 import type { ImageRequestTarget } from './image-budget.js'
 import { buildRaccoonNickname, registerJetHubRpc } from './jet-hub-rpc.js'
+import { registerAccountHubCommand, ACCOUNT_HUB_COMMAND } from './account-hub-command.js'
 import { CODEBUDDY, WORKBUDDY, type BuddyProduct } from './product.js'
 import { mountOpenAiGateway } from './openai-gateway/index.js'
 import { buddyExpiringWindowDays } from './buddy-balance-rank.js'
@@ -1659,7 +1660,11 @@ const zcodeAdapter = registerZcodeLlm(ctx, {
     opencode: opencodeAdapter,
   }
 
-  registerJetHubRpc(ctx, pool, service, buddy, workbuddy, lobsterai, qoder, qoderCn, trae, cline, loomy, raccoon, minimax, zcode, modelAdapters)
+  const jetHubOps = registerJetHubRpc(ctx, pool, service, buddy, workbuddy, lobsterai, qoder, qoderCn, trae, cline, loomy, raccoon, minimax, zcode, modelAdapters)
+  // `/account_hub`（dst TUI 斜杠命令）——与 Web 端 Jet Hub **共用同一个方法分派**，
+  // 不复制任何业务实现；headless / CLI 下游不到 RPC 端点，但命令照常可用。
+  // ⚠️ 必须晚于 registerJetHubRpc（要拿它返回的 ops）；插件 inject 已含 'commands'。
+  registerAccountHubCommand(ctx, jetHubOps)
   // 网关是旁路功能：这里传 `pool` 只为读设置页里的开关，其内部任何失败都已
   // 自行降级为日志，绝不会让插件 apply() 失败。
   mountOpenAiGateway(ctx, pool)

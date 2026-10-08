@@ -44,11 +44,74 @@ const SRC = readFileSync(
   'utf8',
 )
 
-/** 截取某个函数的源码（从 `function NAME` 到下一个顶层 `}` 之后）。 */
+/**
+ * 截取某个函数的完整源码（从 `function NAME` 到**与之配对**的 `}`）。
+ *
+ * ## ⚠️ 为什么不能切到「第一个 `\n}\n`」（2026-10-05 修复）
+ *
+ * 原实现是 `SRC.indexOf('\n}\n', start)` —— 只要函数体内部**任何一行**恰好
+ * 是列 0 的 `}` 就提前截断。而 `hideWindowWindows` 体内嵌了一段 PowerShell
+ * 脚本模板串，脚本里的 C# 类正是**列 0 的 `}` 收尾**：
+ *
+ * ```text
+ * public class ZcodeWinStyle {
+ *   …
+ *   public static List<IntPtr> All() {
+ *     …
+ *   }
+ * }
+ * ```
+ *
+ * 于是切出来的只有前 27 行（到 C# 方法体为止），后面真正的实现
+ *（`-File` / `powershell.exe` / 样式位 / `child.on('exit'` 等）全被切掉 ⇒
+ * 本文件 7 条 Windows 源码契约用例**恒红**，而报错文案是
+ *「expected … to contain '-File'」，看起来像实现丢了，实际是**取源码的辅助
+ * 函数坏了**。
+ *
+ * ⇒ 改为**按花括号配对**扫描，并跳过字符串 / 模板串 / 注释里的花括号
+ *（模板串整体视为不透明：本文件那处插值 `${String(pid)}` 的花括号自身配对，
+ * 跳过不影响计数）。
+ */
 function fnSource(name: string): string {
   const start = SRC.indexOf(`function ${name}`)
   expect(start, `找不到 function ${name}`).toBeGreaterThan(0)
-  return SRC.slice(start, SRC.indexOf('\n}\n', start))
+  const braceStart = SRC.indexOf('{', start)
+  expect(braceStart, `function ${name} 没有函数体`).toBeGreaterThan(0)
+
+  let depth = 0
+  for (let i = braceStart; i < SRC.length; i++) {
+    const ch = SRC[i]
+    // 行注释：跳到行尾（注释里的引号 / 花括号一律不算数）
+    if (ch === '/' && SRC[i + 1] === '/') {
+      const nl = SRC.indexOf('\n', i)
+      if (nl < 0) break
+      i = nl
+      continue
+    }
+    // 块注释
+    if (ch === '/' && SRC[i + 1] === '*') {
+      const close = SRC.indexOf('*/', i + 2)
+      if (close < 0) break
+      i = close + 1
+      continue
+    }
+    // 字符串与模板串：整体跳过（含其中的花括号与 //）
+    if (ch === '"' || ch === "'" || ch === '`') {
+      i++
+      while (i < SRC.length) {
+        if (SRC[i] === '\\') { i += 2; continue }
+        if (SRC[i] === ch) break
+        i++
+      }
+      continue
+    }
+    if (ch === '{') depth++
+    else if (ch === '}') {
+      depth--
+      if (depth === 0) return SRC.slice(start, i + 1)
+    }
+  }
+  throw new Error(`找不到 function ${name} 的结束位置`)
 }
 
 describe('Linux：parseWmctrlList 解析 wmctrl -lp', () => {
